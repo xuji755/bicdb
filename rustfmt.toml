@@ -1,0 +1,6 @@
+# 本项目仅使用 stable 支持的 rustfmt 选项，
+# 避免引入 nightly-only 配置导致 CI 与本地行为不一致。
+edition = "2021"
+max_width = 100
+use_field_init_shorthand = true
+use_try_shorthand = true

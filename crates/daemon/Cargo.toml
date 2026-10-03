@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-daemon"
+description = "工作进程入口、有界执行池、维护线程、监督器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

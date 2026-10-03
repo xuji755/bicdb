@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-asset"
+description = "ASSET_REF、流式写读、引用登记与回收"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1,0 +1,31 @@
+# 设计依据：§20 —— "CI 每提交跑编译、单测、短模型与隔离回归"
+# 每日/每周的更重门禁（SQL 并发、文件故障、Sanitizer、长稳）待对应
+# 阶段交付后在本文件补充，届时需接入自建 runner。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 编译
+        run: cargo build --workspace
+
+      - name: 单元与集成测试
+        run: cargo test --workspace

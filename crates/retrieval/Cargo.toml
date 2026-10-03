@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-retrieval"
+description = "倒排与分词、精确向量、RRF 融合、HNSW/IVFFlat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

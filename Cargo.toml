@@ -1,0 +1,15 @@
+# bicdb —— 面向 Agent 的用户隔离记忆与资产数据库
+# 设计依据：doc/小型多线程数据库总体开发方案_v0.2.md（内部文档，不随此仓库发布）
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/xuji755/bicdb"
+publish = false
+
+[workspace.dependencies]

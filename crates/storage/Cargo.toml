@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-storage"
+description = "页格式、槽位堆表、跨页行片段、BufferPool、PageGuard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

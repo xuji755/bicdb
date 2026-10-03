@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-txn"
+description = "事务状态机、语句快照、行锁、Undo、死锁检测"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

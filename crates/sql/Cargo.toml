@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-sql"
+description = "Raw AST、Binder、逻辑/物理计划、执行器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

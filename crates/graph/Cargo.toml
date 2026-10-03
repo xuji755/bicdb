@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-graph"
+description = "命名图、顶点/边存储、Cypher 子集、有界遍历"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
