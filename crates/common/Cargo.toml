@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-common"
+description = "统一错误码、LSN/SCN 类型、RAII 与页校验和基础工具"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

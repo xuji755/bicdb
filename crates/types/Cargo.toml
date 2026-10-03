@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-types"
+description = "Oracle 兼容标量、JSON 文档表示、VECTOR 类型"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

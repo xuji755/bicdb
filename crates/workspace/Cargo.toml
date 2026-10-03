@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-workspace"
+description = "WorkspaceContext、身份与路由、根目录句柄、配额与公平调度"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

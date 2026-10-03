@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-tools"
+description = "诊断与检查工具：page_dump、db_check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-index"
+description = "B+Tree：唯一键、复合键、范围访问、并发分裂"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

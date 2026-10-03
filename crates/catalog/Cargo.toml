@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-catalog"
+description = "Catalog 解析、类型描述、对象版本"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

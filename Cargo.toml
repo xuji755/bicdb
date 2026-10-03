@@ -1,0 +1,20 @@
+# bicdb —— 面向 Agent 的用户隔离记忆与资产数据库
+# 设计依据：doc/小型多线程数据库总体开发方案_v0.2.md（内部文档，不随此仓库发布）
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+# MSRV：代码可编译的最低 Rust 版本。这是比工具链精确版本更宽松、更稳定的
+# 约束——开发人员用任意 >= 1.75 的 stable 均可构建。
+#
+# 注意：当前 1.75 是**占位值，尚未经验证**（仓库暂无代码）。MSRV 必须在
+# 有实际代码后由 CI 实测确定，并在 P0 冻结；不得长期保留未经验证的声明。
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/xuji755/bicdb"
+publish = false
+
+[workspace.dependencies]

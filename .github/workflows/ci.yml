@@ -1,0 +1,107 @@
+# 设计依据：§20 —— "CI 每提交跑编译、单测、短模型与隔离回归"
+#
+# 本工作流的门禁**在运行基线内执行**（container: debian:12，glibc 2.36），
+# 而不是在 runner 自带的 Ubuntu 24.04 上。原因见 docs/platform-support.md：
+# 构建环境决定产物链接的 glibc 版本，在 24.04（glibc 2.39）上构建的产物
+# 无法在基线运行。门禁跑在基线里，门禁通过才等于产物真的兼容。
+#
+# 双架构矩阵刻意使用**同一个 OS 版本**，使矩阵只隔离"架构"这一个变量；
+# 否则架构差异与系统差异会混在一起，出问题时无法归因。
+#
+# 开发期以 ARM64 为主，但两架构都是从提交级就纳入门禁，不做事后补测。
+#
+# 每日/每周的更重门禁（SQL 并发、文件故障、Sanitizer、长稳）待对应阶段
+# 交付后在本文件补充。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    name: ${{ matrix.os }} / debian-12 基线
+    runs-on: ${{ matrix.os }}
+    container: debian:12
+    strategy:
+      # 一个架构失败不取消另一个 —— 需要看到两个架构的完整结果
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04      # x86_64 宿主
+          - ubuntu-24.04-arm  # aarch64 宿主（公开仓库免费；ARM 无 -latest 标签）
+
+    steps:
+      # 容器内需先具备 git（checkout 依赖）与构建工具
+      - name: 安装基础依赖
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential binutils
+
+      - uses: actions/checkout@v4
+
+      # 工具链不固定精确版本（见 rust-toolchain.toml），此处装 stable。
+      # 版本在下一步打印留档，满足可追溯性。
+      - name: 安装 Rust stable
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal \
+                --default-toolchain stable \
+                --component rustfmt --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: 打印基线环境信息（留档）
+        run: |
+          set -euo pipefail
+          echo "架构:        $(uname -m)"
+          echo "内核:        $(uname -r)"
+          echo "发行版:      $(cat /etc/debian_version 2>/dev/null || echo '?')"
+          echo "最大 GLIBC:  $(ldd --version | head -1)"
+          echo "rustc:       $(rustc --version)"
+          echo "cargo:       $(cargo --version)"
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy（全部目标，告警即失败）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 编译
+        run: cargo build --workspace
+
+      - name: 单元与集成测试
+        run: cargo test --workspace
+
+      # 机械校验：产物实际引用的 GLIBC 符号不得超过 2.34。
+      #
+      # 2.34 是实测下限（glibc 2.34 将 libpthread 并入 libc，Rust std 依赖
+      # pthread 系列符号，故任何含线程的 Rust 二进制都顶到 2.34）。该值恰好
+      # 覆盖 RHEL 9，没有余量，因此必须机械守住——本步骤是"支持范围"声明的
+      # 证据，而不是靠人工判断。详见 docs/platform-support.md。
+      - name: 校验产物 glibc 符号不高于基线 2.34
+        run: |
+          set -euo pipefail
+          BASE=2.34
+          fail=0
+          found=0
+          for bin in target/debug/*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            head -c4 "$bin" 2>/dev/null | grep -q $'\x7fELF' || continue
+            found=$((found + 1))
+            max=$(objdump -T "$bin" 2>/dev/null \
+                  | grep -o 'GLIBC_[0-9]\+\(\.[0-9]\+\)*' \
+                  | sed 's/GLIBC_//' | sort -V -u | tail -1 || true)
+            [ -z "${max:-}" ] && continue
+            echo "$(basename "$bin") → 最高 GLIBC_$max"
+            if [ "$(printf '%s\n%s\n' "$max" "$BASE" | sort -V | tail -1)" != "$BASE" ]; then
+              echo "::error::$(basename "$bin") 需要 glibc $max，高于基线 $BASE"
+              echo "::error::这会丢掉 RHEL 9 / Ubuntu 22.04 支持，见 docs/platform-support.md"
+              fail=1
+            fi
+          done
+          echo "检查了 $found 个 ELF 产物"
+          exit $fail

@@ -1,0 +1,10 @@
+[package]
+name = "bicdb-wal"
+description = "WAL 记录、重做与撤销、检查点、恢复重入"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
