@@ -66,8 +66,22 @@ M4 = P8–P10 多模型数据能力；M5 = P12 受控试用。
 **同时支持 x86_64 与 aarch64（ARM64）**，两者均为受支持目标，不是"主/备"关系。
 开发期以 **ARM64** 为主进行编译与测试。
 
-工具链版本由 `rust-toolchain.toml` 固定，保证两种架构下门禁可复现。CI 在
-同一 OS 版本上跑双架构矩阵，使差异只来自架构本身：
+运行基线：**glibc ≥ 2.34**、**内核 ≥ 5.14**，不设上界。覆盖 RHEL 9、
+Ubuntu 22.04、Debian 12+、openEuler 24.03+、Ubuntu 24.04+、RHEL 10、Debian 13。
+
+glibc 下限由**二进制实际引用的最高版本符号**决定，而非构建机的 glibc 版本。
+实测下限为 2.34——glibc 2.34 将 libpthread 并入 libc，而 Rust std 依赖 pthread
+系列符号，故任何含线程的 Rust 二进制都顶到 2.34。CI 用机械校验守住这条线。
+
+发布产物仍在最低支持平台（Debian 12）上构建：含 C 代码的依赖会链接构建机
+的 glibc，可能抬高下限，构建在低版本环境可避免这一风险。
+
+> **关键区分**：卡住二进制移植的是 **glibc 符号版本，不是内核版本**。各发行版的
+> 内核代次与 glibc 并不同步（如 openEuler 24.03 内核 6.6、glibc 2.38）。
+> 完整说明与支持列表见 [`docs/platform-support.md`](docs/platform-support.md)。
+
+CI 在 Debian 12 容器中、对两个架构分别执行门禁，使**门禁结果即代表产物的
+真实兼容性**，并附 glibc 符号的机械校验：
 
 | Runner | 架构 |
 | --- | --- |
@@ -80,7 +94,8 @@ M4 = P8–P10 多模型数据能力；M5 = P12 受控试用。
 
 ## 构建
 
-要求 Rust 工具链（版本见 `rust-toolchain.toml`；`rust-version` 下限 1.75）。
+要求 Rust 任意近期 stable；可编译的最低版本（MSRV）见 `Cargo.toml` 的
+`rust-version`。工具链不做精确固定，以保持构建普适性。
 
 ```bash
 cargo build --workspace
@@ -101,8 +116,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## 尚未确定
 
-- 性能与容量数字：均为设计建议，须在 P0 冻结（性能基线与基准机规格同样待冻结，
-  需明确测试在哪一架构上进行、是否需要双架构分别记录）
+以下均须在 P0 冻结，详见 [`docs/platform-support.md`](docs/platform-support.md)：
+
+- **目标发行版清单**：当前支持列表由符号版本**推导**得出，尚未在真实发行版上
+  做过运行验证
+- **MSRV**：`rust-version = "1.75"` 目前是未经验证的占位值
+- **性能与容量数字**：均为设计建议；性能基线的架构归属也待明确
 
 ## 参与开发
 

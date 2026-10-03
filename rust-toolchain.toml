@@ -1,6 +1,9 @@
-# 固定工具链版本，保证本地与 CI、ARM64 与 x86_64 的门禁可复现。
-# 升级工具链时修改此文件，并在同一提交内重新运行全部受影响门禁。
+# 不固定精确工具链版本：开发人员用任意近期 stable 均可构建。
+# 真正的下限由 Cargo.toml 的 rust-version（MSRV）表达。
+#
+# 发布时在 CI 日志中记录当时的精确 rustc 版本（见 .github/workflows/ci.yml
+# 的"打印工具链版本"步骤），以满足可追溯性，而不牺牲构建的普适性。
 [toolchain]
-channel = "1.99.0"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
