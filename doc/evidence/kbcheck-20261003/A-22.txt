@@ -1,0 +1,11 @@
+DB: mysql (detected: mysql)
+WARNING: 未识别到强日志信号，已降级为普通关键词检索。
+
+Signals:
+  - none
+
+Query:
+  plain text
+
+Expanded terms:
+  plain, text

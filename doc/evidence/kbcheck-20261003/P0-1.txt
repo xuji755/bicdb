@@ -1,0 +1,58 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] BINARY_FLOAT/Double与NUMBER精度差异
+      NUMBER列使用十进制精度存储浮点数，所有十进制字面量都能精确存储。BINARY_FLOAT/BINARY_DOUBLE列使用二进制精度，无法精确表示所有十进制值。例如0.1在二进制浮点数中无法精确表示，但在NUMBER中可以精确存储。这种精度差异可能导致舍入误差。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1529900
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] NUMBER(p,s)精度定义
+      按NUMBER(p,s)的形式定义定点数，p和s有以下特征：精度指定数字的总长度。如果不指定精度，则列按应用程序提供的数据存储值，不作任何舍入。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] NUMBER精度与范围限制
+      该条目阐述了Oracle NUMBER类型的理论范围与实际精度限制。核心概念：指数范围-65到62，基数为100，理论可表示范围约为1×10^(-130)到1×10^126。机制：实际精度受限于38位有效数字，超出精度的数值会被四舍五入；若表示一个数字所需字节数超过21（即存储空间不足），Oracle会直接返回溢出错误。应用场景：用于指导数据库设计时选择合适的数据类型，避免精度丢失或溢出错误，特别是在金融计算、科学计算等对精度要求高的场景中。KE kernel perf NUMBER 精度 范围 溢出 38位
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1540368
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] Oracle NUMBER(p)的默认小数位为0
+      原文中 NUMBER(38) 列（ID2）插入1.1后存储为1，而 NUMBER 列（ID1）插入1.1后存储为1.1。说明 NUMBER(p) 形式只定义总精度，小数位默认为0；NUMBER 不指定参数时精度和小数位都不受限。INT 等价于 NUMBER(38)，因此也表现为整数存储。
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] | 代码 | 数据类型 | 说明 |
+|------|----------|------|
+| 2 | `NUMBER[(p[, s])]` | 精度p(1-38)，标度s(-84~127)。占用1-22字节 |
+| 2 | `FLOAT[(p)]` | NUMBER子类型，二进制精度p(1-126)。内部存为NUMBER |
+| 100 | `BINARY_FLOAT` | 32位IEEE754
+      | 代码 | 数据类型 | 说明 |
+|------|----------|------|
+| 2 | `NUMBER[(p[, s])]` | 精度p(1-38)，标度s(-84~127)。占用1-22字节 |
+| 2 | `FLOAT[(p)]` | NUMBER子类型，二进制精度p(1-126)。内部存为NUMBER |
+| 100 | `BINARY_FLOAT` | 32位IEEE754单精度浮点，4字节 |
+| 101 | `BINARY_DOUBLE` | 64位IEEE754双精度浮点，8字节 |
+
+**数值优先级 (Numeric Precedence):**
+1. BINARY_DOUBLE (最高)
+2. BINARY_FLOAT
+3. NUMBER
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:366354
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 字符/NUMBER与浮点数转换的不精确性
+      CHAR、VARCHAR2和NUMBER数据类型使用十进制精度表示数值，而BINARY_FLOAT和BINARY_DOUBLE使用二进制浮点格式。在进行类型转换时，由于基数不同，可能产生舍入误差，导致精度损失。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] NUMBER类型内部存储格式：最大长度与精度
+      NUMBER类型内部使用可变长度数组，每个字节代表一个0-99的基100数字。最大存储长度为21字节。虽然理论上可以表示1*10^(-130)到约1*10^(126)的范围，但实际有效精度被限制在38位十进制数字，超出部分会被舍入。如果表示一个数字需要超过21个字节，Oracle会返回溢出错误。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1548290
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Oracle数字数据类型总体
+      Oracle数据库的数字数据类型存储固定和浮点数字、零、或无穷。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] NUMBER精度限制与溢出处理
+      概念：虽然内部表示可支持指数范围较大（-65~62），但实际精度限制为38位。机制：如果数字需要的存储字节超过21，Oracle会报溢出错误。应用场景：在定义NUMBER列时，应确保精度不超过38位，并注意避免产生超过21字节的数值（如巨量科学计算）。原理 kernel 精度38 21字节限制 溢出错误
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:163664
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] NUMBER内部存储的指数和数字范围
+      由于基100，每个字节最多表示99。指数从-65到62，因此数值范围从1*100^(-65)≈1e-130到99*100^62+...≈1e126。但Oracle只保证38位十进制精度，超出的数字会被四舍五入。所需字节数不超过21，否则溢出错误。
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] KES-KE-5577
+      数字类型
+NUMBER 数据类型存储定点数和浮点数。在KingbaseES 数据库可以存储几乎任意数量级的数字。这些数据能
+在不同操作系统中运行的KingbaseES 数据库之间进行移植。所以对于必须存储数字数据的大多数情况，都建议使用
+NUMBER 数据类型。
+61
+第7 章
+数据库对象管理
+您可以使用NUMBER(p，s) 指定一个定点数，其中p 和s 指的是以下含义：
+• 精度
+精度指定总位数。如果没有指定精度，则列存储的值与应用程序提供的值完全一致，而不进行任何舍入。
+• 标度
+标度指定从小数点到最低有效数字的位数。正数精度将小数点右边的数字计数到最低有效位（包括最低有效
+位）。负数精度将小数点左边的数字计数到最低有效位（不包括最低有效位）。如果指定一个没有指定标度，如
+NUMBER（6）中所示，则标度为0。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1019360
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] ALTER TABLE MODIFY列精度示例
+      SQL数据定义语言中，ALTER TABLE ... MODIFY 列名 数据类型 用于修改已有列的精度或数据类型。本例将sal列从NUMBER(8,2)调整为NUMBER(10,2)。
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

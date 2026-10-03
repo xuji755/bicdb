@@ -1,0 +1,34 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] DROP ... CASCADE 级联删除对象
+      DROP ... CASCADE 级联删除对象：使用 DROP FOREIGN DATA WRAPPER ctl_dummy CASCADE 可以级联删除依赖的外部服务器。
+分类：操作
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] lo_unlink依赖dependency机制
+      lo_unlink依赖dependency机制：大对象删除 lo_unlink 依赖 pg_depend 系统表来维护引用完整性。当删除大对象时，系统会检查是否有其他对象依赖该大对象，防止产生悬挂引用。这是数据库级联删除的一种实现。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 删除extension时依赖检查机制
+      删除extension时依赖检查机制：PostgreSQL在删除extension时，如果有其他数据库对象依赖该extension，则会报错并提示依赖关系，必须使用CASCADE才能级联删除。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] DROP FOREIGN TABLE 删除外部表
+      CASCADE 用于级联删除视图等依赖外部表的对象，避免因依赖导致删除失败。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] CASCADE删除extension及其依赖对象
+      CASCADE删除extension及其依赖对象：当extension有依赖对象时，普通DROP失败，必须指定CASCADE。CASCADE会删除所有依赖该extension的对象，如索引、操作符类、自定义类型、函数，甚至表的列。操作会输出级联删除的通知信息。
+分类：操作
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:489918
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] F032
+      F032：CASCADE删除行为允许级联删除依赖对象。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed,KEOpSQLReviewed] PostgreSQL 使用递归SQL 找出数据库对象之间的依赖关系 - 例如视图依赖
+      PG中对象间存在依赖关系（继承表/视图→基表/主外键/序列等），删除对象时需cascade或先解依赖。本文通过WITH RECURSIVE递归查询pg_depend系统表找出完整依赖链。SQL示例：WITH RECURSIVE dep AS (SELECT objid, refobjid FROM pg_depend WHERE ... UNION ALL SELECT d.objid, d.refobjid FROM pg_depend d JOIN dep ON dep.objid = d.refobjid) SELECT * FROM dep。结合pg_class/pg_namespace获取对象名。实用场景：1)表重建前检查所有依赖对象 2)迁移时验证依赖完整性 3)排查cascade删除的连锁影响。注意pg_depend.deptype字段区分依赖类型(n=normal,a=auto,i=internal,p=pin)。高级用法：结合pg_shdepend查询跨库依赖。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:358369
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] DROP SERVER 删除外部服务器及级联
+      示例：DROP SERVER taxi_srv CASCADE; 删除服务器 taxi_srv 及其所有依赖对象。无 CASCADE 时，如果存在依赖，命令将报错。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed,KEOpSQLReviewed] PG extension被依赖对象的查询——谁依赖了extension里的type、table等
+      通过CTE查询pg_depend和pg_extension，找出哪些用户表/字段依赖了扩展提供的类型(如orafce的varchar2类型)。DROP EXTENSION ... CASCADE会级联删除依赖对象。非IO核心知识。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 依赖跟踪特性
+      依赖跟踪特性：依赖跟踪特性确保当依赖的对象被修改或删除时，函数等对象自动被标记为无效或需要重建，维护数据库对象的一致性和完整性。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] DROP EXTENSION及CASCADE删除依赖
+      不带CASCADE时，如果其他对象（如表、函数）依赖该扩展，删除会失败。CASCADE将递归删除所有依赖对象。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] DBLink 删除后历史依赖延迟暴露
+      原文总结：删除 DBLink 后，并不是所有操作都会立即访问这个历史依赖。这也是为什么这类问题经常表现为“数据库一直正常，今天突然 ALTER TABLE 报一个看起来完全不相关的 Foreign Server 错误”。问题在 DDL 重新处理 View 和列级依赖时暴露：ALTER COLUMN TYPE 检查 county_id 的 pg_rewrite 依赖，重新处理 View 时尝试访问历史 DBLink 对应的 Foreign Server。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1474685
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

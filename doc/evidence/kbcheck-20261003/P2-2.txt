@@ -1,0 +1,44 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 行迁移与行链接机制
+      行链接（Row Chaining）发生在行首次插入时，如果行的长度超过数据库块大小，Oracle 将行分割到多个数据块中。行迁移（Row Migration）发生在 UPDATE 操作后行变长且原块无足够空闲空间时，Oracle 将整行移动到新数据块，在原块保留指向新位置的 rowid 指针。两者都会增加 I/O 开销。CHAIN_CNT 通过 ANALYZE TABLE ... COMPUTE STATISTICS 或 DBMS_STATS 收集，帮助识别需要重建或调整 PCTFREE 的表。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:333061
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 行迁移与行链接的判定依据
+      原文在重新分析后得到 num_rows=4077696、avg_space=854、avg_row_len=68、chain_cnt=874571，判断“坐整体行长度来看不是行链接，应该是行迁移”。说明行长度未超块大小时，大量链式行更可能是更新引起的行迁移。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 行迁移和行链接
+      行迁移：UPDATE操作使行变大，无法放入原块，整行迁移到新块，原位置保留指向新块的指针。行链接：INSERT时行大小超过块大小，行被分割到多个块。行迁移可通过调整PCTFREE减少，行链接通常因块大小或LOB引起。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 行链接与行迁移在数据库层面同类
+      原文：'在数据库层面行链接与行迁移是同样一类，所以上面收集命令也会收集到行迁移数据行'。测试中 LIST CHAINED ROWS 结果只有 id=1 的行，该行因 update d 列变长而无法留在原块，产生链接/迁移，chained_rows.head_rowid 指向该行。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] ANALYZE TABLE LIST CHAINED ROWS 行迁移/行链接诊断
+      行迁移/行链接专项诊断需执行 ANALYZE TABLE 命令，将链式行信息存入预先创建的 CHAINED_ROWS 表，再查询该表获取行链接计数。`CHAIN_CNT` 的解释和准确性受统计方式影响，实战中更建议把它当作“提示信号”，结合 SQL 性能表现再决定是否处理。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1020407
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 行迁移与行链接的区别
+      行迁移是更新时行增大，被整体移到新块，原块只留指针（nrid），行标志只有H位，无F/L。行链接是插入时行太大，被拆分为多个行片，头片包含H、F、N等标志，后续片包含P、L等标志。行迁移后访问需要先读老块再读新块；行链接通常通过一次多块读可能同时加载。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556953
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 行链接与行迁移导致 I/O 增加
+      对于正常未迁移的行，通过索引访问只需一次 I/O 读取索引块，再根据 ROWID 读取一个表数据块。对于迁移行，数据库先读取原块中的转发指针，再根据指针访问新块，因此多一次 I/O。对于行链接，需要逐一读取所有链接块。频繁的链接和迁移会降低查询响应时间，增加 buffer cache 压力。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1051687
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 行迁移和链接的影响
+      行迁移需要I/O访问原块和迁移块，行链接需要多次I/O访问多个块。这增加了随机I/O和逻辑读。可以通过ANALYZE TABLE或V$表检测行迁移和链接。优化方法包括调整PCTFREE、重建表、选择更大的块大小等。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 数据库范围统计中的链接行率
+      链接行率（chained row ratio）反映行链接（row chaining）或行迁移（row migration）的程度，是评估表空间和行存储效率的指标。其核心机制是：当一行数据超过数据库块大小（如8KB）时，必须存储在多个块中（行链接）；或当UPDATE操作导致行变长，原块空间不足时，行被迁移到新块但保留原指针（行迁移）。高链接行率意味着读取单行需要多次I/O，严重影响性能。应用场景包括诊断大字段（如LOB）或频繁UPDATE的表，可通过重建表、调整PCTFREE参数或使用更大的块大小来减少行链接。KE perf kernel 链接行率 行链接 行迁移 PCTFREE v$sysstat
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1555894
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:21201.1 EVENT: 10227 "verify (multi-piece) row structure"
+      Event:10227
+Text: verify (multi-piece) row structure
+-------------------------------------------------------------------------------
+Explanation:
+This a special EVENT code.
+It should *NOT* be used unless explicitly requested by Oracle Support.
+Event 10227 enables checking of chained / migrated row pieces
+by checking that all the row piece flags and NRID links form
+a complete valid row piece. It should only be used to help
+diagnose problems where chaining or row migration seem to cause
+row piece corruption
+Articles:
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995369
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 行迁移和行链接对ITL的影响
+      对于迁移行，原始块中只有行头（被一个ITL覆盖），但实际行数据在另一个块中，因此修改时需要两个块的ITL。对于链接行，行头所在块需要一个ITL，正在修改的链接片若在不同块也需要另一个ITL。这增加了事务对ITL条目的消耗，可能引发ITL等待问题。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:273242
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Oracle行链接与行迁移的区别
+      行链接发生在第一次插入行时，由于行过长（如包含LONG、LONG ROW、LOB等）不能容纳在一个数据块中，Oracle会使用与该块链接的一个或多个数据块来存放该行数据，通常由INSERT操作引起，且不可避免。行迁移发生在更新操作导致当前行数据增大以致无法再容纳在当前块时，Oracle会将整行迁移到一个新数据块，原始数据块只保留指向新块的地址信息，行的ROWID不会改变；行迁移通常由UPDATE操作引起，主要与PCTFREE参数设置过小有关。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1475989
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

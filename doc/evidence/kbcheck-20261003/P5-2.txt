@@ -1,0 +1,12 @@
+  ✅ [ExecutionOperator] NESTED LOOPS
+     描述: 类别: 3. 连接操作符 | 关联优化规则: 11条 | 实战案例: 3个
+     关联优化规则 (10条):
+       • LEADING+USE_HASH多表JOIN顺序优化：11h→25秒
+       • 连接方法选择 — Nested Loops vs Hash Join vs Sort-Merge Join
+       • Nested Loops向量I/O批量优化（11g+）
+       • 拆分SQL优化方法：大查询分解为多个小查询的性能权衡
+       • 相同SQL不同部分生成不同执行计划时使用USE_HASH HINT统一执行计划
+     实战案例 (3个):
+       • sql-top2
+       • sql-top1
+       • topsql1

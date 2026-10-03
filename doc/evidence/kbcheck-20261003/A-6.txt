@@ -1,0 +1,73 @@
+
+============================================================
+  [分析] sysaux 表空间增长过快
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 60，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     通过历史趋势分析（DBA_HIST_TBSPC_SPACE_USAGE）判断是否存在空间暴增，然后按组件维度查看 SM/AWR、SM/OPTSTAT、AUDIT_TABLES 等占用，最后定位到具体段（如 AUD$、WRH$_ACTIVE_SESSION_HISTORY）占用过大的根本原因，采取相应措施。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] SYSAUX 空间增长分析总体思路  (排序分: 9.4)
+     └ 详情：通过历史趋势分析（DBA_HIST_TBSPC_SPACE_USAGE）判断是否存在空间暴增，然后按组件维度查看 SM/AWR、SM/OPTSTAT、AUDIT_TABLES 等占用，最后定位到具体段（如 AUD$、WRH$_ACTIVE_SESSION_HISTORY）占用过大的根本原因，采取相应措施。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:581908
+
+     [KnowledgeEntry] 19c RAC CDB 中 SYSAUX 表空间增长超大  (排序分: 9.4)
+     └ 详情：文档记录某客户 19c RAC CDB 数据库的 SYSAUX 表空间增长超大，分析原因为 Optimizer Statistics Advisor 特性导致 WRI$_ADV_OBJECTS 对象记录数变多。该现象需要关注 SYSAUX 存储容量，并考虑对 PDB SYSAUX 中的大对象进行手动清理。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4010049
+
+     [KnowledgeEntry] 通过v$tablespace生成表空间只读SQL  (排序分: 9.4)
+     └ 详情：v$tablespace视图的NAME列保存所有表空间名称。该SQL将非系统表空间拼接为动态ALTER TABLESPACE语句，便于批量执行。使用时注意排除SYSTEM、SYSAUX、UNDOTBS1、TEMP等系统默认表空间，避免影响系统运行。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1478111
+
+     [KnowledgeEntry] 检查表空间增长率  (排序分: 9.4)
+     └ 摘要：使用DBA_HIST_TBSPC_SPACE_USAGE、DBA_HIST_TABLESPACE_STAT等，按天计算永久表空间（排除SYSAUX、SYSTEM、UNDOTBS1）的最大使用大小。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4115909
+
+     [CaseStudy] SYSAUX表空间300GB异常增长处理案例  (排序分: 9.1)
+     └ 摘要：SYSAUX表空间达300GB。诊断：SM/AWR占用260,713MB，SM/OPTSTAT占用7,607MB；AWR保留31天，快照间隔30分钟，日增约2GB；WRH$_ACTIVE_SESSION_HISTORY表分区占118GB，索引占17GB。尝试DBMS_WORKLOAD_REPOSITORY.DROP_SNAPSHOT_RANGE删除快照，24小时未完成且致UNDO膨胀240GB。处理：将AWR保留期从31天改为7天，后台自动清理过期分区，空间恢复正常。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1529199
+
+     [FaultModel] SYSAUX 表空间设置过小导致告警  (排序分: 8.6)
+     └ 摘要：SYSAUX 表空间初始分配过小且未启用数据文件自动扩展，当空间使用超过阈值时触发表空间使用率告警，表现为表空间满，但实际 SYSAUX 内部并无异常增长对象。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:581923
+
+
+### 诊断关联（图谱关系，需结合现场核实）
+入口 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:581908：显示 2/2 个相关对象，原始 2 个
+  SYS.GV$SYSAUX_OCCUPANTS — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2668033
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:10026213
+  SYS.V$SYSAUX_OCCUPANTS — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:98813
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:10026212
+入口 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4115909：显示 4/4 个相关对象，原始 4 个
+  SYS.DBA_HIST_INTERCONNECT_PINGS — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:108479
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:12712209
+  SYS — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1520074
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:12715726
+  SYS.DBA_HIST_TABLESPACE_STAT — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:97940
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:10581013
+  SYS.DBA_SYS_PRIVS — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:98154
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:10583218
+入口 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4010049：显示 8/8 个相关对象，原始 8 个
+  SYS — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1520074
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:11986942
+  OPTIMIZER_USE_SQL_QUARANTINE — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2387178
+    out REFERENCES_PARAM；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1943526
+  OPTIMIZER_FEATURES_ENABLE — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2387183
+    out REFERENCES_PARAM；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1943525
+  VECTOR_MEMORY_SIZE — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2387187
+    out REFERENCES_PARAM；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1943527
+  SYS.V$STATS_ADVISOR_RULES — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:255765
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:11986946
+  SYS.AWR_PDB_DLM_MISC — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3476045
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:11986943
+  SYS.AWR_ROOT_DLM_MISC — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3476208
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:11986944
+  SYS.DBA_HIST_DLM_MISC — python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:97883
+    out REFERENCES_VIEW；via=；via_edge=；edge=5:8ed6c541-fe08-4ade-ae68-a79bf45316f4:11986945
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

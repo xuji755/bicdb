@@ -1,0 +1,45 @@
+
+============================================================
+  [问题诊断] JSON 类型 路径 索引 表达式
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 45，摘要筛选通过 23，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 14，摘要筛选通过 14，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     MySQL主要使用BTREE索引，支持全文索引（inverted）和多值索引（JSON数组）。表达式索引有限制：SPATIAL和FULLTEXT不能有函数键部分
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] MySQL索引类型: btree, invert(fulltext, multi-value, json array), 表达式索引受限  (排序分: 10.0)
+     └ 详情：MySQL索引类型: btree, invert(fulltext, multi-value, json array), 表达式索引受限：MySQL主要使用BTREE索引，支持全文索引（inverted）和多值索引（JSON数组）。表达式索引有限制：SPATIAL和FULLTEXT不能有函数键部分
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:549055
+
+     [KnowledgeEntry] 表达式索引适用场景  (排序分: 10.0)
+     └ 详情：表达式索引适用场景：1) JSON中经纬度提取后做空间距离排序或过滤；2) 多列分数相加后查询总分；3) 任何需要函数或表达式处理后的条件过滤。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1284566
+
+     [KnowledgeEntry] protobuf与JSON对比（索引）  (排序分: 10.0)
+     └ 详情：protobuf与JSON对比（索引）：PG内置JSON支持GIN索引，可直接加速查询；protobuf存储为bytea，需通过插件函数解析后建表达式索引，复杂度较高。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:982635
+
+     [KnowledgeEntry] SQL/JSON路径表达式  (排序分: 10.0)
+     └ 详情：SQL/JSON路径表达式：SQL/JSON路径表达式。
+分类：表达式
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:586509
+
+     [CaseStudy] Greenplum JSON unicode case  (排序分: 10.0)
+     └ 详情：案例：Greenplum JSON unicode case
+摘要：Greenplum中当standard_conforming_strings=off时JSON内UNICODE正常转换；设为on时UNICODE原样插入并导致提取报错invalid byte sequence。PostgreSQL 9.4无此问题，属Greenplum特定行为。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1474278
+
+     [FaultModel] 在 COPY FROM 或非 JSON 格式中使用 force_array 导致的错误  (排序分: 9.5)
+     └ 摘要：在 COPY FROM 或非 JSON 格式中使用 force_array 导致的错误：force_array仅在COPY TO且FORMAT JSON时有效，否则数据库抛出错误。需检查使用场景。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1291826
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

@@ -1,0 +1,28 @@
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 角色权限定义与打包授权
+      文档说明角色权限就是将属于用户的权限授予一个角色，任何权限都可以授予给一个角色。授予系统权限给被授予者必须使用 WITH ADMIN OPTION 子句。角色机制可用于集中管理权限集合。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 用户与角色映射的维护复杂度
+      文档采用角色-用户映射，隐含假设通过调整角色即可统一变更一组用户的权限。边界条件若某用户拥有多个角色，角色间权限冲突（如同时被授予和回收一个权限）需Oracle的权限解析规则（以grant/revoke顺序为准）。此外，若直接对用户授予了系统权限，角色变更不会影响已直接授权的权限，导致权限残留。建议完全避免直接授权。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560516
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 对象权限与系统权限的回收顺序
+      文档提到’Revoke <role> from <user>‘。隐含假设撤销角色后用户失去该角色所有权限。边界条件若用户同时被直接授予相同对象权限，直接授予的权限保留。此外，角色撤销不自动回收相同对象的依赖权限（如虽然失去SELECT，但已存在的同义词不会自动删除）。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560408
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed] GRANT select,update ON sh.sales TO mgrrole
+      GRANT ... ON schema.object TO role 可向角色授予对象级权限。示例中用户将 sh.sales 上的 select 和 update 授予 mgrrole，说明角色可接收对象权限，且对象权限与系统权限不冲突。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] @privs 脚本按用户查询系统角色、系统权限和对象权限
+      该脚本依次输出三个查询结果；文档说明其查询的是系统角色、系统权限和对象权限三个 view。输出中的 `no rows selected` 表示对应查询没有记录。可用它验证 revoke 后权限是否被回收。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 授权SQL语句
+      授权语句示例：SQL>grant create table to <user>; SQL>grant select on <table> to <user>; SQL>grant r_dba to <user>; SQL> grant create table to r_dba;
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 角色权限不能依赖存储 SQL 中的权限
+      文档强调角色权限不能依靠存储在 SQL 中的权限。如果函数、程序、包、触发器或者方法使用另一个计划拥有的对象，那么就必须直接给对象的拥有者授权。原因是权限不会在会话之间改变。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 角色嵌套与权限冲突
+      文档未提及角色嵌套，但实际Oracle支持角色授予角色。隐含假设角色层次简单。边界条件若无意中创建循环（A授予B，B授予A），Oracle虽能检测并阻止，但复杂层次可能造成权限难以追踪。此外，不同角色对同一对象具有grant与deny（Oracle无deny语句），只存在grant与否，无冲突。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560600
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 授予系统权限的SQL语法
+      授予系统权限：GRANT <系统权限> TO <user or role>; 授予对象权限：GRANT SELECT ON <table> TO <user>; 授予角色：GRANT <角色> TO <user>; 例如：GRANT CREATE TABLE TO zhangsan; GRANT SELECT ON scott.emp TO zhangsan; GRANT R_DBA TO zhangsan;
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 定义者权限存储过程不启用角色
+      实验中test被grant dba后直接truncate成功，但过程内truncate报ORA-00942；直接grant drop any table后过程成功。说明角色（DBA）在定义者权限存储过程内不生效，开发时需注意直接授权。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 拥有CONNECT和RESOURCE角色且无独立系统权限时创建表的权限判定
+      在Oracle权限模型中，系统权限可以通过角色授予用户。SL_REP用户有CONNECT和RESOURCE角色且无独立系统权限。RESOURCE角色提供CREATE TABLE等创建对象的权限，因此该用户执行CREATE TABLE orders... TABLESPACE purchase_space命令成功，答案B正确。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] SET ROLE 控制会话角色权限
+      文档指出在会话期间通过 SET ROLE 语句授予或撤销角色权限。该机制影响当前会话中角色权限是否可用，是角色权限管理的一部分。
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

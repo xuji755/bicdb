@@ -1,0 +1,209 @@
+🔍 图搜索: "shared_pool" [db=oracle]
+
+  匹配: 20
+  ✅ 官方文档: 19
+  ✅ MOS Note: 1
+
+======================================================================
+📘官方文档: [oracle] Dynamically Changing shared_pool_size fail!(动态修改Shared pool size失败)
+  源: doc/fa161e0d-bd25-55c4-979d-fdb3e2a00f8f-01986_dynamically-changing-shared_pool_size-fail%e5%8a%a8%e6%80%81%e4%bf%ae%e6%94%b9sh.md
+======================================================================
+(第23-34字符, 共4382字符)
+# Dynamically Changing shared_pool_size fail!(动态修改Shared pool size失败)
+
+- 来源类型：普通博客（ANBOB，非官方资料、非已确认专家）
+- 原文链接：https://www.anbob.com/archives/1986.html
+- 文章ID：1986
+- 原始日期：2013-09-10T10:51:10
+- 最后修改：2013-09-10T10:51:10
+- 站内分类：ORACLE 9i-23ai
+- 站内标签：Troubleshooting
+
+---
+因安装数据库时启用了ASMM,过了几天发现分配不太理想想禁用ASMM，手动调整shared_pool_size, 这是一个动态参数，修改后立即生效无需重启数据库实例，但修改时遇到了比较奇怪的现象。
+
+SQL> select * from v$version where rownum=1;
+BANNER
+——————————————————————————–
+Oracle Database 11g Enterprise Edition Release 11.2.0.3.0 – 64bit Production
+
+SQL> select name,ISSYS_MODIFIABLE from  v$parameter where name=’shared_pool_size’;
+NAME                 ISSYS_MOD
+——————– ———
+shared_pool_size     IMMEDIATE
+
+sys@ICME>show parameter shared_pool
+NAME                                 TYPE        VALUE
+———————————— ———– ——————————
+shared_pool_reserved_size            big integer 144M
+shared_pool_size                     big integer 2560M
+
+SQL> show parameter sga_target
+NAME                                 TYPE        VALUE
+———————————— ———– ——————————
+sga_target                           big integer 30272M
+SQL> show parameter sga_max
+NAME                                 TYPE        VALUE
+———————————— ———– ——————————
+sga_max_size                         big integer 30272M
+
+sys@ICME>alter system set sga_target=0;
+System altered.
+
+sys@ICME>alter system set shared_pool_size=1200m;
+alter system set shared_pool_size=1200m
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ ORA-04034: unable to shrink pool to specified size
+
+
+======================================================================
+📘官方文档: [oracle] DBMS_SHARED_POOL包 创建与使用
+  源: doc/470906a0-8bd6-5a64-93c1-ab57aedd1323-01415_dbms_shared_pool%e5%8c%85-%e5%88%9b%e5%bb%ba%e4%b8%8e%e4%bd%bf%e7%94%a8.md
+======================================================================
+(第7-18字符, 共9549字符)
+# DBMS_SHARED_POOL包 创建与使用
+
+- 来源类型：普通博客（ANBOB，非官方资料、非已确认专家）
+- 原文链接：https://www.anbob.com/archives/1415.html
+- 文章ID：1415
+- 原始日期：2012-03-28T16:52:58
+- 最后修改：2012-03-28T16:52:58
+- 站内分类：ORACLE 9i-23ai
+- 站内标签：oracle管理
+
+---
+DBMS_SHARED_POOL 是从10.2开始提供的包，可以访问shared_pool中的对象，
+功能检查大于批定大小的对象，加入/移除shared_pool对象
+下面看我的例子
+
+```
+Connected to:
+Oracle Database 10g Enterprise Edition Release 10.2.0.1.0 - Production
+With the Partitioning, OLAP and Data Mining options
+
+SYS>desc dbms_shared_pool;
+ERROR:
+ORA-04043: object dbms_shared_pool does not exist
+
+SYS>select object_name,object_id,object_type from dba_objects where object_name='DBMS_SHARED_POOL';
+
+no rows selected
+
+SYS>exit
+Disconnected from Oracle Database 10g Enterprise Edition Release 10.2.0.1.0 - Production
+With the Partitioning, OLAP and Data Mining options
+
+[oracle@ora10g admin]$ vi dbmspool.sql
+
+rem
+rem $Header: dbmspool.sql 15-jun-99.08:54:18 mjungerm Exp $
+rem
+Rem  Copyright (c) 1991, 1996, 1997, 1998, 1999 by Oracle Corporation
+Rem    NAME
+Rem      dbmspool.sql - dbms_shared_pool utility package.
+Rem    DESCRIPTION
+Rem      This package allows you to display the sizes of objects in the
+Rem      shared pool, and mark them for keeping or unkeeping in order to
+Rem      reduce memory fragmentation.
+Rem    RETURNS
+Rem
+Rem    NOTES
+Rem    MODIFIED   (MM/DD/YY)
+Rem     mjungerm   06/15/99 -  add java shared data object type
+Rem     ansriniv   04/13/98 -  keep functionality for types
+Rem     gdoherty   06/05/97 -  invoke prvtpool
+Rem     ansriniv   03/26/97 -  provide keep/unkeep for sequences
+
+
+======================================================================
+📘官方文档: [oracle] Oracle 19c 性能参数排查：ACS 未开启引发的执行计划突变案例分析
+  源: https://www.modb.pro/db/2079461683051978752
+======================================================================
+(第2251-2262字符, 共8095字符)
+SELECT table_name, last_analyzed, num_rows
+FROM dba_tables
+WHERE table_name IN ('YOUR_TABLES')
+ORDER BY last_analyzed DESC;
+
+* Oracle 默认在夜间（通常 22:00-06:00）自动收集统计信息
+* 统计信息更新后，相关的游标会被标记为 **INVALID**
+* 下次执行时触发硬解析，可能生成新的执行计划
+* 因为这个表没有数量级的变化，变化程度也没有超过10%。所以没有被收集过。而且如果因为是这个原因的话，那早就出问题了。
+
+#### （3）对象结构变更
+
+* 索引重建、表分析、DDL 操作等都会导致游标失效
+* 这个也问了相关的人，没有做过DDL和索引重建
+
+#### （4）实例重启或共享池刷新
+
+当然很明显这个数据库没有重启过。
+
+-- 查看实例启动时间
+SELECT startup_time FROM v$instance;
+
+-- 查看是否有人手动刷新共享池
+SELECT * FROM dba_audit_trail WHERE obj_name = 'FLUSH SHARED_POOL';
+
+### 2.4 问题复现路径
+
+基于以上分析，问题的完整路径应该是：
+
+1. ACS 关闭（隐藏参数 _optimizer_adaptive_cursor_sharing = FALSE）
+2. SQL 游标因某种原因被清除（共享池压力/统计信息更新等）
+3. 早上 8 点业务高峰，该 SQL 第一次执行
+4. 硬解析时碰巧遇到一个"非典型"的绑定变量值
+5. 生成了一个次优的执行计划（比如全表扫描）
+6. 由于 ACS 关闭，后续所有执行都复用这个次优计划
+7. 性能急剧下降，且问题持续存在
+
+### 2.5 解决方案验证
+
+采用的方案是：
+
+-- 清除该 SQL 的所有游标
+ALTER SYSTEM FLUSH SHARED_POOL;  -- 方法1：清空整个共享池（影响大）
+这种方案一般来说是不用的。
+-- 所以采用下面的
+SELECT address, hash_value FROM v$sqlarea WHERE sql_id = 'your_sql_id';
+-- 然后逐个清除
+
+这个方案是**正确的**，因为：
+
+* 清除了次优计划的游标
+* 下次执行时触发硬解析
+* 如果此时绑定变量值是"典型"的值，就会生成正确的执行计划
+* 由于 ACS 关闭，这个正确计划会被固化下来
+
+**但治本的方案是**：
+
+-- 开启 ACS（需要重启）
+ALTER SYSTEM SET "_optimizer_adaptive_cursor_sharing" = TRUE SCOPE=SPFILE;
+ALTER SYSTEM SET "_optimizer_extended_cursor_sharing" = 'UDO' SCOPE=SPFILE;
+ALTER SYSTEM SET "_optimizer_extended_cursor_sharing_rel" = 'NONE' SCOPE=SPFILE;
+-- 然后重启数据库
+
+---
+
+## 三、Oracle 11g-19c 性能相关参数清单
+
+基于这次排查经验，我整理了 **Oracle 11g 到 19c 所有与性能相关的参数**，包括默认值和查询方式。
+
+### 3.1 自适应游标共享（ACS）相关
+
+| --- | --- | --- | --- | --- |
+| `_optimizer_adaptive_cursor_sharing` | TRUE (11gR2+) | 启用 ACS | 避免绑定变量导致的次优计划 | `SELECT ksppinm, ksppstvl FROM x$ksppi x, x$ksppcv y WHERE x.indx = y.indx AND ksppinm = '_optimizer_adaptive_cursor_sharing';` |
+| `_optimizer_extended_cursor_sharing` | UDO (11gR2+) | 控制扩展游标共享行为 | 与 ACS 配合使用 | 同上，替换参数名 |
+| `_optimizer_extended_cursor_sharing_rel` | NONE (11gR2+) | 关联查询的扩展游标共享 | 影响复杂查询稳定性 | 同上，替换参数名 |
+
+**注意**：这三个参数都是**隐藏参数**，修改需要重启实例。
+
+### 3.2 自适应优化器特性
+
+| --- | --- | --- | --- | --- |
+| `_optimizer_adaptive_features` | TRUE (12cR1+) | 启用自适应优化器 | 运行时调整执行策略 | 隐藏参数查询 |
+
+
+... 还有 17 个匹配文档未展示。使用 --list 查看全部。

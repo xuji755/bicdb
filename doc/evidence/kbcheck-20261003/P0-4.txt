@@ -1,0 +1,29 @@
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] 4.2 逻辑存储结构
+      数据库逻辑存储结构采用层次化组织，实现物理与逻辑分离，便于在不影响逻辑结构的情况下管理物理存储。最上层为表空间，作为段的逻辑容器，每个表空间至少包含一个数据文件。表空间内包含多个段，段是为用户对象（如表、索引）、undo数据或临时数据分配的区集合。区是一次分配获得的逻辑连续数据块集合，而数据块是最细粒度的存储单元，对应磁盘上特定字节数。这种分层结构使得存储管理灵活高效。物理与逻辑分离：可以在不影响逻辑结构的情况下管理物理存储。Tablespace (表空间) └── Segment (段) —— 为用户对象(表/索引)、undo数据或临时数据分配的extent集合 └── Extent (区) —— 一次分配获得的逻辑连续数据块集合 └── Data Block (数据块) —— 最细粒度的存储单元，对应磁盘上特定字节数 | 层次 | 说明 | |------|------| | Tablespace | 数据库划分为多个表空间，每个表空间是段的逻辑容器，至少包含一个数据文件 | | Segment | 为特定对象类型分配的一组extent（如表段、索引段...
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:363753
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 逻辑存储核心四层结构
+      虽然用户看到的是表，但从存储组织角度看，Oracle核心的逻辑结构层次为：表空间→段→扩展区→数据块。表被映射为段，因此不单独作为独立存储结构。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Oracle逻辑存储结构定义
+      Oracle数据库的逻辑存储结构定义了数据的组织方式，从大到小依次为表空间、段、扩展区和数据块。物理存储层面则由操作系统块组成的数据文件承载逻辑数据块。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 段（segment）由一个或多个区（extent）组成
+      21题选项A正确。Oracle逻辑存储结构按层级包括数据库、表空间、段、区、数据块等，段作为逻辑存储组件，其空间分配通过一个或多个区实现。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Oracle 物理存储结构与逻辑结构独立性
+      物理与逻辑独立性是 Oracle 架构的核心特征，通过将表空间、段、区等逻辑概念与数据文件等物理文件解耦，允许 DBA 移动、重命名、增减物理文件而对应用透明。
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] 三、逻辑存储结构
+      逻辑存储结构层次（从大到小）：  ``` Database → Tablespace → Segment → Extent → Data Block ```  **核心原则：** 物理与逻辑分离。应用程序不关心数据的物理磁盘地址，数据库数据可以在多个物理磁盘上进行条带化和镜像。  ### 3.1 数据块（Data Block）  - **最小的逻辑存储单元，也是 I/O 最小单位** - 与操作
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:335269
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 物理与逻辑存储结构分离
+      这种分离将数据的物理存储位置与逻辑视图解耦。DBA 可以在不中断应用程序的情况下移动或重命名数据文件，因为表、索引等逻辑对象的名称和访问方式不依赖于物理文件的具体路径和名称。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] struct_krvxlcr
+      struct_krvxlcr是Oracle 10.2.0.1中X$逻辑变更记录结构，53个字段，是逻辑复制的核心数据结构，存储变更记录的完整信息，异常可能导致逻辑复制中断。概念 kernel krvxlcr
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 复合分区存储结构
+      创建复合分区表时，主分区（范围分区）是逻辑容器，不单独占用段。每个子分区对应一个数据段，存储实际数据。例如CREATE TABLE ... PARTITION BY RANGE... SUBPARTITION BY HASH... STORE IN。
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] 一、存储结构总览
+      Oracle 数据库的存储结构分为**物理存储结构**和**逻辑存储结构**两个维度，二者相互独立：  - **物理存储结构**：操作系统级别可见的文件，如数据文件、控制文件、重做日志文件 - **逻辑存储结构**：Oracle 内部管理的数据组织方式，操作系统不可见，如 tablespace、segment、extent、data block  从 Oracle 21c 开始，**多租户容器数
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1019954
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 逻辑存储层次关系
+      存储层次呈树状结构：表空间是最大的逻辑容器，包含零个或多个段；每个段由一个或多个扩展区组成；每个扩展区由一组连续的数据块组成。这种层次关系使得空间管理从粗粒度到细粒度有序进行。
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] 一、存储结构总览
+      Oracle 数据库的存储结构分为**物理存储结构**和**逻辑存储结构**两个维度，二者相互独立：  - **物理存储结构**：操作系统级别可见的文件，如数据文件、控制文件、重做日志文件 - **逻辑存储结构**：Oracle 内部管理的数据组织方式，操作系统不可见，如 tablespace、segment、extent、data block  从 Oracle 21c 开始，**多租户容器数
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:335267
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

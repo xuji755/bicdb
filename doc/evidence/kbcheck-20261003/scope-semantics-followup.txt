@@ -1,0 +1,34 @@
+=== Oracle view scope=PDB ===
+对象：SYS.DBA_TABLESPACES
+类型：系统视图 | SCHEMA：SYS
+已收录版本（8个）：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+容器类型属性（与版本列表独立）：CDB_ROOT、NON_CDB、PDB
+合并字段总数：36（跨版本/范围并集，不代表单个版本列数）
+当前筛选：1个分别满足版本与范围条件的组合；以下仅展示匹配字段。
+
+[19c / PDB] 36列
+对象节点描述（未按版本筛选）：DBA_TABLESPACES describes all tablespaces in the database. Related View USER_TABLESPACES describes the tablespaces accessible to the current user. This view does not display the PLUGGED_IN column. Description of all tablespaces 说明（23ai/PDB、23ai/CDB_ROOT）：Description of all tablespaces 实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+
+=== Oracle param ===
+  ✅ [Parameter] SHARED_POOL_SIZE
+     定义 1
+       适用: 版本: 19c
+       描述: SHARED_POOL_SIZE SHARED_POOL_SIZE specifies (in bytes) the size of the shared pool. Note: Oracle recommends against setting this parameter in a PDB. The only shared memory sizing parameter that should be set in a PDB is SGA_TARGET , which specifies the maximum SGA that the PDB can use at any time. P…
+       类型: big_integer
+       值域: Minimum: the granule size Maximum: operating system-dependent
+
+=== ob opsql scope=SYS ===
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  ✅ [OpSQL] 合并阻塞  匹配 1 条运维 SQL
+     1. 指定租户全局合并轮次与冻结SCN
+=== ob opsql scope=ORACLE ===
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  ⚠️ [OpSQL] 未找到: 合并阻塞
+=== ob opsql scope=MYSQL ===
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  ⚠️ [OpSQL] 未找到: 合并阻塞
+
+=== ob opsql 不传 scope ===
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  ✅ [OpSQL] 合并阻塞  匹配 1 条运维 SQL
+     1. 指定租户全局合并轮次与冻结SCN

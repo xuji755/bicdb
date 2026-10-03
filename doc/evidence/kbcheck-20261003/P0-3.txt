@@ -1,0 +1,297 @@
+🔍 图搜索: "NLS_LANG AL32UTF8" [db=oracle]
+
+  匹配: 20
+  ✅ 官方文档: 20
+
+======================================================================
+📘官方文档: [oracle] ZHSGBK16到AL32UTF8的一点测试
+  源: doc/73ead132-1b09-5db5-9284-afae691c9227-oracle_482.md
+======================================================================
+# ZHSGBK16到AL32UTF8的一点测试
+
+知识域：oracle（2101）
+原始产品分类：oracle
+适用范围：保留原文产品、版本及案例环境限制。
+
+来源：http://www.killdb.com/2011/09/22/zhsgbk16%e5%88%b0al32utf8%e7%9a%84%e4%b8%80%e7%82%b9%e6%b5%8b%e8%af%95/
+文章编号：482
+发布日期：2011-09-22T01:52:49
+站点最后修改：2011-10-08T13:43:38
+原站分类：Oracle rdbms > mangement；Oracle rdbms
+来源类别：普通博客
+
+---
+
+```
+
+关于字符集的一点测试，由于某客户的一套rac需要更改字符集，所以我这里再次进行测试。
+```
+```
+
+#### 原库
+
+SQL> select userenv('language') from dual;
+
+USERENV('LANGUAGE')
+----------------------------------------------------
+SIMPLIFIED CHINESE_CHINA.ZHS16GBK
+
+SQL> show parameter nls
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+nls_calendar                         string
+nls_comp                             string
+nls_currency                         string
+nls_date_format                      string
+nls_date_language                    string
+nls_dual_currency                    string
+nls_iso_currency                     string
+nls_language                         string      AMERICAN
+nls_length_semantics                 string      BYTE
+nls_nchar_conv_excp                  string      FALSE
+nls_numeric_characters               string
+nls_sort                             string
+nls_territory                        string      AMERICA
+nls_time_format                      string
+nls_time_tz_format                   string
+nls_timestamp_format                 string
+nls_timestamp_tz_format              string
+
+SQL> conn roger/roger
+已连接。
+
+SQL> create table zifuji(name varchar2(6));
+
+表已创建。
+
+SQL> insert into zifuji values('海天');
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> commit;
+
+提交完成。
+
+SQL> select dump('海天') from dual;
+
+DUMP('海天')
+-----------------------------
+Typ=96 Len=4: 186,163,204,236
+
+++++ 我们可以看到在GBK下，一个汉字占2个字节 ++++
+```
+```
+
+++++ 下面进行数据的导出 ++++
+
+OWNER      DIRECTORY_NAME                 DIRECTORY_PATH
+---------- ------------------------------ --------------------------------------------
+
+======================================================================
+📘官方文档: [oracle] ZHSGBK16到AL32UTF8的一点测试
+  源: doc/4a4f6546-96ad-549b-992d-57773be1aaf7-oracle_482.md
+======================================================================
+# ZHSGBK16到AL32UTF8的一点测试
+
+知识域：oracle（2101）
+原始产品分类：oracle
+适用范围：保留原文产品、版本及案例环境限制。
+
+来源：http://www.killdb.com/2011/09/22/zhsgbk16%e5%88%b0al32utf8%e7%9a%84%e4%b8%80%e7%82%b9%e6%b5%8b%e8%af%95/
+文章编号：482
+发布日期：2011-09-22T01:52:49
+站点最后修改：2011-10-08T13:43:38
+原站分类：Oracle rdbms > mangement；Oracle rdbms
+来源类别：普通博客
+
+---
+
+```
+
+关于字符集的一点测试，由于某客户的一套rac需要更改字符集，所以我这里再次进行测试。
+```
+```
+
+#### 原库
+
+SQL> select userenv('language') from dual;
+
+USERENV('LANGUAGE')
+----------------------------------------------------
+SIMPLIFIED CHINESE_CHINA.ZHS16GBK
+
+SQL> show parameter nls
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+nls_calendar                         string
+nls_comp                             string
+nls_currency                         string
+nls_date_format                      string
+nls_date_language                    string
+nls_dual_currency                    string
+nls_iso_currency                     string
+nls_language                         string      AMERICAN
+nls_length_semantics                 string      BYTE
+nls_nchar_conv_excp                  string      FALSE
+nls_numeric_characters               string
+nls_sort                             string
+nls_territory                        string      AMERICA
+nls_time_format                      string
+nls_time_tz_format                   string
+nls_timestamp_format                 string
+nls_timestamp_tz_format              string
+
+SQL> conn roger/roger
+已连接。
+
+SQL> create table zifuji(name varchar2(6));
+
+表已创建。
+
+SQL> insert into zifuji values('海天');
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> commit;
+
+提交完成。
+
+SQL> select dump('海天') from dual;
+
+DUMP('海天')
+-----------------------------
+Typ=96 Len=4: 186,163,204,236
+
+++++ 我们可以看到在GBK下，一个汉字占2个字节 ++++
+```
+```
+
+++++ 下面进行数据的导出 ++++
+
+OWNER      DIRECTORY_NAME                 DIRECTORY_PATH
+---------- ------------------------------ --------------------------------------------
+
+======================================================================
+📘官方文档: [oracle] ZHSGBK16到AL32UTF8的一点测试
+  源: doc/a3a62589-30c7-5fd6-b687-dbe4de748298-oracle_482.md
+======================================================================
+# ZHSGBK16到AL32UTF8的一点测试
+
+知识域：oracle（2101）
+原始产品分类：oracle
+适用范围：保留原文产品、版本及案例环境限制。
+
+来源：http://www.killdb.com/2011/09/22/zhsgbk16%e5%88%b0al32utf8%e7%9a%84%e4%b8%80%e7%82%b9%e6%b5%8b%e8%af%95/
+文章编号：482
+发布日期：2011-09-22T01:52:49
+站点最后修改：2011-10-08T13:43:38
+原站分类：Oracle rdbms > mangement；Oracle rdbms
+来源类别：普通博客
+
+---
+
+```
+
+关于字符集的一点测试，由于某客户的一套rac需要更改字符集，所以我这里再次进行测试。
+```
+```
+
+#### 原库
+
+SQL> select userenv('language') from dual;
+
+USERENV('LANGUAGE')
+----------------------------------------------------
+SIMPLIFIED CHINESE_CHINA.ZHS16GBK
+
+SQL> show parameter nls
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+nls_calendar                         string
+nls_comp                             string
+nls_currency                         string
+nls_date_format                      string
+nls_date_language                    string
+nls_dual_currency                    string
+nls_iso_currency                     string
+nls_language                         string      AMERICAN
+nls_length_semantics                 string      BYTE
+nls_nchar_conv_excp                  string      FALSE
+nls_numeric_characters               string
+nls_sort                             string
+nls_territory                        string      AMERICA
+nls_time_format                      string
+nls_time_tz_format                   string
+nls_timestamp_format                 string
+nls_timestamp_tz_format              string
+
+SQL> conn roger/roger
+已连接。
+
+SQL> create table zifuji(name varchar2(6));
+
+表已创建。
+
+SQL> insert into zifuji values('海天');
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> /
+
+已创建 1 行。
+
+SQL> commit;
+
+提交完成。
+
+SQL> select dump('海天') from dual;
+
+DUMP('海天')
+-----------------------------
+Typ=96 Len=4: 186,163,204,236
+
+++++ 我们可以看到在GBK下，一个汉字占2个字节 ++++
+```
+```
+
+++++ 下面进行数据的导出 ++++
+
+OWNER      DIRECTORY_NAME                 DIRECTORY_PATH
+---------- ------------------------------ --------------------------------------------
+
+... 还有 17 个匹配文档未展示。使用 --list 查看全部。

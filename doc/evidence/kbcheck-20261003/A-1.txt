@@ -1,0 +1,1 @@
+匹配多个对象，请用 schema.name 限定：oceanbase.GV$OB_MEMORY, SYS.GV$OB_MEMORY

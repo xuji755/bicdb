@@ -1,0 +1,36 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IVFFlat需要k-means聚类
+      IVFFlat需要k-means聚类：必须先对样本执行k-means得到中心，再将所有向量分配到最近的列表，因此需要训练阶段。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 训练流程
+      训练流程：先训练粗量化器，再训练PQ码本（对残差）。
+分类：操作
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] ChatGPT背后的数据库技术体验 - 向量近似搜索之PostgreSQL+pase
+      深入介绍PG向量近似搜索：pase插件和pgvector插件，支持hnsw/ivfflat/ivfpq等多种ANN算法索引。ivfflat需训练k-means聚类中心列表数，hnsw参数m(每层连接数)和ef_construction(构建搜索宽度)。PolarDB内核集成pase向量检索加速。SQL: CREATE INDEX ON t USING hnsw (vec vector_l2_ops) WITH (M=16, ef_construction=200)。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:362864
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 模型训练
+      模型训练：模型训练是机器学习核心步骤。PostgresML支持在数据库内使用SQL训练多种算法，自动管理训练数据和模型版本。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IVFFlat-并行计算优化-Rayan
+      IVFFlat-并行计算优化-Rayan：IVFFlat可利用并行计算加速k-means训练和查询，提升索引构建和检索吞吐。
+分类：架构
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IVFFlat_data_requirement_before_index
+      IVFFlat_data_requirement_before_index：创建IVFFlat索引前需保证足够数据（至少lists*50条），否则聚类质量差，召回率低。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 在Apple Silicon Mac上微调LLM——使用MLX框架进行完整fine-tuning实践。包括mlx_lm安装配置、LoRA适配器训练、训练数据准备(从PG知识库提取QA对)和训练参数调优。利用Metal Performance Shaders加速训练，Docker运行ollama加载微调后模型推理。
+      在Apple Silicon Mac上微调LLM——使用MLX框架进行完整fine-tuning实践。包括mlx_lm安装配置、LoRA适配器训练、训练数据准备(从PG知识库提取QA对)和训练参数调优。利用Metal Performance Shaders加速训练，Docker运行ollama加载微调后模型推理。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] PlainStorage与SBQ存储的训练需求差异
+      PlainStorage与SBQ存储的训练需求差异：PlainStorage无需训练，而SBQ存储需要SbqQuantizer训练过程。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector IVFFlat最佳实践
+      pgvector IVFFlat最佳实践：IVFFlat最佳实践：先装载数据再建索引；lists取rows/1000或sqrt(rows)；probes逐步增大。观察k-means和assigning阶段进度。
+分类：操作
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 大模型训练过程为什么要使用Dropout技术防止过拟合
+      [大模型训练过程为什么要使用Dropout技术防止过拟合] 标签:Dropout,过拟合,大模型训练,丢弃部分神经元输出。 我们来深入介绍一下大模型（如GPT、BERT等）训练过程中常用的一项关键技术： Dropout。 这是一项非常巧妙且有效的技术，主要用于解决深度学习中最头疼的问题之一 —— 过拟合。 想象你在训练一支篮球队（这相当于训练一个神经网络）。 -   过拟合现象：如果每次训练，你都只让首发五名球员（特定的神经元）上场，那么这五个人之间的配合会非常默契，但一旦其中一人受伤离场（遇到没见过的数据），整个队伍可能就不会打球了。队伍对这套固定阵容产生了过度的依赖。 -   Dropout策略：Dropout 相当于教练规定：在每一次训练回合（每个训练批次）中，随机让一部分球员（神经元）休息，不上场。 这样一来，球队里的每个人都不能只依赖某一个球星，每个人都必须学会在不同的阵容搭配下得分。最后形成的队伍，是一个泛化能力极强的队伍，即使有人缺席，整体战斗力依然在线。 技术定义： 在神经网络的训练过程中，Dr
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:345194
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 标签_PostgreSQL_训练营
+      标签_PostgreSQL_训练营：训练营标签标识文档主题属于PostgreSQL训练营内容，包含系统性学习路径和动手实践环节，适合开发者集中提升。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IVFFlat建索引注意事项
+      IVFFlat建索引注意事项：ComputeCenters()要求样本至少10000，样本少会发出NOTICE警告。经验起点：100万行以内lists=rows/1000，超过100万行lists=sqrt(rows)；probes从sqrt(lists)开始。
+分类：操作
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

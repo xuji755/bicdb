@@ -1,0 +1,28 @@
+{
+  "database": "oracle",
+  "db_type_code": "2101",
+  "results": [
+    {
+      "name": "SHARED_POOL_SIZE",
+      "status": "found",
+      "default_value": "If SGA_TARGET is set: If the parameter is not specified, then the default is 0 (internally determined by the Oracle Database). If the parameter is specified, then the user-specified value indicates a minimum value for the memory pool. If SGA_TARGET is not set (32-bit platforms): 64 MB, rounded up to the nearest granule size. If SGA_TARGET is not set (64-bit platforms): 128 MB, rounded up to the nearest granule size. For considerations when dealing with database instances using Oracle ASM, see \"SHARED_POOL_SIZE and Automatic Storage Management\".",
+      "function_description": "指定共享池的大小（字节）。建议设置一个初始值（也是最小值），确保数据库缓冲无性能问题。如果共享池（shared pool）、库缓冲（library cache）、字典缓冲（row cache）、CURSOR(cursor、mutex）等方面的等待比较严重，共享池经常出现resize，则建议设置一个较大的初始值，否则无需关注。",
+      "attribute_description": "| 属性 | 值 |\n| --- | --- |\n| 参数类型 | 整数 |\n| 默认值 | If SGA_TARGET is set: If the parameter is not specified, then the default is 0 (internally determined by the Oracle Database). If the parameter is specified, then the user-specified value indicates a minimum value for the memory pool. If SGA_TARGET is not set (32-bit platforms): 64 MB, rounded up to the nearest granule size. If SGA_TARGET is not set (64-bit platforms): 128 MB, rounded up to the nearest granule size. For considerations when dealing with database instances using Oracle ASM, see \"SHARED_POOL_SIZE and Automatic Storage Management\". |\n| 取值范围 | Minimum: the granule size Maximum: operating system-dependent |\n| 是否重启数据库实例生效 | 否 |\n| 应用范围 | 无 |\n| Basic | No |\n| PDB | Yes |",
+      "source": "ora_ref_index_21c",
+      "versions": null,
+      "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:97462",
+      "candidate_count": 5
+    },
+    {
+      "name": "PGA_AGGREGATE_TARGET",
+      "status": "found",
+      "default_value": "10 MB or 20% of the size of the SGA, whichever is greater For a PDB, the",
+      "function_description": "指定实例中所有服务器进程可使用的总PGA内存目标值，修改后无需重启。如果设为0，是关闭了PGA自动管理，有SORT_AREA_SIZE等工作区参数起作用。如果无特殊情况，不建议关闭PGA自动管理。PGA_AGGREGATE_TARGET>0且 WORKAREA_SIZE_POLICY = AUTO启用自动管理。该参数提供了一个PGA可用内存大小的评估值，而并非上限，数据库中PGA总量超过此参数值是正常现象。从12C开始提供的PGA_AGGREGATE_LIMIT可以真正限制PGA的上限。如果指标ID:2189001(内存排序比例）低于90%时，在物理内存充足的情况下，可加大此参数。如果是由于存在超大规模排序（比如超过512M），则修改此参数可能无效。指标ID:2189053(每次排序平均记录数）可以侧面反映出是否存在超大排序。",
+      "attribute_description": "| 属性 | 值 |\n| --- | --- |\n| 参数类型 | 整数 |\n| 默认值 | 10 MB or 20% of the size of the SGA, whichever is greater For a PDB, the |\n| 取值范围 | Minimum: 10 MB Maximum: 4096 GB - 1 |\n| 是否重启数据库实例生效 | 否 |\n| 应用范围 | 无 |\n| Basic | Yes |\n| PDB | Yes |",
+      "source": "ora_ref_index_21c",
+      "versions": null,
+      "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:97408",
+      "candidate_count": 3
+    }
+  ]
+}

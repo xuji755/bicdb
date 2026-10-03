@@ -1,0 +1,40 @@
+
+============================================================
+  [问题诊断] 大对象 外部文件 一致性 校验
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 263，摘要筛选通过 1，批次 5；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 3，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     文档建议将主从一致性校验纳入定期运维流程：在低峰期运行 pt-table-checksum，生成差异清单，并将差异表转入工单系统跟踪处理，形成从发现到修复的闭环。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 定期主从一致性校验策略  (排序分: 9.4)
+     └ 详情：文档建议将主从一致性校验纳入定期运维流程：在低峰期运行 pt-table-checksum，生成差异清单，并将差异表转入工单系统跟踪处理，形成从发现到修复的闭环。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2079967
+
+     [KnowledgeEntry] pt-table-checksum 复制一致性校验命令  (排序分: 9.4)
+     └ 详情：Percona Toolkit 中的 pt-table-checksum 用于校验主从数据一致性。示例指定连接从库（--host=replica），只校验 app 库的 orders 表。该命令按块（chunk）拆分表并生成校验和，是文档推荐的定期校验工具链核心。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2085722
+
+     [KnowledgeEntry] pt-table-checksum 主从一致性校验  (排序分: 9.4)
+     └ 详情：通过在主库执行校验并比较从库结果，pt-table-checksum 可定位主从行级数据差异，是主从不一致排障的入口工具。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2077646
+
+     [KnowledgeEntry] DD 层在 DEBUG 下通过 dd_instant_columns_consistent 校验 instant 列一致性  (排序分: 9.4)
+     └ 摘要：dict0dd.h:401-405 定义 dd_instant_columns_consistent，用于 DEBUG 校验表的 instant 列信息与 se_private_data 一致；dd_table_has_instant_cols 中通过 ut_ad(!instant || dd_instant_columns_consistent(table)) 强制触发校验。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2013310
+
+     [CaseStudy] MySQL ERROR 3136 (HY000): Version token mismatch for ?. Correct value ?  (排序分: 6.5)
+     └ 摘要：MySQL错误3136：版本令牌不匹配，客户端提供的令牌值与服务器期望值不一致，导致操作被拒绝，常见于并发控制或数据一致性校验场景。 参考指标ID:2020207(每秒SELECT命令执行数用于衡量MYSQL数据库执行查询类操作的频度)，参考指标ID:2020208(每秒DML命令执行数用于衡量MYSQL数据库执行修改类操作的频度)，参考指标ID:2020237(每秒INNODB BUFFER CACHE逻辑读用于衡量 MYSQL 数据库每秒进行的逻辑读取操作数)，参考指标ID:3001040(THE AVERAGE TIME FOR I/O REQUEST(MS))
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:592883
+
+     [FaultModel] GTID 集合不一致导致从库复制中断  (排序分: 5.2)
+     └ 摘要：从库 IO 线程报 ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS 或 ER_REPLICA_HAS_MORE_GTIDS_THAN_SOURCE；SET GLOBAL gtid_purged 报 ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS；开启 GTID 执行非事务/临时表语句被拒。根因是 GTID 集合违反三个一致性不变量。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2088988
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

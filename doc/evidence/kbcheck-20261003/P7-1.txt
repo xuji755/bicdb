@@ -1,0 +1,45 @@
+
+============================================================
+  [问题诊断] 混合检索 融合 排序 RRF
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 10，摘要筛选通过 8，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 60，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 1，摘要筛选通过 1，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     混合检索例子中的RRF融合SQL：使用三层CTE，FULL OUTER JOIN合并，计算加权RRF分数，返回Top10。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 混合检索例子中的RRF融合SQL  (排序分: 10.0)
+     └ 详情：混合检索例子中的RRF融合SQL：使用三层CTE，FULL OUTER JOIN合并，计算加权RRF分数，返回Top10。
+分类：操作
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1266870
+
+     [KnowledgeEntry] 混合检索函数hybrid_search  (排序分: 10.0)
+     └ 详情：混合检索函数hybrid_search：接受向量、文本、JSON过滤等参数，内部用CTE获取候选集，通过RRF和加权融合计算综合分数返回结果。
+分类：操作
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1266875
+
+     [KnowledgeEntry] 混合检索三大支柱图示  (排序分: 10.0)
+     └ 详情：混合检索三大支柱图示：混合检索三大支柱：用户查询经向量检索（语义）、全文检索（关键词）、标量过滤（条件），经RRF融合输出Top-K。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1266868
+
+     [KnowledgeEntry] 混合检索技术实现  (排序分: 10.0)
+     └ 详情：混合检索技术实现：为向量列和过滤列分别创建索引（HNSW、GIN、B-Tree），使用EXPLAIN ANALYZE分析计划，使用RRF或cross-encoder合并结果。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1266880
+
+     [CaseStudy] 混合搜索最小可验证模板  (排序分: 9.5)
+     └ 详情：案例：混合搜索最小可验证模板
+摘要：混合搜索最小可验证模板：步骤包括创建扩展、表、BM25索引和HNSW向量索引，分别验证词法和向量分支，最后CTE+RRF融合。诊断表明该模板可快速验证混合搜索效果，推荐作为基准方案。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1488262
+
+     [FaultModel] pg_rrf_weight_misconfig  (排序分: 9.3)
+     └ 摘要：RRF权重配置不当导致混合搜索结果异常，根因在于k值（默认60）或融合权重偏离算法最优设定，典型场景为pgvector混合搜索中向量检索与全文检索结果融合失效。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:119928
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

@@ -1,0 +1,43 @@
+
+============================================================
+  [问题诊断] latch 闩锁 争用 自旋
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 57，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 54，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2-c3 SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2 . Copyright © 2006, Oracle. All rights reserved.
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2-c3  (排序分: 14.4)
+     └ 详情：SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2-c3
+SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2
+.
+Copyright © 2006, Oracle. All rights reserved.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2044509
+
+     [KnowledgeEntry] L1：Note:43567.1 VIEW: X$KSLLT - Latch statistics + Child latches  (排序分: 14.4)
+     └ 摘要：X$KSLLT 视图记录内核服务锁管理的闩锁统计与子闩锁信息，包含闩锁编号 KSLLTNUM、立即获取次数 KSLLTNGT、立即获取失败次数 KSLLTNFA、等待获取次数 KSLLTWGT、首次尝试失败后的等待获取次数 KSLLTWFF、唤醒次数 KSLLTWKC、获取失败时。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997517
+
+     [KnowledgeEntry] L1：Note:752876.1 SUMMARY OF BUGS CAUSING DATABASE HANG OR SPIN  (排序分: 12.9)
+     └ 摘要：该条目汇总了Oracle 9.2.0.4至11.1.0.7版本中引发数据库挂起或自旋的已知Bug，按根因分类：闩锁争用（如cache buffer chains latch被不存在进程持有、shared pool latch在AMM下自旋、row cache objects闩锁竞争）、资源管理器配置（如resmgr:waiting。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040423
+
+     [KnowledgeEntry] 查询V$LATCH确认闩锁竞争  (排序分: 9.4)
+     └ 详情：执行 select latch#, substr(name,1,25), sleeps from v$latch where sleeps!=0 order by 3 desc; 可以找出sleeps最多的闩锁。sleeps表示线程因无法获取闩锁而睡眠的次数，数值大表明竞争严重。例如library cache latch的sleeps很多，则需进行库缓存调优。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:244826
+
+     [CaseStudy] library_cache_latch_contention_case  (排序分: 9.1)
+     └ 详情：现象：系统出现大量'latch free'等待事件，等待对象为library cache latch。诊断：V$LATCH中library cache latch的SLEEPS值极高，V$SQLAREA中发现大量类似SQL但未共享。处理：修改应用程序使用绑定变量，减少硬解析次数，缓解闩锁竞争。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545900
+
+     [FaultModel] 缓冲区缓存闩锁竞争  (排序分: 8.6)
+     └ 摘要：当多个进程同时尝试访问由同一闩锁保护的工作集数据结构（如LRU列表或检查点队列）时，发生闩锁竞争，导致性能下降。根因为工作集数量不足（由参数_db_block_lru_latches控制）或工作集内缓冲区数量分布不均，造成热点闩锁争用，影响缓冲区管理效率。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1558647
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

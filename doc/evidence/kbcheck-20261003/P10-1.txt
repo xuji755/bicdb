@@ -1,0 +1,35 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] openCypher graph query language standard
+      openCypher graph query language standard：openCypher是一种开源的图查询语言标准，类似Cypher。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Apache AGE扩展使PostgreSQL具备图数据库能力,通过openCypher查询语言和cypher()函数实现SQL与图查询混合。实践步骤:1)创建图空间:SELECT create_graph('social_graph'); 2)创建节点:SELECT * FROM cypher('social_graph',$$ CREATE (:User {name:'Alice',age:3
+      Apache AGE扩展使PostgreSQL具备图数据库能力,通过openCypher查询语言和cypher()函数实现SQL与图查询混合。实践步骤:1)创建图空间:SELECT create_graph('social_graph'); 2)创建节点:SELECT * FROM cypher('social_graph',$$ CREATE (:User {name:'Alice',age:30}),(:User {name:'Bob',age:28}) $$) AS (v agtype); 3)创建关系:MATCH (a:User),(b:User) CREATE (a)-[:FRIEND]->(b); 4)图模式匹配:MATCH (a:User)-[:FRIEND]->(b:User) RETURN a.name,b.name; 5)可变长度路径:MATCH (a)-[:FRIEND*1..3]->(b)实现1-3层好友查询; 6)好友推荐算法:MATCH (a)-[:FRIEND]->()-[:FRIEND]->(candidate) WHERE NOT (a)-[:FRIEND]->(candidate)。AGE内部自动管理节点/边/属性表,agtype为AGE自定义扩展类型(类似JSONB超集)。企业应用:社交网络好友推荐、金融反欺诈(Account→Device→IP→Merchant网络分析)、知识图谱。核心能力:属性图模型+openCypher+SQL融合+ACID事务继承。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:365917
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] openCypher规范
+      openCypher规范：openCypher是Cypher查询语言的开源规范，由Neo4j贡献，旨在推动图查询语言的标准化。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] PostgreSQL 图计算插件 AGE(a graph extension)发布0.4版本 - agensgraph extension 0.4
+      AGE(A Graph Extension) 0.4是PostgreSQL的图数据库插件，基于Apache AGE项目(incubating)。在PG中增加Cypher图查询语言支持(openCypher标准)，提供图数据模型(vertex/edge/label/property)。SELECT * FROM cypher('graph_name', $$ MATCH (n:Person)-[:KNOWS]->(m) RETURN n.name, m.name $$)执行图查询。支持图遍历、最短路径、中心度等图算法。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:347659
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] Apache AGE 提供 OpenCypher 图查询
+      Apache AGE 作为图数据库扩展，为 PostgreSQL 添加类 Neo4J 的 OpenCypher 查询支持，使开发者可在 PostgreSQL 中执行图查询。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] openCypher_图查询语言
+      openCypher_图查询语言：openCypher是一种声明式图查询语言，被Apache AGE采用，用于在图数据库中执行模式匹配、路径查询等操作。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] openCypher查询语言
+      openCypher查询语言：openCypher是Apache AGE使用的图查询语言，用于模式匹配、路径查询和关系分析，语法类似SQL但专为图结构设计。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] RETURN子句
+      RETURN子句：openCypher的RETURN子句用于指定从匹配中返回哪些表达式或变量。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] DuckPGQ SQL/PGQ标准语法参考。属性图由顶点表和边表通过MATCH子句查询：GRAPH_TABLE(graph_name MATCH (a)-[e]->(b) WHERE a.name='X' COLUMNS(...))。支持图模式匹配、路径变量、最短路径(ANY SHORTEST/ALL SHORTEST)、可达性查询。PG对应：Apache AGE扩展提供openCypher语法，
+      DuckPGQ SQL/PGQ标准语法参考。属性图由顶点表和边表通过MATCH子句查询：GRAPH_TABLE(graph_name MATCH (a)-[e]->(b) WHERE a.name='X' COLUMNS(...))。支持图模式匹配、路径变量、最短路径(ANY SHORTEST/ALL SHORTEST)、可达性查询。PG对应：Apache AGE扩展提供openCypher语法，Cypher('graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a,b,r $$) AS (a agtype, b agtype, r agtype)。纯PG用法：递归CTE或使用ltree/pgrouting扩展。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:357346
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Apache AGE扩展使PostgreSQL具备图数据库能力,通过openCypher查询语言和cypher()函数实现SQL与图查询混合。实践步骤:1)创建图空间:SELECT create_graph('social_graph'); 2)创建节点:SELECT * FROM cypher('social_graph',$$ CREATE (:User {name:'Alice',age:30}),(:User {name:'Bob',age:28}) $$) AS (v agtype); 3)创建关系:MATCH (a:User),(b:User) CREATE (a)-[:FRIEND]->(b); 4)图模式匹配:MATCH (a:User)-[:FRIEND]->(b:User) RETURN a.name,b.name; 5)可变长度路径:MATCH (a)-[:FRIEND*1..3]->(b)实现1-3层好友查询; 6)好友推荐算法:MATCH (a)-[:FRIEND]->()-[:FRIEND]->(candidate) WHERE NOT (a)-[:FRIEND]->(candidate)。AGE内部自动管理节点/边/属性表,agtype为AGE自定义扩展类型(类似JSONB超集)。企业应用:社交网络好友推荐、金融反欺诈(Account→Device→IP→Merchant网络分析)、知识图谱。核心能力:属性图模型+openCypher+SQL融合+ACID事务继承。
+      1)图数据分析场景;2)Apache AGE扩展;3)图查询响应时间; 参考参数:shared_preload_libraries='age', 参考指标ID:2300101[blks_read],2300102[blks_hit], 参考事件:DataFileRead, 参考系统视图:pg_extension, 参考故障模型:N/A, {}
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] PolarDB整合Apache AGE图算法插件实现图式搜索加速。AGE是兼容openCypher的PG扩展，支持图数据创建与遍历。编译AGE需使用`USE_PGXS=1 make`；在PolarDB PG11上需手动修改QTW_EXAMINE_RTES宏。使用：`CREATE EXTENSION age; LOAD 'age'; SET search_path=ag_catalog; SELEC
+      PolarDB整合Apache AGE图算法插件实现图式搜索加速。AGE是兼容openCypher的PG扩展，支持图数据创建与遍历。编译AGE需使用`USE_PGXS=1 make`；在PolarDB PG11上需手动修改QTW_EXAMINE_RTES宏。使用：`CREATE EXTENSION age; LOAD 'age'; SET search_path=ag_catalog; SELECT create_graph('g');`。场景：刑侦、社交、风控、族谱等图谱关系搜索。[KES: KES PG12.1理论可安装AGE，但需验证内核接口兼容性]
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:366176
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Apache AGE(A Graph Extension)是将图数据库功能集成到PostgreSQL的扩展，支持openCypher图查询语言和标签层次结构。基于Bitnine的AgensGraph(PG10 fork)演变而来，目标是创建统一存储处理关系型和图模型数据。PG11发布首个版本，后续支持PG12/13。使用方式: CREATE EXTENSION age; LOAD 'age'; S
+      Apache AGE(A Graph Extension)是将图数据库功能集成到PostgreSQL的扩展，支持openCypher图查询语言和标签层次结构。基于Bitnine的AgensGraph(PG10 fork)演变而来，目标是创建统一存储处理关系型和图模型数据。PG11发布首个版本，后续支持PG12/13。使用方式: CREATE EXTENSION age; LOAD 'age'; SET search_path = ag_catalog, ...; SELECT * FROM cypher('graph_name', $$ MATCH (n) RETURN n $$) AS (n agtype); 号称图数据库热度仅次于时序数据库，在风控、推荐系统、知识库场景应用广泛。同时查询多个图: 可将多个graph的cypher结果合并。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:347674
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

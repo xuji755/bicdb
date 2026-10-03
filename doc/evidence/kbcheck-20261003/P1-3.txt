@@ -1,0 +1,40 @@
+
+============================================================
+  [问题诊断] 资源隔离 租户 资源单元 配额
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 27，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     __all_unit：核心运维表之一。记录资源单元（Resource Unit）在集群各个 OBServer 节点上的实际分布情况。资源单元是 OceanBase 资源隔离与调度的最小物理载体。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：OB系统视图 __all_unit  (排序分: 14.0)
+     └ 详情：__all_unit：核心运维表之一。记录资源单元（Resource Unit）在集群各个 OBServer 节点上的实际分布情况。资源单元是 OceanBase 资源隔离与调度的最小物理载体。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:326714
+
+     [KnowledgeEntry] 创建资源单元命令 CREATE RESOURCE UNIT  (排序分: 9.4)
+     └ 摘要：创建资源单元 thn_ut1，指定 max_cpu=10、memory_size='8G'。资源单元定义了租户可用的 CPU 和内存上限，是资源池和租户资源隔离的基础。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1762005
+
+     [KnowledgeEntry] OCP 与 DBMS_RESOURCE_MANAGER 资源隔离配置  (排序分: 9.4)
+     └ 详情：《资源隔离概述（OCP）》说明 OCP 视角的资源隔离配置；《配置租户内资源隔离（实践）》通过 DBMS_RESOURCE_MANAGER 展示租户内资源隔离的落地方法。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1925694
+
+     [KnowledgeEntry] OceanBase 多租户与资源隔离能力  (排序分: 9.4)
+     └ 详情：文档总结指出，OceanBase 的多租户和资源隔离能力是解决资源管理痛点的关键，已在多个核心业务系统中使用。该能力用于在共享集群中隔离租户资源、提升资源管理效率。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2248831
+
+     [CaseStudy] 文章学习: OceanBase 云平台 - 删除资源隔离计划  (排序分: 9.1)
+     └ 摘要：当业务不再需要某项资源隔离计划时，可进行删除操作。根因在于删除需具备集群维护或租户维护权限、资源隔离菜单权限，且依赖Cgroup开启，计划须未被启用。解决方案：登录OCP，进入目标租户的资源隔离页面，选中待删计划，点击删除按钮即可。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:139099
+
+     [FaultModel] ob_cgroup资源隔离下连接访问冲突导致连环core  (排序分: 8.6)
+     └ 摘要：cgroup资源隔离下连接访问冲突导致连环core，系统性能下降，需关注并排查。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:95419
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

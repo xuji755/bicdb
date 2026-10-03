@@ -1,0 +1,40 @@
+
+============================================================
+  [问题诊断] TTL 过期 淘汰 惰性删除
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 18，摘要筛选通过 17，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 58，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 4，摘要筛选通过 1，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     大量 key 使用相同或接近的 TTL 会在同一时间失效，引发缓存雪崩和命中率骤降。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [CaseStudy] Redis缓存命中率骤降: TTL不合理导致缓存雪崩  (排序分: 10.0)
+     └ 摘要：大量 key 使用相同或接近的 TTL 会在同一时间失效，引发缓存雪崩和命中率骤降。
+     详情请见：python3 kb_graph.py redis detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:262132
+
+     [KnowledgeEntry] 惰性删除与定期删除协同的过期回收模型  (排序分: 10.0)
+     └ 详情：惰性删除发生在读取键时检查 TTL；定期删除是 activeExpireCycle。expired_stale_perc 是监控指标，反映主动过期是否追上过期键产生速度。权重滑动平均避免瞬时抖动。
+     详情请见：python3 kb_graph.py redis detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2050179
+
+     [KnowledgeEntry] TTL 缓存淘汰策略  (排序分: 10.0)
+     └ 摘要：TTL（生存时间）策略为每个缓存条目设置过期时间，到期后无论访问频率或最近性都强制淘汰。这适用于数据更新频繁、需避免提供过时信息的场景。
+     详情请见：python3 kb_graph.py redis detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:175876
+
+     [KnowledgeEntry] 会话型淘汰策略保持 volatile-ttl  (排序分: 10.0)
+     └ 详情：对会话型业务，键通常都设置了过期时间，应采用 volatile-ttl 淘汰策略，当内存满时优先淘汰剩余 TTL 最短的易失键，而不会淘汰未设置过期时间的持久键，避免误删关键会话数据。
+     详情请见：python3 kb_graph.py redis detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2036356
+
+     [KnowledgeEntry] volatile-ttl 淘汰策略  (排序分: 10.0)
+     └ 详情：volatile-ttl 从设置了过期时间的键中，按照剩余存活时间（TTL）由短到长选择键进行淘汰，即越早过期的键越优先被淘汰。
+     详情请见：python3 kb_graph.py redis detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1484136
+
+     [FaultModel] volatile-*策略下键无TTL导致OOM误判  (排序分: 9.3)
+     └ 摘要：现象：db0:keys=1000000,expires=0 却报 OOM。根因：业务键全都没设 TTL，volatile-* 策略无可淘汰键，等价 noeviction。确认方法：INFO keyspace 查看 keys/expires 比值。修复：为键设置 TTL 或改用 allkeys-* 策略。
+     详情请见：python3 kb_graph.py redis detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2055598
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

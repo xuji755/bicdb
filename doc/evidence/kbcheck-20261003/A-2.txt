@@ -1,0 +1,127 @@
+[独立问题检索] 3 个问题（完全重复的问题只执行一次）
+
+问题 1/3
+
+============================================================
+  [问题诊断] 合并阻塞
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 29，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 36，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 15，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     参考《集群合并阻塞》和《合并问题排查（社区）》，采用标准排查流程定位合并不结束的原因。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 集群合并阻塞排查流程  (排序分: 9.4)
+     └ 详情：参考《集群合并阻塞》和《合并问题排查（社区）》，采用标准排查流程定位合并不结束的原因。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1923537
+
+     [FaultModel] ob_blog_如何排查和分析_OB_4_X_合并卡住的问题  (排序分: 8.8)
+     └ 摘要：合并卡住，根因是OBServer节点因重启后时钟同步服务未启动，导致时间落后60s+，集群合并时无法正常推进。典型场景：节点时钟不同步影响分布式协调，导致合并阻塞。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:50948
+
+     [KnowledgeEntry] 问题描述：备租户合并卡住， 并且导致合并卡住的对应的 tablet 在 __all_virtual_tablet_compaction_info 表中 extra_info 的 last_medium_scn 与第一个 medium_info 的 last_medium_snapshot 不匹配。 问题诊断 备份和 medium compaction 并发， 并且备份转储和备份基线在不同的 ser  (排序分: 8.8)
+     └ 摘要：备租户合并卡住，根因是备份转储与基线并发导致last_medium_scn与medium_info的last_medium_snapshot不匹配，典型场景为备租户合并阻塞。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:75191
+
+     [KnowledgeEntry] 基本信息：- **来源**: OceanBase 知识库 - **类型**: 合并转储 - **产品**: OceanBase 数据库 - **标签**: V1.4.x, V2.1.x, V2.2.x, V3.1.x, V3.2.x, 合并转储, TechNote  (排序分: 8.8)
+     └ 详情：基本信息：- **来源**: OceanBase 知识库 - **类型**: 合并转储 - **产品**: OceanBase 数据库 - **标签**: V1.4.x, V2.1.x, V2.2.x, V3.1.x, V3.2.x, 合并转储, TechNote
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:73277
+
+     [KnowledgeEntry] ob_cluster_merge_timeout OceanBase 集群合并超时：- **ID**: 1000000005296343 - **来源**: product_doc > 告警描述 该告警检测 OceanBase 集群的合并状态，如果一个 Zone 3 个小时仍然没有完成合并，则触发该告警。 说明 合并超时并不表示合并停止，合并仍然继续进行，超时是指合并耗时超过了预期时间，需要关注原  (排序分: 8.8)
+     └ 摘要：OceanBase集群某Zone合并耗时超过3小时触发告警，合并仍在进行但耗时超预期，无明确根因，需排查合并阻塞或性能瓶颈，影响资源释放和后续合并计划。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:60760
+
+     [CaseStudy] OceanBase 数据库 V4.x 转储合并信息查询手册及问题排查  (排序分: 5.9)
+     └ 摘要：OceanBase V4.x 转储合并过程中出现性能下降或阻塞现象，根因多为内存压力过大、转储策略不当或合并线程冲突。通过查询系统视图定位阻塞源，调整转储阈值、合并并发度及内存配置可有效恢复系统稳定。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:134366
+
+
+问题 2/3
+
+============================================================
+  [问题诊断] 内存不足
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 47，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 39，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     错误码速查：-4013 租户内存不足（OB_ALLOCATE_MEMORY_FAILED），联动 01/02 篇。本主题相关参数：memstore 族 / _tx_share_memory_limit_percentage / _storage_meta_memory_limit_percentage / _system_tenant_limit_mode。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 错误码 -4013 租户内存不足  (排序分: 9.4)
+     └ 详情：错误码速查：-4013 租户内存不足（OB_ALLOCATE_MEMORY_FAILED），联动 01/02 篇。本主题相关参数：memstore 族 / _tx_share_memory_limit_percentage / _storage_meta_memory_limit_percentage / _system_tenant_limit_mode。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1976493
+
+     [KnowledgeEntry] 租户内存不足导致 allocate memory fail  (排序分: 9.4)
+     └ 摘要：该文档指出租户内存不足会触发 allocate memory fail 错误，文档的规避方式章节内容为无，未记录可用的规避手段。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2489468
+
+     [KnowledgeEntry] ERROR 4030 表示 MemStore 内存不足  (排序分: 9.4)
+     └ 详情：错误码 4030 的错误信息为 ERROR 4030 ( HY000 ): Over tenant memory limits。该错误码表示 MemStore 内存不足，该错误通常发生在 INSERT、UPDATE、DELETE 语句及 table_scan 动作等 MemStore 操作上，此时错误的日志信息不是 ERROR 级别，而是 WARN 级别。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:255147
+
+     [KnowledgeEntry] 租户内存不足-4013/-4030诊断  (排序分: 9.4)
+     └ 摘要：错误码-4013/-4030表示租户内存不足。优先通过__all_virtual_memory_info查看哪个ctx/label占用高：MemStore高→转储慢；SQL工作区高→调整ob_sql_work_area_percentage/query_memory_limit_percentage；plan cache高→错误码OB_REACH_MEMORY_LIMIT -5226。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1924732
+
+     [CaseStudy] temp table 计划执行异常一段时间后租户内存不足并且无法释放  (排序分: 9.1)
+     └ 摘要：临时表计划执行异常导致租户内存持续增长，最终内存不足且无法释放。根因在于异常执行计划占用了大量临时表空间，且系统未及时回收，造成内存泄漏。解决方案：优化异常计划识别与终止机制，增加临时表空间自动清理策略，并设置内存使用上限告警。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:135053
+
+     [FaultModel] 租户内存不足（-4013/-4030 风暴）  (排序分: 8.6)
+     └ 摘要：现象为出现 -4013/-4030 错误码及限流日志，根因是大查询占用内存或 memstore 水位过高，触发条件为租户内存不足，诊断方法是通过 GV$OB_SQL_AUDIT 按 mem_used 查找大查询并检查 memstore 水位，处置为杀查询、转储/合并、扩容、调参。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1927744
+
+
+问题 3/3
+
+============================================================
+  [问题诊断] 转储
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 512，摘要筛选通过 1，批次 8；达到候选上限，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 11，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 512，摘要筛选通过 1，批次 8；达到候选上限，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     当 freeze_trigger_percentage 被调低，会更频繁触发冻结，转储变多；minor_compact_trigger（2）随后触发 minor 合并；合并调度加剧数据盘写入，当数据盘水位达到 _datafile_usage_upper_bound_percentage（90）时触顶，系统报 -4184。源码锚点：seed:524/1193/1221/45；ob_partition_merge_policy.cpp:594；ob_block_manager.cpp:1798。跨主题落点：09 合并、
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 频繁冻结-转储-minor合并-数据盘水位写放大传导链  (排序分: 9.4)
+     └ 摘要：freeze_trigger_percentage↓ 导致频繁冻结和转储增多，minor_compact_trigger(2) 触发 minor，合并调度后数据盘水位 _datafile_usage_upper_bound_percentage(90) 触顶并报 -4184。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1970022
+
+     [KnowledgeEntry] 转储失败（dump/compaction_failure）  (排序分: 9.4)
+     └ 摘要：转储任务（dump/compaction）执行失败，[根因]可能涉及资源不足、配置错误或数据损坏，[影响/典型场景]导致合并进度停滞、存储空间无法回收，影响查询性能和系统稳定性。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:100392
+
+     [KnowledgeEntry] 18117367840：- **ID**: blog_18117367840 - **来源**: blog > <html><body><p><br></p><h1 id="转储的理解">转储的理解</h1><p>关于转储的定义困扰了我很久，最开始的理解是memtable内存写到某个大小，触发memtable冻结，将冻结的memtable dump到L0层的mini sstable，而mini s  (排序分: 9.4)
+     └ 摘要：对转储定义理解困扰，根因是memtable内存达到阈值触发冻结后dump到L0层mini sstable，典型场景为OceanBase转储机制认知。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:62729
+
+     [KnowledgeEntry] 问题描述：转储失败可能导致内存无法按预期释放，。 本文档提供了一种方法来排查和诊断转储失败和内存无法释放的问题。 诊断冻结与转储失败 在数据库操作中，。 首先需要确定问题是冻结（freeze）操作失败还是转储（dump/flush）操作失败。 冻结失败 如果 MemTable 没有发生冻结，。 转储失败 如果 MemTable 已经冻结，。 可以通过查找日志中转储失败的迹象来进行排查：。  (排序分: 9.4)
+     └ 摘要：转储失败导致内存无法按预期释放，需区分是冻结失败还是转储失败。根因在于MemTable未冻结或已冻结但转储未完成。典型场景为内存持续增长，需通过日志排查转储迹象。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:75506
+
+     [FaultModel] ob_转储失败_dump_compaction_failure  (排序分: 8.6)
+     └ 摘要：转储队列满（错误码4019）导致memtable移到prepare_list后转储DAG执行失败，无法从列表中移除。大量memtable堆积，持续占用内存，出现“memtable flush failed”日志，最终引发OOM，系统性能严重下降。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:95366
+
+     [CaseStudy] 文章学习: OceanBase 数据库 - 查看转储信息  (排序分: 7.4)
+     └ 摘要：触发转储后，管理员需实时监控进度以确保任务正常执行。根因在于转储任务状态分散，缺乏直观的进度展示。解决方案是通过GV$OB_TABLET_COMPACTION_PROGRESS视图查看未完成数据量及预期完成时间，该视图仅显示正在运行的Compaction任务，任务结束后自动消失，支持系统租户和用户租户查询。
+     详情请见：python3 kb_graph.py ob detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:143024
+
+
+合格结果：18 个不同 EID；每个问题独立评分与选择。
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

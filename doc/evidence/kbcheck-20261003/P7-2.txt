@@ -1,0 +1,35 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector源码学习：3.1节-向量距离度量。支持三种距离：L2距离(欧氏距离)sqrt(Σ(ai-bi)²)用于空间相似度；余弦距离1-cos(θ)用于文本/语义相似度(归一化后等价内积)；内积Σ(ai×bi)用于推荐评分。SQL: SELECT * FROM items ORDER BY embedding <-> query_vec LIMIT 10; (L2); ORDER BY em
+      pgvector源码学习：3.1节-向量距离度量。支持三种距离：L2距离(欧氏距离)sqrt(Σ(ai-bi)²)用于空间相似度；余弦距离1-cos(θ)用于文本/语义相似度(归一化后等价内积)；内积Σ(ai×bi)用于推荐评分。SQL: SELECT * FROM items ORDER BY embedding <-> query_vec LIMIT 10; (L2); ORDER BY embedding <=> query_vec (余弦); ORDER BY embedding <#> query_vec (内积)。选择合适距离度量是检索质量关键。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:347762
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector中内积距离与余弦相似度的关系
+      pgvector中内积距离与余弦相似度的关系：余弦距离=1-余弦相似度，归一化向量的内积等于余弦相似度。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector中距离操作符
+      pgvector中距离操作符：距离操作符：L2(<->)、内积(<#>)、余弦(<=>)、L1(<+>)、汉明(<~>)、Jaccard(<%>)。
+分类：工具
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector源码学习：3.3节-操作符类(Operator Classes)。pgvector为PG索引注册了操作符类：vector_l2_ops(L2距离索引)、vector_ip_ops(内积索引)、vector_cosine_ops(余弦距离索引)。CREATE INDEX ON t USING ivfflat(vec vector_l2_ops) WITH(lists=100); 不同
+      pgvector源码学习：3.3节-操作符类(Operator Classes)。pgvector为PG索引注册了操作符类：vector_l2_ops(L2距离索引)、vector_ip_ops(内积索引)、vector_cosine_ops(余弦距离索引)。CREATE INDEX ON t USING ivfflat(vec vector_l2_ops) WITH(lists=100); 不同距离度量的索引不通用，需按查询距离选择正确opclass。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:347764
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] pgvector <=> 余弦距离语义搜索
+      openai_chat 查询 commit_logs 时使用 where embedding <=> (select emb from q) < 0.8 过滤，并使用 order by embedding <=> (select emb from q) 排序，limit 10 取最近邻记录。<=> 是 pgvector 的余弦距离运算符。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector支持的向量距离计算方法
+      pgvector支持的向量距离计算方法：归一化向量后使用内积性能最佳，余弦距离与内积等价。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] pgvector 距离运算符与相似度公式
+      译者校订指出上游使用 L2 <-> 与已创建的 vector_cosine_ops 索引不一致，因此统一改为余弦距离 <=>，并用 1 - 余弦距离计算余弦相似度。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] vector_distance_metrics
+      vector_distance_metrics：pgvector实现的向量距离度量：平方欧氏距离(L2)、负内积、余弦距离（归一化内积），每种对应特定操作符和索引支持。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector距离操作符
+      pgvector距离操作符：<->欧氏距离，<#>负内积，<=>余弦距离。
+分类：工具
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector距离度量总览
+      pgvector距离度量总览：六种距离度量：L2、内积、余弦、L1适用于vector/halfvec/sparsevec；汉明和杰卡德仅适用于bit。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 余弦距离操作符<->
+      余弦距离操作符<->：使用embedding <-> query_vector表示L2距离（欧氏距离），常用于余弦相似度搜索（配合vector_cosine_ops索引）。注意<->在pgvector中默认是L2距离，而非余弦。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 向量距离搜索操作符
+      向量距离搜索操作符：pgvector提供多种向量距离操作符用于相似度计算，包括欧氏距离(L2)、内积、余弦距离、曼哈顿距离等。
+分类：概念
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

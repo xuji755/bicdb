@@ -1,0 +1,183 @@
+[
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422895",
+    "metric_id": "2189030",
+    "name": "LOGICAL READS PER SEC用于衡量 ORACLE 数据库每秒进行的逻辑读取操作数",
+    "description": "指标:Logical Reads Per Sec用于衡量 Oracle 数据库每秒进行的逻辑读取操作数。逻辑读取包括从内存缓冲区缓存（Buffer Cache）中读取数据块，而不涉及物理磁盘 I/O 操作。这个指标反映了数据库的缓存效率和数据访问频率。每秒逻辑读过多，会消耗大量的CPU资源。如果该指标异常增长可能产生的影响：1）CPU负载增加；2）latch: cache buffers chains等待事件增多，闩锁争用加剧，影响并发性能；3）数据库缓冲池压力加大；",
+    "source": "std_metric",
+    "db_type": "2101",
+    "score": 54.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:95902",
+    "metric_id": "2189030",
+    "name": "Logical Reads Per Sec用于衡量 Oracle 数据库每秒进行的逻辑读取操作数",
+    "description": "指标:Logical Reads Per Sec用于衡量 Oracle 数据库每秒进行的逻辑读取操作数。逻辑读取包括从内存缓冲区缓存（Buffer Cache）中读取数据块，而不涉及物理磁盘 I/O 操作。这个指标反映了数据库的缓存效率和数据访问频率。每秒逻辑读过多，会消耗大量的CPU资源。如果该指标异常增长可能产生的影响：1）CPU负载增加；2）latch: cache buffers chains等待事件增多，闩锁争用加剧，影响并发性能；3）数据库缓冲池压力加大；",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 54.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879020",
+    "metric_id": "ORA_3003",
+    "name": "逻辑读(Logical Reads Per Sec)",
+    "description": "指标类别：性能-逻辑读(Logical Reads Per Sec)。描述：数据库每秒从Buffer Cache读取的数据块数量(Consistent Gets + DB Block Gets)。通过V$SYSSTAT中'consistent gets'+'db block gets'差值计算。高逻辑读消耗大量CPU资源。异常影响：CPU使用率上升、Buffer Cache闩锁争用加剧。 [RootCause] 1、SQL执行计划劣化导致逻辑读/物理读大幅增加，检查执行计划变化。；2、大量SQL未使用绑定变量导致硬解析频繁，检查force_matching_signature。；3、Buffer Cache不足导致命中率下降，物理读增加，检查Buffer Cache Hit Ratio。；4、检查点(checkpoint)频繁触发导致物理写增加，检查Redo Log切换频率。；5、直接路径读(direct path read)增加，检查并行查询和排序溢出。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 46.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1495167",
+    "metric_id": "2180012",
+    "name": "逻辑读累计值",
+    "description": "逻辑读累计值",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 38.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:26341",
+    "metric_id": "2180012",
+    "name": "逻辑读累计值",
+    "description": "逻辑读累计值",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 38.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422793",
+    "metric_id": "2180083",
+    "name": "最长SQL时间",
+    "description": "最长sql时间，如果该时间超出预期，则需要找到该SQL并进行优化，SQL执行时间过长可能会产生以下影响：1）消耗过多的CPU资源；2）消耗过多内存资源；3）产生过多的逻辑读；4）如果是DML操作，可能会增加行锁等待的时间；",
+    "source": "std_metric",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422837",
+    "metric_id": "2180543",
+    "name": "存在TOP SQL",
+    "description": "指标:存在TOP SQL，存在高开销或者高并发执行的SQL，可能会导致数据库服务器的资源使用率过高（CPU,内存，IO，网络等），或者数据库活跃会话数增多，或者逻辑读、物理读增多，数据库并发于负载增高、性能下降等。",
+    "source": "std_metric",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422853",
+    "metric_id": "2184312",
+    "name": "LATCH CACHE BUFFERS CHAIN 平均等待时间",
+    "description": "指标:latch cache buffers chain 平均等待时间，是数据库会话访问某个数据块的时候，通过HASH链定位某个缓冲区时候访问的闩锁的延时，如果该指标异常，会产生以下影响：1）导致事务处理延迟，会话因等待latch而无法及时获取数据块，导致事务提交时间（log file sync）显著增加，甚至触发应用超时，高频争用会引发连锁等待（如enq: TX - row lock contention），进一步拖慢业务响应；2）过度消耗 CPU资源，会话在等待latch时可能进入spin状态（CPU空转），导致CPU使用率飙升；高逻辑读的SQL会占用大量CPU资源，形成“CPU瓶颈+latch争用”的恶性循环；3）导致系统吞吐量骤降，在高并发场景下，latch争用会导致吞吐量急剧下降。例如某系统业务处理时间延长至平时的10倍，甚至出现“卡死”现象；4）连锁资源争用，可能引发buffer busy waits（数据块被其他会话修改或读取到内存中）或library cache latch争用（共享池压力传导），在RAC环境中，可能因全局缓冲池争用导致实例驱逐（Instance Eviction）；​5） 实例稳定性风险，长时间未解决的latch争用可能导致实例夯住（Hang），需强制重启。",
+    "source": "std_metric",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422893",
+    "metric_id": "2189026",
+    "name": "USER CALLS PER SEC用于衡量 ORACLE 数据库每秒接收的用户调用数",
+    "description": "指标:User Calls Per Sec用于衡量 Oracle 数据库每秒接收的用户调用数。这些调用可以是查询、插入、更新、删除等操作。这个指标反映了数据库的活动水平和用户交互频率。如果该指标异常可能产生的影响：1）导致CPU使用率激增；2）共享池（Shared Pool）的闩锁（Latch）争用（如library cache lock）加剧。还会进一步消耗内存资源，导致shared pool碎片化或cursor: pin S wait on X等待事件；3）高并发用户调用可能引发行级锁争用（enq: TX - row lock contention）；4）逻辑读与物理读压力加大；5）在RAC集群中，高用户调用可能引发Global Cache blocks received/served异常。",
+    "source": "std_metric",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422944",
+    "metric_id": "2189121",
+    "name": "EXECUTIONS PER SEC是 ORACLE 数据库中的一个性能指标",
+    "description": "指标:Executions Per Sec是 Oracle 数据库中的一个性能指标，表示每秒执行的 SQL 语句数量。它反映了数据库在单位时间内处理 SQL 请求的频率，是评估数据库负载和性能的关键参数。如果这个指标异常增长，可能意味着数据库正在处理过多的 SQL 语句。如果该指标异常增加，可能产生如下影响：1）CPU使用率可能增加；2）每秒事务数可能增加；3）每秒REDO生成量可能增加；4）每秒逻辑读数量可能增加；5）每秒物理读数量可能增加；6）内存使用率可能上升；7)IOPS和IO吞吐量可能增加；8）活跃会话数可能增加；",
+    "source": "std_metric",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:878886",
+    "metric_id": "ORA_OS_3000009",
+    "name": "指标：running process，当前正在执行或者等待CPU的队列，反映出CPU真实的负载情况",
+    "description": "指标类别：OS指标-指标：running process，当前正在执行或者等待CPU的队列，反映出CPU真实的负载情况。如果该指标超过系统CPU线程数的2倍，则认为CPU负载过高，可能会影响数据库的整体性能。当前的CPU线程数为{[cib,2260001,cpu_count]}。。描述：指标：running process，当前正在执行或者等待CPU的队列，反映出CPU真实的负载情况。如果该指标超过系统CPU线程数的2倍，则认为CPU负载过高，可能会影响数据库的整体性能。当前的CPU线程数为{[cib,2260001,cpu_count]}。。异常影响：操作系统级性能指标，异常可能影响数据库稳定性。 [RootCause] CPU使用率高；并发问题；存在Top SQL等有关。如果指标异常可能原因：1）并发会话过多；2）存在大开销的进程或者线程；3）IO子系统存在严重问题；导致WIO占比过大；4）换页等操作导致SYS CPU使用过高；5）大量的中断占用了CPU；6）存在慢SQL；消耗了大量的CPU资源；其特征是逻辑读的数量很大；指标ID：2189030的值很高或者异常增加；",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879021",
+    "metric_id": "ORA_3004",
+    "name": "物理读(Physical Reads Per Sec)",
+    "description": "指标类别：性能-物理读(Physical Reads Per Sec)。描述：数据库每秒从磁盘读取的数据块数量。通过V$SYSSTAT中'physical reads'差值计算。物理读过多表明Buffer Cache命中率下降或大量全表扫描。异常影响：IO子系统压力剧增、db file sequential/scattered read等待增加。 [RootCause] 1、SQL执行计划劣化导致逻辑读/物理读大幅增加，检查执行计划变化。；2、大量SQL未使用绑定变量导致硬解析频繁，检查force_matching_signature。；3、Buffer Cache不足导致命中率下降，物理读增加，检查Buffer Cache Hit Ratio。；4、检查点(checkpoint)频繁触发导致物理写增加，检查Redo Log切换频率。；5、直接路径读(direct path read)增加，检查并行查询和排序溢出。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879022",
+    "metric_id": "ORA_3005",
+    "name": "物理写(Physical Writes Per Sec)",
+    "description": "指标类别：性能-物理写(Physical Writes Per Sec)。描述：数据库每秒向磁盘写入的数据块数量(DBWR写入+Direct Write)。通过V$SYSSTAT中'physical writes'差值计算。异常增长常伴随检查点频繁触发。异常影响：IO子系统过载、free buffer waits等待增加。 [RootCause] 1、SQL执行计划劣化导致逻辑读/物理读大幅增加，检查执行计划变化。；2、大量SQL未使用绑定变量导致硬解析频繁，检查force_matching_signature。；3、Buffer Cache不足导致命中率下降，物理读增加，检查Buffer Cache Hit Ratio。；4、检查点(checkpoint)频繁触发导致物理写增加，检查Redo Log切换频率。；5、直接路径读(direct path read)增加，检查并行查询和排序溢出。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879023",
+    "metric_id": "ORA_3011",
+    "name": "Top SQL(Buffer Gets)",
+    "description": "指标类别：性能-Top SQL(Buffer Gets)。描述：按逻辑读(Buffer Gets)排序的TOP SQL语句列表。高逻辑读SQL消耗大量CPU和Buffer Cache资源。异常影响：Buffer Cache压力增大、CPU使用率上升。 [RootCause] 1、SQL执行计划劣化（统计信息过期、索引失效），检查AWR SQL执行计划变化。；2、数据量增长但未优化SQL或索引，检查表行数增长趋势。；3、等待事件增加（IO延迟/锁竞争/Latch争用），检查对应等待事件。；4、绑定变量窥探导致执行计划不稳定（ACS自适应游标），检查V$SQL_SHARED_CURSOR。；5、并行度设置不合理或并行操作相互等待。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879135",
+    "metric_id": "ORA_3006",
+    "name": "SQL解析数(Parse Count Per Sec)",
+    "description": "指标类别：性能-SQL解析数(Parse Count Per Sec)。描述：数据库每秒SQL解析的总次数(含硬解析和软解析)。通过V$SYSSTAT中'parse count(total)'差值计算。解析过多会消耗CPU和Shared Pool闩锁(latch: shared pool, library cache)。异常影响：CPU使用率上升、latch争用加剧、TPS下降。 [RootCause] 1、SQL执行计划劣化导致逻辑读/物理读大幅增加，检查执行计划变化。；2、大量SQL未使用绑定变量导致硬解析频繁，检查force_matching_signature。；3、Buffer Cache不足导致命中率下降，物理读增加，检查Buffer Cache Hit Ratio。；4、检查点(checkpoint)频繁触发导致物理写增加，检查Redo Log切换频率。；5、直接路径读(direct path read)增加，检查并行查询和排序溢出。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879136",
+    "metric_id": "ORA_3007",
+    "name": "硬解析数(Hard Parse Count Per Sec)",
+    "description": "指标类别：性能-硬解析数(Hard Parse Count Per Sec)。描述：SQL语句第一次执行或执行计划被淘汰后重新解析的次数。通过V$SYSSTAT中'parse count(hard)'差值计算。硬解析消耗大量CPU(语法分析+语义检查+执行计划生成)。异常影响：CPU使用率上升、Shared Pool和Library Cache闩锁争用加剧、SQL执行延长。 [RootCause] 1、SQL执行计划劣化导致逻辑读/物理读大幅增加，检查执行计划变化。；2、大量SQL未使用绑定变量导致硬解析频繁，检查force_matching_signature。；3、Buffer Cache不足导致命中率下降，物理读增加，检查Buffer Cache Hit Ratio。；4、检查点(checkpoint)频繁触发导致物理写增加，检查Redo Log切换频率。；5、直接路径读(direct path read)增加，检查并行查询和排序溢出。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879137",
+    "metric_id": "ORA_3008",
+    "name": "软解析比(Soft Parse Ratio)",
+    "description": "指标类别：性能-软解析比(Soft Parse Ratio)。描述：软解析占总解析的比例(Soft Parse%/Parse Count)。软解析复用已缓存的执行计划，代价远低于硬解析。建议>95%。若偏低说明大量SQL未使用绑定变量或Shared Pool不足。 [RootCause] 1、SQL执行计划劣化导致逻辑读/物理读大幅增加，检查执行计划变化。；2、大量SQL未使用绑定变量导致硬解析频繁，检查force_matching_signature。；3、Buffer Cache不足导致命中率下降，物理读增加，检查Buffer Cache Hit Ratio。；4、检查点(checkpoint)频繁触发导致物理写增加，检查Redo Log切换频率。；5、直接路径读(direct path read)增加，检查并行查询和排序溢出。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:879183",
+    "metric_id": "ORA_OS_3000003",
+    "name": "指标：CPU used，该指标过高说明数据库负载较大，如果超过70%，可能降低数据库整体性能，如果超过95%则可能引起较为严重的性能问题，影响范围可能包括：1）活跃会话数过多；2）数据库并发能力下降；3）SQL执行延时变长；",
+    "description": "指标类别：OS指标-指标：CPU used，该指标过高说明数据库负载较大，如果超过70%，可能降低数据库整体性能，如果超过95%则可能引起较为严重的性能问题，影响范围可能包括：1）活跃会话数过多；2）数据库并发能力下降；3）SQL执行延时变长；。描述：指标：CPU used，该指标过高说明数据库负载较大，如果超过70%，可能降低数据库整体性能，如果超过95%则可能引起较为严重的性能问题，影响范围可能包括：1）活跃会话数过多；2）数据库并发能力下降；3）SQL执行延时变长；。异常影响：操作系统级性能指标，异常可能影响数据库稳定性。 [RootCause] 1）并发会话过多；2）存在大开销的进程或者线程；3）IO子系统存在严重问题；导致WIO占比过大；4）换页等操作导致SYS CPU使用过高；5）大量的中断占用了CPU；6）存在慢SQL；消耗了大量的CPU资源；其特征是逻辑读的数量很大；指标ID:2250003的值很高或者异常增加；",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:95800",
+    "metric_id": "2180083",
+    "name": "最长sql时间",
+    "description": "最长sql时间，如果该时间超出预期，则需要找到该SQL并进行优化，SQL执行时间过长可能会产生以下影响：1）消耗过多的CPU资源；2）消耗过多内存资源；3）产生过多的逻辑读；4）如果是DML操作，可能会增加行锁等待的时间；",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  },
+  {
+    "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:95844",
+    "metric_id": "2180543",
+    "name": "存在TOP SQL",
+    "description": "指标:存在TOP SQL，存在高开销或者高并发执行的SQL，可能会导致数据库服务器的资源使用率过高（CPU,内存，IO，网络等），或者数据库活跃会话数增多，或者逻辑读、物理读增多，数据库并发于负载增高、性能下降等。",
+    "source": "expert",
+    "db_type": "2101",
+    "score": 12.0
+  }
+]
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

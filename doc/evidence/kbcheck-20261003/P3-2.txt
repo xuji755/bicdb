@@ -1,0 +1,40 @@
+
+============================================================
+  [问题诊断] ORA-01555 快照过旧
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 56，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 57，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 58，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     ORA-01555“快照太旧”错误源于Oracle读一致性机制：查询以System Change Number (SCN)标记快照，通过回滚段重构数据块的历史版本。当所需前镜像因回滚段空间被频繁提交覆盖或回绕而丢失时，查询无法重建快照即报错。常见场景包。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:10630.1 ORA-01555: "Snapshot too old" - Overview  (排序分: 15.0)
+     └ 摘要：ORA-01555“快照太旧”错误源于Oracle读一致性机制：查询以System Change Number (SCN)标记快照，通过回滚段重构数据块的历史版本。当所需前镜像因回滚段空间被频繁提交覆盖或回绕而丢失时，查询无法重建快照即报错。常见场景包。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1993918
+
+     [KnowledgeEntry] L1：Note:10630.1 ORA-01555: "Snapshot too old" - Overview  (排序分: 15.0)
+     └ 摘要：ORA-01555“快照太旧”错误源于查询所需的读一致性快照无法从回滚段中重建，通常因回滚段过小导致提交事务空间被覆盖、回滚段损坏或跨提交fetch操作引发。该错误涉及SCN和读一致性机制，诊断时需关注回滚段配置、长查询。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040430
+
+     [KnowledgeEntry] L1：Note:460844.1 INTEPRETING 10442 TRACE INFO FOR DIAGNOISING ORA-1555  (排序分: 14.7)
+     └ 摘要：event 10442 trace 用于诊断 ORA-01555 快照过旧错误，通过分析 trace 中 SSOLD 输出可获取查询长度、undo retention、env SCN 及数据块 ITL 清理状态等关键信息。当 undo retention 小于查询长度，且存在 commit SCN 大于 env SCN 的已清理 ITL 时，表。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2045035
+
+     [KnowledgeEntry] L1：Bug 6469109 PHSB: QUERY REPORTED ORA-00600:[4097] ON READABLE STANDBY  (排序分: 14.7)
+     └ 摘要：Bug 6469109 描述在可读物理备用库（readable standby）上查询时偶发 ORA-00600 [4097] 内部错误，同时伴生 ORA-01555 快照过旧和 ORA-00339 归档日志不含重做的错误。触发环境为 ASM 上的 11.1.0.0.0 最大性能模式备库，查询使用 AS OF SCN 子句。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2048511
+
+     [CaseStudy] ORA-01555快照过旧: 大事务与UNDO表空间配置不当引发一致性读失败  (排序分: 10.0)
+     └ 详情：某数据仓库报表查询在运行30分钟后失败，报ORA-01555 snapshot too old。分析发现UNDO表空间仅10GB，AUM(自动撤销管理)的UNDO_RETENTION设为900秒但未启用GUARANTEE模式。长达1小时的查询需要一致性读时，所需UNDO信息已被后续事务所覆盖。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:862620
+
+     [FaultModel] Ora-01555快照过旧  (排序分: 10.0)
+     └ 摘要：Oracle数据库报错，具体含义请参考Oracle官方错误码文档
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:365040
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

@@ -1,0 +1,1 @@
+  No equivalents found for Oracle.GV$OB_MEMORY (EQUIVALENT_TO edges not yet built)

@@ -1,0 +1,746 @@
+[
+ {
+  "id": "P0-1",
+  "group": "类型",
+  "cmd": "kb_graph.py oracle entity knowledge NUMBER 精度 标度 舍入",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 3583,
+  "lines": 59,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] BINARY_FLOAT/Double与NUMBER精度差异",
+   "NUMBER列使用十进制精度存储浮点数，所有十进制字面量都能精确存储。BINARY_FLOAT/BINARY_DOUBLE列使用二进制精度，无法精确表示所有十进制值。例如0.1在二进制浮点数中无法精确表示，但在NUMBER中可以精确存储。这种精度差异可能导致舍入误差。",
+   "详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1529900"
+  ]
+ },
+ {
+  "id": "P0-2",
+  "group": "类型",
+  "cmd": "kb_graph.py oracle problem 空字符串 NULL 语义",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2749,
+  "lines": 41,
+  "head": [
+   "[问题诊断] 空字符串 NULL 语义",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 60，摘要筛选通过 39，批次 1；本路已取尽"
+  ]
+ },
+ {
+  "id": "P0-3",
+  "group": "类型",
+  "cmd": "doc_retrieve.py NLS_LANG AL32UTF8 --db oracle",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 6827,
+  "lines": 298,
+  "head": [
+   "匹配: 20",
+   "✅ 官方文档: 20",
+   "源: doc/73ead132-1b09-5db5-9284-afae691c9227-oracle_482.md"
+  ]
+ },
+ {
+  "id": "P0-4",
+  "group": "存储",
+  "cmd": "kb_graph.py oracle entity knowledge 块 区 段 逻辑存储结构",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2995,
+  "lines": 30,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] 4.2 逻辑存储结构",
+   "数据库逻辑存储结构采用层次化组织，实现物理与逻辑分离，便于在不影响逻辑结构的情况下管理物理存储。最上层为表空间，作为段的逻辑容器，每个表空间至少包含一个数据文件。表空间内包含多个段，段是为用户对象（如表、索引）、undo数据或临时数据分配的区集合。区是一次分配获得的逻辑连续数据块集合，而数据块是最细",
+   "详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:363753"
+  ]
+ },
+ {
+  "id": "P1-1",
+  "group": "隔离",
+  "cmd": "kb_graph.py oracle entity knowledge 权限 角色 对象权限 最小权限",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2676,
+  "lines": 29,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,SyncEntity] 角色权限定义与打包授权",
+   "文档说明角色权限就是将属于用户的权限授予一个角色，任何权限都可以授予给一个角色。授予系统权限给被授予者必须使用 WITH ADMIN OPTION 子句。角色机制可用于集中管理权限集合。",
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 用户与角色映射的维护复杂度"
+  ]
+ },
+ {
+  "id": "P1-2",
+  "group": "隔离",
+  "cmd": "kb_graph.py linux problem 符号链接 路径穿越 权限 提权",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 1825,
+  "lines": 41,
+  "head": [
+   "[问题诊断] 符号链接 路径穿越 权限 提权",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 18，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P1-3",
+  "group": "隔离",
+  "cmd": "kb_graph.py ob problem 资源隔离 租户 资源单元 配额",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 1999,
+  "lines": 41,
+  "head": [
+   "[问题诊断] 资源隔离 租户 资源单元 配额",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 27，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P2-1",
+  "group": "存储",
+  "cmd": "kb_graph.py postgresql problem TOAST 大字段 外联存储 压缩",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 1890,
+  "lines": 46,
+  "head": [
+   "[问题诊断] TOAST 大字段 外联存储 压缩",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 47，摘要筛选通过 37，批次 1；本路已取尽"
+  ]
+ },
+ {
+  "id": "P2-2",
+  "group": "存储",
+  "cmd": "kb_graph.py oracle entity knowledge 行链接 行迁移 链式行",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 3905,
+  "lines": 45,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 行迁移与行链接机制",
+   "行链接（Row Chaining）发生在行首次插入时，如果行的长度超过数据库块大小，Oracle 将行分割到多个数据块中。行迁移（Row Migration）发生在 UPDATE 操作后行变长且原块无足够空闲空间时，Oracle 将整行移动到新数据块，在原块保留指向新位置的 rowid 指针。两者都",
+   "详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:333061"
+  ]
+ },
+ {
+  "id": "P2-3",
+  "group": "存储",
+  "cmd": "kb_graph.py postgresql entity knowledge FSM 空闲空间映射 页面复用",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 1915,
+  "lines": 34,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 空闲空间映射（FSM）",
+   "空闲空间映射（FSM）：空闲空间映射（FSM）记录每个数据块的空闲空间，插入时根据FSM找到足够容纳新行的块，避免全表扫描。",
+   "分类：概念"
+  ]
+ },
+ {
+  "id": "P3-1",
+  "group": "恢复",
+  "cmd": "kb_graph.py postgresql problem 检查点 checkpoint 恢复 重做 起点",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2035,
+  "lines": 45,
+  "head": [
+   "[问题诊断] 检查点 checkpoint 恢复 重做 起点",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 38，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P3-2",
+  "group": "恢复",
+  "cmd": "kb_graph.py oracle problem ORA-01555 快照过旧",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2453,
+  "lines": 41,
+  "head": [
+   "[问题诊断] ORA-01555 快照过旧",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 56，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P4-1",
+  "group": "并发",
+  "cmd": "kb_graph.py oracle problem 死锁 ORA-00060 锁等待",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2772,
+  "lines": 41,
+  "head": [
+   "[问题诊断] 死锁 ORA-00060 锁等待",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 37，摘要筛选通过 31，批次 1；本路已取尽"
+  ]
+ },
+ {
+  "id": "P4-2",
+  "group": "并发",
+  "cmd": "kb_graph.py oracle problem latch 闩锁 争用 自旋",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2706,
+  "lines": 44,
+  "head": [
+   "[问题诊断] latch 闩锁 争用 自旋",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 57，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P4-3",
+  "group": "并发",
+  "cmd": "kb_graph.py postgresql entity knowledge 唯一索引 并发 插入 冲突",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2681,
+  "lines": 36,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引与唯一约束冲突检查",
+   "B-tree索引与唯一约束冲突检查：B-tree 索引与唯一约束冲突检查：并发插入相同 key 需额外同步，影响性能。高并发下应减少唯一索引或使用 deferrable 约束。",
+   "分类：原理"
+  ]
+ },
+ {
+  "id": "P5-1",
+  "group": "SQL",
+  "cmd": "kb_graph.py postgresql entity knowledge 解析器 原始语法树 语义分析 绑定",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 3441,
+  "lines": 39,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 【主题】体系化剖析开源OB代码: 2.1 语法解析器(Parsing)和语义解析器(Resolution) 【背景】[《Parsing 和 Resolution 的区别》](../202510/20251013_11.",
+   "【主题】体系化剖析开源OB代码: 2.1 语法解析器(Parsing)和语义解析器(Resolution) 【背景】[《Parsing 和 Resolution 的区别》](../202510/20251013_11.md) 本文分享 OceanBase 如何处理 SQL 查询，从初始语法解析阶段(",
+   "详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:349896"
+  ]
+ },
+ {
+  "id": "P5-2",
+  "group": "SQL",
+  "cmd": "kb_graph.py oracle entity operator NESTED LOOPS",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 401,
+  "lines": 13,
+  "head": [
+   "✅ [ExecutionOperator] NESTED LOOPS",
+   "描述: 类别: 3. 连接操作符 | 关联优化规则: 11条 | 实战案例: 3个",
+   "关联优化规则 (10条):"
+  ]
+ },
+ {
+  "id": "P5-3",
+  "group": "SQL",
+  "cmd": "kb_graph.py postgresql problem JSON 类型 路径 索引 表达式",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2162,
+  "lines": 46,
+  "head": [
+   "[问题诊断] JSON 类型 路径 索引 表达式",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 45，摘要筛选通过 23，批次 1；本路已取尽"
+  ]
+ },
+ {
+  "id": "P5-4",
+  "group": "SQL",
+  "cmd": "kb_graph.py ob problem 执行计划缓存 失效 绑定变量",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2376,
+  "lines": 41,
+  "head": [
+   "[问题诊断] 执行计划缓存 失效 绑定变量",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 59，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P6-1",
+  "group": "资产",
+  "cmd": "kb_graph.py mysql problem 大对象 外部文件 一致性 校验",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2492,
+  "lines": 41,
+  "head": [
+   "[问题诊断] 大对象 外部文件 一致性 校验",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 263，摘要筛选通过 1，批次 5；本路已取尽"
+  ]
+ },
+ {
+  "id": "P6-2",
+  "group": "资产",
+  "cmd": "kb_graph.py postgresql entity knowledge 级联删除 依赖 引用完整性",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2754,
+  "lines": 35,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] DROP ... CASCADE 级联删除对象",
+   "DROP ... CASCADE 级联删除对象：使用 DROP FOREIGN DATA WRAPPER ctl_dummy CASCADE 可以级联删除依赖的外部服务器。",
+   "分类：操作"
+  ]
+ },
+ {
+  "id": "P6-3",
+  "group": "资产",
+  "cmd": "kb_graph.py redis problem TTL 过期 淘汰 惰性删除",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 1916,
+  "lines": 41,
+  "head": [
+   "[问题诊断] TTL 过期 淘汰 惰性删除",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 18，摘要筛选通过 17，批次 1；本路已取尽"
+  ]
+ },
+ {
+  "id": "P6-4",
+  "group": "资产",
+  "cmd": "kb_graph.py postgresql entity knowledge 幂等 事务 重试 唯一键",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 3640,
+  "lines": 39,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,SyncEntity] 重放幂等性依赖 redo 内部",
+   "原文指出：分发只靠一个 rmid，生产者与消费者用同一 ID 绑定，重放器无需知道记录内部结构。幂等性不靠分发层：每条记录恰好调一次 redo，幂等靠 redo 内部 XLogReadBufferForRedo 的 LSN 比较（4.6 节）。这意味着若同一记录被重复重放（如崩溃后重启），redo ",
+   "详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2072141"
+  ]
+ },
+ {
+  "id": "P7-1",
+  "group": "检索",
+  "cmd": "kb_graph.py postgresql problem 混合检索 融合 排序 RRF",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 1916,
+  "lines": 46,
+  "head": [
+   "[问题诊断] 混合检索 融合 排序 RRF",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 10，摘要筛选通过 8，批次 1；本路已取尽"
+  ]
+ },
+ {
+  "id": "P7-2",
+  "group": "检索",
+  "cmd": "kb_graph.py postgresql entity knowledge pgvector 距离 余弦 内积 精度",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2749,
+  "lines": 36,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgvector源码学习：3.1节-向量距离度量。支持三种距离：L2距离(欧氏距离)sqrt(Σ(ai-bi)²)用于空间相似度；余弦距离1-cos(θ)用于文本/语义相似度(归一化后等价内积)；内积Σ(ai×bi)用",
+   "pgvector源码学习：3.1节-向量距离度量。支持三种距离：L2距离(欧氏距离)sqrt(Σ(ai-bi)²)用于空间相似度；余弦距离1-cos(θ)用于文本/语义相似度(归一化后等价内积)；内积Σ(ai×bi)用于推荐评分。SQL: SELECT * FROM items ORDER BY e",
+   "详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:347762"
+  ]
+ },
+ {
+  "id": "P8-1",
+  "group": "ANN",
+  "cmd": "kb_graph.py postgresql entity knowledge IVFFlat 训练 nprobe 列表",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2799,
+  "lines": 37,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IVFFlat需要k-means聚类",
+   "IVFFlat需要k-means聚类：必须先对样本执行k-means得到中心，再将所有向量分配到最近的列表，因此需要训练阶段。",
+   "分类：概念"
+  ]
+ },
+ {
+  "id": "P10-1",
+  "group": "图",
+  "cmd": "kb_graph.py postgresql entity knowledge openCypher CREATE MATCH RETURN",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 5304,
+  "lines": 36,
+  "head": [
+   "🔍 [bic_agent_KnowledgeEntry,KGV2Managed] openCypher graph query language standard",
+   "openCypher graph query language standard：openCypher是一种开源的图查询语言标准，类似Cypher。",
+   "分类：概念"
+  ]
+ },
+ {
+  "id": "P10-2",
+  "group": "图",
+  "cmd": "kb_graph.py postgresql problem 图遍历 变长路径 深度限制",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2492,
+  "lines": 45,
+  "head": [
+   "[问题诊断] 图遍历 变长路径 深度限制",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 512，摘要筛选通过 1，批次 8；达到候选上限，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P11-1",
+  "group": "可靠性",
+  "cmd": "kb_graph.py postgresql problem 故障注入 崩溃恢复 演练",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 1866,
+  "lines": 46,
+  "head": [
+   "[问题诊断] 故障注入 崩溃恢复 演练",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 44，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P11-2",
+  "group": "可靠性",
+  "cmd": "kb_graph.py oracle problem RMAN 备份 校验 一致性",
+  "verdict": "EMPTY",
+  "rc": 0,
+  "chars": 2575,
+  "lines": 48,
+  "head": [
+   "[问题诊断] RMAN 备份 校验 一致性",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "P11-3",
+  "group": "可靠性",
+  "cmd": "kb_graph.py postgresql problem 磁盘满 fsync 慢 数据页 刷盘",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2008,
+  "lines": 43,
+  "head": [
+   "[问题诊断] 磁盘满 fsync 慢 数据页 刷盘",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 32，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "A-1",
+  "group": "子命令",
+  "cmd": "kb_graph.py ob entity view GV$OB_MEMORY --version 4.2.1 --scope SYS",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 66,
+  "lines": 2,
+  "head": [
+   "匹配多个对象，请用 schema.name 限定：oceanbase.GV$OB_MEMORY, SYS.GV$OB_MEMORY"
+  ]
+ },
+ {
+  "id": "A-2",
+  "group": "子命令",
+  "cmd": "kb_graph.py ob batch 合并阻塞 内存不足 转储",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 7481,
+  "lines": 128,
+  "head": [
+   "[独立问题检索] 3 个问题（完全重复的问题只执行一次）",
+   "问题 1/3",
+   "[问题诊断] 合并阻塞"
+  ]
+ },
+ {
+  "id": "A-3",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle diagnose 索引扫描后回表变慢",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2290,
+  "lines": 41,
+  "head": [
+   "[统一诊断] 索引扫描后回表变慢",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 47，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "A-4",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle fault 日志切换缓慢",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 9837,
+  "lines": 164,
+  "head": [
+   "[故障检索] 日志切换缓慢",
+   "FM / LogPattern / Bug 独立召回；候选证据不代表已确认现场根因。",
+   "LogPattern：已取 512，相关 0，显示 0，批次 8；达到候选上限，仍有未取候选"
+  ]
+ },
+ {
+  "id": "A-5",
+  "group": "子命令",
+  "cmd": "kb_graph.py ob entity opsqllist --version 4.2.1",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 18294,
+  "lines": 143,
+  "head": [
+   "### ob OpSQL（136 条）",
+   "从下表复制 EID 查看 OpSQL 详情及完整 SQL：`python3 kb_graph.py ob detail \"<EID>\"`",
+   "| EID | 名称 | 摘要 | 支持租户 | 相关表/视图 |"
+  ]
+ },
+ {
+  "id": "A-6",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle analyze sysaux 表空间增长过快",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 5373,
+  "lines": 74,
+  "head": [
+   "[分析] sysaux 表空间增长过快",
+   "三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）",
+   "FaultModel：已取 64，摘要筛选通过 60，批次 1；相关证据已满足，仍有未取候选"
+  ]
+ },
+ {
+  "id": "A-7",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle diagnostic 归档日志空间满",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 56,
+  "lines": 5,
+  "head": [
+   "未定位到故障别名：归档日志空间满",
+   "### 诊断关联（图谱关系，需结合现场核实）",
+   "所选证据没有符合条件的关联。"
+  ]
+ },
+ {
+  "id": "A-8",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle impact view GV$SESSION",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 50,
+  "lines": 4,
+  "head": [
+   "Source: {}",
+   "Impacted entries: 0",
+   "Related faults: []"
+  ]
+ },
+ {
+  "id": "A-9",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle discover",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 0,
+  "lines": 1,
+  "head": []
+ },
+ {
+  "id": "A-10",
+  "group": "子命令",
+  "cmd": "kb_graph.py ob equivalent GV$OB_MEMORY",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 83,
+  "lines": 2,
+  "head": [
+   "No equivalents found for Oracle.GV$OB_MEMORY (EQUIVALENT_TO edges not yet built)"
+  ]
+ },
+ {
+  "id": "A-11",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle entity want x",
+  "verdict": "ERR",
+  "rc": 2,
+  "chars": 31,
+  "lines": 2,
+  "head": [
+   "未知实体类型：want；不限类型请使用 entity all"
+  ]
+ },
+ {
+  "id": "A-12",
+  "group": "子命令",
+  "cmd": "kb_graph.py oracle entity knowledge 统计信息收集 --limit 3",
+  "verdict": "ERR",
+  "rc": 2,
+  "chars": 34,
+  "lines": 2,
+  "head": [
+   "当前命令不支持参数：--limit；使用 --help 查看支持项"
+  ]
+ },
+ {
+  "id": "A-13",
+  "group": "工具",
+  "cmd": "kg_deep_diagnose.py oracle 日志切换缓慢 --limit 10 --format json",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 9869,
+  "lines": 223,
+  "head": [
+   "[",
+   "{",
+   "\"db_type\": \"2101\","
+  ]
+ },
+ {
+  "id": "A-14",
+  "group": "工具",
+  "cmd": "search_kg.py --db oracle 执行计划 --limit 10 --json",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 4796,
+  "lines": 154,
+  "head": [
+   "[",
+   "{",
+   "\"type\": \"SQL优化\","
+  ]
+ },
+ {
+  "id": "A-15",
+  "group": "工具",
+  "cmd": "search_sqlgen.py --db oracle --category SQL改写 --keyword 谓词推入",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 846,
+  "lines": 17,
+  "head": [
+   "=== SQL改写 (3条) ===",
+   "[oracle] 某SQL使用PUSH_PRED hint对包含UNION ALL的视图做谓词推入，但DMD_PAYMENT_UNIT_CONTROL_T表仍做了全表扫描（无直接关联条件导致笛卡尔积） score=15.500",
+   "某SQL使用PUSH_PRED hint对包含UNION ALL的视图做谓词推入，但DMD_PAYMENT_UNIT_CONTROL_T表仍做了全表扫描（无直接关联条件导致笛卡尔积）。原始连接条件：DBPH.PAYMENT_UNIT_ID = HS.PAYMENT_UNIT_ID AND HS.PA"
+  ]
+ },
+ {
+  "id": "A-16",
+  "group": "工具",
+  "cmd": "view_join_search.py GV$OB_MEMORY --db ob --trusted-only --json",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 101,
+  "lines": 7,
+  "head": [
+   "{",
+   "\"search\": \"GV$OB_MEMORY\",",
+   "\"total_relations\": 0,"
+  ]
+ },
+ {
+  "id": "A-17",
+  "group": "工具",
+  "cmd": "metric_lookup.py oracle search 逻辑读 --json",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 10633,
+  "lines": 184,
+  "head": [
+   "[",
+   "{",
+   "\"element_id\": \"4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422895\","
+  ]
+ },
+ {
+  "id": "A-18",
+  "group": "工具",
+  "cmd": "wait_event_info.py oracle log file sync json",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 461,
+  "lines": 13,
+  "head": [
+   "[",
+   "{",
+   "\"name\": \"LOG FILE SYNC\","
+  ]
+ },
+ {
+  "id": "A-19",
+  "group": "工具",
+  "cmd": "doc_retrieve.py shared_pool --db oracle",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 6269,
+  "lines": 210,
+  "head": [
+   "匹配: 20",
+   "✅ 官方文档: 19",
+   "✅ MOS Note: 1"
+  ]
+ },
+ {
+  "id": "A-20",
+  "group": "工具",
+  "cmd": "parameter_info.py oracle shared_pool_size pga_aggregate_target",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 2862,
+  "lines": 29,
+  "head": [
+   "{",
+   "\"database\": \"oracle\",",
+   "\"db_type_code\": \"2101\","
+  ]
+ },
+ {
+  "id": "A-21",
+  "group": "工具",
+  "cmd": "kg_log_search.py --db oracle --stdin",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 6307,
+  "lines": 93,
+  "head": [
+   "DB: oracle (detected: oracle)",
+   "Possible causes:",
+   "1. [KnowledgeEntry] L1：Note:437924.1 ASM Instances Are Reporting ORA-04031 Errors. [ID 1370925.1]"
+  ]
+ },
+ {
+  "id": "A-22",
+  "group": "工具",
+  "cmd": "kg_log_search.py --db mysql --no-search 'plain text'",
+  "verdict": "OK",
+  "rc": 0,
+  "chars": 131,
+  "lines": 12,
+  "head": [
+   "DB: mysql (detected: mysql)",
+   "WARNING: 未识别到强日志信号，已降级为普通关键词检索。",
+   "Signals:"
+  ]
+ },
+ {
+  "id": "A-23",
+  "group": "工具",
+  "cmd": "plsql_full_check.py --db oracle --sql 'SELECT 1 FROM dual'",
+  "verdict": "ERR",
+  "rc": 2,
+  "chars": 78,
+  "lines": 5,
+  "head": [
+   "{",
+   "\"status\": \"input_error\",",
+   "\"message\": \"first argument must be database\""
+  ]
+ }
+]

@@ -1,0 +1,40 @@
+
+============================================================
+  [问题诊断] 空字符串 NULL 语义
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 60，摘要筛选通过 39，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 54，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 49，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Bug 1626489 描述零长度字符串 '' 在 Oracle 9i 及之前版本中被等效处理为 NULL，与 ANSI SQL 1992 标准相悖，且 sql92_security 参数设置为 TRUE 或 FALSE 均不影响此行为。该问题用于诊断 SQL*Plus 及 PL/SQL 中 IS NULL 条件意外返回空字符串、空。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Bug 1626489 ZERO-LENGTH STRINGS '' ARE TREATED AS NULLS  (排序分: 15.0)
+     └ 摘要：Bug 1626489 描述零长度字符串 '' 在 Oracle 9i 及之前版本中被等效处理为 NULL，与 ANSI SQL 1992 标准相悖，且 sql92_security 参数设置为 TRUE 或 FALSE 均不影响此行为。该问题用于诊断 SQL*Plus 及 PL/SQL 中 IS NULL 条件意外返回空字符串、空。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2041827
+
+     [KnowledgeEntry] L1：Bug 5277649 INSERT NULL VALUE WITH SETNULL(X,JAVA.SQL.TYPES.CHAR) CAUSES BIND_MISMATCH  (排序分: 15.0)
+     └ 摘要：使用JDBC薄驱动时，setNull(x,java.sql.Types.CHAR)对CHAR列插入NULL导致绑定变量dty=96 (ANSI固定字符类型)且oacflg=21，而setObject(x,value,java.sql.Types.CHAR)绑定dty=1 (字符串类型)且oacflg=01，两者不匹配引发bind_mismatch（v$sql_shared_cursor中BIND_MISMATCH=。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047393
+
+     [KnowledgeEntry] L1：Note:241116.1 Post Rapid Clone Step Crashs Instance & fails with ORA-30012 Missing UNDO Tablespace called "NULL"  (排序分: 15.0)
+     └ 摘要：Rapid Clone Preclone 步骤从模板 afinit_db901.ora 获取 undo 参数时，由于模板中 undo_tablespace 使用绑定变量而其他 undo 参数显式设置，导致目标环境 init.ora 生成 undo_tablespace=NULL 与 undo_management=AUTO 并存，打开数据库时因缺少 UNDO 表空间。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043818
+
+     [KnowledgeEntry] L1：Note:1330583.9 ora 600: '' argument for directory in utl_file.fopen  (排序分: 14.7)
+     └ 摘要：当 utl_file.fopen 的 directory 参数传入空字符串 '' 时可能触发 ORA-600 [psdufa]，根本原因是 NT 平台上的路径规范化函数 slnrm 无法处理长度为 0 的目录，而其他平台使用 memcmp 不会报错。在 9.2 版本可用 NULL 替代 ''，更早版本即使 NULL。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994186
+
+     [CaseStudy] #119 从is null能否走索引说起  (排序分: 10.0)
+     └ 摘要：[现象] is null条件查询可能不走索引；[根因] 对B-tree索引中NULL值存储机制理解不足，复合索引设计不当导致无法利用索引；[影响/典型场景] 单列索引下is null可走索引，但复合索引中前导字段为NULL时可能无法使用索引。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:889838
+
+     [FaultModel] 绑定变量NULL/NOT NULL交替导致游标版本膨胀  (排序分: 9.5)
+     └ 摘要：绑定变量在NULL和NOT NULL之间变化，导致每个调用生成新子游标。现象：游标版本数激增。根因：客户端库版本低于7.3时，绑定NULL和非NULL导致游标不可共享。影响：共享池压力增大，可能引发性能问题。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325140
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

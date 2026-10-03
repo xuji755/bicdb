@@ -1,0 +1,38 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 【主题】体系化剖析开源OB代码: 2.1 语法解析器(Parsing)和语义解析器(Resolution) 【背景】[《Parsing 和 Resolution 的区别》](../202510/20251013_11.md) 本文分享 OceanBase 如何处理 SQL 查询，从初始语法解析阶段(parsing)到语义解析阶段(resolution)。它涵盖了如何将原始 SQL 文本转换为结构化
+      【主题】体系化剖析开源OB代码: 2.1 语法解析器(Parsing)和语义解析器(Resolution) 【背景】[《Parsing 和 Resolution 的区别》](../202510/20251013_11.md) 本文分享 OceanBase 如何处理 SQL 查询，从初始语法解析阶段(parsing)到语义解析阶段(resolution)。它涵盖了如何将原始 SQL 文本转换为结构化的内部表示，以便进一步优化和执行。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:349896
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] gram.y - Bison语法分析器
+      gram.y - Bison语法分析器：gram.y 使用 Bison 工具实现的语法分析器，将词法分析生成的 token 流根据 SQL 语法规则解析为原始解析树（raw parse tree）。
+分类：架构
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] SQL解析流水线 - 从SQL到查询树
+      SQL解析流水线 - 从SQL到查询树：SQL 解析流水线分三步：1）词法分析（scan.l）分解 token；2）语法分析（gram.y）构建原始解析树；3）语义分析（analyze.c 等）进行名称解析、类型检查、权限检查，生成查询树。查询树是优化器和执行器的输入。理解此流程有助于定位语法或语义错误。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:586787
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] analyze.c - 语义分析（转换原始解析树为查询树）
+      analyze.c - 语义分析（转换原始解析树为查询树）：analyze.c是语义分析核心，将语法解析树转换为查询树。可优化语句会获取表锁并进行完整分析；实用命令直接转换；特殊命令需额外处理。涉及名称解析、类型和权限检查。
+分类：架构
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:881897
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] PostgreSQL SQL解析三树管线
+      词法分析由scan.l生成token流，语法分析由gram.y生成原始AST（RawStmt/SelectStmt/A_Expr），语义分析由analyze.c/parse_analyze生成类型解析的Query树，规则重写由rewriteHandler展开视图，查询规划由planner生成Plan树。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] SQL解析器（SQL Parser）
+      SQL解析器（SQL Parser）：PostgreSQL 的 SQL 解析器使用 lex/yacc（flex/bison）生成，将输入的 SQL 语句解析为原始语法树（raw parse tree）。解析效率影响高并发下的 CPU 开销，使用绑定变量、预编译语句可减少解析次数，提升性能。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:586786
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Parser（解析器）
+      Parser（解析器）：Parser架构：GNU Flex做词法分析分割token，GNU Bison做语法分析构建AST（parse nodes），生成原始解析树链表。
+分类：架构
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] SQL解析 (3.1)
+      SQL解析 (3.1)：解析器包括词法分析器（flex）将 SQL 拆分为 token，语法分析器（bison）根据语法规则生成语法树（parse tree）。PG 还支持自定义语法扩展，通过修改 gram.y 或利用扩展钩子添加新语法。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] parser.c - 解析器入口点
+      parser.c - 解析器入口点：parser.c作为SQL解析主入口，调用词法分析、语法分析和语义分析，生成解析树和查询树，确保在事务中止状态下仍能进行基本语法解析。
+分类：架构
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 词法语法分析与语义分析
+      SQL文本首先经过词法分析器scan.l和语法分析器gram.y生成RawParseTree，然后通过parse_analyze进行语义分析，将抽象语法树转换为带语义信息的Query树。该Query树包含targetList、jointree、rtable等字段，是后续重写和规划阶段的输入。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 解析阶段
+      解析阶段：将SQL文本转换成结构化的解析树(parse tree)，识别语法成分但不理解语义。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] AI辅助PolarDB内核学习第9篇：Parser(SQL解析器)。解读PostgreSQL 15源码src/backend/parser目录。核心流程：①scan.l做词法分析(lexer)，将SQL字符串分解为token；②gram.y做语法分析，基于BNF文法构建parse tree；③parse_*.c将parse tree转为Query/SelectStmt等内部结构。关键文件：anal
+      AI辅助PolarDB内核学习第9篇：Parser(SQL解析器)。解读PostgreSQL 15源码src/backend/parser目录。核心流程：①scan.l做词法分析(lexer)，将SQL字符串分解为token；②gram.y做语法分析，基于BNF文法构建parse tree；③parse_*.c将parse tree转为Query/SelectStmt等内部结构。关键文件：analyze.c(语义分析)、parse_clause.c(FROM/WHERE)、parse_expr.c(表达式)、parse_func.c(函数)、parse_oper.c(操作符)、parse_target.c(SELECT列表)、parse_relation.c(表引用)。适用KES V8R6(PG 12.1内核)理解。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:356528
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

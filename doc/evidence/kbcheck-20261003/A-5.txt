@@ -1,0 +1,142 @@
+### ob OpSQL（136 条）
+
+从下表复制 EID 查看 OpSQL 详情及完整 SQL：`python3 kb_graph.py ob detail "<EID>"`
+
+| EID | 名称 | 摘要 | 支持租户 | 相关表/视图 |
+|---|---|---|---|---|
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618755 | MySQL 指定表分区明细（3.2.4/4.2.1 MySQL 租户） |  | MYSQL | information_schema.PARTITIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618753 | MySQL 指定表列（MySQL 模式） | 在 MySQL 模式按库名和表名查看列名、类型、顺序、可空性、键及默认值，用于核对表字段定义。 | MYSQL | information_schema.COLUMNS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618752 | MySQL 指定表容量明细（MySQL 模式） | 在 MySQL 模式按库名和表名读取估计行数、数据长度、索引长度及创建更新时间，用于检查指定表容量。 | MYSQL | information_schema.TABLES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618756 | MySQL 指定表自增列水位（3.2.4/4.2.1 MySQL 租户） | 读取MySQL业务租户指定表的自增列及表元数据；3.2.4与4.2.1最终SQL均可执行，但测试为空集，未证明真实自增列场景。 | MYSQL | information_schema.TABLES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619221 | MySQL 模式表及分区统计信息过旧判定 | 在 OceanBase MySQL 模式业务租户中读取表、分区和子分区的 IS_STALE、修改量、上次分析行数及时间，判断统计信息是否过旧。 | MYSQL | oceanbase.DBA_OB_TABLE_STAT_STALE_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619634 | MySQL租户全局授权清单 |  | MYSQL、SYS | information_schema.USER_PRIVILEGES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619641 | MySQL租户列级授权清单 |  | MYSQL、SYS | information_schema.COLUMN_PRIVILEGES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619632 | MySQL租户指定账号状态与认证方式 |  | MYSQL<br>MYSQL、SYS | mysql.user |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619635 | MySQL租户数据库级授权清单 |  | MYSQL、SYS | information_schema.SCHEMA_PRIVILEGES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619369 | MySQL租户表容量与估计行数定位 | 行数来自统计估计，非实时COUNT；详情查询会取消发现用的行数截断。 | MYSQL | information_schema.TABLES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619636 | MySQL租户表级授权清单 |  | MYSQL、SYS | information_schema.TABLE_PRIVILEGES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620579 | OBServer节点事件时间线 |  | SYS | oceanbase.DBA_OB_SERVER_EVENT_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618759 | Oracle 业务租户索引列（4.x Oracle 业务租户） |  | ORACLE | SYS.DBA_IND_COLUMNS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618760 | Oracle 指定分区表属性（4.x Oracle 业务租户） |  | ORACLE | SYS.DBA_PART_TABLES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618761 | Oracle 指定表分区明细（4.x Oracle 业务租户） |  | ORACLE | SYS.DBA_TAB_PARTITIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618758 | Oracle 指定表列（Oracle 模式） | 在 Oracle 模式按拥有者和表名查看列名、类型、可空性及统计列信息，用于核对表字段定义。 | ORACLE | SYS.DBA_TAB_COLUMNS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619222 | Oracle 模式表及分区统计信息过旧判定 | 在 OceanBase Oracle 模式业务租户中读取表、分区和子分区的 IS_STALE、修改量、上次分析行数及时间，判断统计信息是否过旧。 | ORACLE | SYS.DBA_OB_TABLE_STAT_STALE_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618736 | Oracle 租户版本（Oracle 模式） | 读取 Oracle 模式租户当前连接显示的 OceanBase 数据库版本标识，用于确认实例版本。 | ORACLE | SYS.V$VERSION |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618757 | Oracle指定段、表段与分区容量明细 |  | ORACLE | SYS.DBA_SEGMENTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619224 | Oracle模式子分区结构与边界 |  | ORACLE | SYS.DBA_TAB_SUBPARTITIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619223 | Oracle模式索引及索引分区统计明细 |  | ORACLE | SYS.DBA_IND_STATISTICS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619642 | Oracle租户直接列级授权 |  | ORACLE | SYS.DBA_COL_PRIVS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619640 | Oracle租户直接对象授权 |  | ORACLE | SYS.DBA_TAB_PRIVS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619639 | Oracle租户直接系统权限 |  | ORACLE | SYS.DBA_SYS_PRIVS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619638 | Oracle租户直接角色授权 |  | ORACLE | SYS.DBA_ROLE_PRIVS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619637 | Oracle租户账号状态与认证方式 |  | ORACLE | SYS.DBA_USERS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619345 | Oracle表统计估计行数及采样信息 | 行数来自统计估计，非实时COUNT；详情查询会取消发现用的行数截断。 | ORACLE | SYS.DBA_TABLES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620363 | SPM基线空间预算与保留周期配置 | 查看SPM空间预算与计划保留周期等管理参数及最后修改时间，辅助解释基线保留和自动清理行为。 | MYSQL | oceanbase.DBA_SQL_MANAGEMENT_CONFIG |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650947 | SQL执行记录及指定TRACE请求明细 |  | ORACLE<br>SYS | SYS.V$OB_SQL_AUDIT<br>oceanbase.GV$OB_SQL_AUDIT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618742 | Unit 配置 | 在 SYS 租户按配置 ID 查看 Unit 的 CPU、内存及 IOPS 边界。 | SYS | oceanbase.DBA_OB_UNIT_CONFIGS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619225 | 业务租户表组规则和完整成员 | 把表组分片规则与成员表关联，识别空表组、成员遗漏和进一步共置检查范围。 | MYSQL | oceanbase.DBA_OB_TABLEGROUPS<br>oceanbase.DBA_OB_TABLEGROUP_TABLES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619934 | 仲裁降级的日志流副本列表 |  | SYS | oceanbase.GV$OB_LOG_STAT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620439 | 入站 RPC 类型及排队阶段 | 原视图行是计数器/状态快照；新增精确筛选不改变指标时间口径，不能据此还原单次请求。 | SYS | oceanbase.GV$OB_RPC_INCOMING |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620440 | 出站 RPC 失败与超时统计 | 原视图行是计数器/状态快照；新增精确筛选不改变指标时间口径，不能据此还原单次请求。 | SYS | oceanbase.GV$OB_RPC_OUTGOING |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620342 | 创建索引任务阶段与长时间停滞线索 |  | SYS | oceanbase.GV$SESSION_LONGOPS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650953 | 副本位置 | 按版本定位指定存储对象的副本位置。 | SYS | oceanbase.CDB_OB_LS_LOCATIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620450 | 历史ASH样本及SQL、会话、等待事件下钻 | 一行一个节点的ASH样本；多次采样不等于执行次数。phase仅筛选对应样本。 | MYSQL | oceanbase.DBA_WR_ACTIVE_SESSION_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620157 | 各租户备份清理历史结果与失败线索 |  | SYS | oceanbase.CDB_OB_BACKUP_DELETE_JOB_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620156 | 各租户当前备份清理作业及完成数 |  | SYS | oceanbase.CDB_OB_BACKUP_DELETE_JOBS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620158 | 各租户自动备份清理策略与恢复窗口 |  | SYS | oceanbase.CDB_OB_BACKUP_DELETE_POLICY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619933 | 各节点租户 Schema 刷新滞后 |  | SYS | oceanbase.GV$OB_SERVER_SCHEMA_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619261 | 备份集父链与最低恢复SCN | 取得指定备份集的前序基线和恢复边界，以便检查增量链。 | SYS | oceanbase.CDB_OB_BACKUP_SET_FILES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619346 | 失效存储过程及其他无效对象 |  | ORACLE | SYS.DBA_OBJECTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620446 | 失败或部分失败的统计信息收集任务 |  | MYSQL | oceanbase.DBA_OB_TASK_OPT_STAT_GATHER_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620447 | 失败表及统计信息缓存刷新失败节点 |  | MYSQL | oceanbase.DBA_OB_TABLE_OPT_STAT_GATHER_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620160 | 已结束清理任务的备份对象与错误历史 |  | SYS | oceanbase.CDB_OB_BACKUP_DELETE_TASK_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620770 | 异常LS定位及对应副本同步明细 | 只针对当前可见副本识别异常LS，再返回全部可见副本；完整副本结果不截断。指定任意LS详情使用LOG-001。 | SYS | oceanbase.GV$OB_LOG_STAT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620441 | 当前分区迁移任务及关联任务 ID |  | SYS | oceanbase.CDB_OB_TRANSFER_PARTITION_TASKS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619929 | 当前及待替换的仲裁服务地址 | 核对集群是否配置仲裁服务，以及地址替换过程中当前和旧地址的并存状态。 | SYS | oceanbase.DBA_OB_ARBITRATION_SERVICE |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620159 | 当前备份集与归档片段清理任务 |  | SYS | oceanbase.CDB_OB_BACKUP_DELETE_TASKS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620442 | 当前底层 Transfer 任务和 LS 路径 |  | SYS | oceanbase.CDB_OB_TRANSFER_TASKS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620366 | 当前租户SQL并发限流Outline规则清单 |  | MYSQL | oceanbase.DBA_OB_CONCURRENT_LIMIT_SQL |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620448 | 当前租户WR快照间隔和保留设置 | 核对WR快照间隔、历史保留与Top SQL设置，解释历史查询缺口。 | MYSQL | oceanbase.DBA_WR_CONTROL |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620364 | 当前租户执行计划Outline绑定清单 |  | MYSQL | oceanbase.DBA_OB_OUTLINES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620071 | 当前租户物理恢复任务阶段与进度 |  | SYS | oceanbase.CDB_OB_RESTORE_PROGRESS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620445 | 当前跨节点统计信息收集进度 |  | MYSQL | oceanbase.GV$OB_OPT_STAT_GATHER_MONITOR |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618735 | 当前连接版本与库（MySQL 方言，3.2.4/4.2.1 SYS 已测） | 读取当前MySQL方言连接的产品版本、默认库和用户；现有最终SQL回执来自3.2.4与4.2.1的SYS入口，不能当作业务租户已实测。 | SYS | 未关联 |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620365 | 执行计划与限流规则Outline历史状态 |  | MYSQL | oceanbase.DBA_OB_OUTLINE_CONCURRENT_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616701 | 指定LS的Palf主从角色与日志位点 | 核对某个LS的复制成员、角色、同步标志和日志边界，为提交慢或副本异常建立证据。 | SYS | oceanbase.GV$OB_LOG_STAT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650948 | 指定SQL_ID计划缓存摘要 |  | SYS | oceanbase.GV$OB_PLAN_CACHE_PLAN_STAT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620362 | 指定SQL与计划的SPM基线状态明细 | 一行一条计划基线；only_abnormal=0查看全部，=1查看异常候选。 | MYSQL | oceanbase.DBA_SQL_PLAN_BASELINES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650951 | 指定Server资源容量 | 检查指定 Server 的资源容量与使用量。 | SYS | oceanbase.GV$OB_SERVERS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616695 | 指定Tablet冻结MemTable与SCN边界 | 按已知 Tablet 查看活跃及已冻结 MemTable 的 SCN 边界，用于排查冻结后转储迟迟未完成。 | SYS | oceanbase.GV$OB_MEMSTORE_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619125 | 指定Tablet的SSTable清单与占用 |  | SYS | oceanbase.GV$OB_SSTABLES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616692 | 指定Tablet转储及合并任务进度 |  | SYS | oceanbase.GV$OB_TABLET_COMPACTION_PROGRESS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619059 | 指定Tablet近期合并建议 | 获取合并执行层针对具体Tablet的建议，与现有诊断信息及历史任务互相验证。 | SYS | oceanbase.GV$OB_COMPACTION_SUGGESTIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619128 | 指定Zone的节点运行与迁入限制 |  | SYS | oceanbase.DBA_OB_SERVERS<br>oceanbase.DBA_OB_ZONES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650952 | 指定分区合并历史 |  | SYS | oceanbase.GV$OB_TABLET_COMPACTION_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616696 | 指定分布式事务参与者与二阶段提交状态 | 按事务 ID 查看各 LS 参与者的二阶段提交状态和日志持久化进度，定位部分参与者不推进的分布式事务。 | SYS | oceanbase.GV$OB_TRANSACTION_PARTICIPANTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650945 | 指定参数及租户、节点配置明细 | 精确参数名必填；租户和节点可选；保留原视图及方言，不把V$改成GV$。 | SYS | oceanbase.GV$OB_PARAMETERS<br>oceanbase.V$OB_PARAMETERS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650949 | 指定对象副本占用 |  | SYS | oceanbase.CDB_OB_TABLET_REPLICAS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619371 | 指定库物理对象Leader Tablet容量明细 | 一行一个物理对象的Leader Tablet；不再汇总成表容量；缺失容量单列。 | SYS | oceanbase.CDB_OB_TABLET_REPLICAS<br>oceanbase.CDB_OB_TABLE_LOCATIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620054 | 指定死锁事件完整参与环 | 按已确认租户与 EVENT_ID 回读所有参与节点的环位置、角色和优先级，识别 victim。 | SYS | oceanbase.CDB_OB_DEADLOCK_EVENT_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619348 | 指定用户不可用或无效索引 |  | ORACLE | SYS.DBA_INDEXES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619343 | 指定用户最大物理段Top |  | ORACLE | SYS.DBA_SEGMENTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619229 | 指定真实缓存计划的完整算子 | 读取已缓存计划的算子与属性，补足原计划摘要。 | SYS | oceanbase.GV$OB_PLAN_CACHE_PLAN_EXPLAIN |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616699 | 指定租户与Server的回调相关指标发现 | 原视图行是计数器/状态快照；新增精确筛选不改变指标时间口径，不能据此还原单次请求。 | SYS | oceanbase.GV$SYSSTAT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620278 | 指定租户与会话的跨节点执行、重试和事务状态 | 按租户与会话 ID 查看执行节点、命令耗时、重试次数及事务状态，排查会话重试或长命令。 | SYS | oceanbase.GV$OB_PROCESSLIST |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616691 | 指定租户全局合并轮次与冻结SCN | 排查租户大合并卡住、合并阻塞或轮次不推进时，对比冻结、广播和已完成 SCN，并查看暂停、错误及阶段状态。 | SYS | oceanbase.CDB_OB_MAJOR_COMPACTION |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619126 | 指定租户冻结轮次和Schema版本 |  | SYS | oceanbase.CDB_OB_FREEZE_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619129 | 指定租户各节点冻结和合并参数 |  | SYS | oceanbase.GV$OB_PARAMETERS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620280 | 指定租户各节点的请求队列与工作线程 | 原视图行是计数器/状态快照；新增精确筛选不改变指标时间口径，不能据此还原单次请求。 | SYS | oceanbase.GV$OB_TENANT_RUNTIME_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619936 | 指定租户合并轮次事件时间线与边界耗时 | 一行一条原始合并事件；边界仅在当前时间窗内计算，未结束或缺失事件保留；跨度不等于每次重试的实际耗时。 | SYS | oceanbase.DBA_OB_ROOTSERVICE_EVENT_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616702 | 指定租户备份任务明细 | 查看指定租户备份作业状态、任务标识与错误码，排查备份失败、备份卡住或任务未结束。 | SYS | oceanbase.CDB_OB_BACKUP_JOBS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618961 | 指定租户实时ASH样本及SQL、会话、事件下钻 | 一行一个节点的ASH样本；多次采样不等于执行次数。phase仅筛选对应样本。 | SYS | oceanbase.GV$ACTIVE_SESSION_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616703 | 指定租户归档目的端及检查点 | 查看租户日志归档目的端和检查点 SCN，排查归档停滞或检查点长期不推进。 | SYS | oceanbase.CDB_OB_ARCHIVELOG |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619054 | 指定租户按Zone核对合并轮次 |  | SYS | oceanbase.CDB_OB_ZONE_MAJOR_COMPACTION |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619055 | 指定租户按节点与轮次查看合并进度 |  | SYS | oceanbase.GV$OB_COMPACTION_PROGRESS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619127 | 指定节点数据文件按需扩展配置 | 将数据文件初始分配、扩展步长与最大值同时列出，解释磁盘剩余充足但数据库数据区不足的配置原因。 | SYS | oceanbase.GV$OB_PARAMETERS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619227 | 指定表逐Tablet副本容量与角色明细 | 一行一个Tablet副本；LEFT JOIN保留缺少容量证据的副本，禁止把缺失当0。 | SYS | oceanbase.CDB_OB_TABLET_REPLICAS<br>oceanbase.CDB_OB_TABLE_LOCATIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616700 | 指定请求的排队与执行耗时分解 | 围绕一次已知慢请求拆分排队、调度、执行和网络等待，区分租户工作线程拥塞与SQL执行慢。 | SYS | oceanbase.GV$OB_SQL_AUDIT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616698 | 按事务ID和时间窗关联SQL Audit | 按事务 ID 和时间窗串联 SQL Audit 的错误、等待及排队耗时，排查分布式事务超时对应的 SQL 序列。 | SYS | oceanbase.GV$OB_SQL_AUDIT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618737 | 按名称筛选当前连接可见租户（4.2.1 Oracle 租户已测） | 按名称读取当前连接可见的`DBA_OB_TENANTS`租户元数据；现有Oracle租户成功空集回执不证明SYS跨租户识别能力。 | ORACLE | SYS.DBA_OB_TENANTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620771 | 按租户查看副本可回收位点到最大写入位点跨度 |  | SYS | oceanbase.GV$OB_LOG_STAT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619263 | 日志流恢复异常与同步位置 | 查看当前连接节点上目标LS的日志恢复状态和错误码。 | SYS | oceanbase.V$OB_LS_LOG_RESTORE_STATUS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619347 | 最近发生DDL相关变化的对象 |  | ORACLE | SYS.DBA_OBJECTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620443 | 最近失败或取消的底层 Transfer 任务 |  | SYS | oceanbase.CDB_OB_TRANSFER_TASK_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620444 | 最近失败的分区迁移任务 |  | SYS | oceanbase.CDB_OB_TRANSFER_PARTITION_TASK_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620072 | 最近完成的租户物理恢复结果与失败线索 |  | SYS | oceanbase.CDB_OB_RESTORE_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619930 | 未分配租户的资源池 Unit 抽样 |  | SYS | oceanbase.DBA_OB_RESOURCE_POOLS<br>oceanbase.DBA_OB_UNITS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2618754 | 根据 tablegroup_id 查询表组及所属表 | 在 SYS 租户按租户 ID 和表组 ID 查看表组及成员表名称。 | SYS | oceanbase.CDB_OB_TABLEGROUP_TABLES<br>oceanbase.__all_virtual_tablegroup |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620279 | 活跃长命令或反复重试的会话线索 |  | SYS | oceanbase.GV$OB_PROCESSLIST |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619056 | 目标合并轮次下尚未追平的Tablet副本 |  | SYS | oceanbase.CDB_OB_TABLET_REPLICAS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619935 | 租户 Unit 日志盘使用率 Top 20 |  | SYS | oceanbase.GV$OB_UNITS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650946 | 租户MemStore内存与冻结阈值 | 定位指定租户和 Server 的 MemStore 使用及冻结阈值。 | SYS | oceanbase.GV$OB_MEMSTORE |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619057 | 租户Tablet副本校验异常入口 |  | SYS | oceanbase.CDB_OB_TABLET_CHECKSUM_ERROR_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2650950 | 租户Unit分布与资源配额 |  | SYS | oceanbase.DBA_OB_UNITS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619048 | 租户Unit迁移源与目标节点 |  | SYS | oceanbase.DBA_OB_UNITS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619046 | 租户主备角色、切换阶段及恢复边界 | 区分主备切换未完成、日志接收推进与可读水位停止，定位需继续分析的阶段。 | SYS | oceanbase.DBA_OB_TENANTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619058 | 租户主表与索引列校验差异 |  | SYS | oceanbase.CDB_OB_COLUMN_CHECKSUM_ERROR_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619052 | 租户事件时间线与返回码 |  | SYS | oceanbase.CDB_OB_TENANT_EVENT_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4519142 | 租户会话发现及指定会话、SQL与等待明细 | 一行一个会话及当前等待；保持业务租户范围。only_active=0全部，=1活跃。 | MYSQL | oceanbase.GV$OB_PROCESSLIST<br>oceanbase.GV$SESSION_WAIT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619050 | 租户分节点模块内存Top3及CTX/模块筛选 | 查询指定租户各节点按USED排名前3的模块内存，支持进一步按CTX_NAME或MOD_NAME筛选。 | SYS | oceanbase.__all_virtual_memory_info |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619051 | 租户变更作业状态与失败码 |  | SYS | oceanbase.DBA_OB_TENANT_JOBS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619053 | 租户各日志流的布局与同步水位 |  | SYS | oceanbase.CDB_OB_LS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2616694 | 租户合并诊断发现及指定Tablet异常明细 |  | SYS | oceanbase.GV$OB_COMPACTION_DIAGNOSE_INFO |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619260 | 租户备份作业历史与结束码 |  | SYS | oceanbase.CDB_OB_BACKUP_JOB_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620052 | 租户已结束负载均衡任务 |  | SYS | oceanbase.CDB_OB_BALANCE_TASK_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620051 | 租户已结束负载均衡工作 |  | SYS | oceanbase.CDB_OB_BALANCE_JOB_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619258 | 租户并发事务参与者与超时线索 |  | SYS | oceanbase.GV$OB_TRANSACTION_PARTICIPANTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619262 | 租户归档Piece状态与SCN范围 | 在归档轮次内检查日志片保留状态及推进范围，为备份恢复链检查提供证据。 | SYS | oceanbase.CDB_OB_ARCHIVELOG_PIECE_FILES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620050 | 租户当前负载均衡任务与日志流 |  | SYS | oceanbase.CDB_OB_BALANCE_TASKS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620049 | 租户当前负载均衡工作 |  | SYS | oceanbase.CDB_OB_BALANCE_JOBS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619259 | 租户当前锁请求和持有者明细 |  | SYS | oceanbase.GV$OB_LOCKS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619045 | 租户状态、锁定与Locality变更前后 | 检查租户连接锁定、回收站状态及 Locality 变更线索；4.x/5.x 变体还可区分租户类型。 | SYS | oceanbase.DBA_OB_TENANTS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620438 | 租户节点线程及Latch等待明细 | 一行一个线程；Latch地址按字符串精确筛选，不推断持有/等待因果。 | SYS | oceanbase.GV$OB_THREAD |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619047 | 租户资源池配额与配置关联 |  | SYS | oceanbase.DBA_OB_RESOURCE_POOLS<br>oceanbase.DBA_OB_TENANTS<br>oceanbase.DBA_OB_UNIT_CONFIGS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620053 | 租户近期死锁事件入口 | 一事件一条原始代表记录；不再用多个MAX拼接；event_id接DEADLOCK-002完整参与环。 | SYS | oceanbase.CDB_OB_DEADLOCK_EVENT_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619226 | 表及分区到Tablet、LS和副本的映射 |  | SYS | oceanbase.CDB_OB_TABLE_LOCATIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619228 | 表组分区共置原始映射 |  | SYS | oceanbase.CDB_OB_TABLE_LOCATIONS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620367 | 计划缓存中的大查询识别与排队计数 | 原视图行是计数器/状态快照；新增精确筛选不改变指标时间口径，不能据此还原单次请求。 | MYSQL | oceanbase.GV$OB_PLAN_CACHE_PLAN_STAT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620449 | 调查时间窗内WR快照覆盖 |  | MYSQL | oceanbase.DBA_WR_SNAPSHOT |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619932 | 跨租户异常状态索引抽样 |  | SYS | oceanbase.CDB_INDEXES |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619928 | 运行中的 OBServer 任务及持续时间 |  | SYS | oceanbase.DBA_OB_SERVER_JOBS |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2619931 | 近一天 Root Service 事件抽样 | 一行一条Root Service事件；时间窗必填，可按模块、事件或RS节点筛选。 | SYS | oceanbase.DBA_OB_ROOTSERVICE_EVENT_HISTORY |
+| 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2620578 | 集群升级事件时间线 |  | SYS | oceanbase.DBA_OB_CLUSTER_EVENT_HISTORY |

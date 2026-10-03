@@ -1,0 +1,45 @@
+
+============================================================
+  [问题诊断] TOAST 大字段 外联存储 压缩
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 47，摘要筛选通过 37，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 4，摘要筛选通过 4，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     TOAST自动将大字段压缩并存储在单独的pg_toast表中，减少主表元组大小。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] TOAST (大字段存储)  (排序分: 10.0)
+     └ 详情：TOAST (大字段存储)：TOAST自动将大字段压缩并存储在单独的pg_toast表中，减少主表元组大小。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:619361
+
+     [KnowledgeEntry] TOAST  (排序分: 10.0)
+     └ 详情：TOAST：TOAST（The Oversized-Attribute Storage Technique）将超过页大小的字段值压缩或存储到外部TOAST表，透明处理大数据。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:619422
+
+     [KnowledgeEntry] TOAST压缩存储  (排序分: 10.0)
+     └ 详情：TOAST压缩存储：PostgreSQL对超过页面大小（约2KB）的大字段自动进行TOAST压缩和外部存储。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:619467
+
+     [KnowledgeEntry] TOAST Table  (排序分: 10.0)
+     └ 详情：TOAST Table：TOAST表通过pg_class.reltoastrelid关联，存储大字段值。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:619403
+
+     [CaseStudy] toast_memory_persistence_with_pgfincore  (排序分: 10.0)
+     └ 详情：案例：toast_memory_persistence_with_pgfincore
+摘要：对主表执行pgfadvise_willneed时TOAST表未缓存。通过pg_class找到TOAST表，用超级用户执行pgfadvise_willneed成功加载。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1487726
+
+     [FaultModel] postgresql_cross_large_obj_toast_io  (排序分: 9.5)
+     └ 摘要：大对象TOAST IO开销异常是根因，导致数据库性能下降，严重时引发业务中断和系统资源耗尽。关键指标为TOAST相关IO趋势持续攀升。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1271660
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

@@ -1,0 +1,222 @@
+[
+  {
+    "db_type": "2101",
+    "keyword": "日志切换缓慢",
+    "stats": {
+      "fault_count": 5,
+      "ke_count": 5,
+      "total_metrics": 26,
+      "total_waits": 28,
+      "total_triggers": 0,
+      "bug_count": 0,
+      "_mode": "fast"
+    },
+    "recall": {
+      "raw_faults": 161,
+      "raw_knowledge": 161,
+      "candidate_limit": 160,
+      "fault_pool_truncated": true,
+      "knowledge_pool_truncated": true,
+      "prepare_ms": 86.11308,
+      "fetch_ms": 332.32273000000004,
+      "rank_ms": 8.987381,
+      "traversal_ms": 35.738483,
+      "edge_fetch_ms": 30.338351,
+      "organize_ms": 5.4001719999999995,
+      "relevant_faults": 50,
+      "relevant_knowledge": 160,
+      "selected_faults": 5,
+      "selected_knowledge": 5,
+      "linked_faults": 0,
+      "edge_rows": 106,
+      "traversal_fault_limit": 5,
+      "traversal_knowledge_limit": 5
+    },
+    "error_codes": [],
+    "fault_models": [
+      {
+        "name": "Redo日志缓冲区空间等待",
+        "summary": "重做日志缓冲区空间等待（log buffer space）：前台进程因LGWR写出速度跟不上redo生成速度而等待日志缓冲区空间。根因是Redo生成速率超过LGWR写盘速率，或日志切换缓慢导致缓冲区无法释放。",
+        "description": "",
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324237",
+        "alias": "Redo日志缓冲区空间等待",
+        "meaning": "重做日志缓冲区空间等待（log buffer space）：前台进程因LGWR写出速度跟不上redo生成速度而等待日志缓冲区空间。根因是Redo生成速率超过LGWR写盘速率，或日志切换缓慢导致缓冲区无法释放。",
+        "db_type": "2101",
+        "_rank_score": 9.4,
+        "_rerank_score": 9.4
+      },
+      {
+        "name": "检查点进度停止",
+        "summary": "事件oracle_checkpoint_progress_stuck：脏页写入过慢导致检查点无法推进，引起数据库性能下降。根因为I/O子系统瓶颈、日志切换缓慢或频繁的大事务。影响为检查点延迟，可能引发日志切换等待和系统响应变慢。",
+        "description": "",
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325014",
+        "alias": "检查点进度停止",
+        "meaning": "事件oracle_checkpoint_progress_stuck：脏页写入过慢导致检查点无法推进，引起数据库性能下降。根因为I/O子系统瓶颈、日志切换缓慢或频繁的大事务。影响为检查点延迟，可能引发日志切换等待和系统响应变慢。",
+        "db_type": "2101",
+        "_rank_score": 8.3,
+        "_rerank_score": 8.3
+      },
+      {
+        "name": "Log file parallel write 写盘等待高",
+        "summary": "LGWR写redo耗时过长通常因磁盘I/O性能不足或日志文件所在存储资源竞争导致，典型影响表现为事务提交延迟和系统吞吐量下降，关键现象包括redo write time持续偏高、log file sync等待事件显著增加，可伴有日志切换缓慢。",
+        "description": "",
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:323294",
+        "alias": "Log file parallel write 写盘等待高",
+        "meaning": "LGWR写redo耗时过长通常因磁盘I/O性能不足或日志文件所在存储资源竞争导致，典型影响表现为事务提交延迟和系统吞吐量下降，关键现象包括redo write time持续偏高、log file sync等待事件显著增加，可伴有日志切换缓慢。",
+        "db_type": "2101",
+        "_rank_score": 8.3,
+        "_rerank_score": 8.3
+      }
+    ],
+    "metrics": [],
+    "wait_events": [
+      {
+        "summary": "ASM 实例正在等待 COD (Continuing Operations Directory) 中记录的回滚操作完成。这是一个 管理类等待事件，通常出现在 ASM 磁盘组操作（如 add/drop disk、rebalance、文件删除）未完成或中断后，ASM 需要通过 COD 机制进行回滚。它常见于 磁盘组操作中断、文件操作失败或 rebalance 中断 场景。通常是正常的保护机制，但如果长时间停留在该事件，需要检查 ASM 磁盘组状态、alert.log 和存储网络稳定性。",
+        "metric_id": null,
+        "name": "ASM COD ROLLBACK OPERATION COMPLETION",
+        "description": "ASM 实例正在等待 COD (Continuing Operations Directory) 中记录的回滚操作完成。这是一个 管理类等待事件，通常出现在 ASM 磁盘组操作（如 add/drop disk、rebalance、文件删除）未完成或中断后，ASM 需要通过 COD 机制进行回滚。它常见于 磁盘组操作中断、文件操作失败或 rebalance 中断 场景。通常是正常的保护机制，但如果长时间停留在该事件，需要检查 ASM 磁盘组状态、alert.log 和存储网络稳定性。",
+        "alias": null,
+        "id": null,
+        "index_id": null,
+        "title": null,
+        "version": null,
+        "bug_id": null,
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420306",
+        "desc": "ASM 实例正在等待 COD (Continuing Operations Directory) 中记录的回滚操作完成。这是一个 管理类等待事件，通常出现在 ASM 磁盘组操作（如 add/drop disk、rebalance、文件删除）未完成或中断后，ASM 需要通过 COD 机制进行回滚。它常见于 磁盘组操作中断、文件操作失败或 rebalance 中断 场景。通常是正常的保护机制，但如果长时间停留在该事件，需要检查 ASM 磁盘组状态、alert.log 和存储网络稳定性。",
+        "sources": [
+          {
+            "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556043",
+            "name": "日志切换等待事件",
+            "relationship": "ACCOMPANIED_BY",
+            "outgoing": true
+          }
+        ],
+        "wait_event": "ASM COD ROLLBACK OPERATION COMPLETION"
+      },
+      {
+        "summary": "RMAN 在通过 MML (Media Management Library) 执行备份或恢复时，进程正在等待 MML 分配或返回一个直接缓冲区（direct buffer）。",
+        "metric_id": null,
+        "name": "BACKUP: MML OBTAIN A DIRECT BUFFER",
+        "description": "RMAN 在通过 MML (Media Management Library) 执行备份或恢复时，进程正在等待 MML 分配或返回一个直接缓冲区（direct buffer）。",
+        "alias": null,
+        "id": null,
+        "index_id": null,
+        "title": null,
+        "version": null,
+        "bug_id": null,
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420318",
+        "desc": "RMAN 在通过 MML (Media Management Library) 执行备份或恢复时，进程正在等待 MML 分配或返回一个直接缓冲区（direct buffer）。",
+        "sources": [
+          {
+            "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556043",
+            "name": "日志切换等待事件",
+            "relationship": "ACCOMPANIED_BY",
+            "outgoing": true
+          },
+          {
+            "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:323294",
+            "name": "Log file parallel write 写盘等待高",
+            "relationship": "ACCOMPANIED_BY",
+            "outgoing": true
+          },
+          {
+            "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324237",
+            "name": "Redo日志缓冲区空间等待",
+            "relationship": "ACCOMPANIED_BY",
+            "outgoing": true
+          }
+        ],
+        "wait_event": "BACKUP: MML OBTAIN A DIRECT BUFFER"
+      },
+      {
+        "summary": "RMAN 在通过 MML (Media Management Library) 执行备份或恢复时，进程正在等待 MML 释放一个直接缓冲区（direct buffer）。",
+        "metric_id": null,
+        "name": "BACKUP: MML RELEASE A DIRECT BUFFER",
+        "description": "RMAN 在通过 MML (Media Management Library) 执行备份或恢复时，进程正在等待 MML 释放一个直接缓冲区（direct buffer）。",
+        "alias": null,
+        "id": null,
+        "index_id": null,
+        "title": null,
+        "version": null,
+        "bug_id": null,
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420330",
+        "desc": "RMAN 在通过 MML (Media Management Library) 执行备份或恢复时，进程正在等待 MML 释放一个直接缓冲区（direct buffer）。",
+        "sources": [
+          {
+            "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556043",
+            "name": "日志切换等待事件",
+            "relationship": "ACCOMPANIED_BY",
+            "outgoing": true
+          },
+          {
+            "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:323294",
+            "name": "Log file parallel write 写盘等待高",
+            "relationship": "ACCOMPANIED_BY",
+            "outgoing": true
+          },
+          {
+            "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324237",
+            "name": "Redo日志缓冲区空间等待",
+            "relationship": "ACCOMPANIED_BY",
+            "outgoing": true
+          }
+        ],
+        "wait_event": "BACKUP: MML RELEASE A DIRECT BUFFER"
+      }
+    ],
+    "params": [],
+    "triggers": [],
+    "reverse_triggers": [],
+    "impact": [],
+    "system_views": [],
+    "knowledge_entries": [
+      {
+        "name": "L1：Note:50517.1 WAITEVENT: V8 \"switch logfile command\"",
+        "summary": "等待事件“switch logfile command”标识会话因执行日志切换命令而等待切换完成，等待期间每5秒超时以检查中断。该事件可用于诊断手动或自动日志切换缓慢场景，应结合alert log和LGWR活动排查切换延迟、I/O瓶颈或LGWR性能问题。",
+        "description": "",
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996112",
+        "alias": "L1：Note:50517.1 WAITEVENT: V8 \"switch logfile command\"",
+        "meaning": "等待事件“switch logfile command”标识会话因执行日志切换命令而等待切换完成，等待期间每5秒超时以检查中断。该事件可用于诊断手动或自动日志切换缓慢场景，应结合alert log和LGWR活动排查切换延迟、I/O瓶颈或LGWR性能问题。",
+        "db_type": "2101",
+        "_rank_score": 14.4,
+        "_rerank_score": 14.4
+      },
+      {
+        "name": "日志切换等待事件",
+        "summary": "日志切换相关等待事件主要包括四种：log file switch completion 等待是因为日志切换未完成，可能由归档速度慢或日志组数量不足导致；log buffer space 表示日志缓冲区已满，需等待LGWR写入；log file switch (archiving needed) 是等待归档完成才能重用日志文件；log file sync 则等待LGWR将提交日志写入磁盘。这些等待事件会影响数据库性能，解决措施包括增加日志组数量、调整日志文件大小、优化归档速度以及调整LOG_BUFFER参数。",
+        "description": "",
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556043",
+        "alias": "日志切换等待事件",
+        "meaning": "日志切换相关等待事件主要包括四种：log file switch completion 等待是因为日志切换未完成，可能由归档速度慢或日志组数量不足导致；log buffer space 表示日志缓冲区已满，需等待LGWR写入；log file switch (archiving needed) 是等待归档完成才能重用日志文件；log file sync 则等待LGWR将提交日志写入磁盘。这些等待事件会影响数据库性能，解决措施包括增加日志组数量、调整日志文件大小、优化归档速度以及调整LOG_BUFFER参数。",
+        "db_type": "2101",
+        "_rank_score": 8.2,
+        "_rerank_score": 8.2
+      },
+      {
+        "name": "重做日志切换不足诊断",
+        "summary": "重做日志切换不足错误是由于日志切换时检查点尚未完成，导致重做日志无法重用。常见原因包括日志文件大小过小、DBWR写入速度慢或检查点间隔设置过大。可通过增加日志组大小或数量、调整FAST_START_MTTR_TARGET等参数进行优化，但前提是I/O带宽充足；若磁盘I/O严重，需先优化I/O。诊断时可查看Alert log中该消息的出现频率，并通过V$LOG_HISTORY分析日志切换时间。",
+        "description": "",
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319690",
+        "alias": "重做日志切换不足诊断",
+        "meaning": "重做日志切换不足错误是由于日志切换时检查点尚未完成，导致重做日志无法重用。常见原因包括日志文件大小过小、DBWR写入速度慢或检查点间隔设置过大。可通过增加日志组大小或数量、调整FAST_START_MTTR_TARGET等参数进行优化，但前提是I/O带宽充足；若磁盘I/O严重，需先优化I/O。诊断时可查看Alert log中该消息的出现频率，并通过V$LOG_HISTORY分析日志切换时间。",
+        "db_type": "2101",
+        "_rank_score": 8.2,
+        "_rerank_score": 8.2
+      },
+      {
+        "name": "private strand flush not complete 导致日志切换延迟",
+        "summary": "日志切换时，如果 LGWR 的私有链（private strand）尚未将 redo 记录全部刷新到当前日志文件，alert 日志会输出 Thread cannot allocate new log, sequence... Private strand flush not complete，表示日志分配因私有链刷新未完成而短暂阻塞。",
+        "description": "",
+        "element_id": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1019242",
+        "alias": "private strand flush not complete 导致日志切换延迟",
+        "meaning": "日志切换时，如果 LGWR 的私有链（private strand）尚未将 redo 记录全部刷新到当前日志文件，alert 日志会输出 Thread cannot allocate new log, sequence... Private strand flush not complete，表示日志分配因私有链刷新未完成而短暂阻塞。",
+        "db_type": "2101",
+        "_rank_score": 8.2,
+        "_rerank_score": 8.2
+      }
+    ],
+    "case_studies": [],
+    "bugs": []
+  }
+]
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

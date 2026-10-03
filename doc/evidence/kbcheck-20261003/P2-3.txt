@@ -1,0 +1,33 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 空闲空间映射（FSM）
+      空闲空间映射（FSM）：空闲空间映射（FSM）记录每个数据块的空闲空间，插入时根据FSM找到足够容纳新行的块，避免全表扫描。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] fsm_and_vm_role_in_stats
+      fsm_and_vm_role_in_stats：FSM记录每个数据页的空闲空间量，VM记录全可见页面。pgstattuple_approx利用VM跳过全可见页面并从FSM获取空闲空间，大幅减少I/O。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] FSM空闲空间映射
+      FSM空闲空间映射：默认三级树覆盖2^32个堆页，支持自修复和VACUUM后扫描，由storage中freespace子模块管理。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] FSM（空闲空间映射）目标
+      FSM（空闲空间映射）目标：快速定位有足够空间的行或判断是否需要扩展页，从8.4开始存储在对象fork文件中，每页1字节，粒度256。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] pgstattuple_approx_approximation_method
+      pgstattuple_approx_approximation_method：pgstattuple_approx利用VM和FSM避免全表扫描，对全可见页面仅从FSM获取空闲空间，未标记页面逐行扫描，估算活元组数。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] fsm分支（空闲空间映射）
+      fsm分支用于记录main分支中的空闲空间信息，帮助插入时快速定位可用页面，分支编号为1。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] FSM fork：空闲空间映射树用于INSERT快速找空页
+      FSM fork 是空闲空间映射，记录每页剩余空间，供 INSERT 快速找到有空间容纳新元组的页。它由 freespace.c 管理。删除 FSM 只会损失找空页的效率，不会直接丢数据，但会导致 INSERT 每页都去探测，或者疯狂扩展文件。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] FSM 存储空闲空间字节流按256份划分
+      FSM 存储空闲空间字节流按256份划分：FSM存储空闲空间字节流按256份划分：每块1字节映射空闲空间，256个值对应0到块大小，插入时快速定位有足够空间的块。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] no_fsm_update_in_heap_prune
+      no_fsm_update_in_heap_prune：代码注释说明heap_page_prune只负责页面内碎片整理和元组删除，不更新全局空闲空间映射(FSM)。调用者需根据返回的删除元组数自行更新FSM，确保后续插入能利用释放空间。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 恢复过程中持久化空闲空间映射变更
+      在恢复过程中，现在会持久化空闲空间映射的变更，以确保备用服务器提升后的性能。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] FSM 空闲页查找与重建
+      FSM 相关函数实现空闲空间映射。GetPageWithFreeSpace 和 fsm_search 用于查找有足够空闲空间的页面。fsm_readbuf 读取 FSM 页面，若 fork 缺失则返回 InvalidBuffer，导致降级为全表扫描。fsm_extend 可以在需要时重建 FSM。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 空闲空间管理
+      空闲空间管理：空闲空间管理涉及FSM更新、记录可用空间、搜索可用页面，FSM可能过时，实际空间会验证修正。
+分类：原理
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

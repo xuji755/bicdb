@@ -1,0 +1,16 @@
+
+=== SQL改写 (3条) ===
+   [oracle] 某SQL使用PUSH_PRED hint对包含UNION ALL的视图做谓词推入，但DMD_PAYMENT_UNIT_CONTROL_T表仍做了全表扫描（无直接关联条件导致笛卡尔积） score=15.500
+      某SQL使用PUSH_PRED hint对包含UNION ALL的视图做谓词推入，但DMD_PAYMENT_UNIT_CONTROL_T表仍做了全表扫描（无直接关联条件导致笛卡尔积）。原始连接条件：DBPH.PAYMENT_UNIT_ID = HS.PAYMENT_UNIT_ID AND HS.PAYMENT_UNIT_ID = PUC.PAYMENT_UNIT_ID。优化尝试1：改写为内联视图先
+   [oracle] PUSH_PRED Hint：将谓词推入视图提前过滤 score=15.500
+      【问题背景】
+当SQL中包含复杂视图(INLINE VIEW/子查询)时，优化器可能将外层的谓词在视图外部应用，导致视图需要扫描全部数据后再过滤。
+
+【示例SQL】
+-- 问题写法
+SELECT * FROM (
+  SELECT a.id, a.name, b.order_cnt
+  FROM customers a
+  LEFT JOIN (SELECT cust_id, COUNT(*) o
+   [oracle] 原UPDATE SQL score=2.000
+      原UPDATE SQL：UPDATE T_DIAG006 a SET a.cnt=(SELECT count(*) FROM T_DIAG006 b WHERE a.id=b.id AND a.name=b.name AND b.data_State!=2) WHERE a.id=123456789。外层走了id字段索引但内层是全表扫描。优化改写：在内层子查询中增加b.id=123456789条件

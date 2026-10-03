@@ -1,0 +1,44 @@
+
+============================================================
+  [问题诊断] 检查点 checkpoint 恢复 重做 起点
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 38，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 8，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     检查点（checkpoint）：检查点减少崩溃恢复时间，由checkpoint_timeout和max_wal_size等参数控制，需平衡I/O与恢复速度。 分类：概念
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 检查点（checkpoint）  (排序分: 10.0)
+     └ 详情：检查点（checkpoint）：检查点减少崩溃恢复时间，由checkpoint_timeout和max_wal_size等参数控制，需平衡I/O与恢复速度。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1265797
+
+     [KnowledgeEntry] 检查点 (Checkpoint)  (排序分: 10.0)
+     └ 详情：检查点 (Checkpoint)：检查点频率由checkpoint_timeout和max_wal_size控制，频繁或低效的检查点会增加WAL写入压力和磁盘I/O，影响恢复时间。
+分类：配置
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1265736
+
+     [KnowledgeEntry] 检查点Checkpoint  (排序分: 10.0)
+     └ 详情：检查点Checkpoint：只读节点定期将IMCI数据刷写到共享存储形成检查点，新节点可直接从检查点加载，减少日志回放量。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1265737
+
+     [KnowledgeEntry] Checkpoint是恢复起点  (排序分: 9.4)
+     └ 详情：Checkpoint是恢复起点：Checkpoint是数据库恢复的起点，从最后一个检查点开始读取WAL并重做，保证数据一致性。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:505242
+
+     [CaseStudy] 长时间关闭时检查点排查与显式 CHECKPOINT 加速案例  (排序分: 9.1)
+     └ 摘要：文档原因 2 的案例：缓冲池大量脏缓冲区导致关闭时检查点长。通过 pg_buffercache 观测脏缓冲区、log_checkpoints 日志监控，并用关闭前显式 CHECKPOINT（必要时两次）减少停机时间；还给出模拟步骤和 pg_ctl stop -m fast 耗时验证。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3267290
+
+     [FaultModel] postgresql_postgresql_checkpoint_recovery_long  (排序分: 8.6)
+     └ 摘要：检查点间隔过大导致数据库恢复时间显著延长，引发性能下降、业务中断及系统资源耗尽风险。关键指标表现为检查点间隔相关趋势异常。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1271134
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

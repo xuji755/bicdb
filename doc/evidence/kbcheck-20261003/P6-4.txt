@@ -1,0 +1,38 @@
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 重放幂等性依赖 redo 内部
+      原文指出：分发只靠一个 rmid，生产者与消费者用同一 ID 绑定，重放器无需知道记录内部结构。幂等性不靠分发层：每条记录恰好调一次 redo，幂等靠 redo 内部 XLogReadBufferForRedo 的 LSN 比较（4.6 节）。这意味着若同一记录被重复重放（如崩溃后重启），redo 函数会检查页面 LSN 决定是否应用，避免重复效果。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2072141
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] start_xact_command / finish_xact_command 事务命令封装
+      【start_xact_command幂等开启事务命令】start_xact_command()首先检查!xact_started，若为真则调用StartTransactionCommand()开始事务命令，并设置xact_started=true。否则，如果处于流水线模式（MyXactFlags & XACT_FLAGS_PIPELINING），则调用BeginImplicitTransactionBlock()。该函数在扩展协议parse/bind/execute每个消息都会被调用，但只有第一次真正启动事务命令，避免重复启动。
+【start_xact_command / finish_xact_command（postgres.c:2787-2848）】这些函数封装了事务命令的开始和结束，被exec_simple_query调用。锚点位置为postgres.c:2787-2848。
+【start_xact_command语句超时启用但不重置时钟】在start_xact_command()中，调用enable_statement_timeout()启动语句超时。但注释明确指出，这不会重置已启动的超时时钟，以避免在start_xact_command()被反复调用而无中间finish_xact_command()（如parse/bind/execute）时的时间开销。如果需要重置，必须显式禁用超时。
+【start_xact_command客户端连接检查超时】start_xact_command()包含逻辑：if (client_connection_check_interval > 0 && IsUnderPostmaster && MyProcPort && !get_timeout_active(CLIENT_CONNECTION_CHECK_TIMEOUT)) enable_timeout_after(CLIENT_CONNECTION_CHECK_TIMEOUT, client_connection_check_interval); 用于定期检查客户端是否已断开。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2068952
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 幂等性接口的最佳实践
+      幂等性接口的最佳实践：幂等性接口的最佳实践使得幂等插入更简洁高效，避免了复杂的try-catch重试逻辑，同时节省IOPS和DBA维护成本。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] RR与SR隔离等级并发冲突应重试
+      【推荐】在RR与SR隔离等级出现并发冲突时，应当视错误类型进行积极的重试。该建议与失败事务重试策略一致。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] go-mysql-elasticsearch的幂等性说明
+      go-mysql-elasticsearch的幂等性说明：工具使用upsert实现INSERT幂等，但DDL（表结构变更）无法保证幂等，同步要求表有主键以实现幂等性。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] transaction_boundary_htap
+      transaction_boundary_htap：PostgreSQL的MVCC、WAL保证强一致性，但pg_duckdb与PG不是原生分布式事务管理器。多语句事务支持受限。生产环境应拆开写路径：在线交易写PG，分析结果写DuckDB或对象存储时单独事务，湖查询结果回写PG时按批次、幂等键、可重试任务处理。诊断要点：避免在混合架构中依赖跨系统事务，采用最终一致性模式。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1022265
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] PostgREST 的幂等 PUT 请求
+      PostgREST 的幂等 PUT 请求：该条目解释 PostgREST 的幂等 PUT 请求：通过数据库 upsert 语义确保幂等，避免重复提交导致数据冲突。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] smgrzeroextend失败后的幂等重试机制
+      注释2848-2853说明：如果smgrzeroextend失败，函数将留下已分配但未标记BM_VALID的缓冲区。由于关系在磁盘上未变长，下一次扩展会得到相同的first_block，如果这些缓冲区未被回收，BufTableInsert会再次找到它们，并回到此处重试smgrzeroextend。这一设计保证扩展操作的幂等性，避免因失败导致块号泄漏。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2072899
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 唯一性检查遇到在飞事务时返回 xwait 供 _bt_doinsert 等待
+      代码：xwait = (TransactionIdIsValid(SnapshotDirty.xmin)) ? SnapshotDirty.xmin : SnapshotDirty.xmax; 若 xwait 有效，则释放 nbuf，设置 *speculativeToken = SnapshotDirty.speculativeToken，设置 insertstate->bounds_valid = false，返回 xwait。调用者 _bt_doinsert 将等待该事务提交/中止后重试。这避免了唯一性检查期间持有锁等待。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2070965
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] OPTIMIZE幂等性
+      OPTIMIZE幂等性：bin-packing只合并小文件，若文件已为大文件，再次执行不会改变文件数量；Z-Order重排则可进一步优化布局。因此OPTIMIZE操作可重复执行而不会产生副作用。
+分类：操作
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 整型主键频繁插入冲突需关注溢出
+      【强制】注意序列号空缺：当使用整型作为主键，且表存在频繁插入冲突时，需要关注整型溢出的问题。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] GIN 扫描 bitmap 位幂等
+      源码注释说明：扫描 pending item 后，其他后端可能将其 post 到主索引，导致主扫描再次访问，但重复设置 bitmap 位无害，这是 GIN 不支持 amgettuple 的主要原因。
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

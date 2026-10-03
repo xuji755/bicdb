@@ -1,0 +1,6 @@
+{
+  "search": "GV$OB_MEMORY",
+  "total_relations": 0,
+  "universal_filters": [],
+  "relations": []
+}

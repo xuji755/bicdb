@@ -1,0 +1,163 @@
+
+[故障检索] 日志切换缓慢
+FM / LogPattern / Bug 独立召回；候选证据不代表已确认现场根因。
+FaultModel：已取 64，相关 31，显示 6，批次 1；已有相关证据，仍有未取候选
+LogPattern：已取 512，相关 0，显示 0，批次 8；达到候选上限，仍有未取候选
+Bug：已取 0，相关 0，显示 0，批次 1；候选已取尽
+正文核实 4 条；最终正文补读 6 条；仅展开入选 FM 的诊断关联。
+
+### FaultModel
+
+[FaultModel] Redo日志缓冲区空间等待（排序分 9.4）
+  摘要/匹配证据片段：重做日志缓冲区空间等待（log buffer space）：前台进程因LGWR写出速度跟不上redo生成速度而等待日志缓冲区空间。根因是Redo生成速率超过LGWR写盘速率，或日志切换缓慢导致缓冲区无法释放。
+  详情片段：原始故障描述：重做日志缓冲区空间等待（log buffer space）：前台进程因LGWR写出速度跟不上redo生成速度而等待日志缓冲区空间。根因是Redo生成速率超过LGWR写盘速率，或日志切换缓慢导致缓冲区无法释放。 故障现象：由于LGWR写出速度跟不上redo生成速度，导致前台进程等待日志缓冲区空间 故障起因及可能路径： 1. Redo生成速率超过LGWR写盘速率，或日志切换缓慢导致缓冲区无法释放 确认与排除方法： 前期异常/触发证据：高并发DML事务，redo log file位于慢速磁盘，log_buffer太小 路径1：Redo生成速率超过L...
+  原因片段：Redo生成速率超过LGWR写盘速率，或日志切换缓慢导致缓冲区无法释放。
+  详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324237
+  诊断关联：显示 12/17 个筛选后对象；原始 17 个，已合并重复路径（图谱关联需结合现场核实）
+    [StdWaitEvent] BACKUP: MML OBTAIN A DIRECT BUFFER — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420318
+    [StdWaitEvent] BACKUP: MML RELEASE A DIRECT BUFFER — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420330
+    [StdWaitEvent] GC BUFFER BUSY ACQUIRE — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420378
+    [StdWaitEvent] GC BUFFER BUSY RELEASE — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420379
+    [StdWaitEvent] GC FLUSHED BUFFER — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420413
+    [StdMetric] NOARCHIVE REDO LOG FILE COUNT — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422816
+    [StdMetric] ACTIVE REDO LOG COUNT — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422817
+    [StdMetric] LOG FILE SYNC 平均等待时间 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422842
+    [StdMetric] LOG FILE PARALLEL WRITE 平均等待时间 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422846
+    [StdMetric] BUFFER BUSY WAITS 平均等待时间 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422854
+    [StdMetric] GC BUFFER BUSY ACQUIRE平均等待时间 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422865
+    [StdMetric] GC BUFFER BUSY RELEASE平均等待时间 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422866
+
+[FaultModel] 检查点进度停止（排序分 9.0）
+  摘要/匹配证据片段：事件oracle_checkpoint_progress_stuck：脏页写入过慢导致检查点无法推进，引起数据库性能下降。根因为I/O子系统瓶颈、日志切换缓慢或频繁的大事务。影响为检查点延迟，可能引发日志切换等待和系统响应变慢。
+  详情片段：原始故障描述：事件oracle_checkpoint_progress_stuck：脏页写入过慢导致检查点无法推进，引起数据库性能下降。根因为I/O子系统瓶颈、日志切换缓慢或频繁的大事务。影响为检查点延迟，可能引发日志切换等待和系统响应变慢。 故障现象：脏页写入过慢导致检查点无法推进，可能引起数据库性能下降 故障起因及可能路径： 1. I/O子系统瓶颈、日志切换缓慢或频繁的大事务 确认与排除方法： 前期异常/触发证据：检查点队列长度持续增长，dirty count居高不下 路径1：I/O子系统瓶颈、日志切换缓慢或频繁的大事务；...
+  原因片段：I/O子系统瓶颈、日志切换缓慢或频繁的大事务。
+  详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325014
+  诊断关联：显示 0/0 个筛选后对象；原始 0 个，已合并重复路径（图谱关联需结合现场核实）
+
+[FaultModel] 日志切换频繁导致检查点过载故障（排序分 7.3）
+  摘要/匹配证据片段：故障模型：重做日志文件切换过于频繁，导致数据库检查点操作过于频繁，影响系统I/O性能。现象：日志切换率过高，系统I/O负载异常增加，数据库性能下降。根因：重做日志文件大小设置过小或事务量过大，导致日志切换速率超过正常阈值，进而触发频繁的增量检查点。影响：频繁的检查点操作增加磁盘I/O压力，可能引发系统响应变慢、事务提交延迟，严重时导致数据库性能瓶颈。
+  详情片段：原始故障描述：故障模型：重做日志文件切换过于频繁，导致数据库检查点操作过于频繁，影响系统I/O性能。现象：日志切换率过高，系统I/O负载异常增加，数据库性能下降。根因：重做日志文件大小设置过小或事务量过大，导致日志切换速率超过正常阈值，进而触发频繁的增量检查点。影响：频繁的检查点操作增加磁盘I/O压力，可能引发系统响应变慢、事务提交延迟，严重时导致数据库性能瓶颈。 故障现象：重做日志文件切...
+  原因片段：重做日志文件太小或事务量过大，导致日志切换率过高，触发频繁的增量检查点。
+  详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1538204
+  诊断关联：显示 0/0 个筛选后对象；原始 0 个，已合并重复路径（图谱关联需结合现场核实）
+
+[FaultModel] 重做日志检查点未完成故障（排序分 7.3）
+  摘要/匹配证据片段：含义：告警日志中出现'Thread n cannot allocate new log, sequence xxxxx checkpoint not complete'消息，表示重做日志切换时检查点尚未完成，导致无法分配新日志。原因：重做日志和相关参数需要调优，检查点进程速度慢于日志切换频率。
+  详情片段：原始故障描述：含义：告警日志中出现'Thread n cannot allocate new log, sequence xxxxx checkpoint not complete'消息，表示重做日志切换时检查点尚未完成，导致无法分配新日志。原因：重做日志和相关参数需要调优，检查点进程速度慢于日志切换频率。 故障现象：告警日志中出现'Thread n cannot allocate n...
+  原因片段：重做日志切换时检查点尚未完成，导致无法分配新日志。
+  详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1538344
+  诊断关联：显示 12/14 个筛选后对象；原始 14 个，已合并重复路径（图谱关联需结合现场核实）
+    [StdWaitEvent] ENQ: KO - FAST OBJECT CHECKPOINT — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420358
+    [StdWaitEvent] PI RENOUNCE WRITE COMPLETE — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420422
+    [StdWaitEvent] LOG FILE SYNC — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420425
+    [StdWaitEvent] OS THREAD STARTUP — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420448
+    [StdWaitEvent] CHECKPOINT COMPLETED — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420458
+    [StdMetric] CHECKPOINT 延迟 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422808
+    [StdMetric] NOARCHIVE REDO LOG FILE COUNT — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422816
+    [StdMetric] ACTIVE REDO LOG COUNT — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422817
+    [StdMetric] LOG FILE SYNC 平均等待时间 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422842
+    [StdMetric] LOG FILE PARALLEL WRITE 平均等待时间 — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422846
+    [SystemView] SYS.GV$LOG — 路径显示 1/1
+      REFERENCES_VIEW out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:256066
+    [SystemView] SYS.GV$THREAD — 路径显示 1/1
+      REFERENCES_VIEW out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:256202
+
+[FaultModel] 日志文件切换完成等待争用（排序分 7.3）
+  摘要/匹配证据片段：等待事件log_file_switch_completion_contention表示进程等待日志切换完成，导致redo生成暂停。根因是日志文件太小导致频繁切换，或归档进程速度慢无法及时完成归档。影响是redo生成暂停，数据库性能下降。
+  详情片段：原始故障描述：等待事件log_file_switch_completion_contention表示进程等待日志切换完成，导致redo生成暂停。根因是日志文件太小导致频繁切换，或归档进程速度慢无法及时完成归档。影响是redo生成暂停，数据库性能下降。 故障现象：进程等待日志切换完成，导致redo生成暂停 故障起因及可能路径： 1. 日志文件太小导致频繁切换，或归档进程速度慢无法及时完成归档 确认与排除方法： 前期异常/触发证据：在线日志文件大小配置过小，或归档目标I/...
+  原因片段：日志文件太小导致频繁切换，或归档进程速度慢无法及时完成归档。
+  详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545711
+  诊断关联：显示 11/11 个筛选后对象；原始 11 个，已合并重复路径（图谱关联需结合现场核实）
+    [StdWaitEvent] LATCH: REDO COPY — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420467
+    [StdWaitEvent] LATCH: REDO WRITING — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420468
+    [StdWaitEvent] ENQ: FG - FG REDO GENERATION ENQ RACE — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420729
+    [StdWaitEvent] ENQ: FG - LGWR REDO GENERATION ENQ RACE — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420730
+    [StdWaitEvent] GES RMS0 RETRY ADD REDO LOG — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420998
+    [StdWaitEvent] LATCH: REDO ALLOCATION — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1421099
+    [StdWaitEvent] LGWR WAIT FOR REDO COPY — 路径显示 1/1
+      ACCOMPANIED_BY out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1421107
+    [StdMetric] NOARCHIVE REDO LOG FILE COUNT — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422816
+    [StdMetric] ACTIVE REDO LOG COUNT — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422817
+    [StdMetric] REDO GENERATED PER SEC — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422886
+    [StdMetric] REDO WRITES PER SEC — 路径显示 1/1
+      REFERENCES_METRIC out 
+      详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422898
+
+[FaultModel] 日志文件切换慢（排序分 7.3）
+  摘要/匹配证据片段：等待事件oracle_log_file_switch_slow表示日志文件切换缓慢，影响数据库性能。根因是日志文件切换速度慢，可能由于磁盘I/O瓶颈或日志组大小不合理。影响是数据库性能下降。
+  详情片段：原始故障描述：等待事件oracle_log_file_switch_slow表示日志文件切换缓慢，影响数据库性能。根因是日志文件切换速度慢，可能由于磁盘I/O瓶颈或日志组大小不合理。影响是数据库性能下降。 故障现象：Log File Switch等待事件表示日志文件切换缓慢，影响数据库性能 故障起因及可能路径： 1. 日志文件切换速度慢，可能由于磁盘I/O瓶颈或日志组大小不合理 确认与排除方法： 前期异常/触发证据：日志文件切换时出现等待...
+  原因片段：日志文件切换速度慢，可能由于磁盘I/O瓶颈或日志组大小不合理。
+  详情：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545712
+  诊断关联：显示 0/0 个筛选后对象；原始 0 个，已合并重复路径（图谱关联需结合现场核实）
+
+### LogPattern
+本次未检索到符合条件的结果。
+
+### Bug
+本次未检索到符合条件的结果。
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

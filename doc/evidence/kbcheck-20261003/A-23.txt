@@ -1,0 +1,4 @@
+{
+  "status": "input_error",
+  "message": "first argument must be database"
+}

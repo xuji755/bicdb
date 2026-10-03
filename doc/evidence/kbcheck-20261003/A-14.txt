@@ -1,0 +1,153 @@
+[
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560893",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "SQL Profile固定执行计划（被动）",
+    "desc": "使用coe_load_sql_profile_noforce_nostageTable脚本快速固定执行计划，无需改SQL。",
+    "db": "oracle",
+    "cat": "执行计划",
+    "scenario": "",
+    "src": "0010101/oradoc2/大道至简-科学SQL优化-FredLiu.txt",
+    "score": 234.256
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:326282",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "启用并行DML会话设置以获取并行执行计划",
+    "desc": "默认情况下，会话禁用并行DML。即使SQL包含并行hint，EXPLAIN PLAN也会输出串行计划。必须显式启用并行DML，才能生成真实的并行执行计划，从而评估并行执行的优势。",
+    "db": "oracle",
+    "cat": "统计信息/执行计划",
+    "scenario": "",
+    "src": "0010101/oradoc3/dsi306.txt",
+    "score": 224.623
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325880",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "使用TRACEONLY EXPLAIN避免计划误差",
+    "desc": "当大型查询只需查看计划时，使用SET AUTOT TRACEONLY EXPLAIN可避免执行开销。但隐含风险：该计划可能不是实际执行计划（如绑定变量不被评估）。实际调优时建议结合STATISTICS或实际trace。",
+    "db": "oracle",
+    "cat": "",
+    "scenario": "",
+    "src": "0010101/oradoc3/304-02.txt",
+    "score": 179.541
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1546129",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "使用SQL Plan Baseline固定执行计划",
+    "desc": "11g及以上版本可以使用SQL Plan Baseline固定执行计划。先创建baseline，然后设置参数使优化器使用baseline中的执行计划。",
+    "db": "oracle",
+    "cat": "",
+    "scenario": "",
+    "src": "oradoc/SQL执行计划改变问题诊断.txt",
+    "score": 179.132
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1546130",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "使用SQL Profile固定执行计划",
+    "desc": "绑定变量窥探导致执行计划不稳定时，可以使用SQL Profile（10g）或SQL Plan Baseline（11g）固定执行计划。先强制SQL进行硬解析，然后使用Hint结合SQL Profile固定执行计划。",
+    "db": "oracle",
+    "cat": "",
+    "scenario": "",
+    "src": "oradoc/SQL执行计划改变问题诊断.txt",
+    "score": 178.299
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325784",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "使用 Stored Outline 固定跨统计变更的执行计划",
+    "desc": "通过创建 stored outline，可以保证在统计数据更新、数据分布变化或新索引创建后，仍然使用原始选定的执行计划。",
+    "db": "oracle",
+    "cat": "",
+    "scenario": "",
+    "src": "0010101/oradoc3/[itpub.net]dsi404_query_optimizer.txt",
+    "score": 172.709
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:334941",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "使用 PLAN_HASH_VALUE 检测执行计划变化",
+    "desc": "在 SQL 调优中，DBA 可以查询 ALL_SQLSET_PLANS 获取历史执行计划的 PLAN_HASH_VALUE，与当前 V$SQL 中的值比较。若不同则说明计划已变更。结合 OTHER_XML 中的 outline 数据，可锁定过去的高效计划，并使用 SQL 计划基线或 SQL Profile 来固定执行计划。",
+    "db": "oracle",
+    "cat": "执行计划分析",
+    "scenario": "",
+    "src": "doc/ora_optimizer/19c/pages/19c/ALL_SQLSET_PLANS.md::0",
+    "score": 172.631
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:334938",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "利用 PLAN_HASH_VALUE 快速比较执行计划",
+    "desc": "PLAN_HASH_VALUE 是优化器为 SQL 执行计划计算出的确定性数值，计划中的任何变化（如表连接顺序、索引选择、访问方法变更）都会导致该值不同。DBA 在进行 SQL 回归分析时，可借助此值高效监控历史方案与当前方案的差异。",
+    "db": "oracle",
+    "cat": "执行计划分析",
+    "scenario": "",
+    "src": "doc/ora_optimizer/11gr2/pages/11gR2/statviews_4047.md::0",
+    "score": 161.799
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560892",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "SQL Profile固定执行计划（主动）",
+    "desc": "优化原理：通过工具将加hint的SQL的执行计划（以outline data形式）保存为原SQL的SQL Profile，使得原SQL无需hint也能获得最优计划。适用于无法修改应用代码的场景。",
+    "db": "oracle",
+    "cat": "执行计划",
+    "scenario": "",
+    "src": "0010101/oradoc2/大道至简-科学SQL优化-FredLiu.txt",
+    "score": 154.992
+  },
+  {
+    "type": "SQL优化",
+    "eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1021448",
+    "labels": [
+      "bic_agent_SQLOptimization",
+      "KGV2Managed"
+    ],
+    "name": "并行执行计划中的访问路径变化",
+    "desc": "在 Using Parallel Execution 的执行计划中，第一个 UNION ALL 分支保持 SPD_CSTAPP_REF 为驱动表，通过 PX BLOCK ITERATOR 进行全表扫描，然后通过 IDV_UI_SALES_INVOICES_IOTYPE 索引嵌套连接 UI_SALES_INVOICES。第二个分支则颠倒连接顺序：以 UI_SALES_INVOICES 全表扫描作为驱动，通过 PX BLOCK ITERATOR 并行扫描全部行，再通过另一个 NESTED LOOPS 用 IDX_SPD_CSTAPP_REF_CSTID 索引将 SPD_CSTAPP_REF 作为被驱动表关联。这种方式充分利用了并行扫描大表的能力和索引小表关联的高效性，但总体成本（3481）高于组合索引方案（8）。",
+    "db": "oracle",
+    "cat": "执行计划",
+    "scenario": "",
+    "src": "system",
+    "score": 154.279
+  }
+]
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

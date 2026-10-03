@@ -1,0 +1,35 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引与唯一约束冲突检查
+      B-tree索引与唯一约束冲突检查：B-tree 索引与唯一约束冲突检查：并发插入相同 key 需额外同步，影响性能。高并发下应减少唯一索引或使用 deferrable 约束。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed] 并发创建唯一索引
+      并发创建唯一索引：并发创建唯一索引允许读写并发进行，但需要额外系统开销和重试机制，适用于需要在线创建唯一约束的场景。
+分类：操作
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 常见坑8：误解唯一索引的成本
+      常见坑8：误解唯一索引的成本：唯一索引除了用于快速查找外，还需在并发插入时执行冲突检查，这会增加额外的同步开销。高并发相同键插入时应考虑去重或使用INSERT ... ON CONFLICT替代。
+分类：安全
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] CIC 创建唯一索引时唯一约束冲突导致失败
+      文档在 CIC 问题中说明：CIC 创建唯一索引过程中，插入/更新的数据违反唯一约束，也会导致 CIC 失败留下失效索引。这是唯一索引与在线创建索引结合时的特定失败路径。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] INSERT concurrency with unique indexes
+      INSERT concurrency with unique indexes：并发会话插入具有唯一索引的表时，可能因锁冲突而阻塞。具体机制详见 Section 61.5，涉及索引锁和行锁。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 23505 UNIQUE_VIOLATION 错误码定义与源码位置
+      23505 是唯一约束/唯一索引冲突错误码。INSERT/UPDATE 引入重复唯一键或并发建唯一索引时已有重复时触发。B-tree 插入由 _bt_check_unique 检查同键元组；建唯一索引走 tuplesortvariants.c:1687；逻辑复制同码在 conflict.c:175。detail 直接给出冲突值，如 (id)=(42)，便于定位冲突行。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2055781
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 插入链调用全图（唯一索引）
+      唯一索引插入的完整调用链：btinsert (nbtree.c:202) -> _bt_doinsert (nbtinsert.c:102) -> _bt_mkscankey构建插入扫描键 -> 唯一性检查_bt_check_unique -> _bt_search_insert (包含fastpath) -> _bt_search下探 -> _bt_findinsertloc查找插入位置（可能执行_bt_delete_or_dedup_one_page进行空间回收） -> _bt_insertonpg实际插入（空间不足时触发_bt_split分裂，分裂后_bt_insert_parent向上递归或_bt_newlevel建新根）。该调用图展示了唯一索引插入的完整路径和关键分支。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2069171
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] HASH索引不支持唯一约束
+      HASH索引不支持唯一约束：HASH索引不支持唯一约束，因为其只存储哈希码，可能发生哈希冲突，无法保证键值的唯一性。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] INSERT_blocking_concurrent_activity
+      INSERT_blocking_concurrent_activity：有唯一索引的表在并发插入时可能因锁冲突而阻塞，详见 Section 61.5。这是并发控制的重要考虑因素。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 为commit_logs(hash)创建唯一索引
+      执行psql命令：create unique index on commit_logs(hash)。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 并发索引构建中唯一性检查用 SnapshotSelf 复查新元组是否存活
+      代码：htid = itup->t_tid; 如果 table_index_fetch_tuple_check(heapRel, &htid, SnapshotSelf, NULL) 返回 false（表示元组已死），则 break，不报错。同时需要跟随 HOT 链，因为并发建索引时插入的是根 TID，实际元组可能在 HOT 链中。如果链中任一元组存活，则仍有唯一键冲突。该机制为避免在并发索引构建期间因元组被并发删除而产生误报。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2071197
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 触发器与唯一约束的对比
+      触发器与唯一约束的对比：唯一约束是声明式，并发控制由索引保证；触发器实现唯一性可能引入并发问题（如竞争条件）。优先使用唯一约束，触发器仅用于复杂唯一规则。
+分类：概念
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

@@ -1,0 +1,44 @@
+
+============================================================
+  [问题诊断] 图遍历 变长路径 深度限制
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 512，摘要筛选通过 1，批次 8；达到候选上限，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 117，摘要筛选通过 1，批次 2；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     CTE用于图遍历的路径数组防环：在图遍历中拼接path数组并用WHERE NOT d.id = ANY(sd.path)防环。 分类：操作
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] CTE用于图遍历的路径数组防环  (排序分: 9.4)
+     └ 详情：CTE用于图遍历的路径数组防环：在图遍历中拼接path数组并用WHERE NOT d.id = ANY(sd.path)防环。
+分类：操作
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:503344
+
+     [KnowledgeEntry] 图遍历期间过滤 (no_filter参数)  (排序分: 9.4)
+     └ 详情：图遍历期间过滤 (no_filter参数)：图遍历期间过滤：no_filter=true跳过标签检查，no_filter=false应用标签重叠检查。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1234561
+
+     [KnowledgeEntry] 触发器无限递归及栈深度限制  (排序分: 9.4)
+     └ 详情：触发器无限递归及栈深度限制：触发器无限递归：若函数内再次操作同一表，可能无限递归。PostgreSQL检测栈深度超限报错。避免方法是不要写回同一语义入口。
+分类：故障模型
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1284965
+
+     [KnowledgeEntry] pgvectorscale DiskANN索引扫描的优化技巧与查询性能调优。关键优化：1)页缓存策略——使用shared_buffers的clock-sweep算法，优先保留图遍历热点页；2)I/O批处理——合并相邻页读取请求减少seek；3)距离计算优化——利用SIMD指令(SSE/AVX/NEON)加速向量距离计算；4)查询批处理——多查询共享图遍历路径。调优参数：diskann_search  (排序分: 9.4)
+     └ 摘要：pgvectorscale DiskANN索引的查询性能优化主要围绕四个方面：页缓存策略利用shared_buffers的clock-sweep算法优先保留图遍历热点页；I/O批处理通过合并相邻页读取减少磁盘寻道；距离计算借助SIMD指令（SSE/AVX/NEON）加速；查询批处理使多查询共享图遍历路径。调优时，参数diskann_search_list_size影响召回率和速度，effective_io_concurrency控制预读页数，降低random_page_cost可鼓励索引扫描。监控I/O模式可参考pg_statio_user_indexes。这些优化能有效提升向量索引的查询效率。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:357451
+
+     [CaseStudy] 图遍历CYCLE防环示例  (排序分: 9.1)
+     └ 详情：案例：图遍历CYCLE防环示例
+摘要：创建有向图表，从节点1开始遍历，使用CYCLE子句标记环，过滤环边。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1487989
+
+     [FaultModel] pg_DuckDB递归查询KEY算法优化通过索引加速递归CTE迭代计算对PG的WITH_RECURSI  (排序分: 6.3)
+     └ 摘要：DuckDB递归KEY算法优化揭示了PostgreSQL递归CTE性能瓶颈的根因：缺乏适配递归JOIN条件的索引导致WorkTable Scan全表扫描，以及work_mem不足引发中间结果集溢出。典型影响包括递归查询响应时间剧增、内存抖动甚至失控深度递归。关键指标为递归Union节点全表扫描占比高、max_recursive_depth触发中断、pg_hint_plan显示低效执行计划。优化需针对递归JOIN字段创建B-Tree/GIN/GiST索引，合理设置work_mem与递归深度限制。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:253963
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

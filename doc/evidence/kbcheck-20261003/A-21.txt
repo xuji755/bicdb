@@ -1,0 +1,92 @@
+DB: oracle (detected: oracle)
+
+Possible causes:
+  1. [KnowledgeEntry] L1：Note:437924.1 ASM Instances Are Reporting ORA-04031 Errors. [ID 1370925.1]
+     cause: ASM RAC 实例出现 ORA-04031 错误，报错信息为无法分配 256 字节共享内存，涉及 shared pool 中的 PCursor 和 kglob 对象，原因在于 shared pool 空闲内存接近 0 MB 导致耗尽。该条目适用于诊断 ASM 共享池内存不足引发的 ORA-04031 故障，通过。
+     evidence: knowledge match
+  2. [KnowledgeEntry] L1：Note:376055.1 Ora-00600 [Opiodr: Call 2] & Ora - 04031 While DML Operations Are Performed On Nested Table
+     cause: 当对嵌套表执行 DML 操作时可能触发 ORA-600[OPIODR: CALL 2] 并伴随 ORA-04031 报错，该问题由内部 Bug 4331272 引起，原因是内部递归调用遇到 ORA-04031 后缺乏异常处理，导致进程失败。Bug 在 9.2.0.8 版本修复并可移植回退，但无独立补丁。
+     evidence: knowledge match
+  3. [KnowledgeEntry] L1：ORA-04031 - SHARED_POOL FRAGMENTED WITH HIGH GES RESOURCE & ENQUEUES-c3
+     cause: ORA-04031 错误伴随 shared pool 碎片化、高 GES 资源与 enqueue 占用，通常出现在 RAC 环境中，shared pool 分配不足或碎片导致请求失败，适合诊断 shared pool 内存耗尽、RAC 全局资源竞争及 shared pool 调整策略。
+     evidence: knowledge match
+  4. [LogPattern] ORA-04031: unable to allocate %s bytes of shared memory ("%s","%s","%s","%s")
+     cause: More shared memory is needed than was allocated in the shared pool or Streams pool.
+     action: If the shared pool is out of memory, either use the DBMS_SHARED_POOL package to pin large packages, reduce your use of shared memory, or increase the amount of available shared memory by increasing the value of the initi
+     evidence: ORA-04031
+  5. [LogPattern] ORA-00600: internal error code, arguments: [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s]
+     cause: This is the generic internal error number for Oracle program exceptions. It indicates that a process has encountered a low-level, unexpected condition. The first argument is the internal message number. This argument and
+     action: Visit My Oracle Support to access the ORA-00600 Lookup tool (reference Note 600.1) for more information regarding the specific ORA-00600 error encountered. An Incident has been created for this error in the Automatic Dia
+     evidence: ORA-00600
+  6. [LogPattern] ORA-16099: internal error ORA-00600 occurred at standby database
+     cause: The RFS process on the standby database received an internal error.
+     action: Check the standby alert log and RFS trace files for more information.
+     evidence: ORA-16099
+  7. [ErrorCode] ORA-04031
+     cause: More shared memory is needed than was allocated in the shared pool or Streams pool.
+     action: If the shared pool is out of memory, either use the DBMS_SHARED_POOL package to pin large packages, reduce your use of shared memory, or increase the amount of available shared memory by increasing the value of the initi
+     evidence: unable to allocate %s bytes of shared memory ("%s","%s","%s","%s")
+  8. [ErrorCode] ORA-00600
+     cause: This is the generic internal error number for Oracle program exceptions. It indicates that a process has encountered a low-level, unexpected condition. The first argument is the internal message number. This argument and
+     action: Visit My Oracle Support to access the ORA-00600 Lookup tool (reference Note 600.1) for more information regarding the specific ORA-00600 error encountered. An Incident has been created for this error in the Automatic Dia
+     evidence: internal error code, arguments: [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s]
+
+Structured:
+  - error_code: ORA-04031, ORA-00600
+  - severity: ERROR
+
+Core messages:
+  - unable to allocate memory
+  - internal error code
+
+Signals:
+  - error_code: ORA-04031 (w=4.5)
+  - error_code: ORA-00600 (w=4.5)
+  - message: unable to allocate memory (w=1.4)
+  - message: internal error code (w=1.4)
+  - severity: ERROR (w=0.8)
+
+Query:
+  ORA-04031 ORA-00600 unable to allocate memory internal error code ERROR 报错 错误 内存 memory mem
+
+Expanded terms:
+  ORA-04031, ORA-00600, unable to allocate memory, internal error code, ERROR, 报错, 错误, 内存, memory, mem
+
+Log patterns:
+  - oracle_msg_ora_04031: ORA-04031: unable to allocate %s bytes of shared memory ("%s","%s","%s","%s")
+    scene: Oracle log reports ORA-04031: unable to allocate %s bytes of shared memory ("%s","%s","%s","%s")
+    action: If the shared pool is out of memory, either use the DBMS_SHARED_POOL package to pin large packages, reduce your use of shared memory, or increase the amount of 
+  - oracle_msg_ora_00600: ORA-00600: internal error code, arguments: [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s]
+    scene: Oracle log reports ORA-00600: internal error code, arguments: [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s], [%s]
+    action: Visit My Oracle Support to access the ORA-00600 Lookup tool (reference Note 600.1) for more information regarding the specific ORA-00600 error encountered. An I
+  - oracle_msg_ora_16099: ORA-16099: internal error ORA-00600 occurred at standby database
+    scene: Oracle log reports ORA-16099: internal error ORA-00600 occurred at standby database
+    action: Check the standby alert log and RFS trace files for more information.
+
+Entity hits:
+  error: 2
+
+KG result counts:
+  faults: 2
+  kes: 5
+  case_studies: 2
+  - [faults] Ora 04031 Error: 原始故障描述：ORA-04031 共享池内存不足，无法分配新的大块内存 根因: 1)共享池碎片化严重；2)大量硬解析；3)共享池大小不足 故障现象：ORA-04031 共享池内存不足，无法分配新的大块内存。 分析要点：ORA-04031 共享池内存不足，无法分配新的大块内存 {[module,memory]} {[mo
+  - [faults] Ora-00600: 原始故障描述：The Oracle database has detected a "ora-00600" condition that may impact normal operation 根因: ### 10.1 ORA-600 [17113] 概述 (文档 39453.1) - **问题**: `ORA-600
+  - [kes] L1：Note:437924.1 ASM Instances Are Reporting ORA-04031 Errors. [ID 1370925.1]: ASM Instances Are Reporting ORA-04031 Errors. [ID 1370925.1]
+Symptoms
+Cause
+Solution
+References
+Applies to:
+Oracle Server - Enterprise Edition - Version: 10.2.0
+  - [kes] L1：Note:376055.1 Ora-00600 [Opiodr: Call 2] & Ora - 04031 While DML Operations Are Performed On Nested Table: Ora-00600 [Opiodr: Call 2] & Ora - 04031 While DML Operations Are Performed On Nested Table
+Symptoms
+Cause
+Solution
+References
+(AuthWiz 2.4.2) Created from SR 5
+  - [kes] L1：ORA-04031 - SHARED_POOL FRAGMENTED WITH HIGH GES RESOURCE & ENQUEUES-c3: ORA-04031 - SHARED_POOL FRAGMENTED WITH HIGH GES RESOURCE & ENQUEUES-c3
+ORA-04031 - SHARED_POOL FRAGMENTED WITH HIGH GES RESOURCE & ENQUEUES
+.
+Copyright © 2006,
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
