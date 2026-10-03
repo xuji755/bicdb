@@ -30,6 +30,15 @@ It unifies five kinds of data under one transactional store:
 > All crates are placeholders. No callable API exists and no interface shape
 > is promised yet.
 
+### Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Requirements](docs/requirements.md) | What V1.0 must do, with numbered requirements and priorities |
+| [Design](docs/design.md) | Overall architecture: isolation, storage, transactions, retrieval, graph, phases |
+| [Storage design](docs/storage.md) | Storage layer: file layout, page format, ROWID, recovery. **Phased — structural design complete, some format details pending** |
+| [Platform support](docs/platform-support.md) | Supported architectures and compatibility baseline |
+
 ### Core constraints
 
 - **User isolation.** A user can only access their own private data. There is no
@@ -162,6 +171,15 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 
 > **设计阶段，仅有目录骨架，未实现任何功能。**
 > 所有 crate 均为占位。不提供任何可调用接口，也不承诺接口形态。
+
+### 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [需求文档](docs/requirements.md) | V1.0 必须做到什么，逐条编号与优先级 |
+| [总体设计](docs/design.md) | 隔离、存储、事务、检索、图，以及研发阶段 |
+| [存储结构设计](docs/storage.md) | 文件布局、页格式、ROWID、恢复。**阶段性**——结构性设计已完成，部分格式细节待冻结 |
+| [平台支持](docs/platform-support.md) | 支持的架构与兼容基线 |
 
 ### 核心约束
 
