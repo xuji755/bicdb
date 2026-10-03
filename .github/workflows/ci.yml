@@ -1,6 +1,13 @@
 # 设计依据：§20 —— "CI 每提交跑编译、单测、短模型与隔离回归"
-# 每日/每周的更重门禁（SQL 并发、文件故障、Sanitizer、长稳）待对应
-# 阶段交付后在本文件补充，届时需接入自建 runner。
+#
+# 双架构：本项目需同时支持 x86_64 与 aarch64。两个 runner 使用**同一个
+# OS 版本**（24.04），使矩阵只隔离"架构"这一个变量；否则架构差异与
+# 系统差异会混在一起，出问题时无法归因。
+#
+# 开发期以 ARM64 为主，但两者都是从提交级就纳入门禁，不做事后补测。
+#
+# 每日/每周的更重门禁（SQL 并发、文件故障、Sanitizer、长稳）待对应阶段
+# 交付后在本文件补充，届时需接入自建 runner。
 name: CI
 
 on:
@@ -10,18 +17,40 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个架构失败不取消另一个 —— 需要看到两个架构的完整结果
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04      # x86_64
+          - ubuntu-24.04-arm  # aarch64（公开仓库免费；注意 ARM 无 -latest 标签）
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # 按 rust-toolchain.toml 安装固定版本，避免 CI 与本地工具链漂移。
+      # 显式 install（而非依赖 rustup show 的副作用，该行为随 rustup 版本变化），
+      # 版本从 rust-toolchain.toml 读取，保持单一来源。
+      - name: 安装固定工具链
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "按 rust-toolchain.toml 安装: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy
+
+      - name: 打印实际架构与版本（留档，便于排查架构相关问题）
+        run: |
+          uname -m
+          rustc --version
+          cargo --version
 
       - name: 格式检查
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy（全部目标，告警即失败）
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: 编译

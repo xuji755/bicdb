@@ -1,0 +1,6 @@
+# 固定工具链版本，保证本地与 CI、ARM64 与 x86_64 的门禁可复现。
+# 升级工具链时修改此文件，并在同一提交内重新运行全部受影响门禁。
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
