@@ -71,6 +71,9 @@ version = "0.0.0"
 [[package]]
 name = "bicdb-wal"
 version = "0.0.0"
+dependencies = [
+ "bicdb-common",
+]
 
 [[package]]
 name = "bicdb-workspace"

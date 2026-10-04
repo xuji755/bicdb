@@ -89,17 +89,38 @@ pub fn crc32c(data: &[u8]) -> u32 {
     c.finish()
 }
 
+/// 通用形态：**指定字段按零参与**、覆盖整块的校验和（不修改调用方数据）。
+///
+/// 数据页（16 KiB，字段在偏移 0）与 redo 页（512 B，字段同在偏移 0）
+/// 共用同一套纪律（`arch` §5.11：redo 页"校验 4B 覆盖整页"）。
+#[must_use]
+pub fn checksum_with_zeroed_field(data: &[u8], field_offset: usize, field_len: usize) -> u32 {
+    debug_assert!(field_offset + field_len <= data.len());
+    let mut c = Crc32c::new();
+    c.update(&data[..field_offset]);
+    c.update(&vec![0u8; field_len]);
+    c.update(&data[field_offset + field_len..]);
+    c.finish()
+}
+
 /// 计算整页校验和：`checksum` 字段按**零**参与计算，页内容不被修改。
 ///
 /// `page.len()` 必须等于 [`PAGE_SIZE`]（`debug` 下断言；发布形态下按调用约定）。
 #[must_use]
 pub fn page_checksum(page: &[u8]) -> u32 {
     debug_assert_eq!(page.len(), PAGE_SIZE, "页大小固定 16 KiB");
-    let mut c = Crc32c::new();
-    c.update(&page[..PAGE_CHECKSUM_OFFSET]);
-    c.update(&[0u8; PAGE_CHECKSUM_LEN]);
-    c.update(&page[PAGE_CHECKSUM_OFFSET + PAGE_CHECKSUM_LEN..]);
-    c.finish()
+    checksum_with_zeroed_field(page, PAGE_CHECKSUM_OFFSET, PAGE_CHECKSUM_LEN)
+}
+
+/// 校验：字段现值与重算值一致（通用块形态；字段在 `field_offset`）。
+#[must_use]
+pub fn verify_zeroed_field_checksum(data: &[u8], field_offset: usize, field_len: usize) -> bool {
+    let stored = u32::from_le_bytes(
+        data[field_offset..field_offset + field_len]
+            .try_into()
+            .expect("4 字节字段"),
+    );
+    stored == checksum_with_zeroed_field(data, field_offset, field_len)
 }
 
 /// 把计算出的校验和写回 `checksum` 字段（小端），返回写入值。
