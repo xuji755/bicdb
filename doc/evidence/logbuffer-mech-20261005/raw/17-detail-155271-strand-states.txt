@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: IMU私有strand状态转换
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155271
+
+  ── 描述 ──
+  Free: 可绑定事务；Used: 事务正在其中生成redo；Commited: 事务标记为已提交但LGWR尚未写盘；Flushed: DBWR通过回调刷新了该strand。隐含假设：事务只能绑定一个
+  strand，直到commit后unbind。边界条件：如果活跃事务数超过私有strand数，超出的事务被降级到共享strand。Flushed状态用于日志切换时确保所有私有strand被刷新。
+
+  ── 摘要 ──
+  IMU私有strand共有四种状态：Free表示可绑定事务；Used表示事务正在生成redo；Commited表示事务已提交但LGWR尚未写盘；Flushed表示DBWR通过回调刷新了该strand。事务只能绑定一个strand，直到commit后unbind。当活跃事务数超过私有strand数量时，超出的事务会被降级到共享strand。Flushed状态用于日志切换时确保所有私有strand被刷新。

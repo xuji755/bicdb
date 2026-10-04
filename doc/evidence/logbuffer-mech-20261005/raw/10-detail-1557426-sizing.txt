@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed
+  名称: 重做日志缓冲区（Redo Log Buffer）大小与性能
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557426
+
+  ── 描述 ──
+  重做日志缓冲区（Redo Log Buffer）是SGA中的一个循环缓冲区，用于暂存重做记录。其大小由初始化参数LOG_BUFFER决定，默认值为操作系统特定（通常为512KB或CPU数*128KB）
+  。如果LOG_BUFFER太小，LGWR进程会频繁写入重做日志文件，增加I/O开销；如果太大，会浪费SGA内存。建议监控V$SYSSTAT中的'redo log space
+  requests'统计信息，如果该值较高，说明日志缓冲区可能太小。在OLTP系统中，通常建议LOG_BUFFER设置为1-3MB。
+
+  ── 摘要 ──
+  重做日志缓冲区（Redo Log Buffer）是SGA中的循环缓冲区，用于暂存重做记录，其大小由初始化参数LOG_BUFFER决定，默认值通常为512KB或CPU数×128KB。若LOG_BUFFER过小，会导致LGWR进程频繁写入重做日志文件，增加I/O开销；若过大，则浪费SGA内存。可通过监控V$SYSSTAT中的“redo log space requests”统计信息判断缓冲区是否过小，该值较高时表明日志缓冲区可能不足。在OLTP系统中，一般建议将LOG_BUFFER设置为1-3MB。

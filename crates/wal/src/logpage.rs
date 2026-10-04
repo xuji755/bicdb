@@ -125,6 +125,13 @@ impl LogPage {
         Self { bytes }
     }
 
+    /// **重置为一张新页**（环形日志缓冲的**页池**复用）：内容清零、
+    /// 起始 LSN 落位；校验和与 `used` 归零（`seal` 时重算）。
+    pub fn reset(&mut self, start_lsn: Lsn) {
+        self.bytes.fill(0);
+        self.bytes[4..10].copy_from_slice(&start_lsn.as_raw().to_le_bytes()[..6]);
+    }
+
     /// 原始字节。
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; LOG_PAGE_SIZE] {

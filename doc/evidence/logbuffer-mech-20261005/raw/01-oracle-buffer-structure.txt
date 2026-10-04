@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] redo log buffer 结构 循环缓冲区 日志缓冲 写盘 LGWR 触发 条件 1/3
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 61，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     日志缓冲区是一个循环缓冲区。LGWR将日志缓冲区中的日志项写入日志文件后，服务器进程即可将新的日志项写入已释放的缓冲区位置。LGWR的写入速度很快，以确保日志缓冲区总有空间写入新的日志项。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 日志缓冲区循环结构与LGWR写入速度  (排序分: 10.0)
+     └ 详情：日志缓冲区采用循环复用方式：LGWR写出的空间可以由服务器进程再次使用，无需等待事务提交。系统依赖LGWR快速、频繁地刷盘来避免日志缓冲区写满后服务器进程等待，这也是redo写入瓶颈会直接影响事务吞吐量的原因。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259096
+
+     [KnowledgeEntry] 重做日志缓冲区（Redo Log Buffer）大小与性能  (排序分: 10.0)
+     └ 摘要：重做日志缓冲区（Redo Log Buffer）是SGA中的循环缓冲区，用于暂存重做记录，其大小由初始化参数LOG_BUFFER决定，默认值通常为512KB或CPU数×128KB。若LOG_BUFFER过小，会导致LGWR进程频繁写入重做日志文件，增加I/O开销；若过大，则浪费SGA内存。可通过监控V$SYSSTAT中的“redo log space requests”统计信息判断缓冲区是否过小，该值较高时表明日志缓冲区可能不足。在OLTP系统中，一般建议将LOG_BUFFER设置为1-3MB。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557426
+
+     [KnowledgeEntry] 2.2 Redo Log Buffer（重做日志缓冲区）  (排序分: 10.0)
+     └ 详情：- SGA 中的循环缓冲区 - 存储描述数据库变更的 redo entries - 参数：LOGBUFFER - LGWR 将 redo log buffer 顺序写入在线重做日志 - 不使用粒度分配（与 Fixed SGA 相同）
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:363762
+
+     [KnowledgeEntry] Redo日志缓冲区大小与LGWR性能  (排序分: 10.0)
+     └ 摘要：Redo日志缓冲区是SGA中的循环缓冲区，LGWR负责将其内容写入在线重做日志文件。缓冲区过小会导致LGWR频繁写入，引发大量I/O操作和性能开销；缓冲区过大虽能减少写入频率，但会占用过多SGA内存，并在检查点或日志切换时增加写入数据量，导致性能抖动。通常建议根据系统事务量和I/O能力进行调优，缓冲区大小一般设置在几MB到几十MB之间，不宜过大。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1549374
+
+     [CaseStudy] INSTANCE CRASH BY LGWR PROCESS WITH ORA-600 [2103]-c2  (排序分: 10.0)
+     └ 摘要：LGWR进程导致实例崩溃，报ORA-600 [2103]，根因为Bug 6267208，影响服务严重丢失，典型场景为多个数据库实例因LGWR进程异常终止。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:397461
+
+     [FaultModel] ORA-4021 ADG LGWR解析锁等待超时  (排序分: 9.5)
+     └ 摘要：ORA-4021错误在ADG环境下由LGWR进程等待exclusive parse lock超时引起，LGWR需要持有该锁编译SQL，但其他会话长时间占用同对象锁，导致LGWR超时并可能引起数据库挂起或宕机。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560727
+

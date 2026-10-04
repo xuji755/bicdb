@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: private strand flush not complete 导致日志切换延迟
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1019242
+
+  ── 描述 ──
+  私有链（private strand）是 Oracle 用于减少 redo 分配争用的机制。在执行日志切换时，必须等待所有私有链的 redo
+  记录写入当前日志文件。若刷新未完成，则无法立即分配新日志组，导致 LGWR 等待并记录该消息。待刷新完成后，日志序列正常推进并完成切换。此消息为正常行为，但若频繁出现则可能表明 redo 写入量大或
+  IO 子系统存在瓶颈。
+
+  ── 摘要 ──
+  日志切换时，如果 LGWR 的私有链（private strand）尚未将 redo 记录全部刷新到当前日志文件，alert 日志会输出 Thread cannot allocate new log, sequence... Private strand flush not complete，表示日志分配因私有链刷新未完成而短暂阻塞。

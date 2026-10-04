@@ -367,6 +367,26 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// 放不下当前组时**自动切换**（记录不得跨组）后重试——因此 `build`
     /// 在切换路径上会被调用**两次**，必须是**纯构造**（无副作用）。
     pub fn append(&mut self, build: impl Fn(Lsn) -> RedoRecord) -> Result<Lsn, GroupError> {
+        // **1/3 触发**（§11.5.5）：占用达阈值先刷盘——单次刷盘体量有界。
+        if self.buffer.flush_recommended() {
+            self.flush(self.buffer.appended_lsn())?;
+        }
+        let mut attempt = 0u32;
+        loop {
+            match self.try_append(&build) {
+                // **满则刷 + 重试**（单写者的空间等待形态）。
+                Err(GroupError::Buffer(WalError::BufferFull { .. })) if attempt < 2 => {
+                    self.flush(self.buffer.appended_lsn())?;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// 追加的实际路径（容量不足时返回 [`WalError::BufferFull`]，由
+    /// [`GroupWriter::append`] 刷盘后重试）。
+    fn try_append(&mut self, build: &impl Fn(Lsn) -> RedoRecord) -> Result<Lsn, GroupError> {
         let probe = self.buffer.appended_lsn();
         let record = build(probe);
         let record = if self.buffer.end_lsn_if_appended(record.encoded_len()) > self.group_end() {
@@ -732,7 +752,7 @@ mod tests {
     use bicdb_workspace::io::MemFileIo;
 
     use super::*;
-    use crate::record::RecordOp;
+    use crate::record::{BlockRef, Change, Rdba, RecordOp};
 
     const A: &str = "/mem/control01.ctl";
     const B: &str = "/mem/control02.ctl";
@@ -1085,6 +1105,60 @@ mod tests {
         assert_eq!(w.entries().groups[0].run, LogRunState::Active);
         let (g1, _) = scan_group(&io, 1, 4);
         assert_eq!(g1[0], RedoRecord::log_switch(g1[0].lsn, 1, 2));
+    }
+
+    #[test]
+    fn one_third_trigger_flushes_automatically() {
+        let io = mem();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 1, 256).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        let initial = w.synced_lsn(); // 激活时切换记录已落盘（>0）
+        assert!(initial > lsn(0), "首组切换记录已刷盘");
+        // 每条 ≈ 1 KiB（记录 ≈ 1032 B ⇒ 3 页）；1/3 默认缓冲 ≈ 43.7 KiB ⇒
+        // 约第 43 条触发自动刷盘（未显式调用 flush）。
+        let mut appended = 0usize;
+        for i in 0..60u64 {
+            w.append(|l| {
+                RedoRecord::page_modification(
+                    l,
+                    1,
+                    vec![BlockRef {
+                        flags: 0,
+                        rdba: Rdba::from_parts(1, 2).unwrap(),
+                        changes: vec![Change {
+                            offset: 0,
+                            after: vec![i as u8; 1000],
+                        }],
+                    }],
+                )
+            })
+            .unwrap();
+            appended += 1;
+        }
+        assert!(appended == 60);
+        assert!(
+            w.synced_lsn() > initial,
+            "1/3 触发应已自动刷盘（synced_lsn 前进）"
+        );
+        // 全部记录最终都落盘（显式刷尽后计数一致）。
+        w.flush(w.appended_lsn()).unwrap();
+        let (records, _) = scan_group(&io, 0, 256);
+        assert!(records.len() >= 60, "切换记录 + 60 条");
     }
 
     #[test]

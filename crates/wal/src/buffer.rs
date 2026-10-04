@@ -11,11 +11,21 @@
 //!    后一条记录刷盘必然覆盖前一条；等待者只要看到 `synced_lsn ≥ 目标`
 //!    即可返回，**共享同一次 fsync**。
 //!
+//! # 环形与容量（§11.5.5）
+//!
+//! 缓冲是**固定容量的环形页池**：空间判据 `end − synced_lsn ≤ 容量`——
+//! **耐久位（sync 成功）之前的数据不许被覆盖**；刷盘成功后页缓冲**回收**
+//! 进池、供后续追加复用（位置量持续单调，环形只复用**内存页**，不改变
+//! 盘上形态）。容量不足 ⇒ [`WalError::BufferFull`]——写方据此先刷盘再重试
+//! （多写者切片改为条件等待 + `log buffer space` 同构诊断）。
+//! 追加侧可按**1/3 占用**建议刷盘（[`LogBuffer::flush_recommended`]，
+//! 单次刷盘体量有界）。
+//!
 //! # 刷盘点与"页被切"
 //!
 //! 刷盘把**截至当时的所有页**（含未写满的当前页——页头的"已用长度"界定
 //! 有效区）写出去；**被刷出的页不再接受追加**，后续追加自动新开一页。
-//! 于是盘上的页序列永远是"前缀"，末尾的不完整记录由恢复扫描按
+//! 于是盘上的序列永远是"前缀"，末尾的不完整记录由恢复扫描按
 //! `frag_no`/`frag_cnt` 丢弃（[`crate::logpage::TailState::Truncated`]）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +47,18 @@ pub enum WalError {
     Io(std::io::Error),
     /// LSN 越过 48 位域。
     LsnExhausted,
+    /// **环形缓冲无空间**（未刷出数据触到容量上限）——写方应先刷盘再重试。
+    BufferFull {
+        /// 需要到达的结束位置与耐久位之差（字节）。
+        need: u64,
+        /// 容量（字节）。
+        capacity: u64,
+    },
+    /// 容量低于下限（最坏单条 34 页 + 余量）。
+    InvalidCapacity {
+        /// 请求的容量（页）。
+        pages: usize,
+    },
 }
 
 impl std::fmt::Display for WalError {
@@ -46,6 +68,13 @@ impl std::fmt::Display for WalError {
             WalError::Record(e) => write!(f, "日志记录错误：{e}"),
             WalError::Io(e) => write!(f, "日志刷盘失败：{e}"),
             WalError::LsnExhausted => f.write_str("LSN 越过 48 位域"),
+            WalError::BufferFull { need, capacity } => write!(
+                f,
+                "日志缓冲无空间（未刷出 {need} B > 容量 {capacity} B）——先刷盘再重试"
+            ),
+            WalError::InvalidCapacity { pages } => {
+                write!(f, "日志缓冲容量 {pages} 页低于下限")
+            }
         }
     }
 }
@@ -63,6 +92,15 @@ impl From<std::io::Error> for WalError {
         WalError::Io(e)
     }
 }
+
+/// 缓冲容量下限（页）：最坏单条记录 34 页 + 2 余量——**缓冲空时任何单条必能落下**。
+pub const MIN_CAPACITY_PAGES: usize = 36;
+/// 默认容量（页）：256 × 512B = 128 KiB（本库画像；§11.5.5 的容量规则）。
+pub const DEFAULT_CAPACITY_PAGES: usize = 256;
+/// 1/3 触发阈值（刷盘建议的比例）。
+pub const FLUSH_TRIGGER_NUM: usize = 1;
+/// 1/3 触发阈值（分母）。
+pub const FLUSH_TRIGGER_DEN: usize = 3;
 
 /// 刷盘去处（日志文件的抽象；文件实现随"日志文件"切片接入）。
 pub trait LogSink {
@@ -101,12 +139,27 @@ impl LogSink for VecLogSink {
 struct BufferState {
     /// 未刷出的页（最后一张是当前追加页；空 = 需要新页）。
     pages: Vec<LogPage>,
+    /// **页池**：已刷出、可复用的页缓冲（环形复用；复用边界 = sync 成功）。
+    pool: Vec<LogPage>,
+    /// 容量（页）。
+    capacity_pages: usize,
     /// 下一张页的起点（刷盘切页后 = 末页起点 + 512）。
     next_page_start: u64,
     /// 追加位置（下一字节的 LSN）。
     appended_lsn: u64,
     /// 已刷盘位置（可由等待者无锁读取）。
     synced_lsn: AtomicU64,
+}
+
+/// 取一张页（优先复用池中缓冲；池空则新建）并写起始 LSN。
+fn acquire_page(pages: &mut Vec<LogPage>, pool: &mut Vec<LogPage>, start: Lsn) {
+    match pool.pop() {
+        Some(mut page) => {
+            page.reset(start);
+            pages.push(page);
+        }
+        None => pages.push(LogPage::new(start)),
+    }
 }
 
 /// 日志缓冲。
@@ -126,20 +179,57 @@ impl std::fmt::Debug for LogBuffer {
 }
 
 impl LogBuffer {
-    /// 以 `start_lsn` 为日志流起点新建。
+    /// 以 `start_lsn` 为日志流起点新建（**默认容量** = 256 页 = 128 KiB）。
     #[must_use]
     pub fn new(start_lsn: Lsn) -> Self {
-        Self {
+        Self::with_capacity_pages(start_lsn, DEFAULT_CAPACITY_PAGES).expect("默认容量不低于下限")
+    }
+
+    /// 以指定**容量**（页）新建；低于 [`MIN_CAPACITY_PAGES`] 即拒绝。
+    pub fn with_capacity_pages(start_lsn: Lsn, capacity_pages: usize) -> Result<Self, WalError> {
+        if capacity_pages < MIN_CAPACITY_PAGES {
+            return Err(WalError::InvalidCapacity {
+                pages: capacity_pages,
+            });
+        }
+        Ok(Self {
             state: Mutex::new(BufferState {
                 // 第 0 页立即就位：页体自 start + 16 起（LSN = 字节位置，
                 // 页头也占位）。
                 pages: vec![LogPage::new(start_lsn)],
+                pool: Vec::new(),
+                capacity_pages,
                 next_page_start: start_lsn.as_raw(),
                 appended_lsn: start_lsn.as_raw() + crate::logpage::LOG_PAGE_HEADER_LEN as u64,
                 synced_lsn: AtomicU64::new(start_lsn.as_raw()),
             }),
             io: Mutex::new(()),
-        }
+        })
+    }
+
+    /// 容量（页）。
+    #[must_use]
+    pub fn capacity_pages(&self) -> usize {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.capacity_pages
+    }
+
+    /// 未刷出的字节数（`appended_lsn − synced_lsn`）。
+    #[must_use]
+    pub fn unflushed_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.appended_lsn - state.synced_lsn.load(Ordering::SeqCst)
+    }
+
+    /// **1/3 触发**：未刷出占用达到容量的 1/3 ⇒ 建议写方刷盘（§11.5.5）。
+    #[must_use]
+    pub fn flush_recommended(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let used = state.appended_lsn - state.synced_lsn.load(Ordering::SeqCst);
+        used * FLUSH_TRIGGER_DEN as u64
+            >= state.capacity_pages as u64
+                * crate::logpage::LOG_PAGE_SIZE as u64
+                * FLUSH_TRIGGER_NUM as u64
     }
 
     /// 追加位置（下一字节 LSN）。
@@ -193,27 +283,50 @@ impl LogBuffer {
     ///
     /// `build` 收到的 LSN 必须原样放进记录（构造器自动做）。
     pub fn append(&self, build: impl FnOnce(Lsn) -> RedoRecord) -> Result<Lsn, WalError> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
+        let mut created_fresh_page = false;
         if state.pages.is_empty() {
             // 刷盘切页后：新页起于 next_page_start（页序列是文件的前缀）。
-            let page =
-                LogPage::new(Lsn::from_raw(state.next_page_start).ok_or(WalError::LsnExhausted)?);
-            state.pages.push(page);
+            let start = Lsn::from_raw(state.next_page_start).ok_or(WalError::LsnExhausted)?;
+            acquire_page(&mut state.pages, &mut state.pool, start);
             state.appended_lsn = state.next_page_start + crate::logpage::LOG_PAGE_HEADER_LEN as u64;
+            created_fresh_page = true;
         }
         // 当前页放不下任何分片 → 新页。
         if state.pages.last().expect("非空").remaining_data_capacity() == 0 {
             let next = state.pages.last().expect("非空").start_lsn().as_raw()
                 + crate::logpage::LOG_PAGE_SIZE as u64;
-            let page = LogPage::new(Lsn::from_raw(next).ok_or(WalError::LsnExhausted)?);
-            state.pages.push(page);
+            let start = Lsn::from_raw(next).ok_or(WalError::LsnExhausted)?;
+            acquire_page(&mut state.pages, &mut state.pool, start);
             state.appended_lsn = next + crate::logpage::LOG_PAGE_HEADER_LEN as u64;
+            created_fresh_page = true;
         }
         let lsn = Lsn::from_raw(state.appended_lsn).ok_or(WalError::LsnExhausted)?;
         let record = build(lsn);
         // 校验：构造器必须把 LSN 写进记录头（互为校验的本地一侧）。
         if record.lsn != lsn {
             return Err(WalError::Record(RecordError::LsnMismatch));
+        }
+        // **容量判据**（§11.5.5）：未刷出数据不得越过容量——耐久位之前不许覆盖。
+        let record_len = record.encoded_len();
+        let last = state.pages.last().expect("刚保证存在");
+        let (end_page, end_used) =
+            crate::logpage::simulate_append(last.start_lsn().as_raw(), last.used(), record_len);
+        let end = end_page + crate::logpage::LOG_PAGE_HEADER_LEN as u64 + end_used as u64;
+        let synced = state.synced_lsn.load(Ordering::SeqCst);
+        let capacity = state.capacity_pages as u64 * crate::logpage::LOG_PAGE_SIZE as u64;
+        if end - synced > capacity {
+            // 未写入任何东西 ⇒ 无副作用；刚取的新页放回池。
+            if created_fresh_page {
+                if let Some(page) = state.pages.pop() {
+                    state.pool.push(page);
+                }
+            }
+            return Err(WalError::BufferFull {
+                need: end - synced,
+                capacity,
+            });
         }
         write_record(&mut state.pages, &record)?;
         // 追加位置推进 = 末页起始 LSN + 页头 16B + 该页已用字节（含本记录的
@@ -267,7 +380,8 @@ impl LogBuffer {
             return Err(e);
         }
 
-        // 3) 持久性点达成：切页 + 前进 synced_lsn。
+        // 3) 持久性点达成：切页 + 前进 synced_lsn + 页**回收进池**
+        //    （环形复用的边界 = sync 成功——次序不能反：先取位置，再回收）。
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let synced_after = pages
             .last()
@@ -281,6 +395,7 @@ impl LogBuffer {
             state.next_page_start =
                 last.start_lsn().as_raw() + crate::logpage::LOG_PAGE_SIZE as u64;
         }
+        state.pool.append(&mut pages);
         let cur = state.synced_lsn.load(Ordering::SeqCst);
         if synced_after > cur {
             state.synced_lsn.store(synced_after, Ordering::SeqCst);
@@ -438,5 +553,124 @@ mod tests {
         let buf = LogBuffer::new(lsn(0));
         let err = buf.append(|_| commit_rec(lsn(999), 1, 1)).unwrap_err();
         assert!(matches!(err, WalError::Record(RecordError::LsnMismatch)));
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+    use crate::record::{BlockRef, Change, Rdba, RedoRecord};
+
+    fn lsn(v: u64) -> Lsn {
+        Lsn::from_raw(v).unwrap()
+    }
+
+    /// 一条 ≈ 1 KiB 的页修改记录（够大，页数增长可控）。
+    fn big_rec(lsn_v: Lsn, id: u8) -> RedoRecord {
+        RedoRecord::page_modification(
+            lsn_v,
+            1,
+            vec![BlockRef {
+                flags: 0,
+                rdba: Rdba::from_parts(1, 2).unwrap(),
+                changes: vec![Change {
+                    offset: 0,
+                    after: vec![id; 1000],
+                }],
+            }],
+        )
+    }
+
+    #[test]
+    fn capacity_bounds_append_and_flush_releases_space() {
+        let buf = LogBuffer::with_capacity_pages(lsn(0), MIN_CAPACITY_PAGES).unwrap();
+        assert_eq!(buf.capacity_pages(), MIN_CAPACITY_PAGES);
+        let mut id = 0u8;
+        let mut full = None;
+        // 填到满：34 页下限保证单条必能落，所以循环必然先满后停。
+        for _ in 0..MIN_CAPACITY_PAGES + 4 {
+            match buf.append(|l| big_rec(l, id)) {
+                Ok(_) => id = id.wrapping_add(1),
+                Err(e @ WalError::BufferFull { .. }) => {
+                    full = Some(e);
+                    break;
+                }
+                Err(e) => panic!("意外错误：{e}"),
+            }
+        }
+        let err = full.expect("容量 36 页下应能填满");
+        match err {
+            WalError::BufferFull { need, capacity } => {
+                assert!(need > capacity);
+                assert_eq!(
+                    capacity,
+                    (MIN_CAPACITY_PAGES * crate::logpage::LOG_PAGE_SIZE) as u64
+                );
+            }
+            _ => unreachable!(),
+        }
+        // 刷盘（无须新增数据）→ 空间释放，可继续追加。
+        let mut sink = VecLogSink::default();
+        buf.flush_to(buf.appended_lsn(), &mut sink).unwrap();
+        assert_eq!(buf.unflushed_bytes(), 0);
+        buf.append(|l| big_rec(l, 200)).unwrap();
+        assert!(buf.unflushed_bytes() > 0);
+    }
+
+    #[test]
+    fn pages_are_recycled_across_flush_cycles() {
+        let buf = LogBuffer::with_capacity_pages(lsn(0), MIN_CAPACITY_PAGES).unwrap();
+        let mut sink = VecLogSink::default();
+        let mut id = 0u8;
+        // 五个"填满 → 刷盘"周期：页缓冲被回收复用，盘上记录必须逐条完好。
+        for cycle in 0..5 {
+            let mut appended = 0usize;
+            loop {
+                match buf.append(|l| big_rec(l, id)) {
+                    Ok(_) => {
+                        id = id.wrapping_add(1);
+                        appended += 1;
+                    }
+                    Err(WalError::BufferFull { .. }) => break,
+                    Err(e) => panic!("第 {cycle} 周期意外错误：{e}"),
+                }
+            }
+            assert!(appended >= 8, "每周期应写下足够多的记录（约 3 页/条）");
+            buf.flush_to(buf.appended_lsn(), &mut sink).unwrap();
+            assert_eq!(buf.unflushed_bytes(), 0, "刷盘后占用归零（可复用）");
+        }
+        // 五个周期的记录全部可重组成序。
+        let (records, clean) = decode_sink_pages(&sink.pages);
+        assert!(clean);
+        assert_eq!(records.len(), usize::from(id), "记录数 = 写入数");
+        // 载荷标识逐条递增（id 在记录里）。
+        for (i, r) in records.iter().enumerate() {
+            match &r.blocks[0].changes[0].after.first() {
+                Some(&v) => assert_eq!(v, i as u8, "第 {i} 条载荷标识"),
+                None => panic!("载荷缺失"),
+            }
+        }
+    }
+
+    #[test]
+    fn flush_recommended_fires_at_one_third() {
+        let buf = LogBuffer::with_capacity_pages(lsn(0), MIN_CAPACITY_PAGES).unwrap();
+        let third = (MIN_CAPACITY_PAGES as u64 * crate::logpage::LOG_PAGE_SIZE as u64) / 3;
+        assert!(!buf.flush_recommended(), "空缓冲不触发");
+        while buf.unflushed_bytes() < third {
+            buf.append(|l| big_rec(l, 7)).unwrap();
+        }
+        assert!(buf.flush_recommended(), "达到 1/3 即建议刷盘");
+        let mut sink = VecLogSink::default();
+        buf.flush_to(buf.appended_lsn(), &mut sink).unwrap();
+        assert!(!buf.flush_recommended(), "刷盘后复位");
+    }
+
+    #[test]
+    fn invalid_capacity_is_rejected() {
+        assert!(matches!(
+            LogBuffer::with_capacity_pages(lsn(0), MIN_CAPACITY_PAGES - 1),
+            Err(WalError::InvalidCapacity { .. })
+        ));
     }
 }

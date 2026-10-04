@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_CaseStudy,KGV2Managed
+  名称: 通过监控 'redo buffer allocation retries' 诊断 LOG BUFFER 过小
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531978
+
+  ── 描述 ──
+  文档描述了一个场景：DBA在一段时间内多次执行查询 `select name,value from V$SYSSTAT where name= 'redo buffer allocation
+  retries'`。如果发现该值持续稳定增长，则表明重做日志缓冲区存在空间压力，进程频繁等待。这个案例指导DBA通过观察趋势而非单一数值来做出调优决策。
+
+  ── 摘要 ──
+  场景：DBA需要诊断重做日志缓冲区（LOG BUFFER）是否过小。诊断：通过多次执行查询 `select name,value from V$SYSSTAT where name='redo buffer allocation retries'`，观察该指标值的持续稳定增长趋势，而非单一数值。该值的增长表明进程因日志缓冲区空间不足而频繁等待，即存在空间压力。处理：基于趋势分析，DBA应增大LOG BUFFER参数，以减少redo buffer allocation retries等待事件，提升系统性能。

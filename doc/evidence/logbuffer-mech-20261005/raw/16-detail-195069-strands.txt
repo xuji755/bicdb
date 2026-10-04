@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: Redo Strand（共享与私有）
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:195069
+
+  ── 描述 ──
+  重做在内存中的日志缓冲区生成。当存在多个缓冲区时，每个缓冲区称为一个redo strand。共享strand（shared
+  strand）是任何前台都可以用来生成重做的重做缓冲区。私有strand（private strand）用于运行In-Memory Undo（IMU）模式，该模式下每个事务直接在私有strand中生成
+  重做（而不是使用栈、UGA、PGA等内存），之后在kcrfw_redo_gen()中将重做复制到共享strand。如果运行在IMU的toss-away undo + zero-copy
+  redo模式下，私有strand中的重做直接写入日志，这被称为零拷贝重做（ZC
+  redo）。共享strand的大小策略依赖最大重做记录大小（128K）和CPU数量。私有strand的大小主要由最大重做记录大小（128K）决定。
+
+  ── 摘要 ──
+  重做在内存中的日志缓冲区生成，每个缓冲区称为一个redo strand。共享strand供任何前台进程使用；私有strand用于In-Memory Undo（IMU）模式，事务直接在私有strand中生成重做，随后通过kcrfw_redo_gen()复制到共享strand。若运行在IMU的toss-away undo + zero-copy redo模式下，私有strand中的重做直接写入日志，即零拷贝重做（ZC redo）。共享strand的大小由最大重做记录大小（128K）和CPU数量共同决定；私有strand的大小主要由该最大重做记录大小决定。

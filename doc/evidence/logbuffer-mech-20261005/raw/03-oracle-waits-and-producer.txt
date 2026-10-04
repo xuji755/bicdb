@@ -1,0 +1,127 @@
+[独立问题检索] 3 个问题（完全重复的问题只执行一次）
+
+问题 1/3
+
+============================================================
+  [问题诊断] log buffer space 等待事件 重做缓冲区 满
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 53，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     log buffer space 等待事件表示进程等待日志缓冲区中有可用空间的时间。当日志缓冲区已满且 LGWR 尚未完成写入时，进程需要等待。该等待通常表明日志缓冲区太小或 LGWR 写入速度跟不上日志生成速度。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] Log Buffer Space 等待事件  (排序分: 10.0)
+     └ 详情：log buffer space 等待事件表示进程等待日志缓冲区中有可用空间的时间。当日志缓冲区已满且 LGWR 尚未完成写入时，进程需要等待。该等待通常表明日志缓冲区太小或 LGWR 写入速度跟不上日志生成速度。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1548161
+
+     [KnowledgeEntry] Log buffer space等待事件  (排序分: 10.0)
+     └ 摘要：Log buffer space等待事件发生在服务器进程（kcrfws）因日志缓冲区空间不足而被迫等待时，通常由前台重做记录生成速度超过LGWR写入磁盘速度所致。根因在于日志缓冲区过小或磁盘I/O性能不足，影响数据库写入性能。解决方法包括增大日志缓冲区大小或采用更快的磁盘（如条带化技术）。该等待事件默认超时时间为1秒，若等待日志切换完成则为5秒。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:156866
+
+     [KnowledgeEntry] Log buffer space 等待事件  (排序分: 10.0)
+     └ 摘要：Log buffer space 等待事件发生在前台进程需要分配日志缓冲区空间但空间不足时，进程被迫等待 LGWR 释放空间。其根因通常是日志缓冲区过小或 LGWR 写出太慢。优化方法包括增大 LOG_BUFFER、将日志文件移到更快磁盘以及启用异步 I/O。该等待的典型时长为 1 秒，若涉及日志切换则可能延长至 5 秒。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:156865
+
+     [KnowledgeEntry] log buffer space等待事件  (排序分: 10.0)
+     └ 摘要：log buffer space等待事件指当前台进程需要分配log buffer空间但无可用空间时，调用kcrfws()进入等待状态。若等待原因为buffer满，超时1秒后重试；若因日志切换正在进行，则超时5秒。该事件表明LGWR写入速度跟不上前台redo生成速度。根因包括log buffer过小、磁盘写入慢或redo生成过多。解决措施可考虑增大log buffer、使用更快磁盘或减少redo生成。等待时长由内部逻辑决定，与buffer大小和磁盘速度相关。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:218178
+
+     [CaseStudy] 通过监控 'redo buffer allocation retries' 诊断 LOG BUFFER 过小  (排序分: 9.1)
+     └ 摘要：场景：DBA需要诊断重做日志缓冲区（LOG BUFFER）是否过小。诊断：通过多次执行查询 `select name,value from V$SYSSTAT where name='redo buffer allocation retries'`，观察该指标值的持续稳定增长趋势，而非单一数值。该值的增长表明进程因日志缓冲区空间不足而频繁等待，即存在空间压力。处理：基于趋势分析，DBA应增大LOG BUFFER参数，以减少redo buffer allocation retries等待事件，提升系统性能。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531978
+
+     [FaultModel] 重做缓冲区保护页违规  (排序分: 8.6)
+     └ 摘要：故障模型：Oracle重做缓冲区保护页违规。现象：尝试非法访问重做缓冲区，被保护页捕获，可能导致操作系统错误。根因：程序错误或内存损坏导致对重做缓冲区的越界访问。影响：可能引发操作系统级错误，影响数据库稳定性。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545812
+
+
+问题 2/3
+
+============================================================
+  [问题诊断] log file sync 提交 等待 LGWR 写盘 完成 提交成功
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     log file sync等待表示用户会话提交时等待LGWR将日志缓冲区中的redo写入在线重做日志文件并收到确认，涵盖从通知LGWR到接收完成信号的时间间隔。与log file parallel write紧密关联，后者反映LGWR实际写IO耗时，若log file parallel write平。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:1205673.1 故障排除："log file sync"等待 (文档 ID 1626301.1)  (排序分: 15.0)
+     └ 摘要：log file sync等待表示用户会话提交时等待LGWR将日志缓冲区中的redo写入在线重做日志文件并收到确认，涵盖从通知LGWR到接收完成信号的时间间隔。与log file parallel write紧密关联，后者反映LGWR实际写IO耗时，若log file parallel write平。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047423
+
+     [KnowledgeEntry] L1：Note:10318123.8 Troubleshooting: "log file sync" Waits (文档 ID 1376916.1)  (排序分: 15.0)
+     └ 摘要：log file sync 等待事件指示用户会话因提交事务而等待 LGWR 将日志缓冲区数据写入联机重做日志文件的过程。高等待通常源于 LGWR 的 I/O 性能问题或应用提交过于频繁，诊断时需收集 AWR 报告及 LGWR 跟踪文件，并对比 log file sync 与。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2044255
+
+     [KnowledgeEntry] L1：Script to Collect Log File Sync Diagnostic Information (lfsdiag.sql) (文档 ID 1064487.1)-c2  (排序分: 15.0)
+     └ 摘要：Log file sync 等待事件表示用户会话提交时等待 LGWR 将重做日志写入磁盘。该脚本 lfsdiag.sql 用于收集诊断信息，包括 commit_logging、commit_wait、commit_write 等参数配置，ASH 中最差的 log file sync 等待分钟及对应 LGWR 的 log file parallel writ。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2049392
+
+     [KnowledgeEntry] L1：Note:741178.1 'Log File Sync' problem Checklist for 10.2  (排序分: 15.0)
+     └ 摘要：log file sync 等待事件指前台进程等待 LGWR 确认其提交的日志缓冲区已刷入物理在线重做日志，等待次数与 LGWR 写出吞吐量相关。在 10.2 版本中，该事件可能源自多个 Bug，如 Bug 6193945（RAC 下 LGWR CPU 高）、Bug 5147386（LGWR 通知前台。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043269
+
+     [CaseStudy] INSTANCE CRASH BY LGWR PROCESS WITH ORA-600 [2103]-c2  (排序分: 10.0)
+     └ 摘要：LGWR进程导致实例崩溃，报ORA-600 [2103]，根因为Bug 6267208，影响服务严重丢失，典型场景为多个数据库实例因LGWR进程异常终止。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:397461
+
+     [FaultModel] Log File Sync等待事件  (排序分: 9.3)
+     └ 摘要：等待事件：Log File Sync，表示用户提交或回滚事务时，会话等待LGWR进程将重做日志缓冲区写入联机重做日志文件。根因是LGWR写入速度慢，可能由磁盘I/O瓶颈或日志缓冲区太小导致，影响事务提交延迟。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545415
+
+
+问题 3/3
+
+============================================================
+  [问题诊断] 服务器进程 写 redo 到 log buffer redo copy latch 分配
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 52，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 61，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     服务器进程在修改数据块时遵循特定算法：1) 以排他模式固定（Pin）数据块缓冲区。2) 在PGA中构建一个变更向量数组（称为kcocv），通过调用kconew()和kcoadd()描述变更。3) 通过调用kcrfwr()将Redo记录写入Log Buffer。kcrfwr()负责确定所需空间、分配空间、确定SCN、获取Redo Copy Latch和Redo Allocation Latch，并最终将变更向量复制到Log Buffer。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] Redo生成算法：服务器进程步骤  (排序分: 9.4)
+     └ 摘要：服务器进程在修改数据块时，通过固定数据块缓冲区，在PGA中构建变更向量数组，并调用kcrfwr将Redo记录写入Log Buffer。该过程涉及使用kconew和kcoadd描述变更，kcrfwr负责确定空间、分配空间、确定SCN，并获取Redo Copy Latch和Redo Allocation Latch以最终复制变更向量。这一算法确保了Redo生成的正确性与并发控制。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1541166
+
+     [KnowledgeEntry] 专用服务器进程模式  (排序分: 9.4)
+     └ 详情：在专用服务器进程中，客户端连接与一个且仅与一个服务器进程相关联。每个客户端进程直接与其服务器进程通信，会话期间该服务器进程专用于其客户端。UGA（用户全局区）存储在PGA中。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1070506
+
+     [KnowledgeEntry] 专用服务器进程  (排序分: 9.4)
+     └ 摘要：专用服务器进程中，Oracle 为每个新会话分配一个专用的服务器进程，该进程在会话期间不可被其他客户端共享。它是通过监听器 fork 出来的新进程。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1072382
+
+     [KnowledgeEntry] 共享服务器进程模式  (排序分: 9.4)
+     └ 摘要：共享服务器连接模式下，多个客户端通过调度器进程共享服务器进程池。调度器接收请求放入请求队列，空闲共享服务器进程处理后将结果放入响应队列，调度器返回结果。UGA存储在SGA中以便所有共享服务器进程访问。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1070502
+
+     [CaseStudy] 锁阻塞导致共享服务器进程耗尽及TNS-12535案例分析  (排序分: 9.1)
+     └ 摘要：数据库shared_servers参数设置一直合理，但突然出现TNS-12535连接失败。通过DPA监控发现，某用户使用Toad执行无WHERE条件的UPDATE后回滚，表锁导致大量会话阻塞，共享服务器进程被占满，新连接在分发器队列中排队超时。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1009987
+
+     [FaultModel] 并行服务器进程耗尽  (排序分: 8.6)
+     └ 摘要：含义：当并发操作过多时，Oracle可能耗尽并行服务器进程，导致操作串行执行或报错。原因：参数`PARALLEL_MAX_SERVERS`设置不足，无法满足高并发并行操作的需求。影响：并行操作被迫串行化，或返回资源不足错误，系统吞吐量和响应时间显著恶化。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545651
+
+
+合格结果：18 个不同 EID；每个问题独立评分与选择。
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

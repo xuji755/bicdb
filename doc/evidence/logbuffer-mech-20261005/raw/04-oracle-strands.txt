@@ -1,0 +1,185 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Redo Strand（共享与私有）
+      重做在内存中的日志缓冲区生成。当存在多个缓冲区时，每个缓冲区称为一个redo strand。共享strand（shared strand）是任何前台都可以用来生成重做的重做缓冲区。私有strand（private strand）用于运行In-Memory Undo（IMU）模式，该模式下每个事务直接在私有strand中生成重做（而不是使用栈、UGA、PGA等内存），之后在kcrfw_redo_gen()中将重做复制到共享strand。如果运行在IMU的toss-away undo + zero-copy redo模式下，私有strand中的重做直接写入日志，这被称为零拷贝重做（ZC redo）。共享strand的大小策略依赖最大重做记录大小（128K）和CPU数量。私有strand的大小主要由最大重做记录大小（128K）决定。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:195069
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IMU私有strand状态转换
+      Free: 可绑定事务；Used: 事务正在其中生成redo；Commited: 事务标记为已提交但LGWR尚未写盘；Flushed: DBWR通过回调刷新了该strand。隐含假设：事务只能绑定一个strand，直到commit后unbind。边界条件：如果活跃事务数超过私有strand数，超出的事务被降级到共享strand。Flushed状态用于日志切换时确保所有私有strand被刷新。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155271
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] private strand flush not complete 导致日志切换延迟
+      私有链（private strand）是 Oracle 用于减少 redo 分配争用的机制。在执行日志切换时，必须等待所有私有链的 redo 记录写入当前日志文件。若刷新未完成，则无法立即分配新日志组，导致 LGWR 等待并记录该消息。待刷新完成后，日志序列正常推进并完成切换。此消息为正常行为，但若频繁出现则可能表明 redo 写入量大或 IO 子系统存在瓶颈。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1019242
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：A look into oracle redo, part 11: log writer worker processes | Frits Hoogland Weblog-c2
+      A look into oracle redo, part 11: log writer worker processes | Frits Hoogland Weblog-c2
+A look into oracle redo, part 11: log writer worker processes | Frits Hoogland Weblog
+Thanks Frits for sharing
+Thomas Saviour
+Reply ↓
+Frits Hoogland said: September 29, 20181:00 pm
+Hi Thomas, thank you for reading!
+Private strands are private to a process, and work closely together with In-Memory Undo. I got a blogpost that shows some of the specifics for both: https://fritshoogland.wordpress.com/2016/11/15/redo-a-blogpost/
+I haven’t investigated private strands as much as I did investigate regular redo generation of a process. Plus there are additional reasons private strands are not used; I do believe RAC disables private strands for example.
+My current thinking is the idea of private strands is the following: traditional redo generation means all generated redo needs access to a public redo strand. By using private strands, the redo generation is done to a buffer that is unique to a single process, so it can’t run into a taken redo allocation latch. However, when the transaction is committed, the generated redo is flushed from the private strand into a public strand, because only the public strands are written to the online redo log files. So my current reasoning is that private strands are a way to batch redo generation into the public strands.
+Any additions or comments are welcome, I did not validate this statement, it is based on my investigations on regular redo generation, as well as investigating private strands generally.
+Second note: I hardly run into databases that have serialisation issues with the redo allocation latch. Some of them might be using private strands, but as I indicated: RAC disables private strand usage too, and these too almost consistently do not have redo allocation latch issues too. This means that as far as I see it now, by creating multiple public strands, Oracle mitigated an issue that was present in certain scenario’s in the past.
+Reply ↓
+Ora600Tom said: September 29, 20184:42 pm
+Thanks Frits. After posting the question, I realized, the consolidated redo vector copied from Private redo strands to the Public Strands, so there is no scope for worker processes. However, the idea of “flushed from Private strands to Public strands during commit” is not digesting to me as
+1. A large transaction can generate much more redo which may not fit into a Private strands. In such cases, Private strands needs flush the redo to the Public strands (or directly to the log file) well before the commit.
+2. Again for a large transaction, it is unconvincing that Oracle will move the entire redo from Private strands to Public and again to log files. Is it not a double work
+Thanks for the discussion!
+Regards
+Thomas Saviour
+Reply ↓
+Frits Hoogland said: September 29, 20184:50 pm
+Perhaps I should have been more clear. The purpose of private strands is to take the pressure off the redo allocation latches. This is a simplification, but essentially it’s a private buffer that sits in front of the public redo strands, and could reduce the number of redo allocation latch gets for the public redo strands.
+And yes, there are many cases where the private strands can not buffer the entire transaction and need to be flushed to the public ones, see x$ktiff for documented reasons.
+What I also tried expressing is that I don’t see a lot of contention for redo allocation latches nowadays, which is probably because of multiple public strands.
+Reply ↓
+Ora600Tom said: September 29, 20185:19 pm
+Thanks for the quick reply!
+Reply ↓
+Leave a Reply Cancel reply
+Fill in your details below or click an icon to log in:
+Email (required) (Address never made public)
+Name (required)
+Website
+You are commenting using your WordPress.com account.
+( Log Out /
+Change )
+You are commenting using your Twitter account.
+( Log Out /
+Change )
+You are commenting using your Facebook account.
+( Log Out /
+Change )
+Cancel
+Connecting to %s
+Notify me of new comments via email. Notify me of new posts via email.
+Δ
+This site uses Akismet to reduce spam. Learn how your comment data is processed.
+Blog at WordPress.com.
+Follow
+Following
+Frits Hoogland Weblog
+Join 4,038 other followers
+Sign me up
+Already have a WordPress.com account Log in now.
+Frits Hoogland Weblog
+Customize
+Follow
+Following
+Sign up
+Log in
+Copy shortlink
+Report this content
+View post in Reader
+Manage subscriptions
+Collapse this bar
+Privacy & Cookies: This site uses cookies. By continuing to use this website, you agree to their use.
+To find out more, including how to control cookies, see here:
+Cookie Policy
+%d bloggers like this:
+ad
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2046002
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 私有strand状态机
+      IMU事务使用的私有strand有四种状态：Free（空闲，可绑定事务）、Used（使用中，事务正在该strand生成重做）、Committed（事务已标记提交但LGWR尚未完成写入）、Flushed（DBWR通过回调已刷新该私有strand）。事务在提交时必须解绑strand。最多只能有一个绑定事务。strand空闲时可分配给新事务，如果事务未绑定到私有strand，则降级为使用共享strand。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:245690
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 私有strand
+      私有strand：在Oracle的In-Memory Undo（IMU）机制中，私有strand是每个事务私有的undo记录缓存区域。事务首先在私有strand中记录undo信息，然后批量写入全局undo段。这种设计减少了undo段上的并发争用，提高了事务处理性能。私有strand的大小和数量由隐含参数控制，适用于高并发OLTP环境。概念 kernel 私有strand IMU undo
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1567650
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:372557.1 Alert Log Messages: Private Strand Flush Not Complete
+      Alert Log Messages: Private Strand Flush Not Complete
+Symptoms
+Cause
+Solution
+References
+(AuthWiz 2.5.3) Created from SR 16301756.6 with ODM
+Click here to edit in wizard.
+This document is being delivered to you via Oracle Support's
+Rapid Visibility (RaV)
+process, and therefore has not been subject to an independent technical review.
+Applies to:
+Oracle Server - Enterprise Edition - Version: 10.2.0.2This problem can occur on any platform.
+"Checked for relevance on 04-Dec-2007"
+Private strand flush not complete
+Symptoms
+"Private strand flush not complete" messages are being populated to the alert log for unknownreasons.ALERT
+LOG EXAMPLE:>Fri May 19 12:47:29 2006Thread 1 cannot allocate new log, sequence 18358Private strand flush
+not completeCurrent log# 7 seq# 18357 mem# 0: /u03/oradata/bitst/redo07.logThread 1 advanced to log sequence 18358Current log# 8 seq# 18358 mem# 0: /u03/oradata/bitst/redo08.log<<
+Cause
+The message means that we haven't completed writing all the redo information to the log when we are trying to switch. It is similar
+in nature to a "checkpoint not complete" except that is only involves the redo being written to the log. The log switch
+can not occur until all of the redo has been written.A "strand" is new terminology for 10g and it deals with latches
+for redo .Strands are a mechanism to allow multiple allocation latches for processes to write redo more efficiently in the
+redo buffer and is related to the log_parallelism parameter present in 9i.The concept of a strand is to ensure that the
+redo generation rate for an instance is optimal and that when there is some kind of redo contention then the number of strands is
+dynamically adjusted to compensate.The initial allocation for the number of strands depends on the number of CPU's and is
+started with 2 strands with one strand for active redo generation.For large scale enterprise systems the amount of redo
+generation is large and hence these strands are *made active* as and when the foregrounds encounter this redo contention (allocated
+latch related contention) when this concept of dynamic strands comes into play.There is always shared strands and a number
+of private strands .Oracle 10g has some major changes in the mechanisms for redo (and undo), which seem to be aimed at reducing
+contention.Instead of redo being recorded in real time, it can be recorded 'privately' and pumped into the redo log buffer on commit.Similary the undo can be generated as 'in memory undo' and applied in bulk.
+This affect the memory used for redo management and the possibility to flush it in pieces.The message you get is related
+to internal Cache Redo File management.You can disregard these messages as normal messages.When you switch logs all private strands have to be flushed to the current log before the switch is allowed to proceed.
+Solution
+These messages are not a cause for concern unless there is a significant gap in seq# between the "cannot allocate new log" message and the "advanced to log sequence" message.
+This issue is infact not a bug and is expected behavior.
+References
+Bug 5241081 - PRIVATE STRAND FLUSH NOT COMPLETE MESSAGE IN THE ALERT LOG ON EVERY LOG SWITCH
+.
+Copyright © 2006, Oracle. All rights reserved.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2042654
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IMU事务与DBWR刷新
+      DBWR在日志切换时调用重做层的回调来刷新IMU事务，确保所有私有strand已被刷新。事务使用完私有strand后解绑。重做层必须保证每个私有strand对应的所有重做都已生成在当前日志文件中，没有“残留”。这是为了防止切换到下一个日志文件（可能支持更少的私有strand）时，无法容纳残留strand的重做。DBWR可以刷新任何持有私有块并阻碍写进展的事务。Log Switch触发所有IMU事务刷新。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155257
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 病理IMU事务（Flushes Marching Out）
+      病理IMU事务条件（也称为“Flushes Marching Out”）表示重做生成器没有日志空间分配给正常（非IMU）事务，但仍有空间给当前私有strand（如果有IMU事务正在进行）。由于严格的并发要求，此时不能允许任何新的私有strand绑定，因为这将占用预期给活跃私有strand的日志空间。这种情况通常发生在日志切换周围，恢复层和DBWR必须刷新所有IMU事务。在此条件下，禁止新的私有strand绑定。可能同时存在没有可用的重做缓冲区但内存缓冲区可用的情况（半病理），此时正常事务无法工作，但IMU事务可继续，直到所有内存缓冲区耗尽。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:245473
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:372557.1 Alert Log Messages: Private Strand Flush Not Complete
+      Alert Log Messages: Private Strand Flush Not Complete
+Symptoms
+Cause
+Solution
+References
+(AuthWiz 2.5.5) Created from SR 16301756.6 with ODM
+Click here to edit in wizard.
+This document is being delivered to you via Oracle Support's
+Rapid Visibility (RaV)
+process, and therefore has not been subject to an independent technical review.
+Applies to:
+Oracle Server - Enterprise Edition - Version: 10.2.0.1 to 10.2.0.4
+This problem can occur on any platform.
+"Checked for relevance on 04-Dec-2007"
+Private strand flush not complete
+Symptoms
+"Private strand flush not complete" messages are being populated to the alert log for unknownreasons.ALERT LOG EXAMPLE:>Fri May 19 12:47:29 2006Thread 1 cannot allocate new log, sequence 18358Private strand flush not completeCurrent log# 7 seq# 18357 mem# 0: /u03/oradata/bitst/redo07.logThread 1 advanced to log sequence 18358Current log# 8 seq# 18358 mem# 0: /u03/oradata/bitst/redo08.log<<
+Cause
+The message means that we haven't completed writing all the redo information to the log when we are trying to switch. It is similar
+in nature to a "checkpoint not complete" except that is only involves the redo being written to the log. The log switch can not occur until all of the redo has been written.A "strand" is new terminology for 10g and it deals with latches for redo .Strands are a mechanism to allow multiple allocation latches for processes to write redo more efficiently in the
+redo buffer and is related to the log_parallelism parameter present in 9i.The concept of a strand is to ensure that the
+redo generation rate for an instance is optimal and that when there is some kind of redo contention then the number of strands is
+dynamically adjusted to compensate.The initial allocation for the number of strands depends on the number of CPU's and is
+started with 2 strands with one strand for active redo generation.For large scale enterprise systems the amount of redo
+generation is large and hence these strands are *made active* as and when the foregrounds encounter this redo contention (allocated
+latch related contention) when this concept of dynamic strands comes into play.There is always shared strands and a number
+of private strands .Oracle 10g has some major changes in the mechanisms for redo (and undo), which seem to be aimed at reducing
+contention.Instead of redo being recorded in real time, it can be recorded 'privately' and pumped into the redo log buffer on commit.Similary the undo can be generated as 'in memory undo' and applied in bulk.
+This affect the memory used for redo management and the possibility to flush it in pieces.The message you get is related
+to internal Cache Redo File management.You can disregard these messages as normal messages.When you switch logs all private strands have to be flushed to the current log before the switch is allowed to proceed.
+Solution
+These messages are not a cause for concern unless there is a significant gap in seq# between the "cannot allocate new log" message and the "advanced to log sequence" message.
+This issue is infact not a bug and is expected behavior.
+References
+Bug 5241081 - PRIVATE STRAND FLUSH NOT COMPLETE MESSAGE IN THE ALERT LOG ON EVERY LOG SWITCH
+.
+Copyright © 2006, Oracle. All rights reserved.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2041197
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] IMU事务的flush必要条件：日志切换时所有私有strand必须被刷新
+      新日志文件可能支持更少的私有strand，如果存在carryover，将无法保证这些strand的redo能写入。因此必须在切换前刷新。隐含假设：所有私有strand的事务会在切换期间响应flush回调。边界条件：如果某个事务长时间不响应（如挂起），日志切换可能阻塞（导致checkpoint not complete）。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155262
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Bug 7005709 LOG FILE SWITCH (PRIVATE STRAND FLUSH INCOMPLETE) WHEN _IN_MEMORY_UNDO=TRUE
+      LOG FILE SWITCH (PRIVATE STRAND FLUSH INCOMPLETE) WHEN _IN_MEMORY_UNDO=TRUE
+*** MBRAGANZ 04/28/08 11:50 am *** TAR: ---- 6808679.994 . PROBLEM: -------- Oracle 10.2.0.3.0 This is a large database for Oracle Applications plus a lot of custom code. . Last night a user noticed slowness between 9 and 10 pm. When we now run AWR and ADDM reports, we see high waits for "log file switch (private strand flush incomplete)". . This looks similar to Bug 6806770 except that we're HPUX 11.11, non-Itanium. . As per the bug, we currently have _in_memory_undo=TRUE. We had this setting set to false for a while as a workaround for another bug . (5028099), but re-enabled it after applying a patch (6733906). . $ >grep memory spfilecfap.ora *._in_memory_undo=TRUE . DIAGNOSTIC ANALYSIS: -------------------- One night a user noticed slowness between 9 and 10 pm. When we now run AWR and ADDM reports, we see high waits for "log file switch (private strand flush incomplete)". . We had _in_memory_undo=FALSE from Jan 15 until March 16, when we applied patch 6733906. Before Jan 15, we had numerous alert log messages like what's below. Since Mar 16, we've had approx. 25 more of these messages. In between Jan 15 and Mar 16 we had none of the messages. . Thread 1 cannot allocate new log, sequence 92288 Private strand flush not complete . WORKAROUND: ----------- The only workaround is to set parameter _in_memory_undo = FALSE to disable IMU . RELATED BUGS: ------------- 6806770 - still at status 11 . REPRODUCIBILITY: ---------------- . TEST CASE: ---------- . STACK TRACE: ------------ . SUPPORTING INFORMATION: ----------------------- . 24 HOUR CONTACT INFORMATION FOR P1 BUGS: ---------------------------------------- . DIAL-IN INFORMATION: -------------------- . IMPACT DATE: ------------ . *** MBRAGANZ 04/28/08 11:56 am *** (CHG: Sta->16) *** MBRAGANZ 04/28/08 11:56 am *** Upload alert log zip and RDA to bugftp: /upload/bug7005709 *** RAVARADH 06/04/08 07:12 am *** (CHG: Asg->RAVARADH) *** RAVARADH 06/04/08 07:12 am *** Pulling due to age. *** RAVARADH 06/04/08 07:16 am *** (CHG: Sta->10) *** RAVARADH 06/04/08 07:16 am *** a)Do we have system state dumps at the time of when the messages started happening I want to see what processes are waiting for and short stacks in it. b)ps outputs at the time of such messages to see if cpu consumption is high . alternatively please get customer to apply 10.2.0.4 patchset as suspected bug 5605290 is fixed in it. *** RAVARADH 08/19/08 06:40 am *** (CHG: Sta->31) *** RAVARADH 08/19/08 06:40 am *** Tar hard closed. Reopen if still an issue with required info for this customer.
+.
+Copyright © 2006, Oracle. All rights reserved.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2048046
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。

@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: Redo Stream与LGWR写入
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1549320
+
+  ── 描述 ──
+  Redo Stream是一个抽象概念，代表了Redo记录的连续、有序的流。服务器进程生成Redo记录并将其写入Redo Log Buffer。LGWR进程负责将Redo Log
+  Buffer中的Redo记录以批量的方式写入在线Redo日志文件，形成物理上的Redo Stream。LGWR的写入时机包括：1) 事务提交时（Log Force at Commit）。2) Redo
+  Log Buffer达到三分之一满时。3) 每3秒超时。4) DBWR进程写入脏块之前（Write Ahead Logging）。
+
+  ── 摘要 ──
+  Redo Stream是Redo记录的连续有序流，由服务器进程生成并写入Redo Log Buffer。LGWR进程负责将缓冲区中的Redo记录批量写入在线Redo日志文件，形成物理Redo Stream。LGWR的写入时机包括：事务提交时强制执行日志写入、Redo Log Buffer达到三分之一满时、每3秒超时触发，以及DBWR写入脏块前保证先写日志（Write Ahead Logging）。这些机制确保事务持久性和数据恢复能力。

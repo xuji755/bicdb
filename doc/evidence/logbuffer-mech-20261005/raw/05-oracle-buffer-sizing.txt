@@ -1,0 +1,42 @@
+
+============================================================
+  [问题诊断] LOG_BUFFER 大小 默认 512KB CPU 数 128KB log buffer 调优
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 2，摘要筛选通过 1，批次 1；本路已取尽
+  KnowledgeEntry：已取 31，摘要筛选通过 22，批次 1；本路已取尽
+  CaseStudy：已取 68，摘要筛选通过 1，批次 2；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ⚠️ 精确对象未入图/未命中: LOG_BUFFER
+     以下语义检索结果仅供参考；请优先补齐这些对象的 SystemView/Column 数据。
+
+  ✅ 答案要点
+     LGWR进程在从9.2.0.5升级到10g R2的scratch3上CPU消耗达11.76%，而其他同期升级数据库仅为3%左右。问题节点log_buffer默认值为2M，其余正常库为30M，即使_ksmg_granule_size设为64M，log_buffer仍为2M。参照Bug 4592994，log_buffer大小计算涉及CPU_COUNT。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Bug 6182944 LGWR IS CONSUMING HIGHER CPU ON SCRATCH3 WHICH IS RECENTLY UPGRADED TO 10G R2  (排序分: 15.0)
+     └ 摘要：LGWR进程在从9.2.0.5升级到10g R2的scratch3上CPU消耗达11.76%，而其他同期升级数据库仅为3%左右。问题节点log_buffer默认值为2M，其余正常库为30M，即使_ksmg_granule_size设为64M，log_buffer仍为2M。参照Bug 4592994，log_buffer大小计算涉及CPU_COUNT。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2049297
+
+     [KnowledgeEntry] 日志缓冲区大小计算：LOG_BUFFER默认值  (排序分: 10.0)
+     └ 摘要：LOG_BUFFER参数用于定义重做日志缓冲区的总大小，其默认值为512KB与128KB乘以CPU数量两者中的较大值，且必须为物理块大小的整数倍。此外，系统强制设置一个最小限制，即最大数据库块大小的四倍加上两个用于保护重做缓冲区的内存页。内存页大小在Sun/Solaris系统上为8192字节，在Windows NT上为4096字节。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1544689
+
+     [KnowledgeEntry] Redo日志缓冲区默认值计算：512K或128K*CPU  (排序分: 10.0)
+     └ 详情：文档提供了LOG_BUFFER默认值的具体计算方式：取512KB和128KB乘以CPU数量这两个值中的较大者。例如，在一个4 CPU的系统上，默认值为max(512K, 128K*4) = max(512K, 512K) = 512K。在一个32 CPU的系统上，默认值为max(512K, 128K*32) = max(512K, 4M) = 4M。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1541149
+
+     [KnowledgeEntry] 重做日志缓冲区（Redo Log Buffer）大小与性能  (排序分: 10.0)
+     └ 摘要：重做日志缓冲区（Redo Log Buffer）是SGA中的循环缓冲区，用于暂存重做记录，其大小由初始化参数LOG_BUFFER决定，默认值通常为512KB或CPU数×128KB。若LOG_BUFFER过小，会导致LGWR进程频繁写入重做日志文件，增加I/O开销；若过大，则浪费SGA内存。可通过监控V$SYSSTAT中的“redo log space requests”统计信息判断缓冲区是否过小，该值较高时表明日志缓冲区可能不足。在OLTP系统中，一般建议将LOG_BUFFER设置为1-3MB。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557426
+
+     [CaseStudy] RAC节点LGWR被control file sequential read阻塞引发大量gc等待案例分析  (排序分: 9.4)
+     └ 摘要：2022-11-18 23:25节点2 LGWR session 4510 hang，导致节点1/2大量gc等待和log file switch checkpoint incomplete；后续早上再次出现，chain signature control file sequential read<=log file switch checkpoint incomplete，blocking 1249 sessions；诊断排除SQL计划变化/CPU/心跳，定位检查点触发不足与业务量过大，建议log_buffer=300M、fast_start_mttr_target=600s。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:170374
+
+     [FaultModel] 恢复选项选择错误：最快打开数据库不等于最佳恢复  (排序分: 8.5)
+     └ 摘要：该条目为故障模型，现象为数据库CPU使用率飙升，伴随等待事件 'log file sync' 频繁出现。根因是应用层频繁提交小事务，导致redo日志写入压力过大，LGWR进程成为瓶颈。影响包括系统响应时间增加，整体性能退化。关键指标ID为等待事件 'log file sync'，参数名如 'commit_write' 或 'log_buffer' 可能相关。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1558424
+

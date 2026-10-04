@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: log buffer space等待事件
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:218178
+
+  ── 描述 ──
+  当前台进程需要分配log buffer空间但无可用空间时，调用kcrfws()等待。若等待原因仅为buffer满，超时1秒后重试；若等待是因为日志切换正在进行，则超时5秒。该事件表明LGWR写入速度跟
+  不上前台redo生成速度。解决：增大log buffer、使用更快磁盘、减少redo生成。隐含假设：等待时长与buffer大小和磁盘速度相关；边界条件：等待时间1秒或5秒由内部逻辑决定。
+
+  ── 摘要 ──
+  log buffer space等待事件指当前台进程需要分配log buffer空间但无可用空间时，调用kcrfws()进入等待状态。若等待原因为buffer满，超时1秒后重试；若因日志切换正在进行，则超时5秒。该事件表明LGWR写入速度跟不上前台redo生成速度。根因包括log buffer过小、磁盘写入慢或redo生成过多。解决措施可考虑增大log buffer、使用更快磁盘或减少redo生成。等待时长由内部逻辑决定，与buffer大小和磁盘速度相关。

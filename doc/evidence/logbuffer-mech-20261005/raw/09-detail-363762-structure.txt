@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed
+  名称: 2.2 Redo Log Buffer（重做日志缓冲区）
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:363762
+
+  ── 描述 ──
+  - SGA 中的循环缓冲区 - 存储描述数据库变更的 redo entries - 参数：LOGBUFFER - LGWR 将 redo log buffer 顺序写入在线重做日志 -
+  不使用粒度分配（与 Fixed SGA 相同）
+
+  ── 摘要 ──
+  重做日志缓冲区是SGA中的循环缓冲区，用于存储描述数据库变更的重做条目。其大小由参数LOGBUFFER控制。LGWR后台进程负责将重做日志缓冲区中的内容顺序写入在线重做日志文件。该缓冲区不采用粒度分配方式，与固定SGA的分配机制相同。
