@@ -17,6 +17,9 @@ version = "0.0.0"
 [[package]]
 name = "bicdb-daemon"
 version = "0.0.0"
+dependencies = [
+ "bicdb-workspace",
+]
 
 [[package]]
 name = "bicdb-graph"

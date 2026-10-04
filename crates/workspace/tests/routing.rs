@@ -12,7 +12,7 @@ use bicdb_workspace::identity::AuthenticatedSubject;
 use bicdb_workspace::registry::{
     Routed, RoutingError, WorkspaceEntry, WorkspaceRegistry, PUBLIC_WORKSPACE,
 };
-use bicdb_workspace::{RootName, UserId, WorkspaceId, WorkspaceRoot};
+use bicdb_workspace::{Quota, RootName, UserId, WorkspaceId, WorkspaceRoot};
 
 const ALICE: u64 = 1;
 const BOB: u64 = 2;
@@ -38,6 +38,7 @@ fn owned(id: u64, owner: u64, name: Option<&str>, base: &Path) -> WorkspaceEntry
         user,
         name.map(str::to_owned),
         WorkspaceRoot::new(base, RootName::for_workspace(wsid)),
+        Quota::new(1 << 30, 1 << 28, 1 << 28, 100 << 30),
     )
 }
 

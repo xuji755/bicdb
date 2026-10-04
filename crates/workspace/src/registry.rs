@@ -22,27 +22,38 @@
 
 use crate::id::{UserId, WorkspaceId};
 use crate::identity::AuthenticatedSubject;
+use crate::quota::Quota;
 use crate::root::{RootName, WorkspaceRoot};
 
-/// 工作区登记条目（`ws$` 一行的运行期投影）。
+/// 工作区登记条目（`ws$` 一行的运行期投影：
+/// `workspace_id` / 属主 / `name` / **四条配额**；`status` 与创建时间随存储侧接入）。
 #[derive(Debug, Clone)]
 pub struct WorkspaceEntry {
     id: WorkspaceId,
     owner: UserId,
     name: Option<String>,
     root: WorkspaceRoot,
+    quota: Quota,
 }
 
 impl WorkspaceEntry {
     /// 构造条目。`name` 为 `None` 表示**未命名**（存储架构 §2.11：
     /// 显示时回退到属主名；`SET NAME = NULL` 即回到跟随）。
+    /// `quota` 即 `ws$` 的四条配额（数据 / undo / temp / 资产）。
     #[must_use]
-    pub fn new(id: WorkspaceId, owner: UserId, name: Option<String>, root: WorkspaceRoot) -> Self {
+    pub fn new(
+        id: WorkspaceId,
+        owner: UserId,
+        name: Option<String>,
+        root: WorkspaceRoot,
+        quota: Quota,
+    ) -> Self {
         Self {
             id,
             owner,
             name,
             root,
+            quota,
         }
     }
 
@@ -68,6 +79,12 @@ impl WorkspaceEntry {
     #[must_use]
     pub fn root(&self) -> &WorkspaceRoot {
         &self.root
+    }
+
+    /// 四条配额（`ws$` 列）。
+    #[must_use]
+    pub fn quota(&self) -> Quota {
+        self.quota
     }
 }
 
@@ -197,7 +214,7 @@ impl WorkspaceRegistry {
             .ok_or(RoutingError::NotFound)
     }
 
-    /// 已登记条目数（含 `public` 与否不影响；装载自检用）。
+    /// 已登记条目数（不含 `public`；装载自检用）。
     #[must_use]
     pub fn owned_len(&self) -> usize {
         self.owned.len()
@@ -207,6 +224,17 @@ impl WorkspaceRegistry {
     #[must_use]
     pub fn has_public(&self) -> bool {
         self.public.is_some()
+    }
+
+    /// 遍历全部普通工作区条目（装载与启动自检用）。
+    pub fn entries(&self) -> impl Iterator<Item = &WorkspaceEntry> {
+        self.owned.iter()
+    }
+
+    /// 保留工作区的根（已登记时）。
+    #[must_use]
+    pub fn public_root(&self) -> Option<&WorkspaceRoot> {
+        self.public.as_ref()
     }
 }
 
@@ -228,6 +256,7 @@ mod tests {
                 Path::new("/srv"),
                 RootName::for_workspace(WorkspaceId::from_raw(id).unwrap()),
             ),
+            crate::quota::Quota::new(1 << 30, 1 << 28, 1 << 28, 100 << 30),
         )
     }
 
