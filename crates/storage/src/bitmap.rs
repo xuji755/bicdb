@@ -327,6 +327,44 @@ impl ExtentMap {
         &self.pages
     }
 
+    /// **由既有页装载**（打开/恢复路径）：页数与 `own_index` 基必须相符——
+    /// "位图静默管错对象"在读盘时即被检出。
+    pub fn from_pages(run_index: u8, pages: Vec<Page>) -> Result<Self, BitmapError> {
+        if pages.len() != BITMAP_PAGES_PER_RUN {
+            return Err(BitmapError::BitOutOfRange);
+        }
+        let base = u16::from(run_index) * BITMAP_PAGES_PER_RUN as u16;
+        for (i, page) in pages.iter().enumerate() {
+            if kind(page)? != BitmapKind::ExtentMap {
+                return Err(BitmapError::WrongKind);
+            }
+            verify_own_index(page, base + i as u16)?;
+        }
+        Ok(Self { pages, run_index })
+    }
+
+    /// 位图页（可变；修改后由调用方写回——写回路径统一 `seal`）。
+    pub fn pages_mut(&mut self) -> &mut [Page] {
+        &mut self.pages
+    }
+
+    /// **已分配的最高区**（数据区水位；`None` = 尚未分配）——文件增长时
+    /// 判断"位图区还能不能往下放"用。
+    #[must_use]
+    pub fn highest_allocated(&self) -> Option<ExtentNo> {
+        let base = u32::from(self.run_index) * BITS_PER_RUN as u32;
+        for (pi, page) in self.pages.iter().enumerate().rev() {
+            for bit in (0..BITS_PER_BITMAP_PAGE as u32).rev() {
+                if is_allocated(page, bit).unwrap_or(false) {
+                    return Some(ExtentNo::from_raw(
+                        base + pi as u32 * BITS_PER_BITMAP_PAGE as u32 + bit,
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// 本区管理的区数上限。
     #[must_use]
     pub fn capacity(&self) -> u32 {

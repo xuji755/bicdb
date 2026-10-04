@@ -449,6 +449,243 @@ pub const fn bitmap_pages_for(pages: u32) -> u32 {
     pages.div_ceil(BITMAP_PAGE_COVERAGE)
 }
 
+// ---------------------------------------------------------------------------
+// 段：创建、扩展与页访问（在数据文件之上；§4.2/§4.5）
+// ---------------------------------------------------------------------------
+
+/// 区映射格式版本（独立于页格式，§5.11）。
+pub const SEG_MAP_FORMAT: u8 = 1;
+
+/// 段的空间操作错误（格式错误 + 文件/分配错误）。
+#[derive(Debug)]
+pub enum SegmentSpaceError {
+    /// 段头格式错误。
+    Format(SegmentError),
+    /// 数据文件错误（含**文件满**）。
+    File(crate::datafile::DataFileError),
+    /// 底层 I/O。
+    Io(std::io::Error),
+    /// 段内位图页覆盖范围不足（多页位图随后切片）。
+    BitmapCoverage,
+    /// 段内位图操作错误（kind/own_index/位号）。
+    Bitmap(crate::bitmap::BitmapError),
+}
+
+impl std::fmt::Display for SegmentSpaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SegmentSpaceError::Format(e) => write!(f, "{e}"),
+            SegmentSpaceError::File(e) => write!(f, "{e}"),
+            SegmentSpaceError::Io(e) => write!(f, "段 I/O：{e}"),
+            SegmentSpaceError::BitmapCoverage => f.write_str("段内位图页覆盖不足（多页位图随后）"),
+            SegmentSpaceError::Bitmap(e) => write!(f, "段内位图：{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SegmentSpaceError {}
+
+impl From<SegmentError> for SegmentSpaceError {
+    fn from(e: SegmentError) -> Self {
+        SegmentSpaceError::Format(e)
+    }
+}
+
+impl From<crate::datafile::DataFileError> for SegmentSpaceError {
+    fn from(e: crate::datafile::DataFileError) -> Self {
+        SegmentSpaceError::File(e)
+    }
+}
+
+impl From<std::io::Error> for SegmentSpaceError {
+    fn from(e: std::io::Error) -> Self {
+        SegmentSpaceError::Io(e)
+    }
+}
+
+impl From<crate::bitmap::BitmapError> for SegmentSpaceError {
+    fn from(e: crate::bitmap::BitmapError) -> Self {
+        SegmentSpaceError::Bitmap(e)
+    }
+}
+
+/// 一个段：段头 + 区映射的内存镜像 + 其所在的数据文件。
+///
+/// 布局约定（每个段的**首区**）：逻辑页 0 = 段头页、逻辑页 1 = **首个段内
+/// 位图页**（空闲级别）、逻辑页 2.. 起为数据页；`HWM` / `追加位置` 从 2 起。
+/// 区按**到达顺序**占逻辑页段——合并只改区映射的存法，不改逻辑编号。
+pub struct Segment<'io, 'f> {
+    file: &'f mut crate::datafile::DataFile<'io>,
+    header: SegmentHeader,
+    page0: u32,
+    map: Vec<ExtentEntry>,
+}
+
+impl std::fmt::Debug for Segment<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Segment")
+            .field("seg_type", &self.header.seg_type)
+            .field("obj", &self.header.obj)
+            .field("page0", &self.page0)
+            .field("extents", &self.map)
+            .field("hwm", &self.header.hwm)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'io, 'f> Segment<'io, 'f> {
+    /// **创建段**：分配首区、写段头页（含首个区映射条目）与段内位图页，
+    /// 并把元数据页标 `FULL`、数据页标 `High`。
+    pub fn create(
+        file: &'f mut crate::datafile::DataFile<'io>,
+        seg_type: SegType,
+        obj: u32,
+        dataobj: u32,
+        itl_max: u8,
+        pctfree: u8,
+        table_opts: u16,
+    ) -> Result<Self, SegmentSpaceError> {
+        let extent = file.allocate_extent()?;
+        let page0 = extent.first_block();
+        let header = SegmentHeader {
+            seg_type,
+            map_format: SEG_MAP_FORMAT,
+            flags: 0,
+            dataobj,
+            obj,
+            pages_per_extent: EXTENT_BLOCKS as u8,
+            itl_max,
+            pctfree,
+            table_opts,
+            hwm: 2, // 逻辑页 0/1 = 元数据；数据页从 2 起
+            append_pos: 2,
+            first_bitmap_page: 1,
+            insert_hint: 1,
+            extent_count: 0, // append_extent 落定首区后为 1
+            bitmap_pages: 1,
+            next_map_page: 0,
+        };
+        let rdba = Rdba::from_parts(file.file_id(), page0).expect("块号在 28 位内");
+        let mut page = Page::new(
+            PageType::SegmentHeader,
+            file.workspace_ref(),
+            file.file_id(),
+            page0,
+        );
+        write_header(&mut page, &header)?;
+        let map = append_extent(&mut page, ExtentEntry::new(rdba, 1))?;
+        let header = read_header(&page)?;
+        file.write_page(page0, &mut page)?;
+
+        // 段内位图页（类型 8，kind = 空闲级别；own_index = 0）。
+        let mut bmp = Page::new(
+            PageType::Bitmap,
+            file.workspace_ref(),
+            file.file_id(),
+            page0 + 1,
+        );
+        crate::bitmap::init(&mut bmp, crate::bitmap::BitmapKind::FreeLevel, 0)?;
+        for k in 0..2u32 {
+            crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::Full)?;
+        }
+        for k in 2..EXTENT_BLOCKS {
+            crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::High)?;
+        }
+        file.write_page(page0 + 1, &mut bmp)?;
+
+        Ok(Self {
+            file,
+            header,
+            page0,
+            map,
+        })
+    }
+
+    /// **打开既有段**（段头物理块已知——来自 `seg$` / 引导页）。
+    pub fn open(
+        file: &'f mut crate::datafile::DataFile<'io>,
+        page0: u32,
+    ) -> Result<Self, SegmentSpaceError> {
+        let page = file.read_page(page0)?;
+        let header = read_header(&page)?;
+        let map = read_extents(&page)?;
+        Ok(Self {
+            file,
+            header,
+            page0,
+            map,
+        })
+    }
+
+    /// **扩展**：分配一个新区（就近合并进区映射）、持久化段头页，
+    /// 并把新区的数据页在段内位图里标 `High`。
+    pub fn extend(&mut self) -> Result<crate::bitmap::ExtentNo, SegmentSpaceError> {
+        let first_logical = self.header.extent_count as u32 * EXTENT_BLOCKS;
+        if first_logical + EXTENT_BLOCKS > BITMAP_PAGE_COVERAGE {
+            return Err(SegmentSpaceError::BitmapCoverage);
+        }
+        let extent = self.file.allocate_extent()?;
+        let rdba =
+            Rdba::from_parts(self.file.file_id(), extent.first_block()).expect("块号在 28 位内");
+        let mut page = self.file.read_page(self.page0)?;
+        let map = append_extent(&mut page, ExtentEntry::new(rdba, 1))?;
+        self.file.write_page(self.page0, &mut page)?;
+        self.header = read_header(&page)?;
+        self.map = map;
+
+        // 新区数据页 → High（仍在首个位图页覆盖内）。
+        let bmp_block = self.logical_block(1).expect("首区位图页");
+        let mut bmp = self.file.read_page(bmp_block)?;
+        for k in first_logical..first_logical + EXTENT_BLOCKS {
+            crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::High)?;
+        }
+        self.file.write_page(bmp_block, &mut bmp)?;
+        Ok(extent)
+    }
+
+    /// 段头（内存镜像）。
+    #[must_use]
+    pub fn header(&self) -> &SegmentHeader {
+        &self.header
+    }
+
+    /// 区映射（内存镜像）。
+    #[must_use]
+    pub fn extents(&self) -> &[ExtentEntry] {
+        &self.map
+    }
+
+    /// 段头页的物理块号。
+    #[must_use]
+    pub fn page0_block(&self) -> u32 {
+        self.page0
+    }
+
+    /// **逻辑页号 → 物理块**（经区映射；`None` = 该逻辑页尚未分配）。
+    #[must_use]
+    pub fn logical_block(&self, logical: u32) -> Option<u32> {
+        logical_to_rdba(&self.map, logical).map(|r| r.block_id())
+    }
+
+    /// 读一个逻辑页（两层完整性校验——**未格式化的数据页读会失败**，
+    /// 这是"未初始化页不得使用"的落点）。
+    pub fn read_page(&self, logical: u32) -> Result<Page, SegmentSpaceError> {
+        let block = self
+            .logical_block(logical)
+            .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?;
+        Ok(self.file.read_page(block)?)
+    }
+
+    /// 写一个逻辑页（seal + 定址写；不隐式 fsync）。
+    pub fn write_page(&self, logical: u32, page: &mut Page) -> Result<(), SegmentSpaceError> {
+        let block = self
+            .logical_block(logical)
+            .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?;
+        self.file.write_page(block, page)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bicdb_common::seq::Lsn;
@@ -632,5 +869,120 @@ mod tests {
         // 页初始化标志不受影响（Page::new 已置 INITIALIZED）。
         assert_eq!(page.header().unwrap().flags & flags::INITIALIZED, 1);
         let _ = Lsn::from_raw(0); // 保持 Lsn 导入被使用（页头 page_lsn 类型）
+    }
+}
+
+#[cfg(test)]
+mod space_tests {
+    use bicdb_workspace::io::MemFileIo;
+    use std::path::Path;
+
+    use super::*;
+    use crate::bitmap::{self, BitmapKind, FreeLevel};
+    use crate::datafile::DataFile;
+    use crate::page::WORKSPACE_REF_LEN;
+
+    const F: &str = "/mem/data1.dat";
+    const WS: [u8; 8] = [7u8; 8];
+
+    fn mem() -> MemFileIo {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        io
+    }
+
+    #[test]
+    fn create_segment_lays_out_header_bitmap_and_extent() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+        let seg = Segment::create(&mut file, SegType::Heap, 11, 12, 4, 10, 0x0001).unwrap();
+
+        assert_eq!(seg.page0_block(), 1, "首区首块");
+        let h = seg.header();
+        assert_eq!(h.seg_type, SegType::Heap);
+        assert_eq!((h.obj, h.dataobj), (11, 12));
+        assert_eq!(h.itl_max, 4);
+        assert_eq!(h.pctfree, 10);
+        assert_eq!(h.table_opts, 0x0001);
+        assert_eq!(h.hwm, 2);
+        assert_eq!(h.append_pos, 2);
+        assert_eq!(h.first_bitmap_page, 1);
+        assert_eq!(h.insert_hint, 1);
+        assert_eq!(h.bitmap_pages, 1);
+        assert_eq!(h.extent_count, 1);
+        assert_eq!(h.map_format, SEG_MAP_FORMAT);
+        assert_eq!(
+            seg.extents(),
+            &[ExtentEntry::new(Rdba::from_parts(3, 1).unwrap(), 1)]
+        );
+
+        // 逻辑页 0 = 段头页；逻辑页 1 = 空闲级别位图页。
+        assert_eq!(seg.logical_block(0), Some(1));
+        assert_eq!(seg.logical_block(1), Some(2));
+        assert_eq!(seg.logical_block(7), Some(8));
+        assert_eq!(seg.logical_block(8), None, "第二个区尚未分配");
+        let bmp = seg.read_page(1).unwrap();
+        assert_eq!(bitmap::kind(&bmp).unwrap(), BitmapKind::FreeLevel);
+        assert_eq!(bitmap::own_index(&bmp).unwrap(), 0);
+        assert_eq!(bitmap::free_level(&bmp, 0).unwrap(), FreeLevel::Full);
+        assert_eq!(bitmap::free_level(&bmp, 1).unwrap(), FreeLevel::Full);
+        assert_eq!(bitmap::free_level(&bmp, 2).unwrap(), FreeLevel::High);
+        assert_eq!(bitmap::free_level(&bmp, 7).unwrap(), FreeLevel::High);
+    }
+
+    #[test]
+    fn extend_merges_and_marks_levels() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+        let mut seg = Segment::create(&mut file, SegType::Heap, 1, 2, 4, 10, 0).unwrap();
+        let e = seg.extend().unwrap();
+        assert_eq!(e.first_block(), 9);
+        // 相邻 ⇒ 合并为一条（1 区 → 2 区）。
+        assert_eq!(
+            seg.extents(),
+            &[ExtentEntry::new(Rdba::from_parts(3, 1).unwrap(), 2)]
+        );
+        assert_eq!(seg.header().extent_count, 2);
+        assert_eq!(seg.logical_block(8), Some(9), "新区首页");
+        assert_eq!(seg.logical_block(15), Some(16));
+        // 新区的数据页在段内位图标 High（逻辑页 8..16）。
+        let bmp = seg.read_page(1).unwrap();
+        for k in 8..16u32 {
+            assert_eq!(bitmap::free_level(&bmp, k).unwrap(), FreeLevel::High);
+        }
+    }
+
+    #[test]
+    fn open_reloads_segment() {
+        let io = mem();
+        {
+            let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+            let mut seg = Segment::create(&mut file, SegType::Temporary, 5, 6, 2, 0, 0).unwrap();
+            seg.extend().unwrap();
+            file.sync().unwrap();
+            file.close().unwrap();
+        }
+        let mut file = DataFile::open(&io, Path::new(F)).unwrap();
+        let seg = Segment::open(&mut file, 1).unwrap();
+        assert_eq!(seg.header().seg_type, SegType::Temporary);
+        assert_eq!(seg.header().extent_count, 2);
+        assert_eq!(seg.logical_block(15), Some(16));
+    }
+
+    #[test]
+    fn formatted_page_roundtrip_through_logical_mapping() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+        let seg = Segment::create(&mut file, SegType::Heap, 1, 2, 4, 10, 0).unwrap();
+
+        // 未格式化的数据页读取会失败（未初始化页不得使用）。
+        assert!(seg.read_page(2).is_err());
+
+        // 插入路径会先"格式化"页（这里是它的替身）：新建页 + 写。
+        let mut page = Page::new(PageType::HeapTable, [0u8; WORKSPACE_REF_LEN], 3, 3);
+        seg.write_page(2, &mut page).unwrap();
+        let back = seg.read_page(2).unwrap();
+        assert_eq!(back.as_bytes(), page.as_bytes());
+        assert_eq!(back.header().unwrap().block_id, 3, "逻辑页 2 ↔ 物理块 3");
     }
 }
