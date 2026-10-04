@@ -951,6 +951,13 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         Ok(rid)
     }
 
+    /// **按 `txn_id` 查事务表槽**（一致性读的可见性判定用）：`None` =
+    /// 槽已复用（`wrap` 不符）——在 CR 里即"**必已提交且旧于一切有效快照**"。
+    pub fn lookup(&self, txn_id: TxnId) -> Result<Option<TxnSlot>, UndoChainError> {
+        let page = self.segment.read_page(0)?;
+        Ok(find_slot(&page, txn_id)?)
+    }
+
     /// **按位置读一条撤销记录**（经区映射反查逻辑页）。
     pub fn read(&self, at: RowId) -> Result<UndoRecord, UndoChainError> {
         let logical = self
@@ -1070,13 +1077,21 @@ pub fn rollback_record(
         .ok_or(RollbackError::Undo(UndoError::MalformedRecord))?;
     let (handle, block) = resolve(rdba).ok_or(RollbackError::Unresolved(rdba))?;
     let mut page = crate::pagefile::read_page_verified(io, handle, block).map_err(page_err)?;
+    apply_undo_to_page(&mut page, record)?;
+    crate::pagefile::write_page(io, handle, block, &mut page).map_err(RollbackError::Io)?;
+    Ok(())
+}
+
+/// **页级补偿动作**（无 I/O）：把一条撤销记录的补偿直接作用在给定页上——
+/// 回滚（写盘路径）与**一致性读的 CR 重建**（内存副本）共用这一处实现。
+pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), RollbackError> {
     let row_no = record.rowid.row_id();
     let index = crate::heap::slot_index(row_no)
         .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;
 
     match record.op {
         UndoOp::Insert => {
-            crate::heap::delete_row(&mut page, row_no)?;
+            crate::heap::delete_row(page, row_no)?;
         }
         UndoOp::Delete => {
             let bytes = match &record.payload {
@@ -1133,29 +1148,26 @@ pub fn rollback_record(
             };
             match old {
                 Some(bytes) => {
-                    crate::itl::restore(&mut page, u16::from(itl_slot), bytes).map_err(|e| {
+                    crate::itl::restore(page, u16::from(itl_slot), bytes).map_err(|e| {
                         RollbackError::Page(match e {
                             crate::itl::ItlError::SlotOutOfRange(_) => "ITL 槽越界",
                             _ => "ITL 字段越界",
                         })
                     })?
                 }
-                None => crate::itl::write_itl(
-                    &mut page,
-                    u16::from(itl_slot),
-                    &crate::itl::ItlEntry::FREE,
-                )
-                .map_err(|e| {
-                    RollbackError::Page(match e {
-                        crate::itl::ItlError::SlotOutOfRange(_) => "ITL 槽越界",
-                        _ => "ITL 字段越界",
-                    })
-                })?,
+                None => {
+                    crate::itl::write_itl(page, u16::from(itl_slot), &crate::itl::ItlEntry::FREE)
+                        .map_err(|e| {
+                            RollbackError::Page(match e {
+                                crate::itl::ItlError::SlotOutOfRange(_) => "ITL 槽越界",
+                                _ => "ITL 字段越界",
+                            })
+                        })?
+                }
             }
         }
         UndoOp::Update => return Err(RollbackError::UpdateNeedsLayout),
     }
-    crate::pagefile::write_page(io, handle, block, &mut page).map_err(RollbackError::Io)?;
     Ok(())
 }
 
