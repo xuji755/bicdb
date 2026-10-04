@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 变更向量 (Change Vector)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:228283
+
+  ── 描述 ──
+  A Change Vector describes changes to one Oracle block. It is used to move the block consistency
+  forward. Multiple change vectors are bundled into a redo record to constitute an atomic change,
+  moving the state of the database forward.
+
+  ── 摘要 ──
+  变更向量用于描述Oracle数据库中的一个数据块所发生的变化，其作用在于推动该块的一致性向前演进。多个变更向量会被打包成一条重做记录，构成一个原子更改，从而使数据库的整体状态向前推进。

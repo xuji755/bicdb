@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: REDO记录结构
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:192544
+
+  ── 描述 ──
+  REDO记录是REDO日志中的最小逻辑单元，每个REDO记录对应一个原子变更。REDO记录包含头部信息：Thread（线程号）、RBA（Redo Block Address，由日志文件序号、块号、字节
+  偏移组成）、LEN（记录长度）、VLD（有效性标志）等。以及SCN（系统变更号）和SUBSCN（子SCN）。每个CHANGE#代表一个变更向量，包含AFN（绝对文件号）、DBA（数据块地址）、BLKS
+  （涉及的块数）、OBJ（对象ID）、SEQ（序列号）、OP（操作码，如19.2表示Direct Loader操作）等。REDO记录的结构对于理解数据库恢复机制至关重要。
+
+  ── 摘要 ──
+  REDO记录是REDO日志中的最小逻辑单元，每个记录对应一个原子变更。其头部包含线程号、RBA（由日志文件序号、块号和字节偏移组成）、记录长度、有效性标志，以及SCN和SUBSCN。每个变更向量由CHANGE#标识，包含绝对文件号、数据块地址、涉及块数、对象ID、序列号和操作码（如19.2表示Direct Loader操作）。REDO记录的结构是理解数据库恢复机制的基础。

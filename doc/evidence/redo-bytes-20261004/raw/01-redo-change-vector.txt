@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] redo 记录 结构 变更向量 change vector 头 字段 长度
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 8，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 34，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     A Change Vector describes changes to one Oracle block. It is used to move the block consistency forward. Multiple change vectors are bundled into a redo record to constitute an atomic change, moving the state of the database forward.
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 变更向量 (Change Vector)  (排序分: 10.0)
+     └ 详情：A Change Vector describes changes to one Oracle block. It is used to move the block consistency forward. Multiple change vectors are bundled into a redo record to constitute an atomic change, moving the state of the database forward.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:228283
+
+     [KnowledgeEntry] 变更向量（Change Vector）  (排序分: 10.0)
+     └ 摘要：变更向量是Oracle数据库中描述单个块变更的核心结构，由一组变更向量构成重做记录。它有两种格式：磁盘格式和内存格式，两者信息相同并可互相转换。变更向量由头部分、长度数组（第一个长度表示长度数组总长度）和按4字节对齐的数据数组组成，对齐确保字段访问无需移动。向量头包含操作码（定义变更类型及回调）、块类、关联块的绝对文件号和相对DBA、变更前块的SCN和变更序列号，以及附加信息类型码（如BWR标记用于崩溃恢复）。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1553792
+
+     [KnowledgeEntry] REDO记录结构  (排序分: 10.0)
+     └ 摘要：REDO记录是REDO日志中的最小逻辑单元，每个记录对应一个原子变更。其头部包含线程号、RBA（由日志文件序号、块号和字节偏移组成）、记录长度、有效性标志，以及SCN和SUBSCN。每个变更向量由CHANGE#标识，包含绝对文件号、数据块地址、涉及块数、对象ID、序列号和操作码（如19.2表示Direct Loader操作）。REDO记录的结构是理解数据库恢复机制的基础。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:192544
+
+     [KnowledgeEntry] 重做记录(Redo Record)和变更向量(Change Vector)  (排序分: 9.4)
+     └ 详情：重做记录（Redo Record）包含多个变更向量（Change Vector），每个变更向量描述单个数据块的修改（如行更新、索引插入），构成完整事务日志。概念 kernel Redo Record Change Vector
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1579355
+
+     [CaseStudy] 分析一个INSERT操作的Redo Record结构  (排序分: 9.4)
+     └ 摘要：通过实验步骤分析INSERT操作的重做记录结构：1. 连接数据库并查询BONUS表；2. 执行ALTER SYSTEM SWITCH LOGFILE切换日志；3. 向BONUS表插入一行；4. 在ENAME列上创建索引；5. 再次插入一行；6. 提交；7. 删除一行并提交；8. 删除所有行并回滚；9. 再次切换日志并转储上一个日志文件；10. 在转储文件中找到第一个INSERT的Redo Record，分析其Change Vector数量。结论：一个INSERT操作可能涉及对多个数据块的修改（如表段头、数据块、索引块），因此一个Redo Record可能包含多个Change Vector。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1559026
+
+     [FaultModel] 变更向量应用错误导致重做记录失效  (排序分: 9.4)
+     └ 摘要：Oracle在重做应用过程中，应用变更向量（change vector）时发生错误，如块版本不匹配、数据块损坏或操作码无效。该重做记录被标记为无效，后续不再返回，可能导致数据不一致或恢复中断。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324592
+
