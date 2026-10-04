@@ -18,9 +18,10 @@
 //! 跨页（首片带"多片头"标志、尾片带"多片尾"，`prev_undo` 恒指首片）。
 
 use bicdb_common::seq::CommitSeq;
+use bicdb_workspace::io::{FileHandle, FileIo};
 
 use crate::page::{Page, PageType, ITL_ENTRY_LEN};
-use crate::rowid::RowId;
+use crate::rowid::{Rdba, RowId};
 use crate::segment::{
     read_header, write_header, SegType, Segment, SegmentSpaceError, BITMAP_PAGE_COVERAGE,
     SEG_EXTENSION_OFFSET,
@@ -497,8 +498,16 @@ pub enum UndoPayload {
     },
     /// 转发指针更新：旧的转发目标。
     Forward(RowId),
-    /// ITL 覆盖：被覆盖的旧 ITL 内容（`None` = 原为空闲）。
-    ItlOverwrite(Option<[u8; ITL_ENTRY_LEN]>),
+    /// ITL 覆盖：**被覆盖的 ITL 槽号** + 旧内容（`None` = 原为空闲）。
+    ///
+    /// 槽号是回滚的落点（§4.6.2 的"ITL 覆盖"是**块级**动作——不针对某行，
+    /// 记录里的 `rowid` 只借它的 file/block 定位块）。
+    ItlOverwrite {
+        /// 被覆盖的 ITL 槽号。
+        itl_slot: u8,
+        /// 旧内容（`None` = 原为空闲）。
+        old: Option<[u8; ITL_ENTRY_LEN]>,
+    },
 }
 
 /// 一条撤销记录。
@@ -540,10 +549,13 @@ impl UndoRecord {
                 }
             }
             UndoPayload::Forward(target) => out.extend_from_slice(&target.to_bytes()),
-            UndoPayload::ItlOverwrite(old) => match old {
-                Some(entry) => out.extend_from_slice(entry),
-                None => out.extend_from_slice(&[0u8; ITL_ENTRY_LEN]), // 全零 = 原为空闲
-            },
+            UndoPayload::ItlOverwrite { itl_slot, old } => {
+                out.push(*itl_slot);
+                match old {
+                    Some(entry) => out.extend_from_slice(entry),
+                    None => out.extend_from_slice(&[0u8; ITL_ENTRY_LEN]), // 全零 = 原为空闲
+                }
+            }
         }
         out
     }
@@ -608,11 +620,15 @@ impl UndoRecord {
                 UndoPayload::Forward(RowId::from_bytes(body.try_into().expect("6 字节")))
             }
             UndoOp::ItlOverwrite => {
-                if body.len() != ITL_ENTRY_LEN {
+                if body.len() != 1 + ITL_ENTRY_LEN {
                     return Err(UndoError::MalformedRecord);
                 }
-                let entry: [u8; ITL_ENTRY_LEN] = body.try_into().expect("24 字节");
-                UndoPayload::ItlOverwrite((entry != [0u8; ITL_ENTRY_LEN]).then_some(entry))
+                let itl_slot = body[0];
+                let entry: [u8; ITL_ENTRY_LEN] = body[1..].try_into().expect("24 字节");
+                UndoPayload::ItlOverwrite {
+                    itl_slot,
+                    old: (entry != [0u8; ITL_ENTRY_LEN]).then_some(entry),
+                }
             }
         };
         Ok(Self {
@@ -946,6 +962,260 @@ impl<'io, 'f> UndoChain<'io, 'f> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 回滚：撤销记录的补偿动作与链回放（§4.6.2 的"撤销动作"列）
+// ---------------------------------------------------------------------------
+
+/// 数据页定位器：`rdba` →（已打开的页文件句柄，块号）。
+pub type PageResolver<'a> = dyn FnMut(Rdba) -> Option<(FileHandle, u32)> + 'a;
+
+/// 回滚错误（含 I/O 与页级错误；与格式错误 [`UndoError`] 分开）。
+#[derive(Debug)]
+pub enum RollbackError {
+    /// 底层 I/O。
+    Io(std::io::Error),
+    /// 目标页损坏/越界。
+    Page(&'static str),
+    /// 定位器给不出该块。
+    Unresolved(Rdba),
+    /// 撤销记录格式错误。
+    Undo(UndoError),
+    /// 数据页操作错误（行不存在等）。
+    Heap(crate::heap::HeapError),
+    /// **槽已被复用**（"删除"的原位恢复落不了笔）——单写者语义下不会发生；
+    /// 并发写者下由"未提交删除的槽不得复用"规则兜住（随后切片钉住）。
+    SlotReused {
+        /// 目标行。
+        rowid: RowId,
+    },
+    /// 目标区域已被占用（defrag 之后原位恢复失效）。
+    RegionOccupied {
+        /// 目标行。
+        rowid: RowId,
+    },
+    /// **更新类撤销需要行布局（定长区宽度）**——由行/更新切片接入。
+    UpdateNeedsLayout,
+}
+
+impl std::fmt::Display for RollbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RollbackError::Io(e) => write!(f, "回滚 I/O：{e}"),
+            RollbackError::Page(s) => write!(f, "回滚页错误：{s}"),
+            RollbackError::Unresolved(r) => {
+                write!(
+                    f,
+                    "回滚块无法定位（文件 {} 块 {}）",
+                    r.file_id(),
+                    r.block_id()
+                )
+            }
+            RollbackError::Undo(e) => write!(f, "{e}"),
+            RollbackError::Heap(e) => write!(f, "回滚行操作：{e}"),
+            RollbackError::SlotReused { rowid } => {
+                write!(f, "回滚目标行 {rowid} 的槽已被复用")
+            }
+            RollbackError::RegionOccupied { rowid } => {
+                write!(f, "回滚目标行 {rowid} 的区域已被占用（defrag？）")
+            }
+            RollbackError::UpdateNeedsLayout => {
+                f.write_str("更新类撤销需要行布局（定长区宽度）——行/更新切片接入")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RollbackError {}
+
+impl From<std::io::Error> for RollbackError {
+    fn from(e: std::io::Error) -> Self {
+        RollbackError::Io(e)
+    }
+}
+
+impl From<UndoError> for RollbackError {
+    fn from(e: UndoError) -> Self {
+        RollbackError::Undo(e)
+    }
+}
+
+impl From<crate::heap::HeapError> for RollbackError {
+    fn from(e: crate::heap::HeapError) -> Self {
+        RollbackError::Heap(e)
+    }
+}
+
+fn page_err(e: crate::pagefile::PageFileError) -> RollbackError {
+    match e {
+        crate::pagefile::PageFileError::Io(e) => RollbackError::Io(e),
+        crate::pagefile::PageFileError::Damaged { .. } => RollbackError::Page("页损坏"),
+    }
+}
+
+/// **回滚一条撤销记录**：把它的补偿动作应用到 `record.rowid` 指向的数据页。
+///
+/// | `op` | 补偿动作 |
+/// | --- | --- |
+/// | 插入 | 删除该行（槽位置空闲） |
+/// | 删除 | 整行旧值**原位**写回原槽（槽必须仍空闲、区域未被 defrag 占用） |
+/// | 转发指针更新 | 恢复旧目标（槽回 `Forwarding`） |
+/// | ITL 覆盖 | 还原被覆盖的 ITL（或恢复为空闲）——**块级**动作 |
+/// | 更新 | **需要行布局**——由行/更新切片接入（本切片明确拒绝） |
+pub fn rollback_record(
+    io: &dyn FileIo,
+    record: &UndoRecord,
+    resolve: &mut PageResolver<'_>,
+) -> Result<(), RollbackError> {
+    let rdba = Rdba::from_parts(record.rowid.file_id(), record.rowid.block_id())
+        .ok_or(RollbackError::Undo(UndoError::MalformedRecord))?;
+    let (handle, block) = resolve(rdba).ok_or(RollbackError::Unresolved(rdba))?;
+    let mut page = crate::pagefile::read_page_verified(io, handle, block).map_err(page_err)?;
+    let row_no = record.rowid.row_id();
+    let index = crate::heap::slot_index(row_no)
+        .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;
+
+    match record.op {
+        UndoOp::Insert => {
+            crate::heap::delete_row(&mut page, row_no)?;
+        }
+        UndoOp::Delete => {
+            let bytes = match &record.payload {
+                UndoPayload::FullRow(bytes) if !bytes.is_empty() => bytes,
+                _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
+            };
+            let entry = page
+                .slot(index)
+                .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;
+            if entry.status() != crate::page::SlotStatus::Free {
+                return Err(RollbackError::SlotReused {
+                    rowid: record.rowid,
+                });
+            }
+            let offset = entry.offset() as usize;
+            if offset + bytes.len() > crate::page::PAGE_SIZE {
+                return Err(RollbackError::Undo(UndoError::MalformedRecord));
+            }
+            if offset < page.free_end() {
+                // 行区只向下生长；原位恢复要求该区域仍在空闲侧（defrag 会破坏）。
+                return Err(RollbackError::RegionOccupied {
+                    rowid: record.rowid,
+                });
+            }
+            page.as_bytes_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+            let restored =
+                crate::page::SlotEntry::new(offset as u16, crate::page::SlotStatus::Normal)
+                    .ok_or(RollbackError::Undo(UndoError::MalformedRecord))?;
+            page.set_slot(index, restored);
+        }
+        UndoOp::Forward => {
+            let target = match &record.payload {
+                UndoPayload::Forward(t) => *t,
+                _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
+            };
+            let entry = page
+                .slot(index)
+                .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;
+            let offset = entry.offset() as usize;
+            if offset + crate::rowid::ROWID_LEN > crate::page::PAGE_SIZE {
+                return Err(RollbackError::Undo(UndoError::MalformedRecord));
+            }
+            page.as_bytes_mut()[offset..offset + crate::rowid::ROWID_LEN]
+                .copy_from_slice(&target.to_bytes());
+            let restored =
+                crate::page::SlotEntry::new(offset as u16, crate::page::SlotStatus::Forwarding)
+                    .ok_or(RollbackError::Undo(UndoError::MalformedRecord))?;
+            page.set_slot(index, restored);
+        }
+        UndoOp::ItlOverwrite => {
+            let (itl_slot, old) = match &record.payload {
+                UndoPayload::ItlOverwrite { itl_slot, old } => (*itl_slot, old),
+                _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
+            };
+            match old {
+                Some(bytes) => {
+                    crate::itl::restore(&mut page, u16::from(itl_slot), bytes).map_err(|e| {
+                        RollbackError::Page(match e {
+                            crate::itl::ItlError::SlotOutOfRange(_) => "ITL 槽越界",
+                            _ => "ITL 字段越界",
+                        })
+                    })?
+                }
+                None => crate::itl::write_itl(
+                    &mut page,
+                    u16::from(itl_slot),
+                    &crate::itl::ItlEntry::FREE,
+                )
+                .map_err(|e| {
+                    RollbackError::Page(match e {
+                        crate::itl::ItlError::SlotOutOfRange(_) => "ITL 槽越界",
+                        _ => "ITL 字段越界",
+                    })
+                })?,
+            }
+        }
+        UndoOp::Update => return Err(RollbackError::UpdateNeedsLayout),
+    }
+    crate::pagefile::write_page(io, handle, block, &mut page).map_err(RollbackError::Io)?;
+    Ok(())
+}
+
+/// **沿链回滚**：从 `head` 起沿 `prev_undo` 走到底，逐条执行补偿动作。
+///
+/// 返回回放的记录数。
+pub fn rollback_chain(
+    io: &dyn FileIo,
+    chain: &UndoChain<'_, '_>,
+    head: Option<RowId>,
+    resolve: &mut PageResolver<'_>,
+) -> Result<u64, RollbackError> {
+    let mut at = head;
+    let mut count = 0u64;
+    while let Some(pos) = at {
+        let record = chain.read(pos).map_err(|e| {
+            RollbackError::Page(match e {
+                UndoChainError::Undo(e) => {
+                    let _ = e;
+                    "撤销记录读取失败"
+                }
+                _ => "撤销记录读取失败",
+            })
+        })?;
+        rollback_record(io, &record, resolve)?;
+        at = record.prev;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// **回滚一个事务**：取事务表槽的链头 → 沿链回放 → 槽置空闲（`wrap + 1`）。
+pub fn rollback_transaction(
+    io: &dyn FileIo,
+    chain: &UndoChain<'_, '_>,
+    slot_index: u16,
+    resolve: &mut PageResolver<'_>,
+) -> Result<u64, RollbackError> {
+    let page = chain
+        .segment()
+        .read_page(0)
+        .map_err(|_| RollbackError::Page("undo 段头页不可读"))?;
+    let head = read_slot(&page, slot_index)
+        .map_err(RollbackError::Undo)?
+        .undo_current;
+    let count = rollback_chain(io, chain, head, resolve)?;
+
+    // 事务表槽收尾：置空闲（释放时推进 wrap）。
+    let mut page = chain
+        .segment()
+        .read_page(0)
+        .map_err(|_| RollbackError::Page("undo 段头页不可读"))?;
+    free_slot(&mut page, slot_index).map_err(RollbackError::Undo)?;
+    chain
+        .segment()
+        .write_page(0, &mut page)
+        .map_err(|_| RollbackError::Page("undo 段头页不可写"))?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1104,11 +1374,17 @@ mod tests {
             op: UndoOp::ItlOverwrite,
             flags: 0,
             rowid: rid(9, 3),
-            payload: UndoPayload::ItlOverwrite(Some([7u8; ITL_ENTRY_LEN])),
+            payload: UndoPayload::ItlOverwrite {
+                itl_slot: 3,
+                old: Some([7u8; ITL_ENTRY_LEN]),
+            },
         };
         assert_eq!(UndoRecord::decode(&itl.encode()).unwrap(), itl);
         let itl_free = UndoRecord {
-            payload: UndoPayload::ItlOverwrite(None),
+            payload: UndoPayload::ItlOverwrite {
+                itl_slot: 0,
+                old: None,
+            },
             ..itl.clone()
         };
         assert_eq!(UndoRecord::decode(&itl_free.encode()).unwrap(), itl_free);
@@ -1378,5 +1654,349 @@ mod chain_tests {
             "长度 = 上一条偏移 − 本条偏移"
         );
         assert_eq!(get_record(&page, 3), Err(UndoError::SlotOutOfRange(3)));
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use std::path::Path;
+
+    use bicdb_workspace::io::MemFileIo;
+
+    use super::*;
+    use crate::datafile::DataFile;
+    use crate::heap::{self, InsertPolicy};
+    use crate::page::{Page, PageType, SlotEntry, SlotStatus, WORKSPACE_REF_LEN};
+    use crate::pagefile;
+    use crate::row::assemble_row;
+
+    const UNDO_F: &str = "/mem/undo1.dat";
+    const DATA_F: &str = "/mem/data.dat";
+    const WS: [u8; 8] = [3u8; 8];
+
+    fn mem() -> MemFileIo {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        io
+    }
+
+    fn row_bytes(itl_slot: u8, payload: &[u8]) -> Vec<u8> {
+        assemble_row(0, itl_slot, &[false], &[], &[payload])
+    }
+
+    /// 建数据页文件（堆表页，file 3 block 0），返回句柄。
+    fn data_file(io: &dyn FileIo) -> FileHandle {
+        let h = pagefile::create(io, Path::new(DATA_F), 1).unwrap();
+        let mut page = Page::new(PageType::HeapTable, [0u8; WORKSPACE_REF_LEN], 3, 0);
+        pagefile::write_page(io, h, 0, &mut page).unwrap();
+        h
+    }
+
+    fn load(io: &dyn FileIo, h: FileHandle) -> Page {
+        pagefile::read_page_verified(io, h, 0).unwrap()
+    }
+
+    fn store(io: &dyn FileIo, h: FileHandle, page: &mut Page) {
+        pagefile::write_page(io, h, 0, page).unwrap();
+    }
+
+    fn rec(op: UndoOp, payload: UndoPayload, row_no: u16) -> UndoRecord {
+        UndoRecord {
+            prev: None,
+            op,
+            flags: 0,
+            rowid: RowId::from_parts(3, 0, row_no).unwrap(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn insert_and_delete_rollback_are_inverse() {
+        let io = mem();
+        let h = data_file(&io);
+        let bytes = row_bytes(1, b"alpha");
+
+        // 插入一行 → Insert 的补偿 = 删除它。
+        {
+            let mut page = load(&io, h);
+            let n = heap::insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+            assert_eq!(n, 1);
+            store(&io, h, &mut page);
+        }
+        let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
+        rollback_record(
+            &io,
+            &rec(UndoOp::Insert, UndoPayload::None, 1),
+            &mut resolve,
+        )
+        .unwrap();
+        let page = load(&io, h);
+        assert_eq!(
+            page.slot(0).unwrap().status(),
+            SlotStatus::Free,
+            "插入已被撤销"
+        );
+        assert_eq!(heap::row(&page, 1), None);
+
+        // 删除一行 → Delete 的补偿 = 整行旧值原位写回。
+        {
+            let mut page = load(&io, h);
+            let n = heap::insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+            heap::delete_row(&mut page, n).unwrap();
+            store(&io, h, &mut page);
+        }
+        let restore = rec(UndoOp::Delete, UndoPayload::FullRow(bytes.clone()), 1);
+        rollback_record(&io, &restore, &mut resolve).unwrap();
+        let page = load(&io, h);
+        assert_eq!(page.slot(0).unwrap().status(), SlotStatus::Normal);
+        assert_eq!(heap::row(&page, 1), Some(&bytes[..]), "旧值原位恢复");
+    }
+
+    #[test]
+    fn delete_rollback_refuses_when_slot_reused() {
+        let io = mem();
+        let h = data_file(&io);
+        {
+            let mut page = load(&io, h);
+            heap::insert_row(&mut page, &row_bytes(1, b"old"), &InsertPolicy::in_place(0)).unwrap();
+            store(&io, h, &mut page);
+        }
+        // 槽已被"别人"占用（状态 Normal）——原位恢复必须拒绝。
+        let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
+        let err = rollback_record(
+            &io,
+            &rec(
+                UndoOp::Delete,
+                UndoPayload::FullRow(row_bytes(1, b"old")),
+                1,
+            ),
+            &mut resolve,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RollbackError::SlotReused { .. }), "{err}");
+    }
+
+    #[test]
+    fn forward_and_itl_overwrite_rollback() {
+        let io = mem();
+        let h = data_file(&io);
+        let target = RowId::from_parts(3, 0, 7).unwrap();
+
+        // 转发指针：槽里放 6B 目标 + Forwarding 状态。
+        {
+            let mut page = load(&io, h);
+            let offset = page.free_end() - 6;
+            page.as_bytes_mut()[offset..offset + 6].copy_from_slice(&target.to_bytes());
+            page.set_free_end(offset);
+            page.set_slot_count(1).unwrap();
+            page.set_slot(
+                0,
+                SlotEntry::new(offset as u16, SlotStatus::Forwarding).unwrap(),
+            );
+            store(&io, h, &mut page);
+        }
+        // 更新路径把指针改掉，回滚恢复旧目标。
+        {
+            let mut page = load(&io, h);
+            let entry = page.slot(0).unwrap();
+            let at = entry.offset() as usize;
+            page.as_bytes_mut()[at..at + 6]
+                .copy_from_slice(&RowId::from_parts(4, 1, 2).unwrap().to_bytes());
+            store(&io, h, &mut page);
+        }
+        let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
+        rollback_record(
+            &io,
+            &rec(UndoOp::Forward, UndoPayload::Forward(target), 1),
+            &mut resolve,
+        )
+        .unwrap();
+        let page = load(&io, h);
+        assert_eq!(page.slot(0).unwrap().status(), SlotStatus::Forwarding);
+        let at = page.slot(0).unwrap().offset() as usize;
+        assert_eq!(&page.as_bytes()[at..at + 6], &target.to_bytes());
+
+        // ITL 覆盖：被覆盖的旧内容原样还原（含"原为空闲"）。
+        {
+            let mut page = load(&io, h);
+            let old = crate::itl::read_itl(&page, 0).unwrap();
+            let mut prev = old;
+            prev.state = crate::itl::ItlState::Committed;
+            prev.commit_seq = Some(CommitSeq::from_raw(11).unwrap());
+            crate::itl::write_itl(&mut page, 0, &prev).unwrap();
+            // 新事务覆盖（活动）→ 回滚恢复成 prev。
+            crate::itl::write_itl(
+                &mut page,
+                0,
+                &crate::itl::ItlEntry {
+                    txn_id: crate::undo::TxnId::from_parts(0, 1, 0),
+                    undo_ptr: None,
+                    commit_seq: None,
+                    lock_cnt: 0,
+                    state: crate::itl::ItlState::Active,
+                },
+            )
+            .unwrap();
+            store(&io, h, &mut page);
+            let mut snap = [0u8; crate::page::ITL_ENTRY_LEN];
+            prev.encode(&mut snap);
+            rollback_record(
+                &io,
+                &rec(
+                    UndoOp::ItlOverwrite,
+                    UndoPayload::ItlOverwrite {
+                        itl_slot: 0,
+                        old: Some(snap),
+                    },
+                    1,
+                ),
+                &mut resolve,
+            )
+            .unwrap();
+            let page = load(&io, h);
+            assert_eq!(crate::itl::read_itl(&page, 0).unwrap(), prev, "旧 ITL 还原");
+        }
+        // "原为空闲"：回滚把槽恢复成空闲。
+        {
+            let mut page = load(&io, h);
+            crate::itl::write_itl(
+                &mut page,
+                0,
+                &crate::itl::ItlEntry {
+                    txn_id: crate::undo::TxnId::from_parts(0, 2, 0),
+                    undo_ptr: None,
+                    commit_seq: None,
+                    lock_cnt: 0,
+                    state: crate::itl::ItlState::Active,
+                },
+            )
+            .unwrap();
+            store(&io, h, &mut page);
+            rollback_record(
+                &io,
+                &rec(
+                    UndoOp::ItlOverwrite,
+                    UndoPayload::ItlOverwrite {
+                        itl_slot: 0,
+                        old: None,
+                    },
+                    1,
+                ),
+                &mut resolve,
+            )
+            .unwrap();
+            let page = load(&io, h);
+            assert_eq!(
+                crate::itl::read_itl(&page, 0).unwrap(),
+                crate::itl::ItlEntry::FREE
+            );
+        }
+    }
+
+    #[test]
+    fn update_rollback_is_explicitly_deferred() {
+        let io = mem();
+        let h = data_file(&io);
+        let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
+        let r = rec(
+            UndoOp::Update,
+            UndoPayload::Update {
+                old_itl_slot: 0,
+                columns: vec![(1, b"old".to_vec())],
+            },
+            1,
+        );
+        assert!(matches!(
+            rollback_record(&io, &r, &mut resolve),
+            Err(RollbackError::UpdateNeedsLayout)
+        ));
+    }
+
+    #[test]
+    fn rollback_transaction_replays_the_chain_and_frees_slot() {
+        let io = mem();
+        let h = data_file(&io);
+        let bytes = row_bytes(1, b"beta");
+
+        // undo 段 + 链 + 事务槽。
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let txn = chain.allocate_slot().unwrap();
+        assert_eq!(txn, 0);
+
+        // 事务动作：插入一行（记 Insert），再删除它（记 Delete，含旧值）。
+        {
+            let mut page = load(&io, h);
+            let n = heap::insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+            store(&io, h, &mut page);
+            let rid = RowId::from_parts(3, 0, n).unwrap();
+            chain
+                .append(txn, UndoOp::Insert, 0, rid, UndoPayload::None)
+                .unwrap();
+            let mut page = load(&io, h);
+            heap::delete_row(&mut page, n).unwrap();
+            store(&io, h, &mut page);
+            chain
+                .append(
+                    txn,
+                    UndoOp::Delete,
+                    0,
+                    rid,
+                    UndoPayload::FullRow(bytes.clone()),
+                )
+                .unwrap();
+        }
+
+        // 全事务回滚：链上两条逆序补偿；净效果 = 初始状态（无此行）。
+        let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
+        let n = rollback_transaction(&io, &chain, txn, &mut resolve).unwrap();
+        assert_eq!(n, 2, "回放两条");
+        let page = load(&io, h);
+        assert_eq!(
+            page.slot(0).unwrap().status(),
+            SlotStatus::Free,
+            "净效果 = 无此行"
+        );
+        assert_eq!(page.slot_count(), 1, "槽目录仍只 1 项");
+
+        // 事务表槽已释放：wrap + 1、状态 Free。
+        let header = chain.segment().read_page(0).unwrap();
+        let slot = read_slot(&header, txn).unwrap();
+        assert_eq!(slot.state, TxnState::Free);
+        assert_eq!(slot.wrap, 1);
+        assert_eq!(slot.undo_current, None);
+
+        // 单条回放的中途状态也可验证：只回放链头（Delete），行应恢复。
+        // （重新构造一遍，避免与上面的净效果混淆。）
+        let mut file = DataFile::create(&io, Path::new("/mem/undo2.dat"), 1, 1, WS, 64).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain2 = UndoChain::open(segment);
+        let txn2 = chain2.allocate_slot().unwrap();
+        let mut page = load(&io, h);
+        let n = heap::insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+        store(&io, h, &mut page);
+        let rid = RowId::from_parts(3, 0, n).unwrap();
+        chain2
+            .append(txn2, UndoOp::Insert, 0, rid, UndoPayload::None)
+            .unwrap();
+        let mut page = load(&io, h);
+        heap::delete_row(&mut page, n).unwrap();
+        store(&io, h, &mut page);
+        let head = chain2
+            .append(
+                txn2,
+                UndoOp::Delete,
+                0,
+                rid,
+                UndoPayload::FullRow(bytes.clone()),
+            )
+            .unwrap();
+        // 只回放链头这一条（rollback_chain 会沿链走到底，此处手动取单条）。
+        let head_rec = chain2.read(head).unwrap();
+        assert_eq!(head_rec.op, UndoOp::Delete);
+        rollback_record(&io, &head_rec, &mut resolve).unwrap();
+        let page = load(&io, h);
+        assert_eq!(heap::row(&page, n), Some(&bytes[..]), "删除被撤销、行恢复");
     }
 }

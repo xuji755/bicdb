@@ -273,7 +273,9 @@ pub fn delete_row(page: &mut Page, row_no: u16) -> Result<(), HeapError> {
     if slot.status() == SlotStatus::Free {
         return Err(HeapError::NoSuchRow);
     }
-    let entry = SlotEntry::new(0, SlotStatus::Free).ok_or(HeapError::BadRow)?;
+    // **保留下标偏移**（只翻状态位）：行字节留在原处——回滚"删除"这条 undo
+    // 要按原位整行写回（§4.6.2）；偏移归零会让原位恢复无从落笔。
+    let entry = SlotEntry::new(slot.offset(), SlotStatus::Free).ok_or(HeapError::BadRow)?;
     page.set_slot(index, entry);
     Ok(())
 }
