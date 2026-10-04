@@ -4,7 +4,9 @@
 //! 记录头（20 字节，固定；**不带 CRC**——§14 第 46 项）
 //!   tot_len   4B   整条记录总长（含本头，**不含分片帧**）
 //!   lsn       6B   本条记录的 LSN（= 首片位置；同时是"应用后该页的 page_lsn"）
-//!   txn_id    6B   产生者（0 = 系统操作）
+//!   txn_id    6B   产生者——**三段式事务标识**（§4.6.3）。全零是
+//!                  **第一个事务的合法身份**（usn 0/slot 0/wrap 0）；
+//!                  "系统记录"由 `op` 识别（切换/检查点），不按 0 判
 //!   op        1B   语义标签（**不参与 apply**；见 [`RecordOp`]）
 //!   flags     1B   bit0 = 存在块段，bit1 = 存在主段（**全 0 = 空载荷记录**，
 //!                  如"回滚完成"——信息全在头部）
@@ -102,7 +104,7 @@ pub struct BlockRef {
 pub struct RedoRecord {
     /// 本条记录的 LSN（= 首片位置）。
     pub lsn: Lsn,
-    /// 产生者事务（0 = 系统操作）。
+    /// 产生者事务（三段式标识；全零 = 第一个事务，**不是**保留值）。
     pub txn_id: u64,
     /// 语义标签（原样保留未知取值）。
     pub op: u8,
@@ -388,6 +390,38 @@ impl RedoRecord {
     }
 }
 
+/// **两页字节的差异 → 变更集**（相邻不同字节**并成一段**；无差异 = 空）。
+///
+/// 只在**同一内存状态**的两份快照之间比对（写入前 vs. 补偿后）——用于
+/// 撤销阶段为"回滚写回"生成 redo（§4.6.6 ③：每次逆操作也是一次页修改）。
+/// `page_lsn` / `mod_seq` 由 apply 路径统一推进，**不换算作变更**
+/// （记录不应把它们当作变更目标，§11.5.4）。
+#[must_use]
+pub fn page_diff(before: &[u8; bicdb_storage::page::PAGE_SIZE], after: &[u8]) -> Vec<Change> {
+    let mut changes = Vec::new();
+    let mut start: Option<usize> = None;
+    let n = before.len().min(after.len());
+    for i in 0..n {
+        if before[i] != after[i] {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            changes.push(Change {
+                offset: s as u16,
+                after: after[s..i].to_vec(),
+            });
+        }
+    }
+    if let Some(s) = start {
+        changes.push(Change {
+            offset: s as u16,
+            after: after[s..n].to_vec(),
+        });
+    }
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +573,37 @@ mod tests {
             }],
         );
         assert_eq!(rec.encoded_len(), 16_417, "§11.5.2 的定量");
+    }
+
+    #[test]
+    fn page_diff_merges_adjacent_runs() {
+        let before = [0u8; bicdb_storage::page::PAGE_SIZE];
+        assert!(page_diff(&before, &before).is_empty(), "无差异 = 空");
+
+        let mut after = before;
+        after[10] = 1;
+        after[11] = 2;
+        after[12] = 3;
+        after[100] = 9;
+        let changes = page_diff(&before, &after);
+        assert_eq!(changes.len(), 2, "相邻字节并成一段");
+        assert_eq!(changes[0].offset, 10);
+        assert_eq!(changes[0].after, vec![1, 2, 3]);
+        assert_eq!(changes[1].offset, 100);
+        assert_eq!(changes[1].after, vec![9]);
+
+        // 往返：把 changes 写回 before 应还原 after。
+        let mut restored = before;
+        for ch in &changes {
+            let at = usize::from(ch.offset);
+            restored[at..at + ch.after.len()].copy_from_slice(&ch.after);
+        }
+        assert_eq!(restored, after);
+
+        // 整页改写：一段 16 KiB。
+        let full = [0xFFu8; bicdb_storage::page::PAGE_SIZE];
+        let changes = page_diff(&before, &full);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].after.len(), bicdb_storage::page::PAGE_SIZE);
     }
 }

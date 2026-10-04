@@ -148,10 +148,12 @@ pub fn analyze_from(
                 continue; // 起点之前的记录：不判定
             }
             report.records_scanned += 1;
-            if record.txn_id == 0 {
-                continue; // 系统记录（切换 / 检查点）：不参与
-            }
             match RecordOp::from_u8(record.op) {
+                // **系统记录由 `op` 识别，不由 `txn_id` 识别**——第一个事务的
+                // `txn_id` =（usn 0, slot 0, wrap 0）= 全零（§4.6.3 的合法身份，
+                // 与"空槽"哨兵相撞是知名陷阱），若按 `txn_id == 0` 跳过，
+                // 输家会**漏判**、其回滚会被跳过。
+                Some(RecordOp::LogSwitch | RecordOp::Checkpoint) => {}
                 Some(RecordOp::Commit) => {
                     let commit_seq = record
                         .commit_seq()
@@ -302,6 +304,36 @@ mod tests {
         assert_eq!(report.highest_commit_seq, 0, "提交记录在起点之前");
         // 起点起：回滚完成 + 页修改 + 检查点 = 3 条。
         assert_eq!(report.records_scanned, 3);
+    }
+
+    #[test]
+    fn zero_txn_id_is_a_real_transaction_not_a_system_record() {
+        let io = mem();
+        let spec = GroupSpec::new(4, 1, 64).unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(4, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec, lsn(0)).unwrap();
+        // 第一个事务：txn_id =（usn 0, slot 0, wrap 0）= 全零。
+        w.append(|l| mod_rec(l, 0, rdba(1, 0), 0x01)).unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+        w.close().unwrap();
+
+        let cf = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let groups = online_groups(&io, &cf, Path::new(WAL), spec).unwrap();
+        let report = analyze_from(&io, &groups, lsn(0)).unwrap();
+        assert_eq!(
+            report.txns.get(&0),
+            Some(&TxnOutcome::Loser),
+            "全零 txn_id 是第一个事务——按 `op` 判系统记录，不按 0 判"
+        );
+        assert_eq!(report.losers(), vec![0]);
     }
 
     #[test]

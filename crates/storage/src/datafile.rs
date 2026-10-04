@@ -288,6 +288,12 @@ impl<'a> DataFile<'a> {
         })
     }
 
+    /// 文件句柄（构建 `rdba → (句柄, 块号)` 解析器用）。
+    #[must_use]
+    pub fn handle(&self) -> FileHandle {
+        self.handle
+    }
+
     /// 文件号。
     #[must_use]
     pub fn file_id(&self) -> u16 {

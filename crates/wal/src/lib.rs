@@ -4,7 +4,7 @@
 //!
 //! - 设计依据：§8 崩溃恢复契约（存储架构 §11.1–§11.5，均已定案）
 //! - 对应阶段：**P3**（已启动）
-//! - 当前状态：**v0.8**——[`record`]（20B 记录头 / 块段 / 主段 / rdba 5B）、
+//! - 当前状态：**v0.9**——[`record`]（20B 记录头 / 块段 / 主段 / rdba 5B）、
 //!   [`logpage`]（512B redo 页 + 12B 分片头 + 跨页重组 + 截断丢弃）、
 //!   [`buffer`]（latch 串行化追加 + **组提交**刷盘 + **环形页池**：
 //!   容量判据/1/3 触发/页复用——§11.5.5）、[`file`]
@@ -19,7 +19,10 @@
 //!   [`analysis`]（**分析阶段**：判定流中每个事务的结局——提交（带序号）/
 //!   回滚完成 / **输家**；`highest_commit_seq` 作恢复后提交序号起点；
 //!   系统记录不参与）。
-//!   **检查点、恢复的撤销阶段、成员镜像随后。**
+//!   [`undo_phase`]（**撤销阶段**：输家逐槽回滚——整链逆操作、**补偿生成
+//!   redo 并刷盘后才写页**（WAL 次序）、0x31 回滚完成标记、槽释放；
+//!   五类补偿幂等 ⇒ 崩溃中断重走整链即可）。
+//!   **检查点、成员镜像随后。**
 //!
 //! 三条纪律（§11.5）：
 //! 1. **只存 after-image**——前像在 undo 里；
@@ -38,6 +41,7 @@ pub mod group;
 pub mod logpage;
 pub mod record;
 pub mod recovery;
+pub mod undo_phase;
 
 pub use apply::{apply_record, ApplyError, ApplyReport, BlockResolver};
 pub use buffer::{decode_sink_pages, LogBuffer, LogSink, VecLogSink, WalError};

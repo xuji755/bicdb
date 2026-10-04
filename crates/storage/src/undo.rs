@@ -134,6 +134,12 @@ impl TxnId {
         (self.0 >> 40) as u8
     }
 
+    /// 原始 48 位值（redo 记录头的 `txn_id` 字段与此同一编码）。
+    #[must_use]
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
+
     /// 事务表槽号。
     #[must_use]
     pub const fn slot(self) -> u8 {
@@ -1123,6 +1129,10 @@ pub fn rollback_record(
 
 /// **页级补偿动作**（无 I/O）：把一条撤销记录的补偿直接作用在给定页上——
 /// 回滚（写盘路径）与**一致性读的 CR 重建**（内存副本）共用这一处实现。
+///
+/// **幂等**（§4.6.6 ③ 的两条结论依赖它：回滚中断 = 重走整链、恢复的撤销
+/// 阶段就是普通回滚的重放）：补偿都是"把某处置回旧值"，重复应用不产生
+/// 额外效果——已"确保不存在"的行再删 = 无操作；已原位恢复的行再写 = 无操作。
 pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), RollbackError> {
     let row_no = record.rowid.row_id();
     let index = crate::heap::slot_index(row_no)
@@ -1130,7 +1140,11 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
 
     match record.op {
         UndoOp::Insert => {
-            crate::heap::delete_row(page, row_no)?;
+            // "确保不存在"：槽已空闲（或越界）说明这条撤销已生效过——幂等返回。
+            match crate::heap::slot_status(page, row_no) {
+                None | Some(crate::page::SlotStatus::Free) => {}
+                Some(_) => crate::heap::delete_row(page, row_no)?,
+            }
         }
         UndoOp::Delete => {
             let bytes = match &record.payload {
@@ -1141,6 +1155,11 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
                 .slot(index)
                 .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;
             if entry.status() != crate::page::SlotStatus::Free {
+                // 槽被占着：**行字节与要恢复的旧值逐字节相同** ⇒ 是本补偿
+                // 已生效过（幂等）；否则是**槽已复用**——拒绝，不猜。
+                if crate::heap::row(page, row_no) == Some(bytes.as_slice()) {
+                    return Ok(());
+                }
                 return Err(RollbackError::SlotReused {
                     rowid: record.rowid,
                 });
@@ -1809,10 +1828,10 @@ mod rollback_tests {
         let h = data_file(&io);
         {
             let mut page = load(&io, h);
-            heap::insert_row(&mut page, &row_bytes(1, b"old"), &InsertPolicy::in_place(0)).unwrap();
+            // 槽里是**别人**的行（字节不同）——原位恢复必须拒绝，不得冒充幂等。
+            heap::insert_row(&mut page, &row_bytes(1, b"new"), &InsertPolicy::in_place(0)).unwrap();
             store(&io, h, &mut page);
         }
-        // 槽已被"别人"占用（状态 Normal）——原位恢复必须拒绝。
         let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
         let err = rollback_record(
             &io,
@@ -1825,6 +1844,62 @@ mod rollback_tests {
         )
         .unwrap_err();
         assert!(matches!(err, RollbackError::SlotReused { .. }), "{err}");
+    }
+
+    #[test]
+    fn compensations_are_idempotent() {
+        let io = mem();
+        let h = data_file(&io);
+        let bytes = row_bytes(1, b"alpha");
+
+        // 插入的补偿：删两次都成功（第二次是"确保不存在"的幂等空操作）。
+        {
+            let mut page = load(&io, h);
+            heap::insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+            store(&io, h, &mut page);
+        }
+        let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
+        let insert_undo = rec(UndoOp::Insert, UndoPayload::None, 1);
+        rollback_record(&io, &insert_undo, &mut resolve).unwrap();
+        rollback_record(&io, &insert_undo, &mut resolve).unwrap(); // 重复应用
+        let page = load(&io, h);
+        assert_eq!(page.slot(0).unwrap().status(), SlotStatus::Free);
+
+        // 删除的补偿：恢复两次都成功（第二次逐字节相同 ⇒ 幂等空操作）。
+        {
+            let mut page = load(&io, h);
+            let n = heap::insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+            heap::delete_row(&mut page, n).unwrap();
+            store(&io, h, &mut page);
+        }
+        let delete_undo = rec(UndoOp::Delete, UndoPayload::FullRow(bytes.clone()), 1);
+        rollback_record(&io, &delete_undo, &mut resolve).unwrap();
+        rollback_record(&io, &delete_undo, &mut resolve).unwrap(); // 重复应用
+        let page = load(&io, h);
+        assert_eq!(heap::row(&page, 1), Some(&bytes[..]), "仍是恢复后的那份");
+
+        // 转发指针的补偿同样幂等。
+        {
+            let mut page = load(&io, h);
+            let offset = page.free_end() - 6;
+            page.as_bytes_mut()[offset..offset + 6].copy_from_slice(&[0u8; 6]);
+            page.set_free_end(offset);
+            page.set_slot(
+                0,
+                SlotEntry::new(offset as u16, SlotStatus::Forwarding).unwrap(),
+            );
+            store(&io, h, &mut page);
+        }
+        let target = RowId::from_parts(3, 0, 7).unwrap();
+        let forward_undo = rec(UndoOp::Forward, UndoPayload::Forward(target), 1);
+        rollback_record(&io, &forward_undo, &mut resolve).unwrap();
+        rollback_record(&io, &forward_undo, &mut resolve).unwrap();
+        let page = load(&io, h);
+        assert_eq!(page.slot(0).unwrap().status(), SlotStatus::Forwarding);
+        assert_eq!(
+            &page.as_bytes()[page.slot(0).unwrap().offset() as usize..][..6],
+            &target.to_bytes()
+        );
     }
 
     #[test]
