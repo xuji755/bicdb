@@ -1,0 +1,57 @@
+# 知识库检索原始输出（2026-10-04）
+# 用途：支撑 evidence.md 表 1 / 2 / 5；留痕 "pg_xact_status 未命中" 与 "PgQ 未收录"。
+
+## 1) 提交状态查询（命中 CLOG 族）
+
+$ python3 kb_graph.py postgresql problem '事务提交状态 查询 提交日志 CLOG 截断 连接丢失 COMMIT 判定'
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 38，摘要筛选通过 27，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 61，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 3，摘要筛选通过 2，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 提交日志（CLOG）  (排序分: 10.0)
+     └ 详情：提交日志（CLOG）：Commit Log（CLOG）存储所有事务的状态（进行中、已提交、已中止），
+        用于并发控制和事务可见性判断。  分类：架构
+     └ :1262055
+
+     [KnowledgeEntry] CLOG（提交日志）  (排序分: 10.0)
+     └ 详情：CLOG（提交日志）：记录事务提交状态的信息，位于pg_xact目录。  分类：概念
+     └ :490359
+
+     [KnowledgeEntry] clog（提交日志）  (排序分: 10.0)
+     └ 详情：clog 记录事务的提交/回滚状态，是判断事务可见性的重要组件。当主库进入保护状态后，
+        clog 复制延迟或中断，从库无法确定部分事务状态，产生存疑事务。
+     └ :4153880
+
+     [KnowledgeEntry] 子事务在 CLOG 中的提交状态编码为 x03  (排序分: 10.0)  └ :2299005
+     [CaseStudy] stap_observation_clog_fsync_period  (排序分: 10.0)  └ :1487686
+     [FaultModel] postgresql_memory_clog_buff_contention  (排序分: 9.5)  └ :1270978
+
+  说明：命中 CLOG 机制条目；**未命中 `pg_xact_status` / `txid_status` 条目本身**（召回有界）。
+
+## 2) doc_retrieve：提交状态（命中"PG18 事务管理器深度学习"源码学习文档）
+
+$ python3 doc_retrieve.py '提交状态 查询 txid' --db postgresql
+  匹配: 13　✅ 官方文档: 13
+
+  📘官方文档: [postgresql] PG18 事务管理器深度学习(01):事务日志(clog)与提交时序核心算法
+  源: doc/01-事务日志clog与提交时序核心算法.md
+  > 本册锚定文件:`src/backend/access/transam/clog.c`、`clog.h`、`transam.c`、`varsup.c`、
+  > `xlog.c`、`xact.c`、`procarray.c`、`transam.h`、`xact.h`
+  > 章节含：clog 本质（每事务 2 bit）／状态写入（TransactionIdSetTreeStatus）／
+  > 组提交（TransactionGroupUpdateXidStatus）／状态读取（TransactionIdGetStatus）／
+  > 提交时序（WAL 与 clog 双写一致性）／synchronous_commit 与 group commit。
+
+## 3) PgQ（未收录，留痕）
+
+$ python3 doc_retrieve.py 'PgQ' --db postgresql
+  匹配: 12（全部不相关——命中的是 **DuckPGQ**（DuckDB 属性图）与 PG 通用文档，
+  非 SkyTools 的 PgQ 队列）。
+
+## 4) Rollback 未知故障（前期检索命中，问题留痕）
+
+[FaultModel] Rollback未知故障  (排序分: 9.5)  └ :1290311
+└ 摘要：客户端发送 rollback 请求后未收到 ACK 响应，无法确定回滚是否执行成功，影响事务一致性判断。
