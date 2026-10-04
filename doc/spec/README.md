@@ -24,7 +24,7 @@
 | [`TYP.md`](TYP.md) | 数据类型 | 9 | ✅ 已完成 |
 | [`CFG.md`](CFG.md) | JSON 与配置版本 | 12 | ✅ 已完成 |
 | [`MEM.md`](MEM.md) | 记忆模型 | 15 | ✅ 已完成 |
-| [`AST.md`](AST.md) | 外部资产 | 12 | ⬜ 待细化 |
+| [`AST.md`](AST.md) | 外部资产 | 12 | ✅ 已完成 |
 | [`RET.md`](RET.md) | 检索与向量 | 27 | ✅ 已完成 |
 | [`GRP.md`](GRP.md) | 属性图与拓扑 | 14 | ✅ 已完成 |
 | [`SQL.md`](SQL.md) | SQL 引擎 | 10 | ⬜ 待细化 |
