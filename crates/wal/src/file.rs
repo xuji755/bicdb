@@ -85,12 +85,26 @@ impl<'a> FileLogSink<'a> {
         file_start_lsn: Lsn,
         file_pages: u64,
     ) -> Self {
+        Self::resume(io, handle, file_start_lsn, file_pages, 0)
+    }
+
+    /// **续写**既有文件：认定盘上已有 `written_pages` 页（文件前缀），
+    /// 从下一页起追加——**已刷出的页不再改写**（重开后接在前缀之后；
+    /// 前缀的合法性由调用方先扫描确定，见 `group::GroupWriter::open`）。
+    #[must_use]
+    pub fn resume(
+        io: &'a dyn FileIo,
+        handle: FileHandle,
+        file_start_lsn: Lsn,
+        file_pages: u64,
+        written_pages: u64,
+    ) -> Self {
         Self {
             io,
             handle,
             file_start_lsn,
             file_pages,
-            written_end: file_start_lsn.as_raw(),
+            written_end: file_start_lsn.as_raw() + written_pages * LOG_PAGE_SIZE as u64,
         }
     }
 
@@ -98,6 +112,12 @@ impl<'a> FileLogSink<'a> {
     #[must_use]
     pub fn written_end(&self) -> Lsn {
         Lsn::from_raw(self.written_end).expect("48 位域内")
+    }
+
+    /// 已写到的页数（文件前缀长度）。
+    #[must_use]
+    pub fn written_pages(&self) -> u64 {
+        (self.written_end - self.file_start_lsn.as_raw()) / LOG_PAGE_SIZE as u64
     }
 }
 

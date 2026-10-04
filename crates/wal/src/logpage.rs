@@ -232,6 +232,60 @@ impl LogPage {
     }
 }
 
+/// 分片尺寸规划：先填 `first_capacity`（0 ⇒ 直接从新页开始），
+/// 其后每片**满装**（除末片）。
+///
+/// [`write_record`]（真正写入）与 [`simulate_append`]（跨组预检）共用本函数——
+/// 两处不会因逻辑漂移而不一致。
+#[must_use]
+pub fn plan_fragments(first_capacity: usize, data_len: usize) -> Vec<usize> {
+    let full_capacity = LOG_PAGE_SIZE - LOG_PAGE_HEADER_LEN - FRAGMENT_HEADER_LEN;
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut remaining = data_len;
+    if first_capacity > 0 && remaining > 0 {
+        let take = first_capacity.min(remaining);
+        sizes.push(take);
+        remaining -= take;
+    }
+    while remaining > 0 {
+        let take = full_capacity.min(remaining);
+        sizes.push(take);
+        remaining -= take;
+    }
+    debug_assert!(data_len == 0 || !sizes.is_empty(), "非空记录至少一片");
+    sizes
+}
+
+/// 模拟：从"末页起始 LSN + 已用字节"出发追加一条 `data_len` 字节的记录后，
+/// 返回（**末页**起始 LSN，该页已用字节）。
+///
+/// 与 [`write_record`] 同一套分片/分页规则（共用 [`plan_fragments`]）；
+/// "记录不得跨组"的提前切换判据据此精确判定。
+#[must_use]
+pub fn simulate_append(
+    last_page_start: u64,
+    last_page_used: usize,
+    data_len: usize,
+) -> (u64, usize) {
+    let first_capacity =
+        LOG_PAGE_SIZE.saturating_sub(LOG_PAGE_HEADER_LEN + last_page_used + FRAGMENT_HEADER_LEN);
+    let sizes = plan_fragments(first_capacity, data_len);
+
+    let mut page_start = last_page_start;
+    let mut used = last_page_used;
+    // 首片是否落在"当前页"：取决于当前页还有容量；其余分片一律在新页。
+    let mut on_current = first_capacity > 0 && data_len > 0;
+    for take in sizes {
+        if !on_current {
+            page_start += LOG_PAGE_SIZE as u64;
+            used = 0;
+        }
+        used += FRAGMENT_HEADER_LEN + take;
+        on_current = false;
+    }
+    (page_start, used)
+}
+
 /// 把一条记录**分片**写入页序列（继续写 `pages` 的最后一页，满则新建页）。
 ///
 /// - 分片除末片外**满装**（填到页的剩余容量）；
@@ -240,24 +294,8 @@ impl LogPage {
 pub fn write_record(pages: &mut Vec<LogPage>, record: &RedoRecord) -> Result<(), LogPageError> {
     let bytes = record.encode();
     let data_len = bytes.len();
-    let full_capacity = LOG_PAGE_SIZE - LOG_PAGE_HEADER_LEN - FRAGMENT_HEADER_LEN;
-
-    // 先定分片尺寸：先填当前页剩余，其后每片满装（除末片）。
-    let mut sizes: Vec<usize> = Vec::new();
-    let mut remaining = data_len;
-    if let Some(p) = pages.last() {
-        let cap = p.remaining_data_capacity();
-        if cap > 0 && remaining > 0 {
-            let take = cap.min(remaining);
-            sizes.push(take);
-            remaining -= take;
-        }
-    }
-    while remaining > 0 {
-        let take = full_capacity.min(remaining);
-        sizes.push(take);
-        remaining -= take;
-    }
+    let first_capacity = pages.last().map_or(0, LogPage::remaining_data_capacity);
+    let sizes = plan_fragments(first_capacity, data_len);
 
     let frag_cnt = sizes.len() as u16;
     debug_assert!(frag_cnt >= 1, "记录非空 ⇒ 至少一片");
@@ -581,5 +619,39 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(records, vec![rec]);
         assert_eq!(records[0].encoded_len(), RECORD_HEADER_LEN);
+    }
+
+    /// 模拟路径与真正写入路径**逐条一致**（跨组预检的依据）。
+    #[test]
+    fn simulate_append_matches_write_record() {
+        fn mod_rec(lsn: Lsn, payload: usize) -> RedoRecord {
+            RedoRecord::page_modification(
+                lsn,
+                7,
+                vec![crate::record::BlockRef {
+                    flags: 0,
+                    rdba: crate::record::Rdba::from_parts(1, 2).unwrap(),
+                    changes: vec![crate::record::Change {
+                        offset: 0,
+                        after: vec![0xAB; payload],
+                    }],
+                }],
+            )
+        }
+        // 混合尺寸：小记录、跨页记录、恰好整页边界附近的记录。
+        let lens = [26usize, 100, 496, 500, 900, 1200, 484, 1];
+        let mut pages = vec![LogPage::new(lsn(0))];
+        for (i, len) in lens.into_iter().enumerate() {
+            // 取一条 encoded_len 恰好为目标值的记录（页修改记录开销 = 20 + 8 + 4）。
+            let payload = len.saturating_sub(RECORD_HEADER_LEN + 8 + 4);
+            let rec = mod_rec(lsn(16 + i as u64), payload);
+            let last = pages.last().expect("非空");
+            let (sim_page, sim_used) =
+                simulate_append(last.start_lsn().as_raw(), last.used(), rec.encoded_len());
+            write_record(&mut pages, &rec).unwrap();
+            let last = pages.last().expect("刚写入");
+            assert_eq!(last.start_lsn().as_raw(), sim_page, "第 {i} 条的末页起点");
+            assert_eq!(last.used(), sim_used, "第 {i} 条的末页已用");
+        }
     }
 }

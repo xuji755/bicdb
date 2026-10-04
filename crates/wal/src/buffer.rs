@@ -156,6 +156,38 @@ impl LogBuffer {
         Lsn::from_raw(state.synced_lsn.load(Ordering::SeqCst)).expect("48 位域内")
     }
 
+    /// **下一次追加所在页**的起始 LSN：缓冲非空 ⇒ 当前页（其尾部空位仍可用）；
+    /// 缓冲为空（刷盘切页后 / 刚新建）⇒ 下一张页的起点。
+    ///
+    /// 日志组切换以它为界——组与组在**页边界**相接；切换记录因此落在
+    /// 新组首张页的页头之后。
+    #[must_use]
+    pub fn current_page_start(&self) -> Lsn {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = match state.pages.last() {
+            Some(last) => last.start_lsn().as_raw(),
+            None => state.next_page_start,
+        };
+        Lsn::from_raw(raw).expect("48 位域内")
+    }
+
+    /// 预检：**现在**追加一条编码长度 `encoded_len` 的记录，其结束 LSN
+    /// （结束字节的下一位置 = 该记录的占用终点）。
+    ///
+    /// 与 [`LogBuffer::append`] 共用同一套分片/分页规则（§`logpage::plan_fragments`）——
+    /// "记录不得跨组"的提前切换据此**精确**判定，而非保守估计。
+    #[must_use]
+    pub fn end_lsn_if_appended(&self, encoded_len: usize) -> Lsn {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (page_start, used) = match state.pages.last() {
+            Some(last) => (last.start_lsn().as_raw(), last.used()),
+            None => (state.next_page_start, 0),
+        };
+        let (end_page, end_used) = crate::logpage::simulate_append(page_start, used, encoded_len);
+        Lsn::from_raw(end_page + crate::logpage::LOG_PAGE_HEADER_LEN as u64 + end_used as u64)
+            .expect("48 位域内")
+    }
+
     /// **追加一条记录**：latch 内分配 LSN（= 本条记录的 LSN，写进记录头）
     /// 并分片入页；返回该 LSN。
     ///
