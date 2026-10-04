@@ -504,10 +504,10 @@ LLM 经常异常不该带倒引擎、资源隔离、可替换）。
 
 | 对象 | 键 | 要点 |
 | --- | --- | --- |
-| `memory` | `memory_id`（UUID） | **逻辑身份**，跨版本不变；含 `status`、`active_revision`、`kind`、**`agent_id`**、**`task_id`（可空）**、**行级 TTL 字段** |
+| `memory` | `memory_id`（48 位序列 ID） | **逻辑身份**，跨版本不变；含 `status`、`active_revision`、`kind`、**`agent_id`**、**`task_id`（可空）**、**行级 TTL 字段** |
 | `memory_version` | `(memory_id, revision)` | **不可变**；含 `content`、双时态四字段、`confidence`、来源引用、**操作者与原因** |
 | `task_checkpoint` | `(task_id, checkpoint_seq)` | REQ-MEM-001 的六个字段 |
-| `source_record` | `source_id`（UUID） | 含 `revoked_at`（REQ-MEM-013） |
+| `source_record` | `source_id`（48 位序列 ID） | 含 `revoked_at`（REQ-MEM-013） |
 | `derived_link` | `(from, relation, to)` | 含 `relation` 区分 `conflicts_with` / `supersedes` / `derived_from` |
 
 #### `agent_id`：多智能体作用域在**工作区之内**
