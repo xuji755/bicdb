@@ -62,6 +62,21 @@ pub const ITL_ENTRY_OFFSET: usize = 40;
 /// 单个 ITL 条目长度（其内部字段由事务域切片实现）。
 pub const ITL_ENTRY_LEN: usize = 24;
 
+/// 第 `index` 个 ITL 条目的页内偏移。
+///
+/// **布局不是等距的**：ITL[0] 在 40..64（事务区头 8 + 一条 = 32B 事务区），
+/// 空间区紧随其后（64..68）；**扩展出来的 ITL[i]（i ≥ 1）在固定头之后**
+/// ——`68 + (i−1)×24`（"每多一个槽页头 +24 字节"，§5.4.1）。空间区的
+/// `slot_count`/`free_end` 因此始终在固定偏移 64/66。
+#[must_use]
+pub const fn itl_entry_offset(index: u16) -> usize {
+    if index == 0 {
+        ITL_ENTRY_OFFSET
+    } else {
+        FIXED_HEADER_LEN + (index as usize - 1) * ITL_ENTRY_LEN
+    }
+}
+
 /// 空间区起点。
 pub const SPACE_OFFSET: usize = 64;
 /// `slot_count` 字段偏移。
