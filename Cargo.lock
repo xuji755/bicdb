@@ -50,6 +50,7 @@ name = "bicdb-storage"
 version = "0.0.0"
 dependencies = [
  "bicdb-common",
+ "bicdb-workspace",
 ]
 
 [[package]]
