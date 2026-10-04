@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: LOG_SWITCH_WAIT 日志切换等待事件
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:330138
+
+  ── 描述 ──
+  当实例执行日志切换（log switch）时，如果无法立即完成，该字段会指示阻塞原因。ARCHIVE LOG 表示日志切换需要等待当前日志归档完成；CLEAR LOG
+  表示等待日志被清除；CHECKPOINT 表示等待检查点完成以释放日志。NULL 值表示 ALTER SYSTEM SWITCH LOGFILE
+  命令被挂起，但当前在线重做日志组中仍有可用空间，这是一种异常挂起状态。
+
+  ── 摘要 ──
+  V$INSTANCE.LOG_SWITCH_WAIT 显示日志切换正在等待的事件。可能值为 ARCHIVE LOG（等待归档完成）、CLEAR LOG（等待日志清除）、CHECKPOINT（等待检查点完成）、NULL（被挂起但当前在线日志仍有空间）。

@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 日志切换 archiving needed 等待事件 ARCn 归档 未归档
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     日志切换相关等待事件：1）log file switch completion：等待日志切换完成（可能因为归档慢或日志组不够）；2）log buffer space：日志缓冲区满，等待LGWR写入；3）log file switch (archiving needed)：等待归档完成才能重用日志；4）log file sync：等待LGWR将提交日志写入磁盘。解决方法：增加日志组数量、调整日志大小、优化归档速度、调整LOG_BUFFER。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 日志切换等待事件  (排序分: 9.4)
+     └ 摘要：日志切换相关等待事件主要包括四种：log file switch completion 等待是因为日志切换未完成，可能由归档速度慢或日志组数量不足导致；log buffer space 表示日志缓冲区已满，需等待LGWR写入；log file switch (archiving needed) 是等待归档完成才能重用日志文件；log file sync 则等待LGWR将提交日志写入磁盘。这些等待事件会影响数据库性能，解决措施包括增加日志组数量、调整日志文件大小、优化归档速度以及调整LOG_BUFFER参数。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556043
+
+     [KnowledgeEntry] 日志切换等待  (排序分: 9.4)
+     └ 摘要：在Oracle数据库中，当日志文件空间不足时，后台进程通过kcrfwr()和kcrfws()函数检测并请求日志切换。若日志组未完成归档或检查点未清除，进程将进入等待状态，对应的等待事件包括'log file switch (archiving needed)'或'log file switch (checkpoint incomplete)'。该文说明了日志切换等待的触发条件及典型等待事件。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:244284
+
+     [KnowledgeEntry] LOG_SWITCH_WAIT 日志切换等待事件  (排序分: 9.4)
+     └ 摘要：V$INSTANCE.LOG_SWITCH_WAIT 显示日志切换正在等待的事件。可能值为 ARCHIVE LOG（等待归档完成）、CLEAR LOG（等待日志清除）、CHECKPOINT（等待检查点完成）、NULL（被挂起但当前在线日志仍有空间）。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:330138
+
+     [KnowledgeEntry] V$INSTANCE.LOG_SWITCH_WAIT 日志切换等待事件  (排序分: 9.4)
+     └ 摘要：LOG_SWITCH_WAIT 列显示日志切换正在等待的事件，值包括 ARCHIVE LOG、CLEAR LOG、CHECKPOINT。若值为 NULL 但 ALTER SYSTEM SWITCH LOGFILE 挂起，说明当前联机重做日志仍有空闲空间。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:330199
+
+     [CaseStudy] 案例1：日志切换频繁导致性能下降  (排序分: 9.1)
+     └ 摘要：场景：某OLTP系统平均每秒产生5MB的REDO日志，但日志文件大小仅为100MB，导致每20秒发生一次日志切换。诊断：频繁的日志切换触发检查点，造成严重的I/O争用和'log file sync'等待事件，系统性能显著下降。处理：解决方案是将日志文件大小增加到1GB，并将日志组成员数增加到3个，显著减少了日志切换频率，缓解了I/O压力，提升了系统整体性能。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1559070
+
+     [FaultModel] 日志切换等待  (排序分: 8.6)
+     └ 摘要：Oracle日志切换等待（log switch wait）是指服务器进程因当前日志文件已满且日志切换尚未完成而等待。根因包括日志文件太小、归档进程慢或日志切换频率过高，导致事务提交延迟和系统性能下降。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1558505
+

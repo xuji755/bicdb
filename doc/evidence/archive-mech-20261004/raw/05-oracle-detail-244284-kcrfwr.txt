@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 日志切换等待
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:244284
+
+  ── 描述 ──
+  当kcrfwr()发现当前日志文件空间不足时，会调用kcrfws()检查是否已有其他进程请求了日志切换。如果没有，则自己请求日志切换。如果日志组未归档或尚未清除，进程需等待。对应等待事件可能为'log
+  file switch (archiving needed)'或'log file switch (checkpoint incomplete)'等。
+
+  ── 摘要 ──
+  在Oracle数据库中，当日志文件空间不足时，后台进程通过kcrfwr()和kcrfws()函数检测并请求日志切换。若日志组未完成归档或检查点未清除，进程将进入等待状态，对应的等待事件包括'log file switch (archiving needed)'或'log file switch (checkpoint incomplete)'。该文说明了日志切换等待的触发条件及典型等待事件。

@@ -1,0 +1,42 @@
+
+============================================================
+  [问题诊断] 日志组 状态 CURRENT ACTIVE INACTIVE UNUSED 重用 条件
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 12，摘要筛选通过 9，批次 1；本路已取尽
+  CaseStudy：已取 2，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ⚠️ 精确对象未入图/未命中: CURRENT, INACTIVE
+     以下语义检索结果仅供参考；请优先补齐这些对象的 SystemView/Column 数据。
+
+  ✅ 答案要点
+     Oracle在线重做日志组的状态包括CURRENT、ACTIVE、INACTIVE、UNUSED。CURRENT表示该组正在被LGWR写入；UNUSED表示该组从未被使用或刚被新增，序列号为0。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] Redo Log Group状态CURRENT与UNUSED  (排序分: 10.0)
+     └ 摘要：Oracle在线重做日志组的状态包括CURRENT、ACTIVE、INACTIVE、UNUSED。CURRENT表示该组正在被LGWR写入；UNUSED表示该组从未被使用或刚被新增，序列号为0。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:581741
+
+     [KnowledgeEntry] v$log视图的关键状态列  (排序分: 10.0)
+     └ 摘要：v$log视图提供日志组的组号、线程号、序列号、大小、成员数、归档状态和当前状态，其中STATUS列是关键，取值包括CURRENT、ACTIVE、INACTIVE、UNUSED。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:936735
+
+     [KnowledgeEntry] v$log状态变化可辅助判断缺失日志影响  (排序分: 10.0)
+     └ 详情：本案例中group3从CURRENT变为ACTIVE、再变为INACTIVE，之后切换挂起；resetlogs后又变为UNUSED，说明v$log状态是诊断在线redo丢失影响的重要观测点。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4097222
+
+     [KnowledgeEntry] 重做日志组状态（v$log.status）  (排序分: 10.0)
+     └ 详情：INACTIVE 表示日志组已完成切换且对应的脏页已写盘，不再需要用于恢复；但不代表已归档，需结合 archived 列判断。UNUSED 表示新建后尚未写入，可直接删除。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1023694
+
+     [KnowledgeEntry] Online Redo Log 状态及其含义  (排序分: 10.0)
+     └ 摘要：在线重做日志组的状态有六种：UNUSED（从未写入，新添加或RESETLOGS后且非当前日志）、CURRENT（当前日志，可能打开或关闭）、ACTIVE（非当前但实例恢复需要，可能用于块恢复）、INACTIVE（实例恢复不再需要，可能用于介质恢复）、CLEARING（正在被ALTER DATABASE CLEAR LOGFILE重建，之后变UNUSED）、CLEARING_CURRENT（当前日志清除中，如遇I/O错误会停留）。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:330213
+
+     [KnowledgeEntry] Online Redo Log 状态  (排序分: 10.0)
+     └ 摘要：在线重做日志有 UNUSED、CURRENT、ACTIVE、CLEARING、CLEARING_CURRENT、INACTIVE、INVALIDATED 等状态，分别表示从未写入、当前使用、活跃但非当前、正在清除、清除当前日志、非活跃不再需要实例恢复、无日志切换归档当前日志等。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:330388
+
