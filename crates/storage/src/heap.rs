@@ -142,6 +142,17 @@ pub fn can_insert(page: &Page, row_len: usize, policy: &InsertPolicy) -> bool {
         && has_slot_room(page, policy)
 }
 
+/// 该页还能容纳的**行字节数**（含槽位目录与 PCTFREE 记账，与
+/// [`can_insert`] 同一套账；片段链据此实现"满装"）。
+#[must_use]
+pub fn capacity_for_row(page: &Page, policy: &InsertPolicy) -> usize {
+    if require_data_page(page).is_err() {
+        return 0;
+    }
+    page.free_space()
+        .saturating_sub(policy.reserved_bytes() + slot_cost(page, policy))
+}
+
 /// 本次插入将占用的槽位目录字节（复用空闲槽 = 0；新增槽 = 2）。
 fn slot_cost(page: &Page, policy: &InsertPolicy) -> usize {
     if policy.reuse_free_slots && find_free_slot(page).is_some() {
@@ -329,6 +340,102 @@ impl Heap {
         page.seal();
         self.pages.push(page);
         RowId::from_parts(1, block_id, row_no).map_err(|_| HeapError::SlotLimit)
+    }
+
+    /// 工作区受校验标识（页头字段）。
+    #[must_use]
+    pub fn workspace_ref(&self) -> [u8; 8] {
+        self.workspace_ref
+    }
+
+    /// 遍历页（块号, 页引用）。
+    pub fn pages_iter(&self) -> impl Iterator<Item = (u32, &Page)> {
+        self.pages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ((i + 1) as u32, p))
+    }
+
+    /// 页引用（块号从 1 起；块 0 留文件头页）。
+    #[must_use]
+    pub fn page(&self, block_id: u32) -> Option<&Page> {
+        if block_id == 0 {
+            return None;
+        }
+        self.pages.get(block_id as usize - 1)
+    }
+
+    /// 追加一张空页并返回块号（段/区分配接入前的顺序分配）。
+    pub fn push_page(&mut self) -> u32 {
+        let block_id = (self.pages.len() + 1) as u32;
+        self.pages.push(Page::new(
+            PageType::HeapTable,
+            self.workspace_ref,
+            1,
+            block_id,
+        ));
+        block_id
+    }
+
+    /// 指定页插入（调用方已选定目标页；片段链用它实现"满装"策略）。
+    pub fn insert_into(
+        &mut self,
+        block_id: u32,
+        row: &[u8],
+        policy: &InsertPolicy,
+    ) -> Result<RowId, HeapError> {
+        let page = self
+            .pages
+            .get_mut(block_id as usize - 1)
+            .ok_or(HeapError::NoSuchRow)?;
+        let row_no = insert_row(page, row, policy)?;
+        page.seal();
+        RowId::from_parts(1, block_id, row_no).map_err(|_| HeapError::SlotLimit)
+    }
+
+    /// **就地改写某条记录内的一段字节**（片段链回填 next 指针用）。
+    ///
+    /// `offset` 相对记录起点；越界拒绝。改写后重新 `seal`。
+    pub fn patch_record(
+        &mut self,
+        id: RowId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), HeapError> {
+        if id.file_id() != 1 {
+            return Err(HeapError::NoSuchRow);
+        }
+        let page = self
+            .pages
+            .get_mut(id.block_id() as usize - 1)
+            .ok_or(HeapError::NoSuchRow)?;
+        let record = row(page, id.row_id()).ok_or(HeapError::NoSuchRow)?;
+        if offset + bytes.len() > record.len() {
+            return Err(HeapError::BadRow);
+        }
+        let start = usize::from(
+            page.slot(slot_index(id.row_id()).unwrap())
+                .unwrap()
+                .offset(),
+        ) + offset;
+        page.as_bytes_mut()[start..start + bytes.len()].copy_from_slice(bytes);
+        page.seal();
+        Ok(())
+    }
+
+    /// 行能否**不经片段链**落在某一页（含"新开一页"的情形）。
+    #[must_use]
+    pub fn fits_one_page(&self, row_len: usize, policy: &InsertPolicy) -> bool {
+        if self.pages.iter().any(|p| can_insert(p, row_len, policy)) {
+            return true;
+        }
+        let fresh = Page::new(
+            PageType::HeapTable,
+            self.workspace_ref,
+            1,
+            (self.pages.len() + 1) as u32,
+        );
+        can_insert(&fresh, row_len, policy)
     }
 
     /// 按 `ROWID` 读取行字节（本切片不跟随转发指针——P3 的更新路径接入）。

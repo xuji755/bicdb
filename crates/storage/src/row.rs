@@ -5,7 +5,7 @@
 //! 完整行（普通行；碎片行重组后同形）：
 //!   偏移 0  1B  row_flags      位 0 已删除 / 位 1 已迁移 / 位 2 片段 / 3–7 保留
 //!   偏移 1  1B  itl_slot       指向本页 ITL 槽索引；0xFF = 无
-//!   偏移 2  2B  row_len        含行头（**碎片行 = 整行长度**）
+//!   偏移 2  2B  row_len        含行头（**每条片段记录 = 片段自身长度**）
 //!   偏移 4  2B  col_count
 //!   偏移 6  2B  null_bitmap_len
 //!   偏移 8  2B  var_col_count
@@ -30,9 +30,11 @@
 //!
 //! - **定长区宽度不在行内**：它由列定义（字典）给出；因此访问定长/变长
 //!   数据的接口都要传 `fixed_len`。行内自描述的是"变长部分各自的长度"。
-//! - **头片段的 `row_len` 是整行长度**（不是片段自身长度）——重组据此
-//!   可校验；因此头片段不能用 [`RowView`]（它要求 `row_len == 字节数`），
-//!   而是 [`HeadFragment`]。
+//! - **每条片段都不例外地是"页里的一条行"**（§6.3："链上每个片段都是页里
+//!   的一'行'，与普通行同规"）：其 `row_len` 是**片段自身长度**；整行长度
+//!   **不在任何一处存**——由链求和推导（"能推导的不存"）。头片段多出的
+//!   只是：行头之后有 6 字节"下一片段 ROWID"，且列元数据（位图与偏移数组）
+//!   描述的是整行——但它描述的对象是**重组后的整行**，不是片段自身。
 
 use crate::rowid::{RowId, ROWID_LEN};
 
@@ -281,8 +283,8 @@ impl<'a> RowView<'a> {
 
 /// **头片段**视图：完整行头 + 下一片段 ROWID 6B + 数据第 1 段。
 ///
-/// 注意 `row_len` 是**整行长度**（重组后长度），因此本类型的
-/// `bytes.len()` 通常小于 `row_len`。
+/// 与 [`RowView`] 同规：`row_len` 是**本片段记录的长度**（§6.3"与普通行同规"）；
+/// 整行长度不存——由链求和推导。列元数据（位图与偏移数组）描述整行。
 #[derive(Debug, Clone, Copy)]
 pub struct HeadFragment<'a> {
     bytes: &'a [u8],
@@ -290,34 +292,38 @@ pub struct HeadFragment<'a> {
 }
 
 impl<'a> HeadFragment<'a> {
-    /// 解析（要求：置 `FRAGMENT` 位；头部区与 6 字节指针都在字节流内；
-    /// `row_len` ≥ 本片段长度）。
+    /// 解析（要求：置 `FRAGMENT` 位；`row_len` 与本片段字节数一致；
+    /// 头部区与 6 字节指针都在字节流内）。
     pub fn new(bytes: &'a [u8]) -> Result<Self, RowError> {
         let header = RowHeader::read_from(bytes)?;
         if header.flags & row_flags::FRAGMENT == 0 {
             return Err(RowError::BadFragmentChain);
         }
+        if usize::from(header.row_len) != bytes.len() {
+            return Err(RowError::LengthMismatch);
+        }
         if header.data_start() + ROWID_LEN > bytes.len() {
             return Err(RowError::Truncated);
-        }
-        if usize::from(header.row_len) < bytes.len() {
-            return Err(RowError::LengthMismatch);
         }
         Ok(Self { bytes, header })
     }
 
-    /// 行头（`row_len` = 整行长度）。
+    /// 行头（`row_len` = 本片段记录长度）。
     #[must_use]
     pub fn header(&self) -> &RowHeader {
         &self.header
     }
 
-    /// 下一片段 ROWID。
+    /// 下一片段 ROWID（全 0 = 无下一个——单片段链的规范写法）。
     #[must_use]
-    pub fn next(&self) -> RowId {
+    pub fn next(&self) -> Option<RowId> {
         let at = self.header.data_start();
         let b: [u8; ROWID_LEN] = self.bytes[at..at + ROWID_LEN].try_into().expect("6 字节");
-        RowId::from_bytes(&b)
+        if b == [0u8; ROWID_LEN] {
+            None
+        } else {
+            Some(RowId::from_bytes(&b))
+        }
     }
 
     /// 数据第 1 段。
@@ -452,19 +458,26 @@ pub fn assemble_row(
 /// 由头片段与后续片段（中/尾，按链序）重组整行字节流。
 ///
 /// 重组 = 完整行头（含整行列元数据）+ 各数据段顺次拼接；
-/// 结果长度必须等于头片段的 `row_len`。
+/// **整行长度 = 各片段之和**（不存、推导），并**回填**到重组结果的
+/// `row_len` 字段——于是重组结果是一条规范完整行。
 pub fn reassemble_row(head: &[u8], rest: &[&[u8]]) -> Result<Vec<u8>, RowError> {
     let head = HeadFragment::new(head)?;
-    let mut out = Vec::with_capacity(usize::from(head.header().row_len));
+    let mut out =
+        Vec::with_capacity(head.bytes.len() + rest.iter().map(|f| f.len()).sum::<usize>());
     out.extend_from_slice(head.header_bytes());
     out.extend_from_slice(head.data());
     for frag in rest {
         let view = FragmentView::new(frag)?;
         out.extend_from_slice(view.data());
     }
-    if out.len() != usize::from(head.header().row_len) {
+    if out.len() > usize::from(u16::MAX) {
         return Err(RowError::LengthMismatch);
     }
+    // 回填整行长度（头片段的 row_len 是片段自身的），
+    // 并清除 `FRAGMENT` 位——该位描述"页内记录是片段"，重组后的逻辑行不是。
+    let total = out.len() as u16;
+    out[2..4].copy_from_slice(&total.to_le_bytes());
+    out[0] &= !row_flags::FRAGMENT;
     Ok(out)
 }
 
@@ -568,14 +581,9 @@ mod tests {
     #[test]
     fn fragment_chain_reassembly() {
         // 整行 = 行头 + 定长 4B + 变长 "0123456789"；拆成头片段（前 4 字节数据）
-        // + 中片段（后 6 字节数据，链尾）。
-        let full = assemble_row(
-            row_flags::FRAGMENT,
-            3,
-            &[false],
-            &[0xDE, 0xAD, 0xBE, 0xEF],
-            &[b"0123456789"],
-        );
+        // + 中片段（后 6 字节数据，链尾）。每条片段记录 = 自身长度（§6.3）。
+        // 原始（未拆分的）行：flags = 0；FRAGMENT 位由拆分方在头片段上置。
+        let full = assemble_row(0, 3, &[false], &[0xDE, 0xAD, 0xBE, 0xEF], &[b"0123456789"]);
         let view = RowView::new(&full).unwrap();
         let data_start = view.header().data_start();
         let (chunk1, chunk2) = full[data_start..].split_at(4);
@@ -583,8 +591,12 @@ mod tests {
         let next = RowId::from_parts(1, 4, 2).unwrap();
         let mut head = Vec::new();
         head.extend_from_slice(&full[..data_start]); // 完整行头（整行列元数据）
+        head[0] |= row_flags::FRAGMENT; // 拆分方置位
         head.extend_from_slice(&next.to_bytes());
         head.extend_from_slice(chunk1);
+        // 头片段的 row_len = 本片段长度。
+        let head_len = head.len() as u16;
+        head[2..4].copy_from_slice(&head_len.to_le_bytes());
 
         let mut mid = Vec::new();
         mid.push(row_flags::FRAGMENT);
@@ -595,12 +607,22 @@ mod tests {
         let mid_len = mid.len() as u16;
         mid[2..4].copy_from_slice(&mid_len.to_le_bytes());
 
-        // 头片段：row_len = 整行长度。
+        // 头片段：row_len = 自身长度；`RowView` 同样可解析（与普通行同规）。
         let hf = HeadFragment::new(&head).expect("头片段可解析");
-        assert_eq!(usize::from(hf.header().row_len), full.len());
-        assert_eq!(hf.next(), next);
+        assert_eq!(usize::from(hf.header().row_len), head.len());
+        assert_eq!(
+            RowView::new(&head).unwrap().header().row_len as usize,
+            head.len()
+        );
+        assert_eq!(hf.next(), Some(next));
         assert_eq!(hf.data(), chunk1);
-        assert_eq!(hf.header_bytes(), &full[..data_start]);
+        // 头片段的行头：除 `row_len`（片段自身长度 ≠ 整行）外与整行头逐字节一致
+        // ——位图与偏移数组描述的是**整行**（列元数据只在头片段）。
+        let hb = hf.header_bytes();
+        assert_eq!(hb.len(), data_start);
+        assert_eq!(&hb[4..], &full[4..data_start], "列/位图/偏移元数据一致");
+        assert_eq!(hb[0], full[0] | row_flags::FRAGMENT, "仅置片段位");
+        assert_eq!(hb[1], full[1]);
 
         // 中片段。
         let fv = FragmentView::new(&mid).expect("片段可解析");
@@ -608,19 +630,14 @@ mod tests {
         assert_eq!(fv.data(), chunk2);
         assert_eq!(fv.itl_slot(), 3);
 
-        // 重组 = 原整行字节流。
+        // 重组 = 原整行字节流（整行 row_len 由链求和回填）。
         let rebuilt = reassemble_row(&head, &[&mid]).expect("可重组");
         assert_eq!(rebuilt, full);
         let rv = RowView::new(&rebuilt).unwrap();
         rv.validate_var_offsets(FIXED).unwrap();
+        assert_eq!(rv.header().row_len as usize, full.len());
         assert_eq!(rv.var_column(0, FIXED), Some(&b"0123456789"[..]));
         assert_eq!(rv.fixed_area(FIXED), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
-
-        // 数量不符 → 长度校验失败。
-        assert_eq!(
-            reassemble_row(&head, &[]).err(),
-            Some(RowError::LengthMismatch)
-        );
 
         // 转发指针：只有 6 字节。
         let dst = RowId::from_parts(2, 9, 3).unwrap();

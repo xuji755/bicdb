@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod fragment;
 pub mod heap;
 pub mod page;
 pub mod row;
