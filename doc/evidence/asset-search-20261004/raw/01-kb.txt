@@ -1,0 +1,33 @@
+# 知识库检索原始输出（2026-10-04）
+# 用途：支撑 evidence.md 表 1 / 2。
+
+$ python3 kb_graph.py postgresql problem '全文检索 tsvector GIN 倒排索引 短语 位置 实现'
+
+  ✅ 答案要点
+     PostgreSQL GIN索引实现倒排索引，将每个词元映射到行ID列表，支持全文检索和JSON等多词元高效查询。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 倒排索引（PostgreSQL GIN）  (排序分: 10.0)  └ :1029114
+     └ 详情：PostgreSQL GIN索引实现倒排索引，将每个词元映射到行ID列表，支持全文检索和JSON等多词元高效查询。分类：概念
+
+     [KnowledgeEntry] GIN倒排索引  (排序分: 10.0)  └ :520536
+     └ 详情：GIN（Generalized Inverted Index）是一种倒排索引，适用于多值类型如数组、全文检索等。分类：概念
+
+     [KnowledgeEntry] 数据库场景：全文检索需要分词和倒排索引  (排序分: 10.0)  └ :1262766
+     └ 详情：全文检索需要分词器和倒排索引（如PostgreSQL的GIN索引），因为传统B-Tree无法直接支持模糊匹配和关键词搜索，
+        专门结构才能提升性能。分类：概念
+
+     [KnowledgeEntry] 功能指标20-倒排索引  (排序分: 10.0)  └ :1212541
+     └ 详情：GIN（Generalized Inverted Index）适用于全文检索、数组、JSON等类型，支持高效多值搜索。分类：架构
+
+     （其余 2 条低相关略。）
+
+$ python3 doc_retrieve.py '全文检索 tsvector' --db postgresql
+  匹配: 20　✅ 官方文档: 15　✅ 案例文档: 5
+
+  📗案例文档: [postgresql] Case Study: 全文检索 不包含 优化 - 阿里云RDS PostgreSQL最佳实践
+  源: /home/jacks/knowledge-base/postgresql/case_studies/cs_digoal_201707_20170727_01.md
+  > PostgreSQL内置了GIN索引，支持全文检索，支持数组检索等多值数据类型的检索。
+  > 在全文检索中，不包含某个关键字能用到索引吗？
+  > 实际上GIN是倒排索引，不包含某个关键字的查询，实际上是跳过主tree上面的TOKEN的扫描。
