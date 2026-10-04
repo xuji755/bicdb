@@ -18,8 +18,9 @@
 //!
 //! 参考实现是 Oracle 的 `tailchk`（块尾保存 SCN Base 低位、块类型、SCN Seq 的副本）。
 
+pub use bicdb_common::checksum::PAGE_SIZE;
 use bicdb_common::checksum::{
-    page_checksum, verify_page_checksum, PAGE_CHECKSUM_LEN, PAGE_CHECKSUM_OFFSET, PAGE_SIZE,
+    page_checksum, verify_page_checksum, PAGE_CHECKSUM_LEN, PAGE_CHECKSUM_OFFSET,
 };
 use bicdb_common::seq::Lsn;
 
@@ -317,6 +318,29 @@ pub enum PageCheck {
 #[derive(Clone)]
 pub struct Page {
     bytes: Box<[u8; PAGE_SIZE]>,
+}
+
+impl std::fmt::Debug for Page {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 紧凑形态：不打印 16 KiB 字节，只给诊断需要的摘要。
+        match self.header() {
+            Some(h) => f
+                .debug_struct("Page")
+                .field("page_type", &h.page_type)
+                .field("file_id", &h.file_id)
+                .field("block_id", &h.block_id)
+                .field("page_lsn", &h.page_lsn)
+                .field("mod_seq", &h.mod_seq)
+                .field("slot_count", &h.slot_count)
+                .field("free_space", &self.free_space())
+                .field("verify", &self.verify())
+                .finish(),
+            None => f
+                .debug_struct("Page")
+                .field("page_type", &"<未知>")
+                .finish(),
+        }
+    }
 }
 
 impl Page {
