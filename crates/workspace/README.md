@@ -6,7 +6,7 @@ WorkspaceContext、身份与路由、根目录句柄、配额与公平调度
 | --- | --- |
 | 设计依据 | §3 隔离契约、§4 工作区目录与资源 |
 | 对应阶段 | P1（已启动） |
-| 当前状态 | **v0.2**——ID、根目录名与校验、目录布局（0700）、配额、上下文、**FileIO 替换接口**（`io` 模块：`OsFileIo` / `MemFileIo` / `FaultInjecting`）；身份路由与监督器随后 |
+| 当前状态 | **v0.3**——ID、根目录名与校验、目录布局（0700）、配额、上下文、**FileIO 替换接口**（`io`）、**身份路由**（`identity` + `registry`）；监督器随后 |
 
 ## 状态说明
 
@@ -25,3 +25,8 @@ WorkspaceContext、身份与路由、根目录句柄、配额与公平调度
   不硬编码 `O_NOFOLLOW` 一类 `fcntl` 常量（各环境数值不同，见 `io::os` 模块文档）。
   三个实现等价可替换：`OsFileIo`（生产）、`MemFileIo`（测试）、
   `FaultInjecting`（按第 n 次操作确定性注入 `Error` / `TornWrite` / `ShortRead`）。
+- **身份路由**（`ISO` REQ-ISO-002/006）：`AuthenticatedSubject` 是路由的
+  **唯一身份来源**（路由函数没有 `user_id` 参数——身份不在请求参数里）；
+  `WorkspaceRegistry` 按 `(属主, 名称)` 解析，**他人的工作区与"不存在"
+  给出不可区分的同一结果**（报"不存在"，不得报"无权限"）；
+  跨属主同名合法、名字只在同属主内唯一。
