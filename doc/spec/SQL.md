@@ -77,6 +77,7 @@ SQL 文本 ──▶ ① Raw AST ──▶ ② Bound Query ──▶ ③ 逻辑�
 | `session` | 会话表（`§8.2` #3：`append_only` + `logging = none` + TTL + `segment_drop`） |
 | `asset$` | 资产元数据（**只读**——写入只经资产接口，`AST` 域） |
 | `ref$` | 引用登记（**不进名字解析**——系统簿记，无直接查询路径） |
+| `audit` | 审计（**属主只读**——写入只经引擎的审计路径，`OPS` REQ-OPS-003；无 DML / DDL 入口） |
 
 **标识符规则**（本域定；比较照 `CONV` §1.3 的字节序）：
 

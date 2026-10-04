@@ -29,7 +29,7 @@
 | [`GRP.md`](GRP.md) | 属性图与拓扑 | 14 | ✅ 已完成 |
 | [`SQL.md`](SQL.md) | SQL 引擎 | 10 | ✅ 已完成 |
 | [`API.md`](API.md) | 访问协议与 SDK | 13 | ✅ 已完成 |
-| [`OPS.md`](OPS.md) | 运维与备份 | 12 | ⬜ 待细化 |
+| [`OPS.md`](OPS.md) | 运维与备份 | 22 | ✅ 已完成 |
 | [`NFR.md`](NFR.md) | 非功能（PERF/REL/SEC/RES/PRT/MNT） | 40 | ⬜ 待细化 |
 
 ## 3 规格条目格式
