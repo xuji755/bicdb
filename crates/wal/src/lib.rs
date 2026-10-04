@@ -4,9 +4,11 @@
 //!
 //! - 设计依据：§8 崩溃恢复契约（存储架构 §11.1–§11.5，均已定案）
 //! - 对应阶段：**P3**（已启动；本片 = 重做记录与 redo 页的字节格式）
-//! - 当前状态：**v0.1**——[`record`]（20B 记录头 / 块段 / 主段 / rdba 5B）、
-//!   [`logpage`]（512B redo 页 + 12B 分片头 + 跨页重组 + 截断丢弃）。
-//!   **日志缓冲与追加（latch 串行化）、刷盘、恢复、检查点随后。**
+//! - 当前状态：**v0.2**——[`record`]（20B 记录头 / 块段 / 主段 / rdba 5B）、
+//!   [`logpage`]（512B redo 页 + 12B 分片头 + 跨页重组 + 截断丢弃）、
+//!   [`buffer`]（latch 串行化追加 + **组提交**刷盘：latch 内摘页、
+//!   latch 外写与 sync；失败不前进 `synced_lsn`）。
+//!   **日志文件与 LSN 落盘映射、恢复、检查点随后。**
 //!
 //! 三条纪律（§11.5）：
 //! 1. **只存 after-image**——前像在 undo 里；
@@ -17,9 +19,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod buffer;
 pub mod logpage;
 pub mod record;
 
+pub use buffer::{decode_sink_pages, LogBuffer, LogSink, VecLogSink, WalError};
 pub use logpage::{
     decode_records, write_record, Fragment, LogPage, LogPageError, TailState, FRAGMENT_HEADER_LEN,
     LOG_PAGE_SIZE,

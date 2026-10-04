@@ -26,7 +26,8 @@
 //!
 //! # LSN 约定
 //!
-//! **LSN = 日志流中的字节位置，分片头也算数**——首片位置即记录的 LSN
+//! **LSN = 日志文件中的字节位置（页头与分片头都占位）**——可推导（"位置
+//! 可推导"）；首片位置即记录的 LSN
 //! （= `rec_id` = 记录头的 `lsn` 字段）。其余分片的位置可推导，**不存**。
 //! **一条记录不得跨越文件边界**（§11.5.1）——文件层接入时落实。
 
@@ -270,7 +271,18 @@ pub fn write_record(pages: &mut Vec<LogPage>, record: &RedoRecord) -> Result<(),
             let start = match pages.last() {
                 Some(p) => Lsn::from_raw(p.start_lsn().as_raw() + LOG_PAGE_SIZE as u64)
                     .expect("LSN 在 48 位域内"),
-                None => record.lsn,
+                None => {
+                    // 空序列：本记录的 LSN 是**首片的字节位置**（含页头），
+                    // 故页起点 = 首片位置 − 页头，且必须页对齐。
+                    let raw = record.lsn.as_raw();
+                    let start = raw.checked_sub(LOG_PAGE_HEADER_LEN as u64);
+                    match start {
+                        Some(s) if s % LOG_PAGE_SIZE as u64 == 0 => {
+                            Lsn::from_raw(s).expect("48 位域内")
+                        }
+                        _ => return Err(LogPageError::PageFull),
+                    }
+                }
             };
             pages.push(LogPage::new(start));
         }
@@ -424,12 +436,12 @@ mod tests {
 
     #[test]
     fn single_fragment_record_roundtrip() {
-        let rec = RedoRecord::commit(lsn(0), 3, 42);
+        let rec = RedoRecord::commit(lsn(16), 3, 42);
         let mut pages = Vec::new();
         write_record(&mut pages, &rec).unwrap();
         assert_eq!(pages.len(), 1);
         let page = &pages[0];
-        assert_eq!(page.start_lsn(), lsn(0));
+        assert_eq!(page.start_lsn(), lsn(0), "页 0 起点 = 首片位置 − 16");
         assert_eq!(page.used(), FRAGMENT_HEADER_LEN + rec.encoded_len());
         for p in pages.iter_mut() {
             p.seal();
@@ -445,7 +457,7 @@ mod tests {
     #[test]
     fn multi_page_record_reassembles_exactly() {
         // 3 页量级的记录。
-        let rec = big_record(512, 1200);
+        let rec = big_record(512 + 16, 1200);
         let mut pages = Vec::new();
         write_record(&mut pages, &rec).unwrap();
         assert!(
@@ -468,7 +480,7 @@ mod tests {
 
     #[test]
     fn worst_case_record_takes_thirty_four_pages() {
-        let rec = big_record(0, 16 * 1024); // 最坏：重写整页
+        let rec = big_record(16, 16 * 1024); // 最坏：重写整页
         assert_eq!(rec.encoded_len(), 16_417);
         assert_eq!(pages_needed_for_record(&rec), 34, "§11.5.2 的定量");
         assert_eq!(worst_case_pages(), 34);
@@ -477,7 +489,7 @@ mod tests {
 
     #[test]
     fn truncated_tail_drops_the_incomplete_record() {
-        let rec1 = RedoRecord::commit(lsn(0), 1, 11);
+        let rec1 = RedoRecord::commit(lsn(16), 1, 11);
         let rec2 = big_record(1024, 900);
         let mut pages = Vec::new();
         write_record(&mut pages, &rec1).unwrap();
@@ -504,7 +516,7 @@ mod tests {
 
     #[test]
     fn tampered_page_fails_checksum() {
-        let rec = RedoRecord::commit(lsn(0), 1, 1);
+        let rec = RedoRecord::commit(lsn(16), 1, 1);
         let mut pages = Vec::new();
         write_record(&mut pages, &rec).unwrap();
         pages[0].seal();
@@ -558,7 +570,7 @@ mod tests {
 
     #[test]
     fn empty_payload_record_roundtrip_through_pages() {
-        let rec = RedoRecord::rollback_done(lsn(0), 5);
+        let rec = RedoRecord::rollback_done(lsn(16), 5);
         let mut pages = Vec::new();
         write_record(&mut pages, &rec).unwrap();
         for p in pages.iter_mut() {
