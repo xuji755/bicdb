@@ -300,7 +300,7 @@
 | `UUID` | §6.6 | 参考环境无此类型 |
 | `FLOAT32` / `FLOAT64` | §6.6 + §6.5 | **是 `NUMBER` 的子类型**——与 Oracle 的 `FLOAT` 同路，**与 `BINARY_FLOAT` 不同路** |
 | `TIMESTAMP_TZ` | §6.6 + `CONV §2` | 时刻存 **UTC**，**原始时区另存** |
-| `JSON` | §6.6 + `CONV §5.3` | 数值**不得经二进制浮点中转** |
+| `JSON` | **`CFG.md`**（内部表示参照 PG 的 `jsonb`）+ §6.6 | 数值**不得经二进制浮点中转**——内部就是 `NUMBER` |
 | `VECTOR(n)` | §6.6 + `CONV §5.2` | **pgvector 式**：维度写在类型里 |
 | `ASSET_REF` | §6.6 | 16 字节资产 ID，**内容不进库** |
 
