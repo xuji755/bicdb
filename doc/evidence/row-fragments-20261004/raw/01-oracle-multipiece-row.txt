@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 行链 行片段 row piece 行头 删除 回收 chained row pieces
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 9，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 56，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 26，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Event:10227 Text: verify (multi-piece) row structure ------------------------------------------------------------------------------- Explanation: This a special EVENT code. It should *NOT* be used unless explicitly requested by Oracle Support. Event 10227 enab
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:21201.1 EVENT: 10227 "verify (multi-piece) row structure"  (排序分: 14.4)
+     └ 摘要：EVENT 10227 用于验证多片行结构，通过检查链式或迁移行片段的行片段标志和NRID链接来确保行片段完整性。该事件仅应在Oracle支持明确要求下使用，用于诊断因行链接或迁移导致的行片段损坏问题。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995369
+
+     [KnowledgeEntry] L1：Note:1944645.1 Bug 18607546 - ORA-600 [kdblkcheckerror]..[6266] corruption with self-referenced chained row. ORA-600 [kdsgrp1] / Wrong Results / ORA-8102 (文档 ID 18607546.8)  (排序分: 14.4)
+     └ 摘要：Bug 18607546 会导致链式行（chained row）的行片段（row piece）自引用（nrid 指向自身），触发逻辑损坏。启用 db_block_checking 时，会报 ORA-600 [kdBlkCheckError] [file#] [block#] [6266]，trace 中出现“kdrchk: Row piece pointing to itself”。否则可能出。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040020
+
+     [KnowledgeEntry] L1：Note:37733.1 ORA-600 [13012] "Update Row Piece predicate Failure"  (排序分: 14.4)
+     └ 摘要：ORA-600 [13012] 表示更新行片段时谓词失效，更新已锁定行却返回失败，常见于 7.3 至 8.1 版本，8.1.6 后外部化为 OER:30926。该错误可能与链接行、行损坏或多触发器相关，参数中的错误码区分比较失败、原先锁定、行不存在等失败。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994058
+
+     [KnowledgeEntry] L1：Note:245840.1 Bug 17806696 - Corruption / ORA-8102 / ORA-600 from update of chained row in OLTP compressed table (文档 ID 17806696.8)  (排序分: 14.4)
+     └ 摘要：Bug 17806696 在对 OLTP 压缩表执行链式行更新时，因重排序压缩块中行片更新次序错误，可导致物理损坏或内部错误，触发 ORA-8102、ORA-600 [13011] / [13013] / [13009]，影响版本包括 11.2.0.1 至 11.2.0.4 以及 12.1.0.1，修复版本为 11.2.0.4 BP16。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2048533
+
+     [CaseStudy] Bug 3440689&nbsp;&nbsp;Block corruption possible inserting large row piece to empty block  (排序分: 9.1)
+     └ 摘要：向空块插入大行片段时可能发生块损坏，根因是Bug 3440689，影响数据完整性，典型场景为大量数据插入操作。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:385714
+
+     [FaultModel] 行链接导致损坏块中丢失更多行  (排序分: 8.6)
+     └ 摘要：该条目描述了一种数据损坏场景：当Oracle数据库块发生损坏时，如果该块中包含因行链接（Row Chaining）而分布的行片段，则这些行片段对应的整行数据将无法访问并丢失。根本原因是行链接机制将一行数据分散存储在多个块中，一旦其中一个块损坏，该行的所有片段均不可用，导致整行数据丢失。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1558658
+

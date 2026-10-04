@@ -1,0 +1,45 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:1944645.1 Bug 18607546 - ORA-600 [kdblkcheckerror]..[6266] corruption with self-referenced chained row. ORA-600 [kdsgrp1] / Wrong Results / ORA-8102 (文档 ID 18607546.8)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040020
+
+  ── 描述 ──
+  Bug 18607546 - ORA-600 [kdblkcheckerror]..[6266] corruption with self-referenced chained row.
+  ORA-600 [kdsgrp1] / Wrong Results / ORA-8102 (文档 ID 18607546.8) Symptoms: Related To: Corruption
+  (Logical) Internal Error May Occur (ORA-600) Wrong Results Error May Occur ORA-8102 / ORA-1499
+  ORA-600 [kdsgrp1] ORA-600 [kdBlkCheckError] ORA-600 [ktbsdp1] ORA-600 [25027] Chained or Migrated
+  Rows UPDATE Description ORA-600 [kdsgrp1] with a row piece of a chained row (nrid) pointing to
+  itself or if db_block_checking is enabled, the corruption is caught and prevented going to disk with
+  ORA-600 [kdBlkCheckError] [file#] [block#] [6266]; message "kdrchk: Row piece pointing to itself" in
+  the trace file. It is most likely to happen but not limited to tables with a large number of columns
+  (e.g. more than 255 columns). Subsequent SQL operations may produce wrong results or different
+  errors like: ORA-8102 by UPDATE (if the table has indexes) ORA-600 [kdsgrp1] ORA-600 [25027]
+  ORA-1499 by "analyze table <name> validate structure cascade" (logical corruption between index and
+  table as the table is returning wrong values for the affected row) Corruption Example from a block
+  dump: Row 58 in Block rdba 0x01aff394 tab 0, row 58, 0x17a tl: 19 fb: -------- lb: 0x16 cc: 10 nrid:
+  0x01aff394.3a --> it points to the same row 58 Both ASSM and MSSM segments are exposed to this
+  problem. Rediscovery Notes ORA-600 [kdsgrp1] with block dump confirming chained row with a row piece
+  pointing to itself. If db_block_checking is enabled then a kdBlkCheckError block check error is seen
+  including arguments 6266 Workaround Once the corruption is introduced: Recreate the table skipping
+  the row: "Create Table As Select (CTAS) where rowid != <rowid of head piece>" or similar can be used
+  eg: export with query clause (where rowid != <rowid of head piece>) then drop or truncate, import OR
+  Use dbms_repair to Soft Corrupt the affected block and skip it for DML's To prevent the corruption
+  going to disk set db_block_checking=medium which will cause ORA-600 [kdBlkCheckError] [file#]
+  [block#] [6266] but the corruption is not propagated to disk. To permanently prevent the issue from
+  happening install this fix. HOOKS OERI:kdsgrp1 OERI:kdBlkCheckError OERI:ktbsdp1 ERROR:ORA-8102
+  ERROR:ORA-1499 SQL:UPDATE OERI:25027 ORA-600 [kdsgrp1] ORA-600 [kdBlkCheckError] ORA-600 [ktbsdp1]
+  ERROR:ORA-8102 ERROR:ORA-1499 SQL:UPDATE ORA-600 [25027] LIKELYAFFECTS XAFFECTS_11.2.0.4
+  XAFFECTS_V11020004 AFFECTS=11.2.0.4 XAFFECTS_12.1.0.1 XAFFECTS_V12010001 AFFECTS=12.1.0.1 (Base
+  Release) XAFFECTS_12.1.0.2 XAFFECTS_V12010002 AFFECTS=12.1.0.2 (Server Patch Set) XPRODID_5
+  PRODUCT_ID=5 PRODID-5 RDBMS XCOMP_RDBMS COMPONENT=RDBMS TAG_CHAINED TAG_CORR/LOG TAG_ERROR TAG_OERI
+  TAG_WRONGRES CHAINED CORR/LOG ERROR OERI WRONGRES FIXED_11.2.0.4.6 FIXED_11.2.0.4.BP16
+  FIXED_12.1.0.2.3 FIXED_12.1.0.2.DBBP06 FIXED_12.2.0.1 FIXED_WIN:B203P36 FIXED_WIN:B204P13
+  FIXED_WIN:C101P:160119 FIXED_WIN:C102P02 SOLVED_SR=93 SOLVED_SR_BAND_4 Further details on this issue
+  can be found in Note 1944645.1 Please note: The above is a summary description only. Actual symptoms
+  can vary. Matching to any symptoms here does not confirm that you are encountering this problem. For
+  questions about this bug please consult Oracle Support. References Bug:18607546 (This link will only
+  work for PUBLISHED bugs) Note:245840.1 Information on the sections in this article
+
+  ── 摘要 ──
+  Bug 18607546 会导致链式行（chained row）的行片段（row piece）自引用（nrid 指向自身），触发逻辑损坏。启用 db_block_checking 时，会报 ORA-600 [kdBlkCheckError] [file#] [block#] [6266]，trace 中出现“kdrchk: Row piece pointing to itself”。否则可能出。

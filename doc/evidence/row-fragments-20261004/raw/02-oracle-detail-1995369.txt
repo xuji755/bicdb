@@ -1,0 +1,16 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:21201.1 EVENT: 10227 "verify (multi-piece) row structure"
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995369
+
+  ── 描述 ──
+  Event:10227 Text: verify (multi-piece) row structure
+  ------------------------------------------------------------------------------- Explanation: This a
+  special EVENT code. It should *NOT* be used unless explicitly requested by Oracle Support. Event
+  10227 enables checking of chained / migrated row pieces by checking that all the row piece flags and
+  NRID links form a complete valid row piece. It should only be used to help diagnose problems where
+  chaining or row migration seem to cause row piece corruption Articles:
+
+  ── 摘要 ──
+  EVENT 10227 用于验证多片行结构，通过检查链式或迁移行片段的行片段标志和NRID链接来确保行片段完整性。该事件仅应在Oracle支持明确要求下使用，用于诊断因行链接或迁移导致的行片段损坏问题。
