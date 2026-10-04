@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 增量CHECKPOINT完成后，控制文件中的“lowest RBA in the buffer cache”会更新
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:231902
+
+  ── 描述 ──
+  隐含假设：检查点只更新文件头。实际增量检查点更新控制文件中的low RBA。边界条件：low
+  RBA更新越频繁，恢复越快，但增加了CKPT的写控制文件开销。失效场景：如果DBWR未能及时写出脏块，low RBA不会前进。
+
+  ── 摘要 ──
+  增量检查点完成后，控制文件中的“lowest RBA in the buffer cache”会随之更新，这与只更新文件头的隐含假设不同。实际增量检查点会更新控制文件中的low RBA，其更新频率影响恢复速度与CKPT写控制文件的开销：更新越频繁，恢复越快，但开销也越大。若DBWR未能及时写出脏块，low RBA不会前进，从而影响恢复效率。

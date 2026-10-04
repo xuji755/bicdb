@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 在线重做日志文件头（Log File Header）的结构
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1554022
+
+  ── 描述 ──
+  每个在线重做日志文件都有一个文件头，其中包含了该日志文件的元数据。关键信息包括：1. Log File Sequence Number: 日志文件的唯一序列号。2. Low SCN:
+  该日志文件中记录的第一个SCN。3. High SCN: 该日志文件中记录的最后一个SCN。4. Thread Number: 所属的Redo Thread。5. Block Size:
+  日志块的尺寸。这些信息对于实例恢复和介质恢复至关重要，Oracle通过它们来确定需要应用哪些日志文件。
+
+  ── 摘要 ──
+  在线重做日志文件头存储了日志文件的元数据，包括日志文件序列号、记录的第一个SCN（Low SCN）和最后一个SCN（High SCN）、所属的Redo Thread编号以及块大小。这些信息对实例恢复和介质恢复至关重要，Oracle通过它们判断需要应用哪些日志文件。

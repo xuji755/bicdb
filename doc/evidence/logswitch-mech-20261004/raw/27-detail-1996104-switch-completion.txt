@@ -1,0 +1,20 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:50418.1 WAITEVENT: V8 "log file switch completion"
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996104
+
+  ── 描述 ──
+  WAITEVENT:LOG_FILE_SWITCH_COMPLETION WaitEvent: LOG FILE SWITCH COMPLETION Identifier: kcrfsot
+  Registered in: kcrfh.h.h (8.0.3) Definition: Waiting for log switch because current log is full and
+  LGWR needs to complete writing to current log and open the new log or some other request to switch
+  log files. Wait Time: Wait 1 second Parameters: No parameters Commentary: We need a log switch to
+  get disk space for redo before we can write to the redo buffer. As some other process may have
+  performed the switch we dont want to do it twice so we wait on the most meaningful event there is
+  describing our situation. In Oracle 8.0.3 the waits are:
+  <WaitEvent:log_file_switch_checkpoint_incomplete> <WaitEvent:log_file_switch_archiving_needed>
+  <WaitEvent:log_file_switch_clearing_log_file> or finally this WaitEvent (log file switch
+  completion). Dependency: Validity: Advise: Related: Redo Metrics < Note:34550.1 >
+
+  ── 摘要 ──
+  log file switch completion 等待事件（标识符 kcrfsot）表示会话因当前联机日志已满或请求切换而等待日志切换完成，此时 LGWR 需先完成对当前日志的写操作并打开新日志，等待固定为 1 秒。该事件常出现在 log file switch checkpoint incomp。

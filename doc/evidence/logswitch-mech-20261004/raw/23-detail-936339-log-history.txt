@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: gv$log_history记录在线日志切换历史
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:936339
+
+  ── 描述 ──
+  该视图提供日志切换历史记录，包括组号、线程号、序列号、第一次更改时间等。在多实例RAC环境中，gv$log_history汇总所有实例的信息，而v$log_history只查看当前实例。first_t
+  ime字段表示日志组被切换为当前日志的时刻，常被用于监控日志切换频率，帮助识别因日志组过小或事务量大导致的频繁切换。
+
+  ── 摘要 ──
+  gv$log_history是Oracle动态性能视图，记录所有实例的在线redo日志切换事件，first_time列存储日志切换发生的时间，可用于按时间统计切换次数、分析LGWR行为。

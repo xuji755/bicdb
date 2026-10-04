@@ -1,0 +1,16 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:50517.1 WAITEVENT: V8 "switch logfile command"
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043647
+
+  ── 描述 ──
+  WAITEVENT: V8 "switch logfile command" WaitEvent: switch logfile command Identifier: kcrfsus
+  Registered in: kcrfh.h (8.0.3) Definition: Waiting for log switch to complete following a switch
+  logfile command. Wait Time: We wait until the log switches but timeout every 5 seconds to check for
+  interrupts etc.. Parameters: No parameters Commentary: If it is taking a long time to switch logs it
+  is sensible to check the alert log and check what LGWR is doing. Related: <WaitEvents:Log> .
+  Copyright © 2006, Oracle. All rights reserved.
+
+  ── 摘要 ──
+  switch logfile command 等待事件表示会话执行 ALTER SYSTEM SWITCH LOGFILE 命令后等待日志切换完成，内部标识符为 kcrfsus，每 5 秒超时检查中断。若等待时间过长，通常反映日志切换性能瓶颈，应检查告警日志和 LGWR 活动，关联 WaitEvent:L。

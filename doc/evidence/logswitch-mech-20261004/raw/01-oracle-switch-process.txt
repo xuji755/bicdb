@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 日志切换 内部过程 LGWR 重做日志 序列号 推进 过程
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 61，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 60，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 58，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     告警日志中Thread 1 advanced to log sequence 139083 (LGWR switch)，表示LGWR完成一次日志切换，在线重做日志序列号推进到139083。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] LGWR日志切换：Thread 1推进到日志序列139083  (排序分: 10.0)
+     └ 详情：DB Alert记录：Thread 1 advanced to log sequence 139083 (LGWR switch)。该事件由LGWR触发，表示当前重做日志线程1的日志序列号已推进到139083，通常伴随在线重做日志组切换。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1725887
+
+     [KnowledgeEntry] LGWR 日志切换推进 Thread 日志序列号  (排序分: 10.0)
+     └ 摘要：alert log 中 'Thread 1 advanced to log sequence 662736 (LGWR switch)' 表示 LGWR 完成一次日志切换，线程 1 的日志序列号推进到 662736，同时记录 Current log# 5 及组成员路径。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3844658
+
+     [KnowledgeEntry] 日志切换与归档条目添加  (排序分: 10.0)
+     └ 详情：当在线重做日志满或手动切换时，LGWR 切换到下一个日志组，序列号加 1。归档进程 (ARCn) 随后将旧的在线日志归档，并在控制文件中添加归档日志条目，包含线程号、序列号和 LAD 信息。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1009891
+
+     [KnowledgeEntry] 主库日志切换与归档过程  (排序分: 10.0)
+     └ 详情：当在线日志写满或手动切换时，LGWR 会将 redo 流切换到新的日志组，并触发 ARC 归档旧日志。归档条目包含线程号、序列号以及相关的 LAD 标识。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1008902
+
+     [CaseStudy] INSTANCE CRASH BY LGWR PROCESS WITH ORA-600 [2103]-c2  (排序分: 10.0)
+     └ 摘要：LGWR进程导致实例崩溃，报ORA-600 [2103]，根因为Bug 6267208，影响服务严重丢失，典型场景为多个数据库实例因LGWR进程异常终止。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:397461
+
+     [FaultModel] LGWR wait for redo copy 等待高  (排序分: 9.5)
+     └ 摘要：等待事件：LGWR 在写盘前等待前台完成对特定 redo 缓冲区的拷贝。根因是 redo copy latches 数量过多，导致 LGWR 需要等待更多前台完成复制，影响 redo 写入效率。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:323045
+

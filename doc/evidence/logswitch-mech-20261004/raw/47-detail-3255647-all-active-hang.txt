@@ -1,0 +1,62 @@
+
+  📖 故障模型详情
+  类型: bic_agent_FaultModel,SyncEntity
+  名称: REDO日志组耗尽导致日志切换挂起
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3255647
+  数据库类型: 2101
+  领域: io
+  维度:
+    - perf
+    - sql
+    - ora_redo
+  质量状态: evidence_ready
+  更新时间: 2026-09-10T09:53:22
+  更新者: pipeline_v3
+
+  ── 摘要 ──
+  摘要: 在 REDO 切换频繁（高峰期 1 分钟一次甚至更频繁）且日志组数量偏少的数据库中，所有 REDO 日志组会耗尽并处于 active 状态（SCN > CKPT SCN），日志切换无法进行，系统修改操作挂起，等待事件
+  LOG FILE SWITCH。解决方案是增加日志组数量或增大日志文件大小。
+
+  ── 现象与触发 ──
+  前期异常: 日志切换频繁（高峰期 1 分钟一次甚至更短），日志组状态均为 active。
+  触发条件: REDO 切换频繁，日志组数量偏少，所有日志组耗尽并处于 active 状态。
+  观测指标: 等待事件 LOG FILE SWITCH，修改操作挂起。
+
+  ── 原因分析 ──
+  直接原因: 所有 REDO 日志组均处于 active 状态，其变化量的 SCN 大于 CKPT SCN，无法被覆盖，日志切换无法进行。
+  次要因素: REDO 日志切换十分频繁（高峰期 1 分钟一次甚至不到 1 分钟一次），且 REDO 日志组数量偏少。
+
+  ── 诊断与反证 ──
+  判断方法: 观察日志切换频率、检查 v$log 中日志组状态是否为 active，以及系统等待事件是否为 LOG FILE SWITCH。
+
+  ── 影响与处置 ──
+  影响: 整个系统的修改操作处于挂起状态，直到某一组 REDO LOG 从 active 转为 inactive，才能继续日志切换。
+  修复方法: 增加 REDO 日志组的数量或者增加 REDO 日志文件的大小。
+
+  ── 证据与来源 ──
+  原文证据: 如果REDO日志组的数量偏少，将会导致所有REDO日志组耗尽，而且它们都处于活跃（active）状态（REDO日志文件中包含的变化量的SCN还大于CKTP SCN），那么日志切换就无法进行，必须等到某一组REDO
+  LOG从活跃转为不活跃（inactive），才能继续进行日志切换。这时，整个系统的修改操作都处于挂起状态，等待日志文件切换完成（其等待事件就是 LOG FILE SWITCH）。
+  来源: system
+  来源文件: doc/DBA的思想天空.md
+
+  ── 完整描述 ──
+  描述: 故障现象：数据库修改操作挂起，等待事件 LOG FILE SWITCH。触发条件：REDO 日志切换十分频繁，日志组数量偏少。根因：所有 REDO 日志组都处于 active 状态，其包含的变化量的 SCN 还大于
+  CKPT SCN，导致无法重用，日志切换必须等待某组转为 inactive。诊断可观察等待事件 LOG FILE SWITCH 和日志组状态。解决：增加 REDO 日志组数量或增加 REDO 日志文件大小。 【故障现象】
+  在 REDO 切换频繁（高峰期 1 分钟一次甚至更频繁）且日志组数量偏少的数据库中，所有 REDO 日志组会耗尽并处于 active 状态（SCN > CKPT SCN），日志切换无法进行，系统修改操作挂起，等待事件
+  LOG FILE SWITCH。解决方案是增加日志组数量或增大日志文件大小。 【故障起因及可能路径】 所有 REDO 日志组均处于 active 状态，其变化量的 SCN 大于 CKPT
+  SCN，无法被覆盖，日志切换无法进行。 【次要因素】 REDO 日志切换十分频繁（高峰期 1 分钟一次甚至不到 1 分钟一次），且 REDO 日志组数量偏少。 【故障前期异常与触发证据】 日志切换频繁（高峰期 1
+  分钟一次甚至更短），日志组状态均为 active。 【确认与排除方法】 观察日志切换频率、检查 v$log 中日志组状态是否为 active，以及系统等待事件是否为 LOG FILE SWITCH。 【故障衍生影响】
+  整个系统的修改操作处于挂起状态，直到某一组 REDO LOG 从 active 转为 inactive，才能继续日志切换。 【处置与恢复】 增加 REDO 日志组的数量或者增加 REDO 日志文件的大小。 【原文证据】
+  如果REDO日志组的数量偏少，将会导致所有REDO日志组耗尽，而且它们都处于活跃（active）状态（REDO日志文件中包含的变化量的SCN还大于CKTP SCN），那么日志切换就无法进行，必须等到某一组REDO
+  LOG从活跃转为不活跃（inactive），才能继续进行日志切换。这时，整个系统的修改操作都处于挂起状态，等待日志文件切换完成（其等待事件就是 LOG FILE SWITCH）。
+
+  ── 图谱关联 ──
+  ← 因果关系 [CAUSED_BY] (1)
+    - REDO日志组耗尽导致日志切换挂起 - 根因 [3bd8049f] [bic_agent_KnowledgeEntry,SyncEntity]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257302
+  → EXTRACTED_FROM [EXTRACTED_FROM] (1)
+    - Instance alive = 1 (kxfrsnins) [bic_agent_DocText,bic_agent_PipelineDocument,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3255542
+  → 相关视图 [REFERENCES_VIEW] (2)
+    - SYS.V$LOG [bic_agent_SystemView,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:98648
+    - V$ [bic_agent_SystemView,SystemView,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1521339
+  → 故障传导 [TRIGGERS] (1)
+    - REDO日志组耗尽导致日志切换挂起 - 前期异常与触发信号 [cc0fbaaa] [bic_agent_KnowledgeEntry,SyncEntity]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257301

@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 控制文件中的检查点进度记录（Checkpoint Progress Records）
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:242459
+
+  ── 描述 ──
+  在dump中：“CHECKPOINT PROGRESS RECORDS: (blkno=0x9, size=107, max=9, in-use=2, last-rec-
+  id=2)”。这些记录用于跟踪增量检查点的进度。隐含假设：检查点进程逐块更新控制文件。边界条件：若进度记录显示长时间未更新，可能表示IO瓶颈。
+
+  ── 摘要 ──
+  控制文件中的检查点进度记录用于跟踪增量检查点的进度，其dump示例包含块号、大小、最大记录数、使用中记录数和最后记录ID等字段。这些记录依赖于检查点进程逐块更新控制文件的隐含假设。若进度记录显示长时间未更新，可能表明存在IO瓶颈。

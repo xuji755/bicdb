@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 日志切换时LGWR记录到控制文件的信息
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556036
+
+  ── 描述 ──
+  这是一个具体的底层实现细节。每次日志切换，LGWR都会更新控制文件中的重做日志记录。记录的信息包括：线程号（Thread Number）、日志序列号（Log Sequence
+  Number）、该日志的低SCN（Low SCN）、低SCN的时间戳（Low SCN Timestamp）以及下一个日志的低SCN（Next SCN）。这些信息对于恢复至关重要。
+
+  ── 摘要 ──
+  每次日志切换时，LGWR进程会更新控制文件中的重做日志记录，写入线程号、日志序列号、低SCN、低SCN时间戳以及下一个日志的低SCN等关键信息。这些数据对于数据库恢复操作至关重要。

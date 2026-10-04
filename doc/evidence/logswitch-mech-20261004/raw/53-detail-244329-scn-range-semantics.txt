@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 日志文件中SCN范围的含义
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:244329
+
+  ── 描述 ──
+  隐含假设：日志中所有redo记录的SCN介于Low SCN和Next SCN之间（不包含Next SCN）。边界条件：如果日志被关闭（log switch），Next SCN被设置为下一个日志的Low
+  SCN。失效场景：如果日志文件头部损坏，恢复时可能无法确定SCN范围。
+
+  ── 摘要 ──
+  日志文件中所有redo记录的SCN位于Low SCN和Next SCN之间（不含Next SCN）。日志切换时，Next SCN被设为下一个日志的Low SCN，形成连续范围。若日志文件头部损坏，恢复时可能无法准确判断SCN范围，导致恢复失败。

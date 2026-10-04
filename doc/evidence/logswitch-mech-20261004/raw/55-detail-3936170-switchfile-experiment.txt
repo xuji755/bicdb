@@ -1,0 +1,11 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed,KEOpSQLReviewed
+  名称: alter system switch logfile 强制日志切换
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3936170
+
+  ── 描述 ──
+  该命令在检查点队列实验中用于推进 on disk RBA 和日志序列。示例：初始 on_disk_rba=12.3.0，执行后变为 13.2.0；继续切换后变为 14.2.0、15.2.0。
+
+  ── 摘要 ──
+  执行 alter system switch logfile; 返回 System altered，强制 Oracle 进行日志切换。文本中多次执行该命令，用于观察 x$kcccp 的 on_disk_rba 推进和 v$log 中 CURRENT/ACTIVE/INACTIVE 状态变化。

@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 内部函数源代码引用
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:224484
+
+  ── 描述 ──
+  文档中References部分列出了与归档和重做相关的内核源代码文件：kcrfw.c, kcrf.h, kcrfh.h, kcrr.h,
+  kcrr.c。这些文件实现了重做日志缓冲区、LGWR、ARCH等核心逻辑。对于深入了解内部机制有价值。
+
+  ── 摘要 ──
+  内部函数源代码引用部分列出了与归档和重做相关的内核源代码文件，包括kcrfw.c、kcrf.h、kcrfh.h、kcrr.h和kcrr.c。这些文件实现了重做日志缓冲区、LGWR以及ARCH等核心逻辑，对于深入了解Oracle数据库内部机制具有重要参考价值。

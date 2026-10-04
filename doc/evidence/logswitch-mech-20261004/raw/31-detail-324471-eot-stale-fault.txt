@@ -1,0 +1,78 @@
+
+  📖 故障模型详情
+  类型: bic_agent_FaultModel,KGV2Managed
+  名称: 使用备份的在线日志导致恢复至错误的EOT点
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324471
+  别名: recover_with_backup_online_log_eot
+  数据库类型: 2101
+  领域: recovery
+  分类: fault
+  维度:
+    - fault
+    - backup
+  质量状态: evidence_enhanced
+  更新时间: 2026-08-11T01:37:50.754000000+00:00
+  更新者: fm_evidence_oracle_second_pass_v1
+
+  ── 摘要 ──
+  摘要: True
+
+  ── 现象与触发 ──
+  触发条件: 使用备份的在线日志文件进行恢复。
+  观测指标: 恢复完成后数据库状态与预期不一致；时间点早于最后一次提交。
+
+  ── 原因分析 ──
+  直接原因: 备份的在线日志中包含过时的EOT标志，恢复时停止在错误的SCN。
+  根因路径:
+    - oracle_root_68e133813b7c248f
+    - oracle_root_e508c66ac583d961
+
+  ── 诊断与反证 ──
+  判断方法: 前期异常/触发证据：使用备份的在线日志文件进行恢复 路径1：备份的在线日志中包含过时的EOT标志，恢复时停止在错误的SCN；确认时核对对应配置、日志或运行状态，证据不成立则排除该路径。
+
+  ── 影响与处置 ──
+  影响: 恢复后的数据库缺少部分事务，数据不一致
+
+  ── 证据与来源 ──
+  证据来源: [{"eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1533426", "kind": "知识", "relationship": "HAS_KNOWLEDGE",
+  "source": "oradoc3/[itpub.net]dsi402e-d12865.txt"}, {"eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1537347",
+  "kind": "知识", "relationship": "HAS_KNOWLEDGE", "source": "oradoc3/M010722.txt"}, {"eid":
+  "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:909768", "kind": "知识", "relationship": "HAS_KNOWLEDGE", "source":
+  "oradoc3/M010722.txt"}, {"eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1188431", "kind": "知识",
+  "relationship": "HAS_KNOWLEDGE", "source": "oradoc3/[itpub.net]dsi402e-d12865.txt"}, {"eid":
+  "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1533376", "kind": "知识", "relationship": "HAS_KNOWLEDGE", "source":
+  "oradoc3/M09533.txt"}]
+  来源: 0010101/oradoc3/InstructordayII.txt
+
+  ── 完整描述 ──
+  描述: 原始故障描述：现象：若恢复时使用了备份的在线日志，会恢复至日志中标记的EOT（线程结束）点，该点可能不是当前实际时间点，导致数据不一致。根因：备份的在线日志中包含过时的EOT标志，恢复时停止在错误的SCN。影响：恢复后的
+  数据库缺少部分事务，数据不一致。 故障现象：若恢复时使用了备份的在线日志，会恢复至日志中标记的EOT（线程结束）点，该点可能不是当前实际时间点，导致数据不一致 故障起因及可能路径： 1.
+  备份的在线日志中包含过时的EOT标志，恢复时停止在错误的SCN 确认与排除方法： 前期异常/触发证据：使用备份的在线日志文件进行恢复
+  路径1：备份的在线日志中包含过时的EOT标志，恢复时停止在错误的SCN；确认时核对对应配置、日志或运行状态，证据不成立则排除该路径。 故障衍生影响：恢复后的数据库缺少部分事务，数据不一致 第二遍补充证据： 知识证据：ca
+  che_layer_components_in_block_dump；逻辑块转储在开头部分会展示缓存层的主要组件，包括相对DBA（rdba）、SCN（scn）、序列号（seq）、标志（flg）和块类型（type）等信息。
+  此外，转储输出中的尾部（tail）字段对应数据块的最后四个字节，用于完整性校验。该描述说明了逻辑块转储的基本结构与关键字段。 知识证据：结束线程标志；每个重做日志头包含一个结束线程标志（EOT）。当实例正常关闭时，会在最
+  后一个日志中设置该标志；介质恢复过程中遇到EOT时，会停止对该线程的恢复。Oracle强烈建议不要备份在线重做日志，因为若在恢复时使用了备份的在线日志，其EOT标志可能指向错误的停止点，导致数据库无法恢复到当前时间点。
+  知识证据：EOT标志与在线日志备份风险；EOT标志存储在日志头中，Oracle始终建议不要备份在线日志，因为存在恢复到错误停止点的风险。若日志的备份副本与数据文件一起恢复，系统将恢复到每个线程的EOT，但此EOT对于完全
+  恢复到当前时间点是不正确的，可能导致恢复点错误。 知识证据：FLM段事务层转储的关键字段；在空闲列表管理（FLM）段的事务层转储中，关键字段包括：csc（清理SCN，用于读一致性）、itc（ITL槽位数）、flg（标志，
+  块在空闲列表上时显示为'O'）、fsl（空闲空间锁）、fnx（指向空闲列表链中下一个块的指针）以及ITL信息。这些字段共同用于描述FLM段事务层的状态和空闲列表管理结构。 知识证据：block_flag_definiti
+  ons；数据块头部中的Flg字段使用位掩码定义块状态标志，包括：KCBHFNEW（0x01）表示新块且数据区已清零；KCBHFDLC（0x02）表示延迟日志记录变更，已推进SCN/序列号；KCBHFCKV（0x04）表示
+  校验值已保存且块XOR为零；KCBHFTMP（0x08）表示临时块。这些标志用于指示数据块的不同状态，是块管理机制的核心组成部分。
+
+  ── 图谱关联 ──
+  → 伴随对象 [ACCOMPANIED_BY] (5)
+    - GES MASTER TO GET ESTABLISHED FOR SCN OP [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420988
+    - RETRY CONTACT SCN LOCK MASTER [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420423
+    - STANDBY QUERY SCN ADVANCE [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1421234
+    - WAIT FOR MASTER SCN [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1421263
+    - WAIT FOR SCN ACK [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1421265
+  ← 因果关系 [CAUSED_BY] (2)
+    - oracle_root_68e133813b7c248f [Knowledge,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1810095
+    - oracle_root_e508c66ac583d961 [Knowledge,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1850413
+  → 关联知识 [HAS_KNOWLEDGE] (5)
+    - EOT标志与在线日志备份风险 [bic_agent_KnowledgeEntry,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:909768
+    - FLM段事务层转储的关键字段 [bic_agent_KnowledgeEntry,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1188431
+    - block_flag_definitions [bic_agent_KnowledgeEntry,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1533376
+    - cache_layer_components_in_block_dump [bic_agent_KnowledgeEntry,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1533426
+    - 结束线程标志 [bic_agent_KnowledgeEntry,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1537347
+  → 相关指标 [REFERENCES_METRIC] (1)
+    - SCN RATE [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422806

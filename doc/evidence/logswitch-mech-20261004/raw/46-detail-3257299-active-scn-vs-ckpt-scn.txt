@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: REDO日志组active状态判断依据
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257299
+
+  ── 描述 ──
+  一个 REDO 日志组处于 active 状态，意味着其中记录的变化尚未被检查点完全写入数据文件，即日志中包含的变化量的 SCN 大于 CKPT SCN。只有等检查点推进，将其变为 inactive
+  后，才能被重新使用。
+
+  ── 摘要 ──
+  REDO 日志组处于 active 状态的判断依据是：REDO 日志文件中包含的变化量的 SCN 还大于 CKPT SCN。此时该组不能被覆盖，日志切换必须等待其转为 inactive。

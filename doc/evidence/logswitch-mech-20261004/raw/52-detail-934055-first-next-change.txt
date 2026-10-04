@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 重做日志文件中的 SCN 范围
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:934055
+
+  ── 描述 ──
+  重做日志组使用 FIRST_CHANGE# 与 NEXT_CHANGE# 界定所包含的变更序列。例如 GROUP# N 的 FIRST_CHANGE# 至 NEXT_CHANGE# 之间的 SCN
+  范围即该日志覆盖。可通过 v$log 或 v$log_history 查询。
+
+  ── 摘要 ──
+  重做日志文件记录 FIRST_CHANGE# 和 NEXT_CHANGE#，分别表示该日志文件的起始 SCN 和下一个日志文件的起始 SCN，用于确定日志覆盖的变更范围。

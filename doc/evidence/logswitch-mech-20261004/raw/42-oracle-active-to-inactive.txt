@@ -1,0 +1,30 @@
+
+============================================================
+  [问题诊断] 日志组 ACTIVE 变 INACTIVE 检查点 完成 控制文件 状态 更新 CKPT 进程 时机
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 1，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 4，摘要筛选通过 1，批次 1；本路已取尽
+  CaseStudy：已取 17，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 12 条；最终正文补读 1 条
+
+  ⚠️ 精确对象未入图/未命中: INACTIVE
+     以下语义检索结果仅供参考；请优先补齐这些对象的 SystemView/Column 数据。
+
+  ✅ 答案要点
+     REDO 日志组处于 active 状态的判断依据是：REDO 日志文件中包含的变化量的 SCN 还大于 CKPT SCN。此时该组不能被覆盖，日志切换必须等待其转为 inactive。
+
+  📍 诊断结果 (3条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] REDO日志组active状态判断依据  (排序分: 10.0)
+     └ 详情：一个 REDO 日志组处于 active 状态，意味着其中记录的变化尚未被检查点完全写入数据文件，即日志中包含的变化量的 SCN 大于 CKPT SCN。只有等检查点推进，将其变为 inactive 后，才能被重新使用。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257299
+
+     [KnowledgeEntry] REDO日志组数量与日志切换性能  (排序分: 9.8)
+     └ 摘要：REDO 日志组数量通常不直接和性能相关。但对于 REDO 切换频繁的数据库（高峰期 1 分钟一次甚至更频繁），若日志组数量偏少，所有组会耗尽且处于 active 状态（SCN > CKPT SCN），日志切换无法进行，系统修改操作挂起，等待事件为 LOG FILE SWITCH。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257300
+
+     [FaultModel] REDO日志组耗尽导致日志切换挂起  (排序分: 8.9)
+     └ 摘要：在 REDO 切换频繁（高峰期 1 分钟一次甚至更频繁）且日志组数量偏少的数据库中，所有 REDO 日志组会耗尽并处于 active 状态（SCN > CKPT SCN），日志切换无法进行，系统修改操作挂起，等待事件 LOG FILE SWITCH。解决方案是增加日志组数量或增大日志文件大小。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3255647
+

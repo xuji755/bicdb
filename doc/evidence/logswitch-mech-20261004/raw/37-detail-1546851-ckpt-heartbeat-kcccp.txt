@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: CKPT心跳与控制文件更新
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1546851
+
+  ── 描述 ──
+  每个实例的 CKPT 进程会定期（默认每3秒）更新控制文件中的一个特定块，该块称为“检查点进度记录”（Checkpoint Progress
+  Record）。这个块对每个实例是唯一的，因此实例之间无需协调。CREATE DATABASE 的 MAXINSTANCE 参数决定了这些块记录的数量。即使是在单实例模式下，心跳也会发生。
+
+  ── 摘要 ──
+  CKPT进程（检查点进程）在每个实例中定期（默认每3秒）更新控制文件中的“检查点进度记录”块，该块对每个实例唯一，因此实例间无需协调。CREATE DATABASE语句中的MAXINSTANCE参数决定了这些记录块的数量。即使运行在单实例模式下，心跳更新机制也会持续进行。

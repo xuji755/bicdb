@@ -1,0 +1,36 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 重做日志格式：日志文件头
+      •线程号：指示日志所属线程，一个日志只能包含一个线程生成的重做。•日志序列号：每次日志切换递增1，每个线程独立分配。•低SCN：第一个重做记录对应的SCN（除非其头中有SCN）。•下一SCN：同一线程下一日志的低SCN，当前日志的下一SCN为无穷大。•下一可用块：当前日志文件结束位置。•resetlogs SCN和时间戳：标识一次RESETLOGS打开操作，若resetlogs数据与控制文件中的数据库信息记录不匹配则恢复时不能应用该重做日志。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:320015
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Redo Log Header（日志文件头）
+      日志文件头包含：Thread#（线程号）、Sequence#（序列号）、Low SCN（日志中第一个重做记录的SCN，除非其头部有SCN）、Next SCN（同一线程中下一个更高序列号日志的低SCN）。当前活动日志的Next SCN为无限大，因为没有更高序列号的日志。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:194668
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 重做日志文件头信息
+      重做日志文件头包含：DB ID（验证日志关联的数据屏）、文件号（日志文件号）和文件类型（2表示重做日志）。线程号唯一标识日志的线程。序列号唯一标识该线程重做流中日志的序列。每个启用线程的当前日志在其头部设置了End-of-Thread (EOT)标记，完全恢复会尝试通过所有线程的EOT继续应用重做。重置日志SCN和计数记录以防止重做被应用到错误的数据库化身。如果重置日志数据与控制文件中的数据库信息记录不匹配，则重做日志不能由恢复应用。低SCN是日志中第一个重做记录关联的SCN，下一个SCN是同一线程下一个更高序列号日志的低SCN。线程启用和关闭信息也存储在日志文件头中。为了防止损坏，文件头中记录了块校验和。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319928
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 重做日志文件头(Redo File Header)
+      重做日志文件头位于块1，通用文件头之后。其特定字段包括：descrip（文本串用于调试）、thread（线程号）、nab（下一个可用块，打开时设为无穷大）、seq（日志序列号）、hws（日志初始化序列内的头写序号）、eot（线程结束标志）、dis（线程是否在日志末尾禁用）、reset logs count/scn（上次日志切换时的控制文件值副本）、Low scn/Next scn（该日志覆盖的SCN范围）、Enabled scn（线程最后启用时的SCN）、Thread closed scn（线程关闭SCN）、Log format vsn（重做格式版本）、Disk cksum/Calc cksum（磁盘/计算校验和）、Terminal Recovery Stamp scn（介质恢复完成SCN）、Miscellaneous flags（归档、LogMiner等标志）。可通过ALTER SYSTEM DUMP REDOHDR命令转储。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319822
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 重做日志头部结构
+      重做日志头部（Log File Header）包含：日志文件序列号（Log Sequence Number）、块大小（Block Size）、文件大小、日志文件状态（CURRENT/ACTIVE/INACTIVE/CLEARING）、首次SCN（First SCN）、下次SCN（Next SCN）、线程号（Thread#）。日志切换时更新头部信息。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557404
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 在线重做日志文件头（Log File Header）的结构
+      每个在线重做日志文件都有一个文件头，其中包含了该日志文件的元数据。关键信息包括：1. Log File Sequence Number: 日志文件的唯一序列号。2. Low SCN: 该日志文件中记录的第一个SCN。3. High SCN: 该日志文件中记录的最后一个SCN。4. Thread Number: 所属的Redo Thread。5. Block Size: 日志块的尺寸。这些信息对于实例恢复和介质恢复至关重要，Oracle通过它们来确定需要应用哪些日志文件。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1554022
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 重做日志头转储
+      概念：重做日志头转储用于查看重做日志文件的头部信息，包括日志序号、线程、SCN范围、文件大小、标志等。机制：通过转储日志头获取关键参数，帮助分析日志切换和归档问题。应用场景：诊断日志切换异常、归档延迟或日志损坏时，通过转储检查日志头字段是否正常。操作 kernel fault 重做日志头转储 redohdr
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557392
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 重做日志文件头结构
+      每个重做日志文件在dump中显示为LOG FILE条目，包含：名称、线程、序列号、大小（siz）、块大小（bsz）、已分配块（nab）、标志（flg）、归档链接、前向/后向指针、Low SCN、Next SCN、文件头（FILE HEADER）包含兼容版本、DB ID、激活ID、控制序列号、格式化ID、redo log key、描述、线程、nab、seq、hws、eot、dis、reset logs count/scn、Low/Next SCN、Enabled SCN、Thread closed SCN、磁盘校验和与计算校验和、Terminal Recovery Stop scn等。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319932
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 日志切换时控制文件的更新内容
+      日志切换时，LGWR将线程号、日志序列号、低SCN、低SCN时间戳和下一个SCN记录到控制文件。这些信息用于实例恢复时定位日志切换点，确保重做日志链的连续性。概念：控制文件中的日志切换记录。机制：LGWR在每个日志切换时刻更新控制文件中的日志切换记录。应用场景：实例恢复、归档日志管理、闪回数据库。原理 kernel 日志切换 控制文件 LGWR
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:244274
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 重做日志文件头(Redo Log File Header)
+      重做日志文件头位于每个重做日志文件的起始，用于描述该日志文件的基本信息和状态。DUMP输出中，/FILE/HEADER: 部分展示了其内容。关键字段包括: Software VSN(软件版本), DB ID(数据库标识), Control Seq(控制文件序列号), File Size(文件大小), File Number(文件编号), BlkSiz(块大小), File Type (文件类型, 如LOG)。此外，在日志文件头之后的部分，描述了日志文件的属性，包括：First Time(第一个日志记录时间), Thread(线程号), Seq(日志序列号), Low SCN(低SCN), Next SCN(下一个SCN), Resetlogs count(重置日志计数), Enabled SCN(启用SCN), Thread closed SCN(线程关闭SCN), Log format VSN(日志格式版本)等。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319823
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 诊断跟踪文件：重做日志头转储（Redo Log Header Dump）
+      重做日志头转储用于查看所有重做日志文件的头部信息。DBA可以通过执行`ALTER SESSION SET EVENTS 'immediate trace name redohdr level <n>'`命令来生成。这对于检查日志序列号、线程信息、首次和最后SCN等非常有用，有助于理解重做日志的生成和切换历史。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557160
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 诊断跟踪文件：重做日志头转储
+      要转储重做日志头信息，DBA需要执行命令：`alter session set events 'immediate trace name redohdr level <n>';`。生成的跟踪文件位于`user_dump_dest`目录。

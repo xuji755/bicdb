@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: ckpt 进程在 mount 前后与控制文件的交互
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:948022
+
+  ── 描述 ──
+  通过查看操作系统进程文件描述符（如 /proc/<pid>/fd），发现在挂载前 ckpt 进程无控制文件相关的 fd，挂载后 ckpt
+  才会打开控制文件，以便更新数据库的检查点信息。这体现了控制文件在 mount 阶段被后台进程访问的过程。
+
+  ── 摘要 ──
+  在 nomount 阶段，ckpt 进程没有打开控制文件的文件描述符；mount 后 ckpt 进程打开控制文件并更新检查点信息。

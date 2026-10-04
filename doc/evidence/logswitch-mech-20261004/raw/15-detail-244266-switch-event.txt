@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 日志切换事件
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:244266
+
+  ── 描述 ──
+  当LGWR写满当前在线重做日志组（或因为其他原因如ALTER SYSTEM SWITCH
+  LOGFILE），会发生日志切换。切换后，当前日志变为inactive（如果归档完成）或active（如果未归档），LGWR开始写入下一个日志组。日志切换是触发ARCH归档的重要事件。
+
+  ── 摘要 ──
+  当日志写入进程（LGWR）写满当前在线重做日志组，或因执行ALTER SYSTEM SWITCH LOGFILE等操作时，会发生日志切换。切换后，原日志组状态变为inactive（若归档已完成）或active（若未归档），LGWR随后开始写入下一个日志组。日志切换是触发归档进程（ARCH）进行归档的关键事件。

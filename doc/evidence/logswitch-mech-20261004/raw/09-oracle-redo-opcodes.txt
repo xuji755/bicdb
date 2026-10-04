@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] REDO DUMP 记录 op 5.1 操作码 含义 日志切换 媒体恢复
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 19，摘要筛选通过 5，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 53，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 12，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Redo vector dump 快速参考，解释 CHANGE 记录中 OPCODE 5.1 对应 undo 封装（ktudb/ktubu redo），OPCODE 11.2/11.3 对应行数据变更；KTB Redo 的 op 取值 F/C/Z/L/R/N 分别表示事务槽（ITL）首次修改、继续更新、首次撤销、最后撤销、替换或无操作。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:29726.1 QREF: REDO VECTOR Dump - Quick Reference  (排序分: 15.0)
+     └ 摘要：Redo vector dump 快速参考，解释 CHANGE 记录中 OPCODE 5.1 对应 undo 封装（ktudb/ktubu redo），OPCODE 11.2/11.3 对应行数据变更；KTB Redo 的 op 取值 F/C/Z/L/R/N 分别表示事务槽（ITL）首次修改、继续更新、首次撤销、最后撤销、替换或无操作。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995588
+
+     [KnowledgeEntry] L1：Note:29726.1 QREF: REDO VECTOR Dump - Quick Reference  (排序分: 15.0)
+     └ 摘要：REDO VECTOR dump 快速参考，解析 ALTER SYSTEM DUMP LOGFILE 输出的 REDO RECORD 结构，包含 Thread、RBA、LEN、VLD 及 CONTINUE SCN 等字段，说明 CHANGE 记录的 CLASS、DBA、SEQ、OPCODE 和 UNDO/REDO 部分。重点阐释 KTB Redo 操作类型（F/C/Z/L 等）及 code（DRP/。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2042750
+
+     [KnowledgeEntry] L1：Note:31077.1 Redo Opcodes  (排序分: 15.0)
+     └ 摘要：Note:31077.1 记录了从 Oracle 7.1.3 源码提取的重做日志组件层（Layer）和操作码（Opcode）定义，包含 Layer 编号、宏常量与描述，以及每个操作码对应的 redo 写入函数和 trace 输出函数。可用于解读使用 ALTER SYSTEM DUMP LOGFILE 命令对重。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995589
+
+     [KnowledgeEntry] L1：Note:29726.1 QREF: REDO VECTOR Dump - Quick Reference  (排序分: 15.0)
+     └ 摘要：Note:29726.1 是 redo vector dump 的快速参考，解释 ALTER SYSTEM DUMP LOGFILE 转出的日志内容格式，包括 REDO RECORD 的 Thread、RBA、LEN、VLD 字段含义，VLD 标志位如 KCRVALID 等六种状态，CHANGE 向量中的 DBA、INC、SEQ 及 OPCODE 引用，并列出 ktudb/ktu。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2045364
+
+     [CaseStudy] 通过数据块和Undo/Redo Dump分析事务  (排序分: 9.8)
+     └ 摘要：案例：通过UPDATE语句（'Anil'→'Amaresh'）演示分析。使用DBMS_ROWID定位数据块（文件4块157），执行ALTER SYSTEM CHECKPOINT后，DUMP数据块、Undo段头、Undo块、Redo日志、Flashback日志。详细展示ITL结构、事务ID、Undo记录、Redo OP码（如11.2/5.1）以及闪回日志块镜像，帮助DBA深入理解事务内部机制。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325708
+
+     [FaultModel] 12c R2 RAC alert log 频繁输出 redo dump 消息（关联 ORA-08103 索引坏块）  (排序分: 9.3)
+     └ 摘要：Oracle 12.2 4节点 RAC 本地磁盘使用率告警，DIAG 目录不断生成 redo dump trace，alert log 持续输出 An internal routine has requested a dump of selected redo；前台同时爆出 ORA-08103 坏块，坏块对象为索引，重建索引后告警消失。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2228483
+

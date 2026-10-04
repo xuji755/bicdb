@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 增量检查点每3秒计算目标RBA并推进CKPTQ写出
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4094051
+
+  ── 描述 ──
+  原文c点：增量检查点会引发checkpoint queue(dirty queue)上的脏块递进地被写出，每三秒CKPT后台进程将计算检查点目标RBA(Redo Block
+  Address)，当增量检查点发生时所有在目标RBA相应时间之前被弄脏的buffer块都当被写出。括号内英文：When a checkpoint is initiated, DBWR writes
+  all buffers on the queue until the checkpoint RBA is less than the head of the CKPTQ RBA。
+
+  ── 摘要 ──
+  增量检查点引发checkpoint queue(dirty queue)上的脏块递进写出；每3秒CKPT后台进程计算检查点目标RBA；增量检查点发生时，所有在目标RBA相应时间之前被弄脏的buffer块都应写出。DBWR写出队列直到检查点RBA小于CKPTQ头部RBA。

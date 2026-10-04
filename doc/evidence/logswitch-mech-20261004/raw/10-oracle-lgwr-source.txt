@@ -1,0 +1,31 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  [bic_agent_KnowledgeEntry,KGV2Managed] L1：ONE OF 6 NODE INSTANCE CRASHED WITH ORA-600[2103] OF LGWR-c3  (排序分: 15.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040611
+  [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:170426.1 WAITEVENT: "LGWR wait on ATTACH"  (排序分: 15.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995809
+  [bic_agent_KnowledgeEntry,KGV2Managed] L1：INSTANCE CRASH BY LGWR PROCESS WITH ORA-600 [2103]-c3  (排序分: 15.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2041050
+  [bic_agent_KnowledgeEntry,KGV2Managed] L1：ONE OF 6 NODE INSTANCE CRASHED WITH ORA-600[2103] OF LGWR-c3  (排序分: 15.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2045301
+  [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:68533.1 Init.ora Parameter "_LGWR_ASYNC_IO" [Hidden] Reference Note  (排序分: 15.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994566
+  [bic_agent_KnowledgeEntry,SyncEntity] LGWR在日志切换时写db alert log，日志写入卡顿传导为实例级等待  (排序分: 10.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:459380
+  [bic_agent_KnowledgeEntry,KGV2Managed] LGWR日志写入进程  (排序分: 10.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1521441
+  [bic_agent_KnowledgeEntry,KGV2Managed] 内部函数源代码引用  (排序分: 10.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:224484
+  [bic_agent_KnowledgeEntry,SyncEntity] 日志缓冲区循环结构与LGWR写入速度  (排序分: 10.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259096
+  [bic_agent_KnowledgeEntry,KGV2Managed] LGWR自动启动ARCH进程  (排序分: 10.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155867
+  [bic_agent_KnowledgeEntry,KGV2Managed] 日志写进程 (LGWR) 写入条件  (排序分: 10.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1523538
+  [bic_agent_KnowledgeEntry,SyncEntity] 日志切换时 LGWR 通知 ARC0 归档  (排序分: 10.0)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:240674
+  [bic_agent_FaultModel,KGV2Managed] LGWR I/O超时故障  (排序分: 9.8)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1529193
+  [bic_agent_FaultModel,KGV2Managed] LGWR写超时警告  (排序分: 9.8)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560697
+  [bic_agent_FaultModel,KGV2Managed] 归档落后于LGWR导致数据库挂起  (排序分: 9.7)
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324819

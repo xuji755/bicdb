@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 低SCN 下一SCN 日志 链 连续 SCN 范围 日志切换
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 55，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     日志切换首先将日志缓冲区中尚未写入当前REDO日志文件的REDO记录写入当前REDO日志文件，然后将最后一个REDO记录的SCN作为High SCN记录在REDO日志文件头中，之后关闭当前日志。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 日志切换时刷写REDO与记录High SCN  (排序分: 10.0)
+     └ 详情：在做日志切换时，首先要将日志缓冲区中还没有写入当前REDO日志文件的REDO记录写入当前REDO日志文件；然后将最后一个REDO记录的SCN作为该日志文件的High SCN记录在REDO日志文件头中。这些操作完成后，就可以关闭当前日志。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259087
+
+     [KnowledgeEntry] 重做日志头的关闭SCN与日志切换的关联  (排序分: 10.0)
+     └ 摘要：重做日志头的关闭SCN与日志切换密切相关。通过dump分析可见，当前正在使用的日志文件其Next SCN为全F，而其他日志文件的Next SCN指向下一个日志文件的Low SCN，这种链接机制保证了日志链的连续性。日志切换被假定为原子操作，但若在切换过程中实例崩溃，Next SCN可能丢失，导致日志链断裂，此时数据库恢复时需要扫描全部日志来重建正确的日志顺序。该机制揭示了日志切换的潜在风险及其对恢复过程的影响。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319755
+
+     [KnowledgeEntry] REDO日志组耗尽导致日志切换挂起 - 根因 [3bd8049f]  (排序分: 10.0)
+     └ 详情：所有 REDO 日志组均处于 active 状态，其变化量的 SCN 大于 CKPT SCN，无法被覆盖，日志切换无法进行。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257302
+
+     [KnowledgeEntry] REDO日志组数量与日志切换性能  (排序分: 10.0)
+     └ 摘要：REDO 日志组数量通常不直接和性能相关。但对于 REDO 切换频繁的数据库（高峰期 1 分钟一次甚至更频繁），若日志组数量偏少，所有组会耗尽且处于 active 状态（SCN > CKPT SCN），日志切换无法进行，系统修改操作挂起，等待事件为 LOG FILE SWITCH。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257300
+
+     [CaseStudy] 修改控制文件调整SCN案例  (排序分: 10.0)
+     └ 详情：步骤：1) 备份控制文件；2) 找到Controlfile Checkpointed at scn偏移（0x4060第9-14字节）；3) 将flag offset 15由0x04改为0x00，清零checksum；4) startup mount后alter database open；5) 验证SCN为1.00001949G。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1580806
+
+     [FaultModel] SCN头寸耗尽（SCN Headroom Exhaustion）  (排序分: 9.5)
+     └ 摘要：SCN余量耗尽（SCN headroom exhaustion）：现象是SCN增长过快接近理论最大值，导致数据库需要降级或出错。根因是SCN分配速率超过每秒16384（如大量并发事务或分布式DB Link），导致SCN头寸不足。影响数据库可能启动保护机制，限制操作或报错。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324258
+

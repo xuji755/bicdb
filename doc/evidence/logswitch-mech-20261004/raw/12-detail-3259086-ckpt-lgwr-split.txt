@@ -1,0 +1,11 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 日志切换中CKPT与LGWR的分工
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259086
+
+  ── 描述 ──
+  日志切换请求发出后，CKPT进程执行一次日志切换CHECKPOINT，LGWR开始执行日志切换工作。LGWR进程通过控制文件中的双向链表查找一个可用的REDO日志文件，将其作为新的当前REDO日志。
+
+  ── 摘要 ──
+  日志切换请求发出后，CKPT进程会执行一次日志切换CHECKPOINT，LGWR开始进行日志切换工作。LGWR通过控制文件中的双向链表查找可用的REDO日志文件，将其作为新的当前REDO日志。

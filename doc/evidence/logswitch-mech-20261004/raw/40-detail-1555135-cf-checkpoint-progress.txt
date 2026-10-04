@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 控制文件中的“检查点进度记录”（Checkpoint Progress Record）
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1555135
+
+  ── 描述 ──
+  控制文件中包含一个“检查点进度记录”（Checkpoint Progress Record），它记录了增量检查点的当前状态。这个记录包含：1)
+  当前检查点RBA（即DBWR已经写出的最旧脏块的RBA）；2) 目标检查点RBA（即CKPT希望DBWR写出的目标位置）。CKPT进程定期更新这个记录。在实例恢复时，Oracle从这个记录中读取当前检
+  查点RBA，并从这个位置开始应用REDO，而不是从日志文件头开始。
+
+  ── 摘要 ──
+  控制文件中的“检查点进度记录”存储了增量检查点的当前状态，包含当前检查点RBA（DBWR已写出的最旧脏块位置）和目标检查点RBA（CKPT期望DBWR写出的目标位置）。CKPT进程定期更新该记录。在实例恢复时，Oracle从该记录读取当前检查点RBA，并从此位置开始应用REDO日志，而非从日志文件头部开始，从而避免冗余的重做操作，提高恢复效率。

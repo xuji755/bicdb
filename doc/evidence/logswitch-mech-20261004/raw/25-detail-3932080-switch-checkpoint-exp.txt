@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 日志切换触发增量检查点并更新数据文件头
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3932080
+
+  ── 描述 ──
+  在Oracle 8i以后，引入增量检查点后，日志切换以及手工执行alter system switch
+  logfile时，都是增量检查点。不过需要说明的是，虽然其是增量检查点，但同时触发时controlfile和datafile header都会进行更新。实验：执行alter system switch
+  logfile后，查询v$datafile_header发现所有数据文件的CHECKPOINT_CHANGE#从916589更新为916611，再次switch
+  logfile后更新为916663；x$kccrt的rtckp_scn也相应更新。
+
+  ── 摘要 ──
+  Oracle 8i以后，日志切换（log switch）和alter system switch logfile触发的是增量检查点，但同时会更新controlfile和datafile header。实验显示switch logfile后，所有数据文件头的CHECKPOINT_CHANGE#更新为新的SCN，x$kccrt的rtckp_scn也更新。

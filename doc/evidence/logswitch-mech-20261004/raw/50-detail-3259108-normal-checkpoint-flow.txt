@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 普通CHECKPOINT执行流程
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259108
+
+  ── 描述 ──
+  由于CKPT QUEUE按LOW RBA排序，DBWR在处理CHECKPOINT批时必须按RBA顺序写脏块。CKPT进程在DBWR完成写盘后更新控制文件和相关文件头的SCN数据。这说明普通检查点的写盘
+  由DBWR批量执行，而CKPT进程主要负责定位队列头、移交队列以及更新检查点SCN。
+
+  ── 摘要 ──
+  普通CHECKPOINT中，CKPT进程先找到CKPT链头部，把CKPT QUEUE交给DBWR，DBWR按RBA/LOW RBA顺序组织CHECKPOINT DBWR批处理并写入脏数据；写完后CKPT进程更新控制文件和相应数据文件头的SCN，记录本次检查点结果。

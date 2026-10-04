@@ -1,0 +1,39 @@
+
+============================================================
+  [问题诊断] 日志文件头 写入 时机 新日志激活 hws 头写序号 EOT 结束标记
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 9，摘要筛选通过 5，批次 1；本路已取尽
+  KnowledgeEntry：已取 39，摘要筛选通过 30，批次 1；本路已取尽
+  CaseStudy：已取 3，摘要筛选通过 1，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     REDOHDR 事件通过 'alter session set events ''immediate trace name redohdr level 10''' 触发 redo log header dump，输出包含控制文件段（如 LOG FILE #1 的 seq、hws、bsz、nab、KCCLE* 标志）和文件头段（如 thread、eot、dis、reset logs count、checksum），可用于。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:104645.1 EVENT: REDOHDR - Obtaining and Interpreting (Oracle8i)  (排序分: 14.7)
+     └ 摘要：REDOHDR 事件通过 'alter session set events ''immediate trace name redohdr level 10''' 触发 redo log header dump，输出包含控制文件段（如 LOG FILE #1 的 seq、hws、bsz、nab、KCCLE* 标志）和文件头段（如 thread、eot、dis、reset logs count、checksum），可用于。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995579
+
+     [KnowledgeEntry] EOT（线程结束）标志  (排序分: 10.0)
+     └ 摘要：EOT（线程结束）标志是设置在每个启用线程的当前日志头部的一个标记。在数据库完整恢复过程中，系统会尝试在所有线程中继续应用重做日志，直到遇到EOT标志为止。该标志用于标识线程日志的结束点，确保恢复操作能够正确停止在相应位置。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:154515
+
+     [KnowledgeEntry] 重做日志文件头(Redo File Header)  (排序分: 10.0)
+     └ 摘要：重做日志文件头位于块1，紧随通用文件头之后，包含多个关键字段：描述调试文本（descrip）、线程号（thread）、下一个可用块（nab，打开时设为无穷大）、日志序列号（seq）、头写序号（hws）、线程结束标志（eot）、线程是否在日志末尾禁用（dis）、上次日志切换时的控制文件值副本（reset logs count/scn）、日志覆盖的SCN范围（Low scn/Next scn）、线程最后启用时的SCN（Enabled scn）、线程关闭SCN（Thread closed scn）、重做格式版本（Log format vsn）、磁盘与计算校验和（Disk cksum/Calc cksum）、介质恢复完成SCN（Terminal Recovery Stamp scn）以及归档、LogMiner等杂项标志（Miscellaneous flags）。可通过ALTER SYSTEM DUMP REDOHDR命令转储该头部信息。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319822
+
+     [KnowledgeEntry] EOT标志与完全恢复保障  (排序分: 10.0)
+     └ 摘要：在介质恢复过程中，当每个线程到达最后一个日志文件时，其文件头包含EOT标志，表示该线程的所有redo数据已结束。完全恢复会应用这些最后一个日志，直到所有EOT标志都被遇到。由于EOT标志存储在日志文件头而非控制文件中，因此即使控制文件丢失，也能完成完全恢复。但这一机制依赖于EOT标志的准确性；若日志文件头损坏而内容完整，系统可能无法识别EOT标志，导致恢复持续等待更多日志。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:154514
+
+     [CaseStudy] 备份控制文件恢复案例  (排序分: 9.4)
+     └ 摘要：备份控制文件恢复案例。场景：控制文件来自备份，Oracle不知道文件的只读状态可能改变。丢失了当前在线日志位置、数据文件停止SCN和启用线程信息。诊断：媒体恢复假设无限停止SCN，并一直应用到日志中的EOT标记。处理：恢复后必须使用RESETLOGS打开数据库，此时会进行一致性检查，可能产生MISSINGnnn条目。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325570
+
+     [FaultModel] 使用备份的在线日志导致恢复至错误的EOT点  (排序分: 9.3)
+     └ 摘要：现象：若恢复时使用了备份的在线日志，会恢复至日志中标记的EOT（线程结束）点，该点可能不是当前实际时间点，导致数据不一致。根因：备份的在线日志中包含过时的EOT标志，恢复时停止在错误的SCN。影响：恢复后的数据库缺少部分事务，数据不一致。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324471
+

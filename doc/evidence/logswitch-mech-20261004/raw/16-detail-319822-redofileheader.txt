@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 重做日志文件头(Redo File Header)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319822
+
+  ── 描述 ──
+  重做日志文件头位于块1，通用文件头之后。其特定字段包括：descrip（文本串用于调试）、thread（线程号）、nab（下一个可用块，打开时设为无穷大）、seq（日志序列号）、hws（日志初始化序列
+  内的头写序号）、eot（线程结束标志）、dis（线程是否在日志末尾禁用）、reset logs count/scn（上次日志切换时的控制文件值副本）、Low scn/Next
+  scn（该日志覆盖的SCN范围）、Enabled scn（线程最后启用时的SCN）、Thread closed scn（线程关闭SCN）、Log format vsn（重做格式版本）、Disk
+  cksum/Calc cksum（磁盘/计算校验和）、Terminal Recovery Stamp scn（介质恢复完成SCN）、Miscellaneous
+  flags（归档、LogMiner等标志）。可通过ALTER SYSTEM DUMP REDOHDR命令转储。
+
+  ── 摘要 ──
+  重做日志文件头位于块1，紧随通用文件头之后，包含多个关键字段：描述调试文本（descrip）、线程号（thread）、下一个可用块（nab，打开时设为无穷大）、日志序列号（seq）、头写序号（hws）、线程结束标志（eot）、线程是否在日志末尾禁用（dis）、上次日志切换时的控制文件值副本（reset logs count/scn）、日志覆盖的SCN范围（Low scn/Next scn）、线程最后启用时的SCN（Enabled scn）、线程关闭SCN（Thread closed scn）、重做格式版本（Log format vsn）、磁盘与计算校验和（Disk cksum/Calc cksum）、介质恢复完成SCN（Terminal Recovery Stamp scn）以及归档、LogMiner等杂项标志（Miscellaneous flags）。可通过ALTER SYSTEM DUMP REDOHDR命令转储该头部信息。

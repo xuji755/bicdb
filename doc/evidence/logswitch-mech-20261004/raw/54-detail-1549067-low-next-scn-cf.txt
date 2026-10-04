@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: REDO日志文件头中的Low SCN和Next SCN
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1549067
+
+  ── 描述 ──
+  日志文件头中的'Low SCN'表示该文件中第一条REDO记录的SCN，'Next
+  SCN'表示该文件中最后一条REDO记录的SCN加1。这两个值用于恢复时确定需要扫描哪些日志文件。如果当前日志文件正在使用，其'Next SCN'为无穷大。这些信息在控制文件的日志文件记录中也有备份。
+
+  ── 摘要 ──
+  REDO日志文件头部记录了两个关键SCN值：Low SCN表示文件中第一条REDO记录的SCN，Next SCN表示最后一条REDO记录的SCN加1。这两个值用于数据库恢复时确定需要扫描的日志文件范围。若当前日志文件正在使用，其Next SCN为无穷大。此外，这些信息也会备份保存在控制文件的日志文件记录中。

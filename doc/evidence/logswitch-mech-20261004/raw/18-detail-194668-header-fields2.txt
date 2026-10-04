@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: Redo Log Header（日志文件头）
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:194668
+
+  ── 描述 ──
+  日志文件头包含：Thread#（线程号）、Sequence#（序列号）、Low SCN（日志中第一个重做记录的SCN，除非其头部有SCN）、Next
+  SCN（同一线程中下一个更高序列号日志的低SCN）。当前活动日志的Next SCN为无限大，因为没有更高序列号的日志。
+
+  ── 摘要 ──
+  日志文件头（Redo Log Header）主要包含线程号（Thread#）、序列号（Sequence#）、日志中第一个重做记录的低系统变更号（Low SCN）以及同一线程中下一个更高序列号日志的低SCN（Next SCN）。对于当前正在活动的日志，其Next SCN被设置为无限大，因为不存在更高序列号的日志。这些信息用于标识日志的归属线程、序列顺序以及SCN边界，是重做日志管理的关键元数据。

@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 重做日志文件头结构
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:319932
+
+  ── 描述 ──
+  每个重做日志文件在dump中显示为LOG FILE条目，包含：名称、线程、序列号、大小（siz）、块大小（bsz）、已分配块（nab）、标志（flg）、归档链接、前向/后向指针、Low
+  SCN、Next SCN、文件头（FILE HEADER）包含兼容版本、DB ID、激活ID、控制序列号、格式化ID、redo log
+  key、描述、线程、nab、seq、hws、eot、dis、reset logs count/scn、Low/Next SCN、Enabled SCN、Thread closed
+  SCN、磁盘校验和与计算校验和、Terminal Recovery Stop scn等。
+
+  ── 摘要 ──
+  重做日志文件头结构在dump中显示为LOG FILE条目，包含文件基本属性如名称、线程、序列号、大小（siz）、块大小（bsz）、已分配块（nab）、标志（flg）、归档链接、前向/后向指针以及Low SCN和Next SCN。文件头部分进一步记录兼容版本、数据库ID（DB ID）、激活ID、控制序列号、格式化ID、redo log key、描述、线程、已分配块、序列号、hws、eot、dis、reset logs计数与SCN、Low/Next SCN、Enabled SCN、Thread closed SCN、磁盘校验和与计算校验和、Terminal Recovery Stop SCN等字段。这些元数据完整描述了重做日志文件的状态与版本信息。

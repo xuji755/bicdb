@@ -1,0 +1,77 @@
+
+  📖 故障模型详情
+  类型: bic_agent_FaultModel,KGV2Managed
+  名称: 检查点未完成导致日志切换等待
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545721
+  别名: oracle_checkpoint_not_complete
+  数据库类型: 2101
+  领域: io
+  分类: fault
+  维度:
+    - fault
+    - ora_redo
+    - perf
+  质量状态: evidence_enhanced
+  更新时间: 2026-08-11T01:37:50.754000000+00:00
+  更新者: fm_evidence_oracle_second_pass_v1
+
+  ── 摘要 ──
+  摘要: True
+
+  ── 现象与触发 ──
+  触发条件: 警报日志中出现'Thread n cannot allocate new log, sequence xxxxx checkpoint not complete'消息。
+  观测指标: 警报日志错误、日志切换等待事件（log file switch (checkpoint incomplete)）、DBWR写入缓慢。
+
+  ── 原因分析 ──
+  直接原因: 重做日志文件过小或DBWR写入速度过慢，导致检查点无法在日志切换前完成。
+  根因路径:
+    - oracle_root_2ce7aacd055c629c
+    - oracle_root_2f7e897b4185c906
+
+  ── 诊断与反证 ──
+  判断方法: 前期异常/触发证据：警报日志中出现'Thread n cannot allocate new log, sequence xxxxx checkpoint not complete'消息
+  路径1：重做日志文件过小或DBWR写入速度过慢，导致检查点无法在日志切换前完成；确认时核对对应配置、日志或运行状态，证据不成立则排除该路径。
+
+  ── 影响与处置 ──
+  影响: 日志切换延迟，可能引发数据库性能下降或挂起
+
+  ── 证据与来源 ──
+  证据来源: [{"eid": "4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1549066", "kind": "知识", "relationship": "HAS_KNOWLEDGE",
+  "source": "oradoc3/M010722.txt"}]
+  来源: oradoc3/01Dsi305.txt
+
+  ── 完整描述 ──
+  描述: 原始故障描述：Oracle等待事件：检查点未完成（Checkpoint Not Complete）。现象：数据库尝试切换到下一个重做日志文件时，发现上一个日志文件所需的检查点尚未完成，导致日志切换被阻塞。根因：重做日志文
+  件过小或DBWR（数据库写入进程）写入速度过慢，导致检查点无法在日志切换前完成。影响：日志切换延迟，可能引发数据库性能下降或挂起。
+  故障现象：当数据库尝试切换到下一个重做日志文件时，发现上一个日志文件所需的检查点尚未完成，导致日志切换被阻塞 故障起因及可能路径： 1. 重做日志文件过小或DBWR写入速度过慢，导致检查点无法在日志切换前完成
+  确认与排除方法： 前期异常/触发证据：警报日志中出现'Thread n cannot allocate new log, sequence xxxxx checkpoint not complete'消息
+  路径1：重做日志文件过小或DBWR写入速度过慢，导致检查点无法在日志切换前完成；确认时核对对应配置、日志或运行状态，证据不成立则排除该路径。 故障衍生影响：日志切换延迟，可能引发数据库性能下降或挂起 第二遍补充证据：
+  知识证据：REDO日志文件大小与归档性能；REDO日志文件的大小对归档性能有重要影响。日志文件过小会导致频繁的日志切换，增加归档进程负担，并可能引发'checkpoint not
+  complete'等待；而日志文件过大则会延长归档时间，增加单点故障风险。建议将日志文件大小设置为每15-30分钟切换一次，对于高事务量系统，可选用2GB至4GB的更大日志文件。
+
+  ── 图谱关联 ──
+  → 伴随对象 [ACCOMPANIED_BY] (15)
+    - CHECKPOINT ADVANCED [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420577
+    - CHECKPOINT COMPLETED [bic_agent_StdWaitEvent,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420458
+    - ENQ: KO - FAST OBJECT CHECKPOINT [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420358
+    - LATCH: REDO COPY [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420467
+    - LATCH: REDO WRITING [bic_agent_StdWaitEvent,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420468
+    - LGWR WAIT ON ATTACH [bic_agent_StdWaitEvent,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420491
+    - LGWR WAIT ON DETACH [bic_agent_StdWaitEvent,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420492
+    - LGWR WAIT ON LNS [bic_agent_StdWaitEvent,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1420493
+    - … 其余 7 条未展开
+  ← 因果关系 [CAUSED_BY] (2)
+    - oracle_root_2ce7aacd055c629c [Knowledge,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1852171
+    - oracle_root_2f7e897b4185c906 [Knowledge,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1813333
+  → 关联知识 [HAS_KNOWLEDGE] (1)
+    - REDO日志文件大小与归档性能 [bic_agent_KnowledgeEntry,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1549066
+  → 相关指标 [REFERENCES_METRIC] (12)
+    - ACTIVE REDO LOG COUNT [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422817
+    - AVG GES MESSAGE PROCESS TIME是ORACLE RAC中衡量全局锁服务（GLOBAL ENQUEUE SERVICES）处理效率的关键指 [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422804
+    - AVG GLOBAL CACHE CR BLOCK FLUSH TIME,是ORACLE RAC环境中衡量CR块（一致性读取块）日志刷新效率的关键指标 [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422800
+    - AVG GLOBAL CACHE CURRENT BLOCK FLUSH TIME,是ORACLE RAC中衡量当前块（CURRENT BLOCK）日志刷新效率 [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422801
+    - AVG GLOBAL CACHE CURRENT BLOCK RECEIVE TIME是ORACLE RAC中衡量当前块跨实例传输效率的核心指标,表示本地实例从 [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422805
+    - AVG MESSAGE SENT QUEUE TIME,是ORACLE RAC中衡量全局缓存服务（GCS）消息队列延迟的核心指标 [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422802
+    - CHECKPOINT 延迟 [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422808
+    - DB FILE SCATTERED READ每秒等待次数是ORACLE中与多块读取 [bic_agent_StdMetric,SyncEntity,KGV2Managed]  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1422874
+    - … 其余 4 条未展开

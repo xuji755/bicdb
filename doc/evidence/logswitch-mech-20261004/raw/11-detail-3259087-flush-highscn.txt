@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 日志切换时刷写REDO与记录High SCN
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259087
+
+  ── 描述 ──
+  在做日志切换时，首先要将日志缓冲区中还没有写入当前REDO日志文件的REDO记录写入当前REDO日志文件；然后将最后一个REDO记录的SCN作为该日志文件的High
+  SCN记录在REDO日志文件头中。这些操作完成后，就可以关闭当前日志。
+
+  ── 摘要 ──
+  日志切换首先将日志缓冲区中尚未写入当前REDO日志文件的REDO记录写入当前REDO日志文件，然后将最后一个REDO记录的SCN作为High SCN记录在REDO日志文件头中，之后关闭当前日志。
