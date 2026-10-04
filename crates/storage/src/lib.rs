@@ -6,9 +6,10 @@
 //! - 对应阶段：**P2**（已启动；本片 = `页格式基础`）
 //! - 当前状态：**v0.5**——[`page`]（页格式与两层完整性检出）、[`rowid`]、
 //!   [`row`]（行格式与片段链）、[`heap`]（堆表操作与内存堆表）、
-//!   [`fragment`]（跨页行片段链）、[`pagefile`]（页文件的定址读写——
-//!   经 P1 的 FileIO 替换接口，支持故障注入闭环）。
-//!   **段与区分配、页分配位图、BufferPool 随后。**
+//!   [`fragment`]（跨页行片段链）、[`pagefile`]（页文件定址读写）、
+//!   [`bitmap`]（位图页与**区分配图 LMT**：区 = 128 KB、位图区 = 8 页、
+//!   容量换算与 `own_index` 自校验）。
+//!   **段与区管理（§4）、BufferPool 随后。**
 //!
 //! 三条纪律：
 //! 1. **字节序定死小端**（REQ-PRT-003）——磁盘格式不随主机变化；
@@ -20,6 +21,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod bitmap;
 pub mod fragment;
 pub mod heap;
 pub mod page;
