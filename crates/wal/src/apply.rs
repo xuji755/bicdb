@@ -190,7 +190,9 @@ fn apply_block(
     }
     // **先应用、后收尾**：变更可以落在页头字段上（ITL 数、槽位数……），
     // 因此重读页头——只把 `page_lsn` 推到本记录、`mod_seq` 推进，
-    // 其余字段以变更后的值为准。
+    // 其余字段以变更后的值为准。注意：变更若落在 **`page_lsn` / `mod_seq`
+    // 两个字段自身的字节上**，会被本次推进覆盖——这两个字段归 apply 管理
+    // （记录不应把它们当作变更目标）。
     let mut header = page.header().ok_or(ApplyError::Damaged { rdba })?;
     header.page_lsn = record_lsn;
     page.write_header(&header);

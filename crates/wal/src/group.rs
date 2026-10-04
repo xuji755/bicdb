@@ -328,27 +328,9 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             if !used {
                 continue; // 从未用过：文件保持全零
             }
-            let handle = files[g][0];
-            let start = match read_group_start(io, handle)? {
-                Some(s) => s,
-                None => {
-                    return Err(GroupError::Damaged {
-                        group: g as u8,
-                        reason: "组状态非 UNUSED 但文件为空",
-                    })
-                }
-            };
-            let scan = scan_log(io, handle, start, spec.group_pages as u64)?;
-            if let Some(bad) = scan.first_bad_page {
-                if any_nonzero_page_after(io, handle, bad + 1, spec.group_pages as u64)? {
-                    return Err(GroupError::Damaged {
-                        group: g as u8,
-                        reason: "中部有坏页而其后仍有数据",
-                    });
-                }
-            }
-            written_pages[g] = scan.pages_scanned;
-            group_ends[g] = Some(lsn_add(start, scan.pages_scanned * LOG_PAGE_SIZE as u64)?);
+            let (pages, start) = scan_used_group(io, files[g][0], g as u8, spec.group_pages)?;
+            written_pages[g] = pages;
+            group_ends[g] = Some(lsn_add(start, pages * LOG_PAGE_SIZE as u64)?);
         }
 
         let current_start =
@@ -625,6 +607,89 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
 
 fn lsn_add(base: Lsn, delta: u64) -> Result<Lsn, GroupError> {
     Lsn::from_raw(base.as_raw() + delta).ok_or(GroupError::Spec("LSN 越过 48 位域"))
+}
+
+/// 在线组（恢复入口的**只读视图**）：一个已用组的文件句柄与流位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineGroup {
+    /// 组号（0 起）。
+    pub group: u8,
+    /// 该组最近一次的日志序列号。
+    pub sequence: u32,
+    /// 组起点 LSN（首张页的位置）。
+    pub start_lsn: Lsn,
+    /// 组结尾 LSN（已写前缀的下一页边界）。
+    pub end_lsn: Lsn,
+    /// 该组成员的文件句柄（恢复只读扫描用）。
+    pub handle: FileHandle,
+    /// 组成员容量（页数）。
+    pub file_pages: u32,
+}
+
+/// 扫描**已用**的在线组，按**序列号升序**返回（= 日志流顺序）。
+///
+/// 只打开已用组的文件（恢复路径不写、不触碰从未使用的组）。序列号重复
+/// ⇒ 控制文件不自洽，明确拒绝。
+pub fn online_groups(
+    io: &dyn FileIo,
+    cf: &ControlFile<'_>,
+    dir: &Path,
+    spec: GroupSpec,
+) -> Result<Vec<OnlineGroup>, GroupError> {
+    let entries = cf.redo_entries()?;
+    if entries.group_count != spec.group_count || entries.member_count != spec.member_count {
+        return Err(GroupError::Spec("控制文件中的组数与规格不一致"));
+    }
+    let mut out = Vec::new();
+    for g in 0..spec.group_count as usize {
+        let entry = entries.groups[g];
+        if entry.run == LogRunState::Unused && entry.sequence == 0 {
+            continue;
+        }
+        let path = dir.join(member_file_name(g as u8, 0));
+        let handle = io.open(&path, OpenOptions::new().read(true))?;
+        let (pages, start) = scan_used_group(io, handle, g as u8, spec.group_pages)?;
+        out.push(OnlineGroup {
+            group: g as u8,
+            sequence: entry.sequence,
+            start_lsn: start,
+            end_lsn: lsn_add(start, pages * LOG_PAGE_SIZE as u64)?,
+            handle,
+            file_pages: spec.group_pages,
+        });
+    }
+    out.sort_by_key(|g| g.sequence);
+    for w in out.windows(2) {
+        if w[0].sequence == w[1].sequence {
+            return Err(GroupError::Spec("在线组序列号重复——控制文件不自洽"));
+        }
+    }
+    Ok(out)
+}
+
+/// 扫描一个已用组：返回（已写页数，组起点 LSN）。
+///
+/// 组的尾部残缺（坏页/空页）与之区分：其后仍有非零页 ⇒ **中部坏页**，按损坏拒绝。
+fn scan_used_group(
+    io: &dyn FileIo,
+    handle: FileHandle,
+    group: u8,
+    group_pages: u32,
+) -> Result<(u64, Lsn), GroupError> {
+    let start = read_group_start(io, handle)?.ok_or(GroupError::Damaged {
+        group,
+        reason: "组状态非 UNUSED 但文件为空",
+    })?;
+    let scan = scan_log(io, handle, start, group_pages as u64)?;
+    if let Some(bad) = scan.first_bad_page {
+        if any_nonzero_page_after(io, handle, bad + 1, group_pages as u64)? {
+            return Err(GroupError::Damaged {
+                group,
+                reason: "中部有坏页而其后仍有数据",
+            });
+        }
+    }
+    Ok((scan.pages_scanned, start))
 }
 
 /// 读组的首张页并将其起始 LSN 作为组起点；整页全零 = 从未写过（`None`）。
