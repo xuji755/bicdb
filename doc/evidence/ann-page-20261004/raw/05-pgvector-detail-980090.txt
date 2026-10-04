@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: pgvector HNSW物理结构
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:980090
+
+  ── 描述 ──
+  pgvector HNSW物理结构：HNSW物理结构包括metapage、element tuple（数据+heap TID）和neighbor tuple（邻居ID数组）。了解结构有助于调优。
+  分类：架构
+
+  ── 摘要 ──
+  HNSW物理结构包括metapage、element tuple（数据+heap TID）和neighbor tuple（邻居ID数组）。了解结构有助于调优。

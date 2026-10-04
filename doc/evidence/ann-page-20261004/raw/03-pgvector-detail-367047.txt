@@ -1,0 +1,16 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 深入讲解pgvector扩展中HNSW和IVFFlat索引的VACUUM垃圾回收机制。HNSW使用三阶段VACUUM：Pass1 RemoveHeapTids扫描元素页删除失效heap TID并构建deleted哈希表；Pass2 RepairGraph修复图连接（先处理入口点EntryPoint，再逐元素查找新邻居HnswFindElementNeighbors并更新双向连接）；Pass3 Ma
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:367047
+
+  ── 描述 ──
+  深入讲解pgvector扩展中HNSW和IVFFlat索引的VACUUM垃圾回收机制。HNSW使用三阶段VACUUM：Pass1 RemoveHeapTids扫描元素页删除失效heap
+  TID并构建deleted哈希表；Pass2
+  RepairGraph修复图连接（先处理入口点EntryPoint，再逐元素查找新邻居HnswFindElementNeighbors并更新双向连接）；Pass3 MarkDeleted标记删除元素（
+  清空向量数据、失效邻居连接、递增版本号到15回绕）。锁定策略：使用HNSW_UPDATE_LOCK（页面0）协调插入与修复，HNSW_SCAN_LOCK（页面1）协调扫描与删除。使用BAS_BULKR
+  EAD缓冲策略防止污染shared_buffer。REINDEX vs VACUUM选择：少量删除(<10%)用VACUUM，大量删除(>20%)推荐REINDEX CONCURRENTLY。涉及au
+  tovacuum配置参数：autovacuum_vacuum_scale_factor、autovacuum_vacuum_threshold、maintenance_work_mem。
+
+  ── 摘要 ──
+  pgvector扩展的HNSW索引采用三阶段VACUUM机制：第一阶段扫描元素页删除失效堆元组TID并构建删除哈希表；第二阶段修复图连接，包括更新入口点和逐元素查找新邻居并更新双向连接；第三阶段标记删除元素，清空向量数据、失效邻居连接并递增版本号。锁定策略通过HNSW_UPDATE_LOCK协调插入与修复，HNSW_SCAN_LOCK协调扫描与删除，并使用BAS_BULKREAD缓冲策略防止污染共享缓冲区。对于IVFFlat索引同样适用VACUUM机制。少量删除（低于10%）推荐VACUUM，大量删除（超过20%）则建议使用REINDEX CONCURRENTLY。相关配置参数包括autovacuum_vacuum_scale_factor、autovacuum_vacuum_threshold和maintenance_work_mem。

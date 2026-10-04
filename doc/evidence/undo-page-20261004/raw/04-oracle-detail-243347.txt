@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 撤销块结构 (KTUBH, KTUBU, KTUBL)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:243347
+
+  ── 描述 ──
+  撤销块（Undo Block）的结构包括：缓存层（Cache layer）、KTUBH（Kernel Transaction Undo Block Header）、KTUBU（用户撤销记录）、KTUB
+  L（起始事务记录，仅第一个撤销记录包含）。KTUBH包含：xid（当前使用该块的事务XID）、seq（块序列号）、cnt（块内撤销记录数）、irb（回滚时第一个要考虑的记录索引）、icl（二阶段提交收
+  集阶段索引）、flg（保留）、idx（记录偏移表，从块底向上增长）。KTUBU包含：obn（对象编号）、obd（数据对象编号）、tsn（表空间ID）、dba（前一个撤销块的DBA）、opc（用户操作码
+  ）、slt（事务表槽号）、rci（回滚记录索引，指向链中前一个记录）、flg（标志位）、wrp（XID增量）。KTUBL仅在第一个撤销记录（Begin
+  Trans）中出现，包含：uba（前一个控制UBA）、scn（前一个控制最大提交时间）、xsc（该槽前一个事务的提交时间）。
+
+  ── 摘要 ──
+  撤销块结构由缓存层、KTUBH（事务撤销块头部）、KTUBU（用户撤销记录）和KTUBL（起始事务记录，仅第一个撤销记录包含）组成。KTUBH包含当前事务XID、块序列号、块内撤销记录数、回滚时第一个考虑的记录索引、二阶段提交收集阶段索引、保留标志以及从块底向上增长的记录偏移表。KTUBU包括对象编号、数据对象编号、表空间ID、前一个撤销块的DBA、用户操作码、事务表槽号、指向链中前一个记录的回滚索引、标志位及XID增量。KTUBL仅在第一个撤销记录中出现，存储前一个控制UBA、前一个控制最大提交时间以及该槽前一个事务的提交时间。

@@ -1,0 +1,93 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:409214.1 How to resolve ORA-600 [4194] errors
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047773
+
+  ── 描述 ──
+  How to resolve ORA-600 [4194] errors Purpose Last Review Date Instructions for the Reader
+  Troubleshooting Details References Oracle Confidential (INTERNAL). Do not distribute to customers
+  Reason: Step by step instructions to assist analysts in resolving ORA-600 4194 errors (AuthWiz
+  2.5.2) Click here to edit in wizard. Applies to: Oracle Server - Enterprise Edition - Version: 7.0
+  to 10.2.0.4 Oracle Server - Standard Edition - Version: 7.0 to 10.2.0.4 Information in this document
+  applies to any platform. Purpose This is intended as an update to replace unpublished Note 281429.1
+  'Basic Steps to be Followed While Solving ORA-00600 [4194]' and provide step by step instructions
+  for resolving such ORA-600 [4194] errors under a variety of conditions. Last Review Date January 19,
+  2007 Instructions for the Reader A Troubleshooting Guide is provided to assist in debugging a
+  specific issue. When possible, diagnostic tools are included in the document to assist in
+  troubleshooting. Troubleshooting Details This error indicates that a mismatch has been detected
+  between redo records and rollback (undo) records.ARGUMENTS: Arg [a] - Maximum Undo record number in
+  Undo block Arg [b] - Undo record number from Redo blockSince we are adding a new undo record to our
+  undo block, we would expect that the new record number is equal to the maximum record number in the
+  undo block plus one. Before Oracle can add a new undo record to the undo block it validates that
+  this is correct. If this validation fails, then an ORA-600 [4194] will be triggered.Oracle is unable
+  to roll back an uncommitted transaction in its transaction table. You probably have corruption in
+  either the rollback/undo segment or corruption in the object in which the rollback/undo segment is
+  trying to apply the undo record.Refer to Note 39283.1 for more details on the description of this
+  error.SOLUTIONGeneral:InNote 39283.1 for more details on the description of this
+  error.SOLUTIONGeneral:In general terms these are the steps to resolve most ORA-600 [4194] errors:1.
+  Determine whether the DB is up or down.2. Check for active transactions.3. If there are no active
+  transactions then drop the problem undo segment or create a new UNDO tablespace and delete the old
+  one.4. If there are active transactions, then you will need to identify the object the undo needs to
+  be applied to and drop and recreate that object.5. If all else fails, then perform a point in time
+  recovery to a point prior to the corruption. Note: Prior to starting the restore/recovery you should
+  always ask your client to take a full back up in case the problem worsens as a result of this
+  action.Detailed:These are more detailed steps:Step 1Confirm whether the database is up and running
+  or not. If the database fails to start or crashes shortly after startup due to this error occurring,
+  then try setting event 10513 at level 2 in the init.ora/spfile to disable transaction recovery and
+  restart the instance, e.g.: event = "10513 trace name context forever, level 2"This may allow the
+  database to successfully open and stay up so that the required diagnostics/actions can be
+  performed.Step 2In the trace file there should be an undo segment header dump, and so check to see
+  if the undo segment header shows an active transaction after recovery, e.g.:TRN TBL <---- Represents
+  the Transaction table for the particular undo segmentindex state cflags wrap# uel scn
+  dba---------------------------------------------------------------------------------------------
+  0x41 9 0x80 0x35ab6 0xffff 0x0695.38f6b959 0x1081e796 0x42 9 0x80 0x35bb1 0x000e 0x0695.38f6b028
+  0x1081e793 0x43 9 0x80 0x35b11 0x005d 0x0695.38f6b7ae 0x1081e795 0x44 9 0x80 0x359f0 0x0036
+  0x0695.38f69a91 0x1081e78e 0x45 10 0x80 0x35b1b 0x0000 0x0695.3a0aba4d 0x1081e796 0x46 9 0x80
+  0x35bb7 0x001c 0x0695.38f69bde 0x1081e78f ===================================State ---> This column
+  specifies the status of the transaction 9 -----> represents a commited transaction 10 --->
+  Represents a active transactionDba -----> Undo block containing the undo records Strictly speaking
+  this is the block at the end of the undo chain.You can see from the transaction table that there is
+  an active transaction for this particular rollback/undo segment after recovery. Therefore this
+  rollback/undo segment and/or undo tablespace cannot be dropped without corrupting the database!
+  Therefore recreating the UNDO tablespace is not an option.Step 3From the trace file determine the
+  affected undo segment, e.g.:Block image after block recovery:UNDO BLK: xid: 0x0015.02b.0001544b seq:
+  0x163e cnt: 0x12 irb: 0x12 icl: 0x0 flg: 0x0000XID ==> Undo segment no + Slot no + Sequence
+  noTherefore, in this case the Undo Segment is:USN# 0x15 (Hex) ==> 21 (Dec) ==> _SYSSMU21$So if and
+  ONLY IF the transaction table shows no active transaction can the rollback/undo segment be offlined
+  and dropped. Note however, that before you can confirm if the entire UNDO tablespace can be dropped,
+  you would need to check the transaction tables of ALL active rollback/undo segments in the same wasy
+  as the above. The steps required to drop the rollback/undo segment are fully detailed in Note
+  179952.1, but are briefly listed here for completeness:If using Automatic Undo ManagementOffline the
+  undo segment using the _OFFLINE_ROLLBACK_SEGMENTS parameter and bounce the database as follows:1.
+  Create and edit the init.ora file for the instance to set the following
+  parameters:UNDO_MANAGEMENT=MANUAL _OFFLINE_ROLLBACK_SEGMENTS=(_SYSSMU21$)2. Open the database in
+  restricted mode to prevent user access, e.g.:connect / as sysdbastartup restrict pfile = '<Full path
+  to init.ora file>';3. Drop the rollback/undo segment, e.g.:drop rollback segment "_SYSSMU21";4.
+  Shutdown the instance, and remove the init.ora parameters added in point 1 and restart the instance,
+  e.g.:shutdown immediatestartupIf SMON was recovering the transaction then this may not work as we
+  cannot open the database if it is determined to be in an inconsistent state. I have reviewed a
+  number of SRs where this approach was successful, so it is important to try it first but understand
+  that it may fail and you will have to resort to a point in time recovery or forcing open the DB and
+  recreating it.Step 4 Now we need to dump the undo block to see which object was affected. We noted
+  in Step 2 that this is the active transaction (from the trace file): TRN TBL index state cflags
+  wrap# uel scn dba 0x45 10 0x80 0x35b1b 0x0000 0x0695.3a0aba4d 0x1081e796 Dba----------------> Undo
+  block containing the undo records dba--->0x1081e796 is the block containing the active transaction .
+  Use the WebIV tools to convert this RDBA to block number (block#) and file number (file#), e.g.: V
+  SPLIT ==> DBA (Hex) = File#,Block# (Hex File#,Block#) = ===== === ===== ============ V8 10,10 ==>
+  276948886 (0x1081e796) = 66,124822 (0x42 0x1e796) So the file# is 66 and the block# is 124822, so
+  dump the block by issuing: SQL> Alter system dump datafile 66 block 124822; This will generate a
+  trace file in the user_dump_dest. The following is a sample of the information in the undo
+  block:UNDO BLK: xid: 0x000c.045.00035b1b seq: 0x1e14 cnt: 0x17 irb: 0x17 icl: 0x0 flg: 0x0000 Rec
+  Offset Rec Offset Rec Offset Rec Offset Rec Offset
+  --------------------------------------------------------------------------- 0x01 0x1f8c 0x02 0x1f30
+  0x03 0x1ed4 0x04 0x1e78 0x05 0x1e1c 0x06 0x1dc0 0x07 0x1d64 0x08 0x1d08 0x09 0x1cac 0x0a 0x1c50 0x0b
+  0x1bf4 0x0c 0x1b98 0x0d 0x1b3c 0x0e 0x1ae0 0x0f 0x1a74 0x10 0x1a18 0x11 0x19bc 0x12 0x1960 0x13
+  0x1904 0x14 0x187c 0x15 0x181c 0x16 0x1798 0x17 0x173c * Rec #0x16 slt: 0x45 objn:
+  1485619(0x0016ab33) objd: 1485619 tblspc: 71(0x00000047) * Layer: 11 (Row) opc: 1 rci 0x00 Undo
+  type: Regular undo Begin trans Last buffer split: No Temp Object: No Tablespace Undo: No rdba:
+  0x00000000 *----------------------------- uba: 0x1081e796.1e14.14 ctl max scn: 0x0695.38f69853 prv
+  tx scn: 0x0695.38f698a1 KDO undo record: KTB Redo op: 0x04 ver: 0x01 op: L itl: scn: 0x0019.009.
+
+  ── 摘要 ──
+  ORA-600 [4194]错误表示重做记录与撤销记录不匹配，新撤销记录号应为撤销块中最大记录号加一，验证失败则触发。通常由回滚段或撤销表空间损坏引起。诊断时检查数据库状态，若无法启动可通过设置事件10513 level 2禁用事务恢。

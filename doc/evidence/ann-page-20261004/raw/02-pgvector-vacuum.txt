@@ -1,0 +1,43 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] pgvector 元素元组 层级 删除标记 堆 TID 向量数据
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 25，摘要筛选通过 12，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 8，摘要筛选通过 6，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     pgvector扩展的HNSW索引采用三阶段VACUUM机制：第一阶段扫描元素页删除失效堆元组TID并构建删除哈希表；第二阶段修复图连接，包括更新入口点和逐元素查找新邻居并更新双向连接；第三阶段标记删除元素，清空向量数据、失效邻居连接并递增版本号。锁定策略通过HNSW_UPDATE_LOCK协调插入与修复，HNSW_SCAN_LOCK协调扫描与删除，并使用BAS_BULKREAD缓冲策略防止污染共享缓冲区。对于IVFFlat索引同样适用VACUUM机制。少量删除（低于10%）推荐VACUUM，大量删除（超过20%）
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 深入讲解pgvector扩展中HNSW和IVFFlat索引的VACUUM垃圾回收机制。HNSW使用三阶段VACUUM：Pass1 RemoveHeapTids扫描元素页删除失效heap TID并构建deleted哈希表；Pass2 RepairGraph修复图连接（先处理入口点EntryPoint，再逐元素查找新邻居HnswFindElementNeighbors并更新双向连接）；Pass3 Ma  (排序分: 10.0)
+     └ 摘要：pgvector扩展的HNSW索引采用三阶段VACUUM机制：第一阶段扫描元素页删除失效堆元组TID并构建删除哈希表；第二阶段修复图连接，包括更新入口点和逐元素查找新邻居并更新双向连接；第三阶段标记删除元素，清空向量数据、失效邻居连接并递增版本号。锁定策略通过HNSW_UPDATE_LOCK协调插入与修复，HNSW_SCAN_LOCK协调扫描与删除，并使用BAS_BULKREAD缓冲策略防止污染共享缓冲区。对于IVFFlat索引同样适用VACUUM机制。少量删除（低于10%）推荐VACUUM，大量删除（超过20%）则建议使用REINDEX CONCURRENTLY。相关配置参数包括autovacuum_vacuum_scale_factor、autovacuum_vacuum_threshold和maintenance_work_mem。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:367047
+
+     [KnowledgeEntry] 颗粒化TID删除  (排序分: 10.0)
+     └ 详情：颗粒化TID删除：Posting list 是 nbtree 去重技术中合并重复键值的列表结构。PostgreSQL 14 的 _bt_delitems_delete() 支持对 posting list 元组进行颗粒化 TID 删除，避免整个元组标记为 LP_DEAD，提高删除精细度。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1289114
+
+     [KnowledgeEntry] TID - Tuple Identifier  (排序分: 10.0)
+     └ 详情：TID - Tuple Identifier：TID用于唯一标识表中物理元组位置，是数据库内部寻址的基础。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:619278
+
+     [KnowledgeEntry] TID  (排序分: 10.0)
+     └ 详情：TID：TID唯一标识表中元组的物理位置，包括页号和页内偏移。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:619306
+
+     [FaultModel] TID有效负载限制阻碍MVCC感知索引  (排序分: 9.5)
+     └ 摘要：TID有效负载限制阻碍MVCC感知索引。索引中TID仅有11位偏移号，无法存储额外可见性信息，设计受限无法扩展。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1290409
+
+     [CaseStudy] Highgo v9索引损坏：autovacuum报failed to re-find parent key与在线重建报invalid duplicate tuple  (排序分: 9.3)
+     └ 摘要：某客户生产数据库Highgo v9（基于PostgreSQL 14）出现索引损坏。autovacuum首先报failed to re-find parent key in index for "%TABLE" deletion target page，表和索引记录无法匹配；在线创建/重建索引时可能报table tid from new index tuple ... overlaps with invalid duplicate tuple。通过日志过滤和pg_index查询定位损坏/无效索引，采用VACUUM INDEX_CLEANUP OFF临时规避，REINDEX CONCURRENTLY根本修复，失败时VACUUM FULL后重建并删除多余索引。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3999516
+
