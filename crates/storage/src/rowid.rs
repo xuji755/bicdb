@@ -116,6 +116,66 @@ impl fmt::Display for RowId {
     }
 }
 
+/// 数据块地址（**rdba**，5 字节）：`file_id` 10 位 │ `block_id` 28 位。
+///
+/// 与 [`RowId`] 的前两段**同口径**（§7.1）——redo 块引用（§11.5）与
+/// 段头区映射条目（§5.11）共用这一编码；比 PG 的
+/// `RelFileLocator`(12B) + `BlockNumber`(4B) 省 11 字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rdba(u64);
+
+impl Rdba {
+    /// 由两段构造；越界拒绝。
+    pub fn from_parts(file_id: u16, block_id: u32) -> Option<Self> {
+        if file_id > 1023 || block_id > (1 << 28) - 1 {
+            return None;
+        }
+        Some(Self((u64::from(file_id) << 28) | u64::from(block_id)))
+    }
+
+    /// 文件号（10 位）。
+    #[must_use]
+    pub fn file_id(self) -> u16 {
+        (self.0 >> 28) as u16
+    }
+
+    /// 块号（28 位）。
+    #[must_use]
+    pub fn block_id(self) -> u32 {
+        (self.0 & ((1 << 28) - 1)) as u32
+    }
+
+    /// 5 字节小端编码。
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 5] {
+        let b = self.0.to_le_bytes();
+        [b[0], b[1], b[2], b[3], b[4]]
+    }
+
+    /// 由 5 字节小端解码。
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8; 5]) -> Self {
+        let mut b = [0u8; 8];
+        b[..5].copy_from_slice(bytes);
+        Self(u64::from_le_bytes(b))
+    }
+}
+
+#[cfg(test)]
+mod rdba_tests {
+    use super::*;
+
+    #[test]
+    fn rdba_roundtrip_and_bounds() {
+        let r = Rdba::from_parts(1023, (1 << 28) - 1).unwrap();
+        assert_eq!(r.file_id(), 1023);
+        assert_eq!(r.block_id(), (1 << 28) - 1);
+        assert_eq!(Rdba::from_bytes(&r.to_bytes()), r);
+        assert!(Rdba::from_parts(1024, 0).is_none());
+        assert!(Rdba::from_parts(0, 1 << 28).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

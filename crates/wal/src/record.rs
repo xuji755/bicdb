@@ -72,49 +72,10 @@ impl RecordOp {
     }
 }
 
-/// 数据块地址（rdba，5 字节）：`file_id` 10 位 │ `block_id` 28 位。
-///
-/// 比 PG 的 `RelFileLocator`(12B) + `BlockNumber`(4B) 省 11 字节——
-/// ROWID 的两段本来就够用（§11.5.2）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Rdba(u64);
-
-impl Rdba {
-    /// 由两段构造；越界拒绝。
-    pub fn from_parts(file_id: u16, block_id: u32) -> Option<Self> {
-        if file_id > 1023 || block_id > (1 << 28) - 1 {
-            return None;
-        }
-        Some(Self((u64::from(file_id) << 28) | u64::from(block_id)))
-    }
-
-    /// 文件号（10 位）。
-    #[must_use]
-    pub fn file_id(self) -> u16 {
-        (self.0 >> 28) as u16
-    }
-
-    /// 块号（28 位）。
-    #[must_use]
-    pub fn block_id(self) -> u32 {
-        (self.0 & ((1 << 28) - 1)) as u32
-    }
-
-    /// 5 字节小端编码。
-    #[must_use]
-    pub fn to_bytes(self) -> [u8; 5] {
-        let b = self.0.to_le_bytes();
-        [b[0], b[1], b[2], b[3], b[4]]
-    }
-
-    /// 由 5 字节小端解码。
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8; 5]) -> Self {
-        let mut b = [0u8; 8];
-        b[..5].copy_from_slice(bytes);
-        Self(u64::from_le_bytes(b))
-    }
-}
+/// 数据块地址（rdba）——**与存储层共用同一编码**（§7.1 / §11.5）：
+/// `file_id` 10 位 │ `block_id` 28 位，5 字节小端（定义在
+/// [`bicdb_storage::rowid`]，此处转出以保持 `bicdb-wal` 的既有路径）。
+pub use bicdb_storage::rowid::Rdba;
 
 /// 一处页内变更（after-image：`offset` 起写入 `len` 字节）。
 #[derive(Debug, Clone, PartialEq, Eq)]
