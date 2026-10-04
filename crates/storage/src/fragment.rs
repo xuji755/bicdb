@@ -10,7 +10,10 @@
 //! - **列元数据只在头片段**（`col_count` / NULL 位图 / `var_offsets` 整行一次），
 //!   中/尾片段的数据是**不透明字节切片**；
 //! - **链上每个片段都是页里的一"行"，与普通行同规**——`row_len` = 片段自身长度；
-//!   **整行长度不存、由链求和推导**（重组时回填）。
+//!   **整行长度不存、由链求和推导**（重组时回填）；
+//! - 片段的**槽位状态 = 3**（§5.7 的"片段头"取值）：本实现让头/中/尾**都用 3**，
+//!   "头/中"的区分靠**链图**（未被任何 next 引用的片段即头）——这样槽位扫描
+//!   不会把短行头的片段误当完整行解析（该取值口径已记入待复核清单）。
 //!
 //! # 读取与防线
 //!
@@ -91,12 +94,15 @@ pub fn insert_row(
     let take = cap.min(data.len());
     let mut head = Vec::with_capacity(head_overhead + take);
     head.extend_from_slice(&encoded_row[..header_len]);
-    head[0] |= row::row_flags::FRAGMENT; // §6.3：链上任一片段都置该位
+    // §6.3：链上任一片段都置 FRAGMENT；链首另置 FRAGMENT_HEAD（保留位，见 row 模块）。
+    head[0] |= row::row_flags::FRAGMENT | row::row_flags::FRAGMENT_HEAD;
     head.extend_from_slice(&[0u8; ROWID_LEN]);
     head.extend_from_slice(&data[..take]);
     data = &data[take..];
     set_own_row_len(&mut head);
-    let head_id = heap.insert_into(page, &head, policy)?;
+    // 片段用槽位状态 3（§5.7；头/中/尾的区分靠链图——见模块文档）。
+    let head_id =
+        heap.insert_into_with_status(page, &head, policy, crate::page::SlotStatus::FragmentHead)?;
 
     // ---- 后续片段：中/尾（短行头），逐片写入并回填前一片的 next ----
     let mut prev = head_id;
@@ -112,7 +118,12 @@ pub fn insert_row(
         frag.extend_from_slice(&[0u8; ROWID_LEN]); // 下一片段占位
         frag.extend_from_slice(&data[..take]);
         data = &data[take..];
-        let id = heap.insert_into(page, &frag, policy)?;
+        let id = heap.insert_into_with_status(
+            page,
+            &frag,
+            policy,
+            crate::page::SlotStatus::FragmentHead,
+        )?;
         heap.patch_record(prev, prev_next_at, &id.to_bytes())?;
         prev = id;
         prev_next_at = FRAGMENT_HEADER_LEN - ROWID_LEN;
@@ -123,6 +134,9 @@ pub fn insert_row(
 /// 读取一条行：头片段 → 沿链收集 → 拼接并**回填整行长度**。
 pub fn read_row(heap: &Heap, head: RowId) -> Result<Vec<u8>, FragmentError> {
     let head_bytes = heap.get(head).ok_or(FragmentError::BrokenChain)?;
+    if head_bytes[0] & row::row_flags::FRAGMENT_HEAD == 0 {
+        return Err(FragmentError::BrokenChain); // 入口必须带链首位
+    }
     let head_view = HeadFragment::new(head_bytes)?;
     let mut out = Vec::new();
     out.extend_from_slice(head_view.header_bytes());
@@ -145,7 +159,7 @@ pub fn read_row(heap: &Heap, head: RowId) -> Result<Vec<u8>, FragmentError> {
     }
     let total = out.len() as u16;
     out[2..4].copy_from_slice(&total.to_le_bytes());
-    out[0] &= !row::row_flags::FRAGMENT; // 逻辑行不是片段
+    out[0] &= !(row::row_flags::FRAGMENT | row::row_flags::FRAGMENT_HEAD); // 逻辑行不是片段
     Ok(out)
 }
 

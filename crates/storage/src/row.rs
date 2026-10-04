@@ -58,6 +58,13 @@ pub mod row_flags {
     pub const MIGRATED: u8 = 1 << 1;
     /// 位 2：跨页行片段（链上任一片段都置）。
     pub const FRAGMENT: u8 = 1 << 2;
+    /// 位 3：**片段链首**（启用自"保留"区；与 `FRAGMENT` 同置）。
+    ///
+    /// 头片段 = 完整行头 + 6B 下一片段 + 数据段、中/尾 = 短行头——
+    /// 两者仅凭字节**无法可靠区分**（中片段的 next 指针字节可伪装成完整
+    /// 行头）。用一个保留位显式标记链首，扫描/检查器无需猜。
+    /// 该取值口径已记入待复核清单（保留位的启用在评审后可换别处表达）。
+    pub const FRAGMENT_HEAD: u8 = 1 << 3;
 }
 
 /// 行格式错误。
@@ -477,7 +484,7 @@ pub fn reassemble_row(head: &[u8], rest: &[&[u8]]) -> Result<Vec<u8>, RowError> 
     // 并清除 `FRAGMENT` 位——该位描述"页内记录是片段"，重组后的逻辑行不是。
     let total = out.len() as u16;
     out[2..4].copy_from_slice(&total.to_le_bytes());
-    out[0] &= !row_flags::FRAGMENT;
+    out[0] &= !(row_flags::FRAGMENT | row_flags::FRAGMENT_HEAD);
     Ok(out)
 }
 

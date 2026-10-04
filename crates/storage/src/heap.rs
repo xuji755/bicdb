@@ -183,6 +183,22 @@ fn find_free_slot(page: &Page) -> Option<usize> {
 /// 返回行号（1 起；= 槽位下标 + 1）。页内字段已改（含 `free_end` 与槽位），
 /// **调用方负责 `seal()`**（写回路径统一收尾）。
 pub fn insert_row(page: &mut Page, row: &[u8], policy: &InsertPolicy) -> Result<u16, HeapError> {
+    insert_record(page, row, policy, SlotStatus::Normal)
+}
+
+/// 插入一条**记录**并指定槽位状态（片段 = [`SlotStatus::FragmentHead`]；
+/// 转发指针由 P3 的更新路径使用 [`SlotStatus::Forwarding`]）。
+///
+/// 记录都必须自带行头（`row_len` 在偏移 2..4）——普通行与片段同规。
+pub fn insert_record(
+    page: &mut Page,
+    row: &[u8],
+    policy: &InsertPolicy,
+    status: SlotStatus,
+) -> Result<u16, HeapError> {
+    if status == SlotStatus::Free {
+        return Err(HeapError::BadRow);
+    }
     require_data_page(page)?;
     if row.len() < ROW_HEADER_FIXED_LEN {
         return Err(HeapError::BadRow);
@@ -219,7 +235,7 @@ pub fn insert_row(page: &mut Page, row: &[u8], policy: &InsertPolicy) -> Result<
         page.set_slot_count(page.slot_count() + 1)
             .map_err(|_| HeapError::SlotLimit)?;
     }
-    let entry = SlotEntry::new(offset as u16, SlotStatus::Normal).ok_or(HeapError::BadRow)?;
+    let entry = SlotEntry::new(offset as u16, status).ok_or(HeapError::BadRow)?;
     page.set_slot(index, entry);
     u16::try_from(index + 1).map_err(|_| HeapError::SlotLimit)
 }
@@ -384,11 +400,22 @@ impl Heap {
         row: &[u8],
         policy: &InsertPolicy,
     ) -> Result<RowId, HeapError> {
+        self.insert_into_with_status(block_id, row, policy, SlotStatus::Normal)
+    }
+
+    /// 指定页插入并指定槽位状态（片段 = [`SlotStatus::FragmentHead`]）。
+    pub fn insert_into_with_status(
+        &mut self,
+        block_id: u32,
+        row: &[u8],
+        policy: &InsertPolicy,
+        status: SlotStatus,
+    ) -> Result<RowId, HeapError> {
         let page = self
             .pages
             .get_mut(block_id as usize - 1)
             .ok_or(HeapError::NoSuchRow)?;
-        let row_no = insert_row(page, row, policy)?;
+        let row_no = insert_record(page, row, policy, status)?;
         page.seal();
         RowId::from_parts(1, block_id, row_no).map_err(|_| HeapError::SlotLimit)
     }
