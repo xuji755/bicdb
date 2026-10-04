@@ -1,0 +1,39 @@
+
+============================================================
+  [问题诊断] 审计 AUD$ 保护 删除 权限 SYS 审计表 只读
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 2，摘要筛选通过 1，批次 1；本路已取尽
+  KnowledgeEntry：已取 22，摘要筛选通过 10，批次 1；本路已取尽
+  CaseStudy：已取 8，摘要筛选通过 4，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     移动SYS.AUD$表到其他表空间或添加触发器是不支持的操作，Oracle内核隐含依赖数据字典表，可能导致升级/备份恢复问题。若表空间不可用，审计功能失效并抛出ORA-9925或ORA-9817。推荐使用DBMS_AUDIT_MGMT.SET_AUDIT_TRAIL_LOCATION管理审计。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:72460.1 Moving AUD$ to Another Tablespace and Adding Triggers to AUD$  (排序分: 15.0)
+     └ 摘要：移动SYS.AUD$表到其他表空间或添加触发器是不支持的操作，Oracle内核隐含依赖数据字典表，可能导致升级/备份恢复问题。若表空间不可用，审计功能失效并抛出ORA-9925或ORA-9817。推荐使用DBMS_AUDIT_MGMT.SET_AUDIT_TRAIL_LOCATION管理审计。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2045586
+
+     [KnowledgeEntry] L1：Note:1019377.6 Script to move SYS.AUD$ table out of SYSTEM tablespace  (排序分: 15.0)
+     └ 摘要：脚本TFSAUDMV.SQL用于将SYS.AUD$表移出SYSTEM表空间。首先创建表空间AUDIT及数据文件aud01.dbf，然后创建audx表作为临时表，接着将AUD$重命名为AUD$$，再将audx重命名为AUD$，最后在AUDIT表空间上创建基于sessionid和ses$tid列的索引I_AUD2。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040213
+
+     [KnowledgeEntry] L1：Note:1020945.6 How to Setup Auditing  (排序分: 14.4)
+     └ 摘要：该文档说明数据库审计的配置方法，包括设置AUDIT_TRAIL参数为DB（写入SYS.AUD$）、OS（写入操作系统审计文件）、DB_EXTENDED（10g后支持，额外填充SQLBIND与SQLTEXT列）或NONE禁用审计；若选用OS还需AUDIT_FILE_DEST指定路径，并注意Windows N。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2044933
+
+     [KnowledgeEntry] L1：Note:360194.1 Dump In kokacau() And PMON Crashes With ORA-600 [17034]  (排序分: 14.2)
+     └ 摘要：ORA-600 [17034]错误表现为kokacau()函数内部转储后PMON崩溃，实例终止，当前SQL是查询tabpart$的游标。原因是不支持地将SYS.AUD$移出SYSTEM表空间或改为分区表，导致内部游标管理异常。解决方案是将AUD$重建回SYSTEM表空间并重新导入记。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043159
+
+     [CaseStudy] 278184.1  (排序分: 9.5)
+     └ 摘要：安装Oracle Label Security后，AUD$表自动从SYS schema移至SYSTEM schema，根因是安装过程强制移动，典型场景为9i/10g中安装OLS导致审计表位置变更，可能影响依赖SYS.AUD$的脚本或权限管理。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:383383
+
+     [FaultModel] SYS.AUD$审计插入引发gc freelist等待导致RAC集群hung  (排序分: 9.3)
+     └ 摘要：RAC集群在上班高峰期出现近似hung，ASH显示gc freelist占比9%以上，diag trace定位到session 1254执行INSERT INTO SYS.AUD$且长时间等待gc freelist，阻塞64个会话，疑似Oracle Bug，可通过调整_gc_element_percent或迁移/关闭审计缓解。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:170885
+

@@ -1,0 +1,26 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:22956.1 What Happens During a Hot Backup
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2049340
+
+  ── 描述 ──
+  What Happens During a Hot Backup What Happens when we go into Hot Backup Mode
+  ============================================ The BEGIN BACKUP command checkpoints the datafiles and
+  advances the datafile header checkpoints to the begin backup checkpoint SCN. Until the END BACKUP
+  command is executed, checkpoints will cease to update the datafile headers. It starts the logging of
+  block images. Each time the block is read into cache an image of the whole block before the first
+  change is logged. The END BACKUP command creates a redo record containing the begin backup
+  checkpoint SCN. It stops the logging of block images and causes the datafile checkpoints to be
+  advanced to the database checkpoint. Datafile updates by DBWR go on as usual during the time the
+  backup is being copied so the backup gets a "fuzzy" copy of the datafile: some blocks may be ahead
+  in time versus other blocks and some may contain updates by transactions that are later rolled back.
+  The "fuzzy" backup copy is unusable without the "focusing" via the redo log that occurs when the
+  backup is restored and undergoes media recovery. Media recovery applies redo (from all threads) from
+  the checkpoint SCN that was captured at BEGIN BACKUP time through the end-point of the recovery
+  operation. Once redo application is finished, uncommited transactions are rolled back to leave a
+  transaction-consistent "focussed" version of the datafile. . Copyright © 2006, Oracle. All rights
+  reserved.
+
+  ── 摘要 ──
+  热备份期间，BEGIN BACKUP 命令将数据文件头检查点推进到备份开始检查点 SCN 并暂停头更新，同时开启块影像日志；备份产生模糊数据文件副本，只有通过从该检查点 SCN 开始的重做日志进行介质恢复并回滚未提交事务后才能获。

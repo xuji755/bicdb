@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 克隆前先 CHECKPOINT 并进入备份模式的 WAL 语义
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2290826
+
+  ── 描述 ──
+  原文将 CHECKPOINT 与 pg_backup_start/pg_backup_stop 的组合称为 PostgreSQL 的原子备份
+  API，用于确保数据一致性。执行顺序固定为：CHECKPOINT → pg_backup_start('pgfork', true) → 在备份模式内完成 PGDATA 复制（rm -rf
+  /pg/data2 && cp -r --reflink=auto /pg/data /pg/data2）→
+  pg_backup_stop(false)。若跳过该序列直接复制文件系统，得到的是数据状态不一致的脏实例，无法启动。
+
+  ── 摘要 ──
+  在 reflink 克隆 PGDATA 之前，先执行 CHECKPOINT，随后 SELECT pg_backup_start('pgfork', true) 进入备份模式，复制完成后 SELECT * FROM pg_backup_stop(false) 退出备份模式；该序列为在线文件级复制提供一致性保障，是克隆体能够正常启动的前提。

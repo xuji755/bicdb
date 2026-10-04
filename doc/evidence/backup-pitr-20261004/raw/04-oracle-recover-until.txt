@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 恢复 UNTIL SCN TIME 归档日志 应用 终止 cancel
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 1，摘要筛选通过 1，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 29，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 12，摘要筛选通过 4，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     当系统时间发生大幅变动时，RECOVER DATABASE UNTIL TIME 无法到达第二个恢复点，应改用 RECOVER DATABASE UNTIL CANCEL 或 UNTIL CHANGE，因为 Oracle 恢复基于 SCN，SCN 不会因时间调整而倒退（resetlogs 除外），而时间戳可能前后变化。DBMS_SCHEDULE。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:77370.1 文档 220970.1-c6  (排序分: 14.7)
+     └ 摘要：当系统时间发生大幅变动时，RECOVER DATABASE UNTIL TIME 无法到达第二个恢复点，应改用 RECOVER DATABASE UNTIL CANCEL 或 UNTIL CHANGE，因为 Oracle 恢复基于 SCN，SCN 不会因时间调整而倒退（resetlogs 除外），而时间戳可能前后变化。DBMS_SCHEDULE。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2041648
+
+     [KnowledgeEntry] RECOVER DATABASE UNTIL TIME命令与归档日志应用  (排序分: 10.0)
+     └ 摘要：RECOVER DATABASE UNTIL TIME命令用于将数据库恢复到指定时间点，执行时会提示应用从控制文件记录的起始SCN到目标时间点之间的所有归档日志。Oracle自动建议日志文件名，用户可输入AUTO或直接回车接受。该命令隐含假设归档日志连续且存在，边界条件要求目标时间点晚于数据文件的检查点SCN且早于当前时间。若目标时间点之后仍有未归档的在线日志，需先执行归档当前日志操作，否则恢复将失败。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:192334
+
+     [KnowledgeEntry] Incomplete Media Recovery（不完全介质恢复）  (排序分: 10.0)
+     └ 详情：当丢失了某些归档日志或需要恢复到特定时间点时，使用不完全恢复。需要恢复备份并应用日志到指定SCN或时间。之后必须使用RESETLOGS打开数据库。方式包括：RECOVER DATABASE UNTIL TIME、UNTIL SCN、UNTIL CANCEL等。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155428
+
+     [KnowledgeEntry] 不完全恢复的三类型：UNTIL TIME, UNTIL CHANGE, UNTIL CANCEL  (排序分: 10.0)
+     └ 摘要：Oracle不完全恢复提供三种方式：恢复到指定时间点的UNTIL TIME、恢复到指定SCN的UNTIL CHANGE，以及通过管理员手动发出CANCEL指令控制恢复停止时机的UNTIL CANCEL。所有方式完成后均需使用RESETLOGS打开数据库。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:221019
+
+     [CaseStudy] 259694.1  (排序分: 9.5)
+     └ 摘要：使用RMAN复制Oracle 10G数据库时，非归档模式必须基于关闭数据库的一致备份，而归档模式可使用`SET UNTIL TIME | SCN | SEQUENCE`子句指定时间点，适用于不同的备份恢复场景。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:398275
+
+     [FaultModel] 不完全恢复导致数据丢失  (排序分: 9.3)
+     └ 摘要：故障模型：现象为执行不完全恢复（时间点恢复）后，晚于恢复时间点的已提交事务全部丢失。根因是DBA手动执行RECOVER DATABASE UNTIL TIME/SCN/CANCEL，或者RMAN时间点恢复。影响：恢复时间点之后的所有数据变更永久丢失。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1537997
+

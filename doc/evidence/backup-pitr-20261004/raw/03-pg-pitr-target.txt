@@ -1,0 +1,31 @@
+
+============================================================
+  [问题诊断] recovery_target 恢复 目标 LSN 时间 停止 重放 WAL 归档
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 2，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 5，摘要筛选通过 4，批次 1；本路已取尽
+  CaseStudy：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 4 条
+
+  ✅ 答案要点
+     在PostgreSQL的PITR恢复过程中，即使最后一个WAL文件中没有事务结束的COMMIT或ABORT记录，或者recovery_target_name不存在，依然可以正常恢复。PG的恢复机制会基于WAL的LSN序列和事务状态确定一致性恢复点，并在最后一个有效WAL位点停止，提示“consistent recovery state reached”。对于未完成的事务，PG会自动回滚，将数据库恢复到最后一个一致性检查点之后的状态。若指定的恢复目标（如recovery_target_time、recovery_ta
+
+  📍 诊断结果 (4条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] PostgreSQL 如果最后一个WAL文件中没有事务结束record或target_name point时，可以正常恢复到指定时间点吗  (排序分: 10.0)
+     └ 摘要：在PostgreSQL的PITR恢复过程中，即使最后一个WAL文件中没有事务结束的COMMIT或ABORT记录，或者recovery_target_name不存在，依然可以正常恢复。PG的恢复机制会基于WAL的LSN序列和事务状态确定一致性恢复点，并在最后一个有效WAL位点停止，提示“consistent recovery state reached”。对于未完成的事务，PG会自动回滚，将数据库恢复到最后一个一致性检查点之后的状态。若指定的恢复目标（如recovery_target_time、recovery_target_xid）不存在，PG会在最后一个有效位点优雅停止，执行promote后即可正常提供服务。相关参数示例包括recovery_target = 'immediate'、recovery_target_time、recovery_target_xid等。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:343802
+
+     [KnowledgeEntry] PostgreSQL_PG18_Ch19_19_5_6  (排序分: 9.7)
+     └ 摘要：PostgreSQL 默认恢复至 WAL 日志末尾，但可通过多个参数指定更早的停止点，且每次只能使用其中一个（如 recovery_target、recovery_target_lsn、recovery_target_name、recovery_target_time 或 recovery_target_xid），这些参数只能在服务器启动时设置。其中 recovery_target 设为 'immediate' 表示在达到一致状态时尽早结束恢复；recovery_target_name 指定命名的恢复点；recovery_target_time 指定恢复截止的时间戳；recovery_target_xid 指定恢复截止的事务 ID；recovery_target_lsn 指定 WAL 日志位置的 LSN。此外，recovery_target_inclusive 控制是否包含目标点本身；recovery_target_timeline 指定恢复的时间线；recovery_target_action 决定达到目标后的行为（暂停、提升或关闭服务器）。这些选项支持精确控制恢复停止点。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1100115
+
+     [KnowledgeEntry] POSTGRESQL-7344  (排序分: 9.7)
+     └ 摘要：该知识条目介绍了PostgreSQL实例级恢复目标的相关参数。默认情况下恢复会进行到WAL日志末尾，但可通过以下参数指定较早停止点：recovery_target（设为immediate表示达到一致状态后立即恢复）、recovery_target_name（使用sys_create_restore_point创建的恢复点）、recovery_target_time（指定时间戳）、recovery_target_xid（指定事务ID）以及recovery_target_lsn（指定写前日志位置的LSN）。这些参数互斥，只能设置其中一个，且需在服务器启动时配置。此外，recovery_target_inclusive参数会影响精确停止点。若配置多个参数则会引发错误。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:451787
+
+     [KnowledgeEntry] 如何判断当前PostgreSQL数据库是否处于一致状态?  (排序分: 9.7)
+     └ 摘要：判断PostgreSQL数据库是否处于一致状态，核心是确保所有数据块无partial write，且一致性位点前已提交事务存在、之后提交的事务不存在。检测方法：若初始化时开启checksum，可用pg_verify_checksums工具离线检查所有块；未开启则只能在查询坏块时报错获悉，可通过zero_damaged_pages参数跳过错误。PITR恢复时，观察恢复日志输出'consistent recovery state reached at LSN位置'来判断。崩溃恢复在开启fsync和full_page_writes时可保证一致性，COW文件系统则可关闭fpw。关键参数recovery_target='immediate'用于到达一致状态后立即停止恢复，相关代码位于src/backend/access/transam/xlog.c。在线备份恢复需确保WAL归档足够，目标LSN大于等于minimum recovery point。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:349119
+

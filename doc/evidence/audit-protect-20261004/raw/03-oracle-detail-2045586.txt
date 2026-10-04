@@ -1,0 +1,79 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:72460.1 Moving AUD$ to Another Tablespace and Adding Triggers to AUD$
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2045586
+
+  ── 描述 ──
+  Purpose Scope and Application Moving AUD$ to Another Tablespace and Adding Triggers to AUD$ Overview
+  Moving AUD$ Overview of adding triggers to AUD$ References (AuthWiz 2.5.5) Click here to edit in
+  wizard. Applies to: Oracle Server - Enterprise Edition - Version: 9.2.0.1 Information in this
+  document applies to any platform. Purpose
+  ****************************************************************************** *** From Bug 531557:
+  *** This is not supported. *** We don't support changing ownership of AUD$, or any triggers on it.
+  ****************************************************************************** Important
+  Note:===============It is strongly recommended to use the DBMS_AUDIT_MGMT.SET_AUDIT_TRAIL_LOCATION
+  provided with the DBMS_MGMT package instead of using the method described in this document, seeNote
+  731908.1 "New Feature DBMS_AUDIT_MGMT To Manage And Purge Audit Information"for more information and
+  references. Also please understand the movement of theaudit tables SYS.AUD$ (or SYSTEM.AUD$ in case
+  of OLS) and FGA_LOG$ tables is supported by the DBMS_AUDIT_MGMT package. But, this gives no support
+  on adding triggers to AUD$ table.Moreover many additional audit features such as Alerts are possible
+  with Audit Vault and should notneed to be implemented on the source database with custom triggers
+  but by using a supported product feature.The procedure described in this note is not officially
+  supported, because the Oracle code makes implicit assumptions about the data dictionary tables such
+  as SYS.AUD$, which could cause problems with upgrades and backup / recovery scenarios. However, in
+  most cases the procedure works as described. If you encounter problems using a trigger on the
+  relocated AUD$ table Oracle Support may suggest to delete it.In case you decide to move AUD$ to a
+  different tablespace, and the tablespace or datafile where you relocated is unavailable, you will
+  not be able to use audit anymore, therefore your applications might get errors such as ORA-9925 or
+  ORA-9817 In such cases, please correct the problem before for this table. You should not move
+  SYS.AUD$ to another tablespace as a means of controlling the growth and size of the audit trail.
+  However, you can modify the default storage parameters in SYS.AUD$. This article contains a script
+  to move the "SYS.AUD$" table from the user SYS and tablespace SYSTEM to another user and tablespace.
+  It also gives an example of a trigger that could be added to the resultant table for recording
+  additional audit information.This article is distributed externally due to customer demand. Scope
+  and Application For DBA's requiring to move SYS.AUD$ from the SYSTEM tablespace or recording
+  additional audit information. Moving AUD$ to Another Tablespace and Adding Triggers to AUD$
+  OverviewThis script has been tested with Oracle8i, Oracle9i. It is NOT supported because the
+  following are NOT supported:- Moving the SYS.AUD$ table out of the SYSTEM tablespace- Moving the
+  SYS.AUD$ table out of the SYS schema- Adding triggers to the AUD$ table The reason the above are not
+  supported is because the Oracle Code makes implicit assumptions about the data dictionary tables
+  such as SYS.AUD$, which could cause problems with upgrades and backup/recovery scenarios. 'Not
+  supported' means Oracle Support cannot involve development if problems arise because of the triggers
+  you put on the AUD$ table. It is strongly advised to seek supported solutions such as Fine Grained
+  Auditing that can be setup to use a handler function for any additional processing you require.
+  Moving AUD$Oracle stores audit trail records in a single table, "SYS.AUD$", being a base data
+  dictionary table, it is not supported to change it. However, it is supported to modify the default
+  storage parameters this growth within the SYSTEM tablespace, but without the additional flexibility
+  provided by moving "SYS.AUD$" to another tablespace.The following script will allow you to move the
+  "SYS.AUD$" table out of the SYSTEM tablespace and from the SYS to SYSTEM user (although it could be
+  any other user). 1. Start the database with : audit_trail=none 2. Run the following in Sqlplus:
+  connect sys/<password> create table system.aud$ tablespace <tablespace name> as select * from aud$;
+  create index system.i_aud1 on system.aud$(sessionid, ses$tid); rename aud$ to aud$_temp; create view
+  aud$ as select * from system.aud$; connect system/<password> grant all on aud$ to sys with grant
+  option; grant delete on aud$ to delete_catalog_role;3. Re-Start the database with : audit_trail=DB4.
+  Recreate the data dictionary views for auditing :connect sys/<password>
+  %ORACLE_HOME%/rdbms/admin/cataudit.sql Overview of adding triggers to AUD$ Default Oracle auditing
+  purely stores a record of the type of action performed by a user; it is often useful to record
+  additional information about the action performed by the user.The following is a example of a
+  trigger that could be added after the above script has been run : create table system.accounting
+  (USERNAME VARCHAR2(30), LOGIN_TIME DATE, LOGOFF_TIME DATE, SCHEMANAME VARCHAR2(30), OSUSER
+  VARCHAR2(15), PROCESS VARCHAR2(12), MACHINE VARCHAR2(64), TERMINAL VARCHAR2(8), PROGRAM
+  VARCHAR2(64), tablespace <tablespace name>; create or replace trigger acc_trigger after update on
+  system.aud$ for each row when (new.action# = 101 or new.action# = 102) declare v_conc_id number;
+  begin v_conc_id := 99; insert into system.accounting select :new.userid, :new.timestamp#,
+  :new.logoff$time, ss.schemaname, ss.osuser, ss.process, ss.machine, ss.terminal, ss.program,
+  ss.type, :new.logoff$lread, :new.logoff$pread, st.sid, ss.audsid, st.value from V$STATNAME S,
+  V$SESSTAT ST, V$SESSION SS where S.STATISTIC# = ST.STATISTiC# AND ST.SID = SS.SID and :new.sessionid
+  = SS.AUDSID and S.NAME='CPU used by this session'; end; / An example of querying the accounting
+  table is : select osuser,username, to_char(LOGIN_TIME,'dd.mm.yy:hh:mi') login,
+  to_char(LOGOFF_TIME,'dd.mm.yy:hh:mi') logout, MACHINE, CPU_TIME from accounting; References Bug
+  531557 - TRIGGER ON AUD$ CAUSES CORE DUMPS Bug 6023472 - AUDIT FILESIZE SHOULD BE LIMITED AND
+  CLEANED UP Note 1019377.6 - Script to move SYS.AUD$ table out of SYSTEM tablespace Note 166301.1 -
+  How to Reorganize SYS.AUD$ Table Note 731908.1 - New Feature DBMS_AUDIT_MGMT To Manage And Purge
+  Audit Information Note 73408.1 - How to Truncate, Delete, or Purge Rows from the Audit Trail Table
+  SYS.AUD$ Keywords MOVE~AUD$ ; SYSTEM~TABLESPACE ; AUDIT_TRAIL ; STORAGE ; AUDIT~TRAIL ; MOVE~AUD$ ;
+  RECREATE~AUD$ ; . Copyright © 2006, Oracle. All rights reserved.
+
+  ── 摘要 ──
+  移动SYS.AUD$表到其他表空间或添加触发器是不支持的操作，Oracle内核隐含依赖数据字典表，可能导致升级/备份恢复问题。若表空间不可用，审计功能失效并抛出ORA-9925或ORA-9817。推荐使用DBMS_AUDIT_MGMT.SET_AUDIT_TRAIL_LOCATION管理审计。

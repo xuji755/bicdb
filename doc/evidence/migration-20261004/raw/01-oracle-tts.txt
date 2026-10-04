@@ -1,0 +1,41 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 可传输表空间 元数据 导出 导入 transportable tablespace 平台 校验
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 60，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     可传输表空间集除数据文件外，还必须包含表空间元数据导出，用于在目标数据库重建表空间结构。元数据通常通过 Data Pump 以 transportable tablespace 模式导出。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 可传输表空间集的元数据导出  (排序分: 9.4)
+     └ 详情：可传输表空间集除数据文件外，还必须包含表空间元数据导出，用于在目标数据库重建表空间结构。元数据通常通过 Data Pump 以 transportable tablespace 模式导出。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2411575
+
+     [KnowledgeEntry] 可传输表空间  (排序分: 9.4)
+     └ 摘要：可传输表空间通过操作系统工具或RMAN复制数据文件，并结合Export/Import特殊模式（TRANSPORT_TABLESPACE=Y）导出数据字典元数据来实现迁移。该方法受限于同一平台和版本依赖，能够将数据文件与元数据导出文件结合，有效实现表空间的“搁置”操作。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1536183
+
+     [KnowledgeEntry] 如何使用Data_Pump导出可传输表空间的元数据  (排序分: 9.4)
+     └ 详情：使用expdp命令并指定TRANSPORT_TABLESPACES参数，例如：
+expdp username dumpfile=expdat.dmp directory=datapump_dir transport_tablespaces=sales1,sales2 logfile=tts_export.log
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1526755
+
+     [KnowledgeEntry] system 表空间与 spfile 不属于可传输表空间集  (排序分: 9.4)
+     └ 详情：Q425 的正确答案 AC 表明 transportable tablespace set 只包括数据文件和导出元数据。system 表空间和 spfile 被排除，因为 system 表空间不能作为普通可传输表空间集的一部分复制，spfile 也不是表空间元数据。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2418178
+
+     [CaseStudy] [三思笔记]使用可传输表空间的特性复制数据  (排序分: 9.1)
+     └ 摘要：使用可传输表空间复制数据时，需查询V$TRANSPORTABLE_PLATFORM确认平台兼容性，典型场景为数据库跨平台迁移或备份恢复。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1227824
+
+     [FaultModel] 可传输表空间兼容性设置过低  (排序分: 8.6)
+     └ 摘要：导入可传输表空间时，若目标数据库的COMPATIBLE初始化参数设置低于导出表空间所需的兼容性版本，则报ORA-19726错误。需调高COMPATIBLE参数。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324352
+

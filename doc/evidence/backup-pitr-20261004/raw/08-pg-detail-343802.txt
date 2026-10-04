@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: PostgreSQL 如果最后一个WAL文件中没有事务结束record或target_name point时，可以正常恢复到指定时间点吗
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:343802
+
+  ── 描述 ──
+  PG PITR恢复中,如果最后一个WAL文件中没有事务结束record(COMMIT/ABORT),或recovery_target_name不存在,能否正常恢复?答案:可以,PG的恢复机制会在最后一
+  个有效WAL位点处停止并提示'consistent recovery state reached'。PG通过WAL的LSN序列和事务状态确定一致性恢复点。即使没有找到明确的事务结束record,PG会
+  回滚未完成的事务,将数据库恢复到最后一个一致性检查点之后的状态。recovery_target参数: recovery_target = 'immediate' (达到一致性立即停止);
+  recovery_target_time = '2024-01-01 12:00:00' (恢复到指定时间); recovery_target_xid = '12345'
+  (恢复到指定事务ID)。如果指定的target不存在,PG会在最后一个有效位点优雅停止,promote后即可提供服务。
+
+  ── 摘要 ──
+  在PostgreSQL的PITR恢复过程中，即使最后一个WAL文件中没有事务结束的COMMIT或ABORT记录，或者recovery_target_name不存在，依然可以正常恢复。PG的恢复机制会基于WAL的LSN序列和事务状态确定一致性恢复点，并在最后一个有效WAL位点停止，提示“consistent recovery state reached”。对于未完成的事务，PG会自动回滚，将数据库恢复到最后一个一致性检查点之后的状态。若指定的恢复目标（如recovery_target_time、recovery_target_xid）不存在，PG会在最后一个有效位点优雅停止，执行promote后即可正常提供服务。相关参数示例包括recovery_target = 'immediate'、recovery_target_time、recovery_target_xid等。
