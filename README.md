@@ -26,9 +26,9 @@ It unifies five kinds of data under one transactional store:
 
 ### Status
 
-> **Design phase. Skeleton only — nothing is implemented.**
-> All crates are placeholders. No callable API exists and no interface shape
-> is promised yet.
+> **Design frozen (2026-10). Skeleton only — nothing is implemented yet.**
+> The V1.0 design documents are frozen; all crates remain placeholders and no
+> callable API exists yet.
 
 ### Documentation
 
@@ -36,7 +36,7 @@ It unifies five kinds of data under one transactional store:
 | --- | --- |
 | [Requirements](docs/requirements.md) | What V1.0 must do, with numbered requirements and priorities |
 | [Design](docs/design.md) | Overall architecture: isolation, storage, transactions, retrieval, graph, phases |
-| [Storage design](docs/storage.md) | Storage layer: file layout, page format, ROWID, recovery. **Phased — structural design complete, some format details pending** |
+| [Storage design](docs/storage.md) | Storage layer: file layout, page format, ROWID, recovery. **Design frozen (2026-10) — all pending items closed** |
 | [Platform support](docs/platform-support.md) | Supported architectures and compatibility baseline |
 
 ### Core constraints
@@ -82,7 +82,7 @@ and is not blocked by them.**
 | `bicdb-memory` | Memory revisions, checkpoints, TTL, derivation and delete propagation |
 | `bicdb-retrieval` | Inverted index and tokenization, exact vector, RRF fusion, HNSW/IVFFlat |
 | `bicdb-graph` | Named graphs, vertex/edge storage, Cypher subset, bounded traversal |
-| `bicdb-net` | Versioned request protocol, idempotency and CAS, SDK/CLI plumbing |
+| `bicdb-net` | Versioned request protocol, ACK/reconcile, sessions, SDK/CLI plumbing |
 | `bicdb-daemon` | Worker process entry, bounded execution pool, maintenance threads |
 | `bicdb-tools` | Diagnostics: `page_dump`, `db_check` |
 
@@ -140,9 +140,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Full Oracle SQL compatibility and PL/SQL; RAC, distributed transactions,
 cross-workspace write transactions; in-database model execution; complex LSM
-storage; in-database LOBs; high availability, online backup, and point-in-time
-recovery; window functions, JIT, and intra-query parallelism; unbounded
-variable-length graph paths; cross-user authorization (permanently).
+storage; in-database LOBs; multi-node high availability and automatic failover;
+window functions, JIT, and intra-query parallelism; unbounded variable-length
+graph paths; cross-user authorization (permanently).
 
 ### License
 
@@ -169,8 +169,8 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 
 ### 当前状态
 
-> **设计阶段，仅有目录骨架，未实现任何功能。**
-> 所有 crate 均为占位。不提供任何可调用接口，也不承诺接口形态。
+> **设计已冻结（2026-10）；仅有目录骨架，尚未实现任何功能。**
+> V1.0 设计文档已冻结；所有 crate 仍为占位，尚无可调用接口。
 
 ### 文档
 
@@ -178,7 +178,7 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | --- | --- |
 | [需求文档](docs/requirements.md) | V1.0 必须做到什么，逐条编号与优先级 |
 | [总体设计](docs/design.md) | 隔离、存储、事务、检索、图，以及研发阶段 |
-| [存储结构设计](docs/storage.md) | 文件布局、页格式、ROWID、恢复。**阶段性**——结构性设计已完成，部分格式细节待冻结 |
+| [存储结构设计](docs/storage.md) | 文件布局、页格式、ROWID、恢复。**设计冻结（2026-10）**——全部待冻结项已关闭 |
 | [平台支持](docs/platform-support.md) | 支持的架构与兼容基线 |
 
 ### 核心约束
@@ -220,7 +220,7 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | `bicdb-memory` | 记忆版本、检查点、TTL、派生依赖与删除传播 |
 | `bicdb-retrieval` | 倒排索引与分词、精确向量、RRF 融合、HNSW/IVFFlat |
 | `bicdb-graph` | 命名图、顶点/边存储、Cypher 子集、有界遍历 |
-| `bicdb-net` | 版本化请求协议、幂等与 CAS、SDK/CLI 对接 |
+| `bicdb-net` | 版本化请求协议、ACK/对账、会话、SDK/CLI 对接 |
 | `bicdb-daemon` | 工作进程入口、有界执行池、维护线程 |
 | `bicdb-tools` | 诊断工具：`page_dump`、`db_check` |
 
@@ -274,7 +274,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ### 明确不做
 
 完整 Oracle SQL 兼容与 PL/SQL；RAC、分布式事务、跨工作区写事务；库内模型执行；
-复杂 LSM 存储；库内 LOB；高可用、在线备份与时间点恢复；窗口函数、JIT 与单查询
+复杂 LSM 存储；库内 LOB；多节点高可用与自动故障切换；窗口函数、JIT 与单查询
 并行；无限变长图路径；跨用户授权（永久不做）。
 
 ### 许可证
