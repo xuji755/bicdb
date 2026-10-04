@@ -1,4 +1,4 @@
-# 外部检索摘要（2026-10-04，6 轮，经 WebSearch）
+# 外部检索摘要（2026-10-04；首轮 6 次 + 复核 2 次，经 WebSearch）
 # 用途：支撑 evidence.md 的第 1 / 3 / 4 条结论。以下为检索结果摘要与本轮取用的关键数字。
 
 ## 1. Oracle Transaction Guard（LTXID / 保留期 / 清理）
@@ -96,3 +96,27 @@
 链接：
 - （官方 RefMan 8.x PDF 与 Percona XA 材料，见检索结果；
   MySQL 内部机制的知识库条目见 raw/01）
+
+## 7. 复核补充（2026-10-04 第二轮）：Transaction Guard 的定位 = AC/TAC 构件
+
+要点（Oracle 官方文档口径）：
+
+- **定位**：TG 是 **Application Continuity（AC）/ Transparent Application Continuity（TAC）**
+  的构件——AC 在"重连 → 判定 → 重放"流程中**用 TG 判断上一笔事务是否已提交**：
+  **已提交的绝不重放**（官方表述：prevents a transaction replayed by AC from being
+  applied more than once；at-most-once），未提交才安全重放。TG 亦可独立启用
+  （JDBC thin / OCI / ODP.NET），但服务的是**切换连续性**（计划内维护、计划外故障）。
+- **可恢复错误来源清单**：planned maintenance、unplanned outages of sessions / **networks** /
+  nodes / storage / databases、timeouts——网络中断是其中一类；动作均为"切换 + 重放"，
+  TG 在其中只回答"交没交"。
+- **提交结果判定覆盖的事务类型**：local / one-phase / 2PC over DB links / distributed /
+  parallel，**含 DDL/DCL 事务**。
+- **限制**：与老式 TAF 互斥（TAF 下 LTXID 恒空、无法判定）；AC 重放侧对
+  ALTER SYSTEM / ALTER DATABASE 等禁用重放。
+- **结论**：TG ≠ 应用层通用重试协议；与 `idem$` 相同的只是"记录物件"构造
+  （提交结果落表 + 保留期 + 周期清理 + 按号查询）。
+
+链接：
+- https://docs.oracle.com/en/database/oracle/oracle-database/21/jjdbc/transaction-guard.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/creating-and-configuring-an-oracle-database.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/cncpt/transactions.html
