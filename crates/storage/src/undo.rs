@@ -434,6 +434,45 @@ pub fn txn_id_of(index: u16, slot: &TxnSlot) -> TxnId {
     TxnId::from_parts(0, index as u8, slot.wrap)
 }
 
+/// **分析阶段的事务表修复**（§4.6.6 ⑤"前滚补标记"）：
+///
+/// 1. 对日志里**已提交**的事务（`committed` = `txn_id → commit_seq` 对），
+///    把事务表槽补成 `Committed` + 准确序号——提交记录已入流，槽标记即使
+///    在崩溃中丢了也在此恢复；
+/// 2. 返回**待撤销的槽列表**（`Active` / `PendingRollback`）——它包含
+///    "检查点前就活动、日志里没有任何记录"的当事务，是输家集合的另一半
+///    （日志侧的另一半由 `bicdb_wal::analysis` 给出）。
+///
+/// **为什么补标记是正确性步骤**：延迟块清除（§11.1.1）下，已提交但未清除
+/// 的块其 ITL 条目仍是"活动"外观，可见性判定靠 `txn_id` 回查本槽
+/// （§12.2 ②′）——槽标记不补，读者会把已提交事务当成未提交去撤销。
+///
+/// 幂等：已有 `Committed` 标记的槽不动；重复调用结果相同。
+pub fn repair_committed_slots(
+    page: &mut Page,
+    committed: &[(TxnId, CommitSeq)],
+) -> Result<Vec<u16>, UndoError> {
+    check_undo_segment(page)?;
+    for (txn_id, seq) in committed {
+        let Some(mut slot) = find_slot(page, *txn_id)? else {
+            continue; // 槽已回收（提交后释放过）：无需补标记
+        };
+        if slot.state != TxnState::Committed {
+            slot.state = TxnState::Committed;
+            slot.commit_seq = *seq;
+            write_slot(page, u16::from(txn_id.slot()), &slot)?;
+        }
+    }
+    let mut losers = Vec::new();
+    for i in 0..TXN_SLOTS as u16 {
+        let slot = read_slot(page, i)?;
+        if matches!(slot.state, TxnState::Active | TxnState::PendingRollback) {
+            losers.push(i);
+        }
+    }
+    Ok(losers)
+}
+
 // ---------------------------------------------------------------------------
 // 撤销记录（§4.6.2）
 // ---------------------------------------------------------------------------
@@ -2010,5 +2049,122 @@ mod rollback_tests {
         rollback_record(&io, &head_rec, &mut resolve).unwrap();
         let page = load(&io, h);
         assert_eq!(heap::row(&page, n), Some(&bytes[..]), "删除被撤销、行恢复");
+    }
+}
+
+/// 分析阶段的事务表修复（前滚补标记 + 输家扫描）。
+#[cfg(test)]
+mod analysis_tests {
+    use std::path::Path;
+
+    use bicdb_common::seq::CommitSeq;
+    use bicdb_workspace::io::MemFileIo;
+
+    use super::*;
+    use crate::datafile::DataFile;
+    use crate::page::Page;
+
+    const F: &str = "/mem/undo_repair.dat";
+    const WS: [u8; 8] = [7u8; 8];
+
+    fn seq(v: u64) -> CommitSeq {
+        CommitSeq::from_raw(v).unwrap()
+    }
+
+    fn mem() -> MemFileIo {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        io
+    }
+
+    /// 新建 undo 段头页（真实段 → 页 0；扩展区就位）。测试只看内存页，不写回。
+    fn header_page(io: &MemFileIo) -> Page {
+        let mut file = DataFile::create(io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        segment.read_page(0).unwrap()
+    }
+
+    #[test]
+    fn marks_committed_and_lists_losers() {
+        let mut page = header_page(&mem());
+        let (s0, _) = allocate_slot(&mut page).unwrap();
+        let (s1, _) = allocate_slot(&mut page).unwrap();
+        let (s2, _) = allocate_slot(&mut page).unwrap();
+        assert_eq!((s0, s1, s2), (0, 1, 2), "空闲链按序弹出");
+
+        let t0 = txn_id_of(s0, &read_slot(&page, s0).unwrap());
+        let losers = repair_committed_slots(&mut page, &[(t0, seq(9))]).unwrap();
+
+        let slot0 = read_slot(&page, s0).unwrap();
+        assert_eq!(slot0.state, TxnState::Committed, "槽 0 前滚补标记");
+        assert_eq!(slot0.commit_seq, seq(9));
+        assert_eq!(losers, vec![s1, s2], "活动槽 = 输家（另一半来自日志）");
+    }
+
+    #[test]
+    fn pending_rollback_is_a_loser() {
+        let mut page = header_page(&mem());
+        let (s0, _) = allocate_slot(&mut page).unwrap();
+        let mut slot = read_slot(&page, s0).unwrap();
+        slot.state = TxnState::PendingRollback;
+        write_slot(&mut page, s0, &slot).unwrap();
+
+        let losers = repair_committed_slots(&mut page, &[]).unwrap();
+        assert_eq!(losers, vec![s0], "待回滚槽要续做到完成");
+    }
+
+    #[test]
+    fn unknown_or_recycled_txn_is_ignored() {
+        let mut page = header_page(&mem());
+        let (s0, _) = allocate_slot(&mut page).unwrap();
+        let live = txn_id_of(s0, &read_slot(&page, s0).unwrap());
+
+        // ① 槽号越界于事务表的 txn_id（usn 1）② wrap 不匹配（槽已换人）
+        let wrong_usn = TxnId::from_parts(1, 0, 0);
+        let wrong_wrap = TxnId::from_parts(0, s0 as u8, 99);
+        let losers =
+            repair_committed_slots(&mut page, &[(wrong_usn, seq(1)), (wrong_wrap, seq(2))])
+                .unwrap();
+
+        assert_eq!(
+            read_slot(&page, s0).unwrap().state,
+            TxnState::Active,
+            "未被误标"
+        );
+        assert_eq!(losers, vec![s0]);
+        // 正常引用仍可补标记。
+        let losers = repair_committed_slots(&mut page, &[(live, seq(3))]).unwrap();
+        assert!(losers.is_empty());
+        assert_eq!(read_slot(&page, s0).unwrap().state, TxnState::Committed);
+    }
+
+    #[test]
+    fn repair_is_idempotent() {
+        let mut page = header_page(&mem());
+        let (s0, _) = allocate_slot(&mut page).unwrap();
+        let t0 = txn_id_of(s0, &read_slot(&page, s0).unwrap());
+
+        let first = repair_committed_slots(&mut page, &[(t0, seq(5))]).unwrap();
+        let after_first = read_slot(&page, s0).unwrap();
+        let second = repair_committed_slots(&mut page, &[(t0, seq(5))]).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(read_slot(&page, s0).unwrap(), after_first);
+
+        // 已标记的槽不再被日志序号改写（保留既有值——重复调用不改字节）。
+        let bytes_before = *page.as_bytes();
+        repair_committed_slots(&mut page, &[(t0, seq(42))]).unwrap();
+        assert_eq!(*page.as_bytes(), bytes_before);
+    }
+
+    #[test]
+    fn free_slot_is_not_touched() {
+        let mut page = header_page(&mem());
+        let (s0, _) = allocate_slot(&mut page).unwrap();
+        let t0 = txn_id_of(s0, &read_slot(&page, s0).unwrap());
+        free_slot(&mut page, s0).unwrap(); // wrap + 1、回空闲链
+
+        let losers = repair_committed_slots(&mut page, &[(t0, seq(7))]).unwrap();
+        assert!(losers.is_empty());
+        assert_eq!(read_slot(&page, s0).unwrap().state, TxnState::Free);
     }
 }

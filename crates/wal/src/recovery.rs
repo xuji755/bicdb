@@ -61,6 +61,8 @@ pub enum RecoveryError {
     File(LogFileError),
     /// 应用错误（页损坏、块无法定位等）。
     Apply(ApplyError),
+    /// 记录结构自洽但语义不完整（如提交记录缺 `commit_seq` 主段）。
+    Malformed(&'static str),
 }
 
 impl std::fmt::Display for RecoveryError {
@@ -69,6 +71,7 @@ impl std::fmt::Display for RecoveryError {
             RecoveryError::Io(e) => write!(f, "恢复 I/O：{e}"),
             RecoveryError::File(e) => write!(f, "恢复扫描：{e}"),
             RecoveryError::Apply(e) => write!(f, "恢复应用：{e}"),
+            RecoveryError::Malformed(s) => write!(f, "恢复：记录不完整——{s}"),
         }
     }
 }
