@@ -85,14 +85,15 @@ impl SegType {
 
     /// 类型扩展区长度。
     ///
-    /// Undo 段 = 事务表（256 槽 × 24B，§4.6.3）；B+Tree = 树头 6B；
-    /// ANN 的扩展区布局随 P8 定案（当前明确拒绝，避免猜 size）。
+    /// Undo 段 = **事务表 6144B + 段控制 24B**（§4.6.3/§4.6.4；控制块宽度
+    /// 为 P3 undo 切片所钉）；B+Tree = 树头 6B；ANN 的扩展区布局随 P8 定案
+    /// （当前明确拒绝，避免猜 size）。
     #[must_use]
     pub const fn extension_len(self) -> Option<usize> {
         match self {
             SegType::Heap | SegType::Adjacency | SegType::Temporary => Some(0),
             SegType::BTree => Some(6),
-            SegType::Undo => Some(256 * 24),
+            SegType::Undo => Some(crate::undo::UNDO_EXTENSION_LEN),
             SegType::Ann => None, // 布局待 P8 定案
         }
     }
@@ -747,7 +748,11 @@ mod tests {
         assert_eq!(entries_offset(SegType::Heap).unwrap(), 128);
         assert_eq!(entries_offset(SegType::Temporary).unwrap(), 128);
         assert_eq!(entries_offset(SegType::BTree).unwrap(), 134, "树头 6B");
-        assert_eq!(entries_offset(SegType::Undo).unwrap(), 128 + 6144, "事务表");
+        assert_eq!(
+            entries_offset(SegType::Undo).unwrap(),
+            128 + 6168,
+            "事务表 6144B + 段控制 24B"
+        );
         assert_eq!(
             entries_offset(SegType::Ann),
             Err(SegmentError::ExtensionNotFrozen(4))
