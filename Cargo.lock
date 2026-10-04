@@ -48,6 +48,9 @@ version = "0.0.0"
 [[package]]
 name = "bicdb-storage"
 version = "0.0.0"
+dependencies = [
+ "bicdb-common",
+]
 
 [[package]]
 name = "bicdb-tools"
