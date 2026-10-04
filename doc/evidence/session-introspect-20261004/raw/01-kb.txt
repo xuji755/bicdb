@@ -1,0 +1,36 @@
+# 知识库检索原始输出（2026-10-04）
+# 用途：支撑 evidence.md 表 1 / 2 / 3。
+
+$ python3 kb_graph.py postgresql problem 'pg_stat_activity 会话 当前查询 事务状态 等待事件 监控'
+
+  🎯 精确/强相关系统对象 (1)
+     [bic_agent_SystemView,SyncEntity,KGV2Managed] pg_stat_activity  (匹配: exact)
+     └ 描述: The pg_stat_activity view will have one row per server process, showing information related to
+        the current activity of that process.
+     └ 已收录版本（PostgreSQL）: 9.6, 10, 11, 12, 13, 14, 15, 16, 17, 18
+     └ 字段(22，显示12)，例：
+        application_name  text         Name of the application that is connected to this backend
+        backend_start     timestamptz  Time when this process was started. For client backends, this is the time the client connected.
+        backend_type      text         Type of current backend（client backend / checkpointer / …）
+        backend_xid       xid          Top-level transaction identifier of this backend, if any
+
+$ python3 kb_graph.py postgresql problem 'pg_locks 锁 视图 等待 阻塞 查询 诊断'
+
+  🎯 精确/强相关系统对象 (1)
+     [bic_agent_SystemView,SyncEntity,KGV2Managed] pg_locks  (匹配: exact)
+     └ 描述: There are several distinct types of lockable objects: whole relations (e.g., tables), individual
+        pages of relations, individual tuples of relations, transaction IDs … "advisory" locks …
+     └ 已收录版本（PostgreSQL）: 9.6 … 18
+     └ 字段(16，显示12)，例：
+        classid    oid      OID of the system catalog containing the lock target …
+        database   oid      OID of the database in which the lock target exists …
+        fastpath   boolean  True if lock was taken via fast path …
+        granted    boolean  True if lock is held, false if lock is awaited
+
+$ python3 doc_retrieve.py 'pg_stat_activity' --db postgresql
+  匹配: 20（官方 7 / 案例 13）
+
+  📗案例文档: plpython3u 调用外部 API 导致 CPU 饱和（pg_howto_23）
+  > 现象：生产集群 CPU 持续 100%，pg_stat_activity 中出现大量 active 状态的 plpython3u 会话，
+  > 空闲事务数异常升高，响应延迟大幅增加。
+  （→ 会话视图用于"发现问题会话"的诊断用途佐证。）

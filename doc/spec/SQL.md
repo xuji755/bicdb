@@ -60,7 +60,7 @@ SQL 文本 ──▶ ① Raw AST ──▶ ② Bound Query ──▶ ③ 逻辑�
 | 顺序 | 命名空间 | 内容 | 可写 |
 | --- | --- | --- | --- |
 | 1 | **对象命名空间**（`obj$`，name + namespace 1=表 / 2=索引） | 用户对象（`obj# ≥ 100`）**与预置对象**（见下） | 属主可写 |
-| 2 | **固定表命名空间**（保留名清单，不在 `obj$`） | `file$` 及将来（§3.1.4） | **不可写** |
+| 2 | **固定表命名空间**（保留名清单，不在 `obj$`） | `file$`、**`session$` / `lock$`**（会话内省，`API` REQ-API-018）及将来（§3.1.4） | **不可写** |
 | 3 | 自举对象（`obj# ≤ 99`：`obj$`、`tab$`…） | **不在会话解析范围内** ✗——引擎内部用 | — |
 
 **三条规则从这里直接得到**：
@@ -74,7 +74,7 @@ SQL 文本 ──▶ ① Raw AST ──▶ ② Bound Query ──▶ ③ 逻辑�
 | 名字 | 是什么 |
 | --- | --- |
 | `memory` / `memory_version` / `task_checkpoint` / `source_record` / `derived_link` | `MEM` 域的五个业务对象 |
-| `session` | 会话表（`§8.2` #3：`append_only` + `logging = none` + TTL + `segment_drop`） |
+| `session` | 会话表（对话记录；`§8.2` #3：`append_only` + `logging = none` + TTL + `segment_drop`）——**与固定表 `session$`（协议会话内省）不同**（`API` REQ-API-018） |
 | `asset$` | 资产元数据（**只读**——写入只经资产接口，`AST` 域） |
 | `ref$` | 引用登记（**不进名字解析**——系统簿记，无直接查询路径） |
 | `audit` | 审计（**属主只读**——写入只经引擎的审计路径，`OPS` REQ-OPS-003；无 DML / DDL 入口） |
