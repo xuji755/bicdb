@@ -1,0 +1,42 @@
+# 知识库检索留痕：Oracle 域未命中 / PostgreSQL 域不相关
+# 时间：2026-10-04
+# 结论：知识库未收录 Transaction Guard（Oracle）与"提交结果未知/幂等键"（PG）相关条目。
+#       Oracle 部分依据改为官方白皮书/文档（raw/03）；PG 部分以官方文档核实（raw/03）。
+
+## Oracle（两路检索均未命中）
+
+$ python3 doc_retrieve.py 'Transaction Guard 提交结果 LTXID' --db oracle
+🔍 图搜索: "Transaction Guard 提交结果 LTXID" [db=oracle]
+
+  匹配: 0
+
+未找到官方文档、MOS Note或案例文档。
+建议: 1) 检查关键词是否准确；2) 尝试其他相关关键词；3) 该内容可能尚未收录到知识库中。
+
+$ python3 kb_graph.py oracle problem 'LTXID 事务保护 提交结果未知 故障切换 重放'
+
+============================================================
+  [问题诊断] LTXID 事务保护 提交结果未知 故障切换 重放
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  CaseStudy：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 0 条
+  文档补充：有效结果不足、缺少可操作的诊断证据、仅有弱相关证据、关键技术条件未覆盖；候选 0，相关 0
+
+  未找到满足相关性要求的证据；未将宽泛背景内容作为精确答案。
+
+## PostgreSQL（命中 6 条，均与主题无关，留痕抄录）
+
+$ python3 kb_graph.py postgresql problem '提交结果未知 连接断开 重试 幂等 重复执行'
+
+  命中示例（全部不相关）：
+  [KnowledgeEntry] psql \watch 重复执行 SQL  (8.8)  :3268406
+  [KnowledgeEntry] 重复执行直到批次表空  (8.8)  :1287769
+  [KnowledgeEntry] psql \watch 按指定秒数重复执行上一条查询  (8.8)  :3268405
+  [KnowledgeEntry] Pigsty 幂等操作剧本  (8.8)  :2289136
+  [CaseStudy] Performance characteristics of T-SQL CTEs  (8.6)  :1226837
+  [FaultModel] SSI 序列化失败：后提交事务被识别为 pivot 并取消  (7.4)  :4166579
+
+  说明：无"提交结果未知 / 幂等键 / 提交结果记录"相关条目。

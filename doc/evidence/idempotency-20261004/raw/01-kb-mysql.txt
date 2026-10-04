@@ -1,0 +1,52 @@
+# 知识库检索原始输出：MySQL 域
+# 命令：source env.sh && python3 kb_graph.py mysql problem '提交结果未知 连接断开 重试 幂等 XA 恢复'
+# 时间：2026-10-04　工具自述：候选覆盖有界，未宣称全库穷尽
+# 备注：统计头保留，条目逐条抄录（省略的仅为格式空行）
+
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+[问题诊断] 提交结果未知 连接断开 重试 幂等 XA 恢复
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 10，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 7，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Annotation 说明：Detaching a prepared XA transaction (a) 备份 MDL 锁，(b) 将 Transaction_ctx
+     从会话缓存移动到进程全局 xa::Transaction_cache（新条目 is_detached() 为 true，状态 XA_PREPARED，
+     保留 is_binlogged 标志），(c) 断开引擎事务与 THD 的连接（InnoDB 为 trx_disconnect_prepared）。
+     此后任何连接都可以通过 XA COMMIT 'xid' 提交。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] detach 后 prepared XA 事务可由任意连接提交  (排序分: 9.4)
+     └ 详情：detach 完成后事务进入进程全局 Transaction_cache，状态 XA_PREPARED，is_detached() 为 true，
+        任何连接可发起 XA COMMIT 'xid' 完成提交。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2073662
+
+     [KnowledgeEntry] XA 事务恢复与断连的 PREPARED 释放路径  (排序分: 9.3)
+     └ 摘要：恢复 XA 事务路径 NOT_STARTED→PREPARED→COMMITTED→freed；
+        关闭或断开前未 ROLLBACK/COMMIT 的 XA 事务路径 NOT_STARTED→PREPARED→freed。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2081650
+
+     [KnowledgeEntry] 升级前检查未提交的 XA 事务  (排序分: 9.3)
+     └ 详情：在升级 MySQL 前，尤其是使用 InnoDB 的 XA 事务时，应执行 XA RECOVER 检查未提交事务。
+        如果返回结果，需要提交（XA COMMIT）或回滚（XA ROLLBACK）这些事务，以确保数据一致性。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:569486
+
+     [KnowledgeEntry] XA 是 MySQL 内部两阶段提交的骨架，与普通事务共用 TC_LOG 抽象  (排序分: 9.3)
+     └ 摘要：普通事务提交走 tc_log->prepare → tc_log->commit，与外部 XA 的 XA PREPARE → XA COMMIT
+        是同一套 TC_LOG 抽象；差异仅在 XA PREPARE 状态跨连接/会话驻留，通过 Transaction_cache 缓存
+        和 m_is_binlogged 两轮日志化完成。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2082721
+
+     [FaultModel] XA 悬挂事务 / 两阶段提交中断  (排序分: 8.6)
+     └ 摘要：XA 事务发出 XA PREPARE 后、XA COMMIT 前连接断开或服务器崩溃，重启后 XA RECOVER
+        仍列出 PREPARED 状态 XID，事务持续占用 InnoDB 锁与 undo 阻塞相关表。
+        根因是 prepare 已持久化、commit 未发生，MySQL 恢复时复活而非自动裁决。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2089047
+
+     [CaseStudy] Caucho连接池访问MySQL随机报Communications link failure的排查案例  (排序分: 7.4)
+     └ 摘要：客户应用日志随机出现数据库访问错误……排查发现连接池 ping 探活默认关闭并给出开启 ping 的解决方案。
+     详情请见：python3 kb_graph.py mysql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:199390
