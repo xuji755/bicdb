@@ -14,8 +14,8 @@ use bicdb_workspace::registry::{
 };
 use bicdb_workspace::{RootName, UserId, WorkspaceId, WorkspaceRoot};
 
-const ALICE: &str = "018f2a7c-3b4d-7e01-9a2b-c3d4e5f60718";
-const BOB: &str = "018f2a7c-3b4d-7e01-9a2b-c3d4e5f60719";
+const ALICE: u64 = 1;
+const BOB: u64 = 2;
 
 fn unique_base(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -30,9 +30,9 @@ fn unique_base(tag: &str) -> PathBuf {
     base
 }
 
-fn owned(id: u64, user_hex: &str, name: Option<&str>, base: &Path) -> WorkspaceEntry {
+fn owned(id: u64, owner: u64, name: Option<&str>, base: &Path) -> WorkspaceEntry {
     let wsid = WorkspaceId::from_raw(id).unwrap();
-    let user = UserId::parse(user_hex).unwrap();
+    let user = UserId::from_raw(owner).unwrap();
     WorkspaceEntry::new(
         wsid,
         user,
@@ -52,8 +52,8 @@ fn routing_is_a_function_of_identity_not_of_request_data() {
     reg.register(owned(3, BOB, Some("main"), &base)).unwrap(); // 跨属主同名：合法
     reg.register(owned(4, BOB, None, &base)).unwrap(); // 未命名槽位
 
-    let alice = AuthenticatedSubject::new(UserId::parse(ALICE).unwrap());
-    let bob = AuthenticatedSubject::new(UserId::parse(BOB).unwrap());
+    let alice = AuthenticatedSubject::new(UserId::from_raw(ALICE).unwrap());
+    let bob = AuthenticatedSubject::new(UserId::from_raw(BOB).unwrap());
 
     // 同名 "main" 路由到各自不同的根。
     let a_main = reg.route(&alice, Some("main")).unwrap();
@@ -69,7 +69,7 @@ fn routing_is_a_function_of_identity_not_of_request_data() {
     match a_main {
         Routed::Owned(entry) => {
             assert_eq!(entry.id(), WorkspaceId::from_raw(1).unwrap());
-            assert_eq!(entry.owner(), UserId::parse(ALICE).unwrap());
+            assert_eq!(entry.owner(), UserId::from_raw(ALICE).unwrap());
             assert_eq!(entry.name(), Some("main"));
         }
         Routed::Public(_) => panic!("main 不是 public"),

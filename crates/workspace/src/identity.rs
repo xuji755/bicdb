@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn subject_is_a_copyable_proof_of_authentication() {
-        let u = UserId::parse("018f2a7c-3b4d-7e01-9a2b-c3d4e5f60718").unwrap();
+        let u = UserId::from_raw(1).unwrap();
         let s = AuthenticatedSubject::new(u);
         assert_eq!(s.user(), u);
         let s2 = s; // Copy：可作为纯值传递，无需共享可变状态

@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn context_exposes_readonly_fields() {
-        let user = UserId::parse("018f2a7c-3b4d-7e01-9a2b-c3d4e5f60718").unwrap();
+        let user = UserId::from_raw(1).unwrap();
         let ws = WorkspaceId::from_raw(7).unwrap();
         let root = WorkspaceRoot::new(Path::new("/srv/bicdb/workspaces"), RootName::public());
         let quota = Quota::new(1, 2, 3, 4);

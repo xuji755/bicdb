@@ -215,14 +215,14 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn subject(hex: &str) -> AuthenticatedSubject {
-        AuthenticatedSubject::new(UserId::parse(hex).unwrap())
+    fn subject(raw: u64) -> AuthenticatedSubject {
+        AuthenticatedSubject::new(UserId::from_raw(raw).unwrap())
     }
 
-    fn entry(id: u64, hex: &str, name: Option<&str>) -> WorkspaceEntry {
+    fn entry(id: u64, owner: u64, name: Option<&str>) -> WorkspaceEntry {
         WorkspaceEntry::new(
             WorkspaceId::from_raw(id).unwrap(),
-            UserId::parse(hex).unwrap(),
+            UserId::from_raw(owner).unwrap(),
             name.map(str::to_owned),
             WorkspaceRoot::new(
                 Path::new("/srv"),
@@ -231,8 +231,8 @@ mod tests {
         )
     }
 
-    const A: &str = "018f2a7c-3b4d-7e01-9a2b-c3d4e5f60718";
-    const B: &str = "018f2a7c-3b4d-7e01-9a2b-c3d4e5f60719";
+    const A: u64 = 1;
+    const B: u64 = 2;
 
     #[test]
     fn registration_guards() {
