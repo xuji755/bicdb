@@ -1,0 +1,90 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引分裂方式：50/50分裂和99/1分裂
+      Oracle B-tree索引在块空间不足时进行分裂：如果插入的键值不是最大值（随机插入），采用50/50分裂，新旧块各约50%空间；如果插入的是最大值（单调递增），采用99/1分裂，旧块保留99%空间，新块几乎为空，仅放新插入的键值。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引分裂方式：50/50和99/1
+      B-tree索引分裂方式：插入非最大键值采用50/50分裂，新旧块各50%；插入最大键值采用99/1分裂，旧块保留99%空间。诊断时检查索引碎片程度，若PCT_USED远低于默认值，表明过于频繁的99/1分裂，建议重建索引或调整存储参数。概念 kernel 索引分裂 50/50 99/1 B-tree索引
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1490356
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引分裂方式
+      B-tree索引分裂方式：50/50分裂将满块数据对半分，99/1分裂仅腾出一个新块放置新键（适用于递增插入）。诊断时若发现索引空间利用不均，可通过analyze index validate structure中的PCT_USED指标分析，考虑调整pctfree。概念 index 50/50分裂 99/1分裂
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1490354
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree 索引分裂两种方式：50/50 和 99/1
+      B-tree索引分裂两种方式（50/50和99/1）取决于插入键值是否为最大值。通过analyze index validate structure查看index_stats中的SPARE1等字段可验证分裂类型。诊断时若索引空间利用率低，可能因大量随机插入导致过多50/50分裂，需考虑调整pctfree。概念 kernel B-tree 索引分裂 50/50 99/1
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1490351
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引分裂两种方式
+      B-tree索引分裂两种方式：50/50分裂用于非最大值插入（如随机值），新旧块各约50%空间；99/1分裂用于最大值插入（如序列），旧块保留99%，新块几乎空。诊断时通过索引统计中的SPARE1确认分裂类型，避免99/1导致空间浪费。原理 arch B-tree 分裂 50/50 99/1
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1490353
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] B-tree索引50-50分裂（默认分裂方式）
+      如果原来块上没有可用空间，就会从原来的块中拿出50%的key value，和新加入值组成新的块，同时还会更新第三个块的指针，因为此块还是按key的顺序出现了插队现象（加塞儿）。示例：初始两个叶块nrow 540和460，插入500到520后，分裂为nrow 279、282、460三个叶块，branch nrow变为3。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2230774
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 50-50分裂的统计指标表现
+      发生50-50分裂时，leaf node splits增加1，leaf node 90-10 splits为0，branch node splits为0，root node splits为0，queue splits为0。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:30405.1 How Does the Index Block Splitting Mechanism Work for B*tree Indexes
+      How Does the Index Block Splitting Mechanism Work for B*tree Indexes
+fix:
+Block Splitting takes place when a new index key has to be inserted and it does
+not fit in the index block.
+Block splitting is done in 2 different ways depending on the inserted value.
+1 - The inserted key value is not the highest (taking into account values of
+deleted rows key entries). In this case we do a 50/50 split which means that
+both the old and the new block are filled 50 percent.
+2 - The inserted key value is the highest (taking into account values of
+deleted rows key entries). In this case, we do a 99/1 split which means that by
+the end of the split the previous block is 99% full and the new one nearly
+empty (only the new key value).
+Method 2 prevents space wastage especially for indexes with only increasing
+values; for example indexes on timestamps.
+The example below shows this behaviour. See the (example-)figures for PCT_USED.
+Index where every inserted key is the largest key in the index
+causing block splitting on a 99/1 basis:
+--------------------------------------------------------------
+drop table t1;
+create table t1 (name varchar2(10),nr number) pctfree 0;
+create index i1 on t1(nr);
+declare
+i number;
+begin
+for i in 1..50000
+loop
+insert into t1 values('XX',i);
+end loop;
+end;
+/
+SQL> analyze index i1 validate structure;
+SQL> select blocks, lf_blks, pct_used from index_stats;
+Results:
+BLOCKS: 104 LF_BLKS: 99 PCT_USED: 99
+Index where the inserted keys are not always the largest in the index
+causing block splitting on a 50/50 basis:
+----------------------------------------------------------------------
+drop table t2;
+create table t2 (name varchar2(10),nr number) pctfree 0;
+create index i2 on t2(nr);
+declare
+i number;
+begin
+for i in 25000..50000
+loop
+insert into t2 values('XX',i);
+end loop;
+for i in 1..25000
+loop
+insert into t2 values('XX',i);
+end loop;
+end;
+/
+SQL> analyze index i2 validate structure;
+SQL> select blocks, lf_blks, pct_used from index_stats;
+Results:
+BLOCKS: 256 LF_BLKS: 146 PCT_USED: 68
+See also Note:30405.1 How Btree Indexes Are Maintained
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2041089
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] leaf node splits统计包含90-10分裂
+      leaf node splits 包含leaf node 90-10 splits，leaf node splits是50-50和90-10的总和。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引分裂触发条件
+      索引分裂触发条件：当向索引块插入新记录，而该块空间不足且不能使用PCTFREE预留空间时，会触发索引分裂。分裂包括叶子块分裂和分支块分裂。频繁分裂会带来性能开销，导致'buffer busy waits'和'enq: TX - index contention'等待。优化手段包括使用顺序键、增大PCTFREE、分区索引等。原理 arch 索引分裂
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1575698
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] analyze_log 表结构与用途
+      通过 drop table analyze_log purge; 清除旧表，然后 create table analyze_log(...) 创建。analyze_quick 过程会向该表插入分析记录。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引叶子块分裂诊断方法
+      索引叶子块分裂诊断方法：全面诊断索引分裂争用需查看AWR中的段统计、等待事件（如enq: TX - index contention）、以及索引增长趋势。可通过DBA_INDEXES的BLEVEL、LEAF_BLOCKS等变化判断分裂频率。进一步可启用索引块转储或使用Oracle提供的脚本分析分裂原因。操作 performance 索引分裂 TX enqueue Global cache Leaf block splits
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1575707

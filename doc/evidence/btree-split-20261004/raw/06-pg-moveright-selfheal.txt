@@ -1,0 +1,41 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 分裂 新页 尚未 链接 父页 搜索 仍然 正确 高键 右链
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 22，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 26，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     在btree搜索过程中，每下探一步就通过_bt_relandgetbuf释放父页的锁，只保留BTStack结构作为导航信息。该栈可能在并发分裂后过期，因此分裂回插父层时使用_bt_getstackbuf重新定位父页和槽位。这一设计避免了长路径锁持有，提高了并发度。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 搜索不持有父页锁原则  (排序分: 9.4)
+     └ 摘要：搜索下探每步释放父页锁，仅保留BTStack作为过期可重定位的导航；分裂回插使用_bt_getstackbuf重找父页。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2072129
+
+     [KnowledgeEntry] 索引页兄弟链接快照与并发分裂正确性  (排序分: 9.4)
+     └ 详情：说明索引扫描采用快照兄弟链接的方式处理并发分裂，避免了额外锁。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2067948
+
+     [KnowledgeEntry] 高键不变量保证 L&Y 算法正确性  (排序分: 9.4)
+     └ 详情：高键不变量是 B-tree 并发控制的核心：当页分裂时，原页的高键更新为新分页的高键，父页 downlink 可能滞后。但高键保证过期的页只可能偏左，通过向右移动可以找到正确页。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2069075
+
+     [KnowledgeEntry] 分裂向右删除留墓碑的并发正确性  (排序分: 9.4)
+     └ 摘要：btree分裂总是向右分裂，搜索走错时沿btpo_next右移自愈；删除的页在safexid全库不可见前不回收（BTPageIsRecyclable判断），保证读者无锁也能找到正确页。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2066615
+
+     [CaseStudy] 修改生成列表达式后索引仍然有效  (排序分: 8.9)
+     └ 详情：案例：修改生成列表达式后索引仍然有效
+摘要：修改表达式后，普通索引、表达式索引和部分索引依然能正确用于查询加速。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1487883
+
+     [FaultModel] Bloom索引不支持搜索NULL值  (排序分: 6.9)
+     └ 摘要：Bloom索引不支持搜索NULL值：Bloom索引的设计不支持NULL值搜索，查询计划显示顺序扫描而非索引扫描。请改用其他索引。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1289563
+

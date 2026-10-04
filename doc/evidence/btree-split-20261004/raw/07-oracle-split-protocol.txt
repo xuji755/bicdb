@@ -1,0 +1,34 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引分裂触发条件
+      索引分裂触发条件：当向索引块插入新记录，而该块空间不足且不能使用PCTFREE预留空间时，会触发索引分裂。分裂包括叶子块分裂和分支块分裂。频繁分裂会带来性能开销，导致'buffer busy waits'和'enq: TX - index contention'等待。优化手段包括使用顺序键、增大PCTFREE、分区索引等。原理 arch 索引分裂
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1575698
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 同一索引块大量 DML 导致索引块分裂
+      索引块分裂会增加索引维护和并发访问成本，使相同 buffer cache 哈希链上的会话发生 latch CBC 与 buffer busy waits 等待。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] KDICBIN 操作码（分支块插入行）
+      KDICBIN是索引B-tree分支块的操作码，用于在叶子节点分裂后更新分支节点。概念：当叶子节点分裂导致B-tree层级变化时，需要向父分支块插入新的索引条目以反映新的结构。机制：该操作码在叶子分裂后，在分支块中插入指向新叶子块的行。应用场景：在B-tree索引维护中，支持索引宽度增长时的分支更新。原理 kernel KDICBIN 分支块插入
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155555
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引块竞争的特殊性：索引分裂和位图更新
+      索引分裂时键需重新分布，阻止其他操作直到完成。最高分支分裂可能导致整个表锁定。通过事件10224跟踪索引分裂，通常伴随高I/O。位图索引更新涉及三个步骤：解压缩编码位图、修改、再压缩，非常耗时，期间其他会话不能更新同一范围的行。因此位图索引不适合OLTP。竞争表现为V$WAITSTAT中bitmap index block等待。隐含假设：右增长索引（序列值）容易引发索引分裂竞争。边界条件：索引分裂可能在树的任何级别发生，根节点分裂影响最大。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:246241
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引块争用
+      索引块分裂时，键需重新分配，期间阻止其他操作。分裂可发生在任何树级别，最坏情况是根节点分裂导致全表锁定。可通过设置事件10224跟踪分裂。位图索引更新时，每个条目覆盖ROWID范围，需要解压、修改、压缩位图，非常耗时，期间其他会话不能更新同一范围的行，因此不推荐用于OLTP系统。位图索引块争用在V$WAITSTAT中显示为'bitmap index block'等待。该概念揭示了索引维护活动的并发影响和性能优化方向。原理 kernel perf 索引块分裂 位图索引争用 事件10224
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:246224
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引分裂方式：50/50分裂和99/1分裂
+      Oracle B-tree索引在块空间不足时进行分裂：如果插入的键值不是最大值（随机插入），采用50/50分裂，新旧块各约50%空间；如果插入的是最大值（单调递增），采用99/1分裂，旧块保留99%空间，新块几乎为空，仅放新插入的键值。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引叶子块分裂诊断方法
+      索引叶子块分裂诊断方法：全面诊断索引分裂争用需查看AWR中的段统计、等待事件（如enq: TX - index contention）、以及索引增长趋势。可通过DBA_INDEXES的BLEVEL、LEAF_BLOCKS等变化判断分裂频率。进一步可启用索引块转储或使用Oracle提供的脚本分析分裂原因。操作 performance 索引分裂 TX enqueue Global cache Leaf block splits
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1575707
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] KDICRSP 操作码（分裂后初始化根块）
+      KDICRSP 操作码用于B-tree索引根块分裂后的初始化。当索引根块发生分裂时，新的根块需要设置正确的索引信息（如高度、块范围等）以确保B-tree结构完整。机制：在根块分裂过程中，原始根块的一部分数据迁移到新块，同时新根块需要初始化元数据（如级别、块号、键范围等）。应用场景：索引维护过程中当根块因插入导致空间不足时触发，通过KDICRSP操作码记录新根块的初始化信息到重做日志，确保恢复时索引结构一致。原理 kernel KDICRSP 根块分裂
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:155578
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引分裂方式
+      B-tree索引分裂方式：50/50分裂将满块数据对半分，99/1分裂仅腾出一个新块放置新键（适用于递增插入）。诊断时若发现索引空间利用不均，可通过analyze index validate structure中的PCT_USED指标分析，考虑调整pctfree。概念 index 50/50分裂 99/1分裂
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1490354
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 索引右侧 90-10 分裂统计
+      原文指出索引是按 KEY 顺序存放的物理结构，insert 时会话都在频繁更新索引最后一个块（或几个块），因而产生热块，并在统计上表现为索引右侧的 90-10 分裂。结合 TOP 等待事件可定位问题来源。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 同一索引块大量 DML 导致索引块分裂与 latch CBC 争用
+      ISAPDB 在 Mar 02 10:49-11:04 的 ASH 显示 CPU+Wait CPU 21.64%、log file sync 21.63%、enq TX row lock contention 19.71%、buffer busy waits 5.86%、latch CBC 5.30%。原文明确指出主要性能问题是同一索引块上大量 DML 导致的索引块分裂；批量业务运行和大量事务提交放大了 log file sync。TOP SQL 中 UPDATE WL_PROCESS_INSTANCE 贡献行锁争用，简单 SELECT ... rownum=1 也占 9.30% activity。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4013732
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] 10. 索引块损坏 (ORA-600 [6122])：### 10.1 原理 — 官方文档 > 来源: cncpt/indexes-and-index-organized-tables.html - B-Tree 索引由根块、分支块和叶子块组成。 - 索引块分裂: 插入时若块满，Oracle 分配新块并重新分配条目。 - 索引块包含行锁信息（ITL 条目）。 ### 10.2 如何故障 — MOS
+      ### 10.1 原理 — 官方文档 > 来源: cncpt/indexes-and-index-organized-tables.html - B-Tree 索引由根块、分支块和叶子块组成。 - 索引块分裂: 插入时若块满，Oracle 分配新块并重新分配条目。 - 索引块包含行锁信息（ITL 条目）。 ### 10.2 如何故障 — MOS 实战经验 > 来源: MOS 99300.1, 16
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:365576

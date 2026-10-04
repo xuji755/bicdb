@@ -1,0 +1,44 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] B-link tree right link high key 搜索 修正
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 256，摘要筛选通过 5，批次 4；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 30，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     b_link_tree：B-link tree通过右链接和high key解决高并发下页分裂与搜索路径稳定性问题。 分类：概念
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] b_link_tree  (排序分: 10.0)
+     └ 详情：b_link_tree：B-link tree通过右链接和high key解决高并发下页分裂与搜索路径稳定性问题。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:884381
+
+     [KnowledgeEntry] B-tree并发：B-link tree算法  (排序分: 9.4)
+     └ 详情：B-tree并发：B-link tree算法：B-tree 并发 B-link 树算法：增加 right link 和 high key，搜索线程可沿 right link 修正。PostgreSQL nbtree 是该算法的正确实现。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:473810
+
+     [KnowledgeEntry] PostgreSQL B-link tree并发查找  (排序分: 9.4)
+     └ 详情：PostgreSQL B-link tree并发查找：PostgreSQL B-link tree并发查找原理：父页旧downlink不一定及时反映最新split状态，但页上有high key和right link，查找可在页级别自我纠正。这允许结构修改操作和读操作更高并发地交错进行。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:557940
+
+     [KnowledgeEntry] GIN entry tree leaf无专门high key  (排序分: 9.4)
+     └ 详情：GIN entry tree leaf无专门high key：GIN entry tree叶子页没有high key，而是用最大leaf tuple充当high key，前提是entry tree不删除tuple。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:520381
+
+     [FaultModel] Highgo/PostgreSQL索引损坏导致autovacuum失败与在线重建失败  (排序分: 9.4)
+     └ 摘要：Highgo v9（PostgreSQL 14）生产库出现索引损坏，autovacuum vacuum索引时报failed to re-find parent key，表和索引记录无法匹配；在线REINDEX时可能因tid重复报new index tuple overlaps with invalid duplicate tuple。临时可用VACUUM (INDEX_CLEANUP OFF, freeze, verbose)跳过索引清理，根本解决需REINDEX CONCURRENTLY，必要时VACUUM FULL后重建并清理多余/无效索引。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3999540
+
+     [CaseStudy] Highgo v9索引损坏：autovacuum报failed to re-find parent key与在线重建报invalid duplicate tuple  (排序分: 9.4)
+     └ 摘要：某客户生产数据库Highgo v9（基于PostgreSQL 14）出现索引损坏。autovacuum首先报failed to re-find parent key in index for "%TABLE" deletion target page，表和索引记录无法匹配；在线创建/重建索引时可能报table tid from new index tuple ... overlaps with invalid duplicate tuple。通过日志过滤和pg_index查询定位损坏/无效索引，采用VACUUM INDEX_CLEANUP OFF临时规避，REINDEX CONCURRENTLY根本修复，失败时VACUUM FULL后重建并删除多余索引。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3999516
+

@@ -1,0 +1,39 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 深入浅出PostgreSQL B-Tree索引结构
+      PG B-Tree采用high-concurrency B-tree management algorithm(Lehman-Yao变种)，索引页分为meta page/root page/branch page/leaf page四类。pageinspect扩展提供底层分析工具：bt_metap()查看元数据(根页号/层级/块数)，bt_page_stats()查看页统计(类型/活元组/死元组/空闲空间)，bt_page_items()查看页内条目(ctid/数据/死标记/htid)。关键机制：1)索引页分裂时右兄弟指针维护并发一致性 2)Vacuum清理死元组回收空间 3)Visibility Map加速Index-only Scan 4)root页分裂增加树层级。案例分析：1亿行表B-Tree深度约3-4层，每次查询约4次IO。源码参考：src/backend/access/nbtree/README。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:358363
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] PostgreSQL B-tree索引结构
+      PostgreSQL B-tree索引结构：平衡树，叶子页包含指向表行的CTID，内部页引导搜索。索引页类型由btpo_flags标识：2为root，1为leaf，0为branch。根页可以是叶子（单层索引）。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] postgresql_synth_21063496
+      [Blog Knowledge] digoal 2016-05-28 PostgreSQL , b-tree , 索引结构 ---- PostgreSQL B-Tree是一种变种(high-concurrency B-tree management algorithm)，算法详情请参考 src/backend/access/nbtree/README PostgreSQL 的B-Tree索引页分为几种类别 ``` meta page root page         #  btpo_flags=2 branch page    #  btpo_flags=0 leaf page         #  btpo_flags=1
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1274422
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] SQLite页面结构和B-Tree实现
+      SQLite页面结构和B-Tree实现：SQLite 数据库文件由多个页面组成，类型包括表 B-Tree 页、索引 B-Tree 页、溢出页等。B-Tree 页包含页头（类型、首个空闲块偏移、单元格数量等），数据存储在单元格中。其页面布局与 PostgreSQL 的堆页面不同，具有独特的实现。了解差异可帮助跨库迁移。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:586614
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree索引结构
+      B-tree索引结构：B-tree 索引结构为平衡树，无序 UUID 插入导致页分裂频繁，产生大量随机写 IO。建议使用有序主键或减少碎片。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] PostgreSQL B-Tree 索引结构
+      PostgreSQL B-Tree 索引结构：PostgreSQL B-Tree索引结构由bt_metap（元数据页）、根页、分支页和叶子页组成。每个索引条目包含键值和指向堆表元组位置的CTID。索引不包含事务版本信息，因此通过索引扫描到的CTID需访问堆表进行可见性判断。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:557937
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] btree索引结构
+      btree索引结构：PostgreSQL的B-tree索引是一种平衡树结构，用于支持等值和范围查询，参考src/backend/access/nbtree/README。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Entry tree结构
+      Entry tree结构：Entry tree是GIN索引的主结构树，类似于B+Tree，用于组织和存储(key, posting list)对。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] Zedstore页面类型
+      Zedstore页面类型：Zedstore的块布局包含多种页面类型：元页、B-Tree页、空闲页、TOAST页、UNDO页。
+分类：架构
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] PostgreSQL B-Tree GIN GIST SP-GIST BRIN HASH索引内部结构
+      PostgreSQL B-Tree GIN GIST SP-GIST BRIN HASH索引内部结构：PostgreSQL B-Tree GIN GIST SP-GIST BRIN HASH索引内部结构参考PGCon 2016 PPT，涵盖各索引的页结构和算法，是深入理解索引原理的宝贵资料。
+分类：原理
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 参考文章：深入浅出PostgreSQL B-Tree索引结构
+      参考文章：深入浅出PostgreSQL B-Tree索引结构：文章深入浅出地讲解了PostgreSQL B-Tree索引结构，通过图解和例子帮助理解B-Tree的存储细节和工作原理。
+分类：概念
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B-tree Index Structure Diagram
+      B-tree Index Structure Diagram：B-tree 索引结构：页面包含头、项、特殊区域。项包含键和行指针（唯一索引直接映射），内部节点用于导航。理解结构对存储优化有帮助。
+分类：概念

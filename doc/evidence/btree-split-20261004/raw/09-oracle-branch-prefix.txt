@@ -1,0 +1,37 @@
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 键压缩的前缀和后缀结构
+      键压缩通过COMPRESS[ n ]启用，n指定前缀长度（对于非唯一索引，默认列数；对于唯一索引或IOT，默认主键列数减1）。压缩只发生在叶块，分支块仍使用后缀截断但不压缩。前缀行包含引用计数（多少后缀行引用它），且前缀行从不锁定，不影响并发。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:320679
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B*-树键压缩
+      键压缩支持IOT和常规索引。仅对叶块中的键进行压缩，分支块中的键仅进行后缀截断。通过COMPRESS选项启用，将键分为前缀（分组部分）和后缀（唯一部分）。后缀行始终写入块中，并通过槽数组引用前缀行。前缀行仅在块中不存在相同键值时写入。前缀行包含引用它们的后缀行计数，且不会被锁定，因此不会引入并发问题。每个前缀行有4字节开销，每个后缀行有2字节开销。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:151583
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引键压缩
+      键压缩将重复的键前缀在叶块内只存储一次，多个后缀条目引用该前缀。例如复合索引 (order_mode, order_status)，前缀为 online,0 等重复组合，压缩后叶块中每个前缀只存一份，后缀为 rowid。指定前缀长度可以控制压缩粒度，如前缀长度 1，则前缀仅为 order_mode，后缀为 order_status 和 rowid。该机制大幅减少索引存储空间，尤其适用于低基数列组合。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1055794
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B*-Tree 键压缩仅适用于叶块，分支块仅作截断
+      文档明确指出：只有叶块中的键被压缩，分支块中的键仍进行后缀截断（suffix truncation）但不受键压缩影响。隐含假设：因为分支块需要快速定位，保持截断形式足够，压缩会带来额外开销。边界条件：COMPRESS 选项不能用于唯一索引（否则语义改变），且压缩前缀长度需指定恰当。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:151511
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B树键压缩原理
+      键压缩适用于索引组织表和普通索引。对于非唯一索引，ROWID附加到键上使其唯一。使用COMPRESS选项时，键分解为前缀条目（分组部分）和后缀条目（唯一部分）。后缀行写入索引块并通过槽数组引用，包含对前缀行的引用。前缀行保证与后缀行在同一索引块上，压缩在单个块内完成。前缀行包含计数表示引用它的后缀行数量，不会被锁定。每个前缀行有4字节开销，每个后缀行每引用一个前缀行有2字节开销。分支块中的键进行后缀截断但不压缩。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1539259
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 键压缩前缀行开销
+      键压缩可以在索引块中节省大量空间，但存在开销：每个前缀行有4字节的开销，每个后缀行每引用一个前缀行有2字节的开销。前缀行仅从前缀槽数组和后缀行内部引用，不包含对后缀行或其他前缀行的引用。所有前缀行包含一个计数，表示此索引块中引用它们的后缀行数量。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545208
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B*树键压缩原理
+      B*树键压缩支持IOT和普通索引。对于非唯一索引，ROWID仍存在于行数据部分或附加到键上。只有叶块中的键被压缩，分支块只进行后缀截断。键由分组部分和唯一部分组成。COMPRESS选项将键分解为前缀条目（分组部分）和后缀条目（唯一部分）。后缀行写入索引块并通过槽数组引用，包含对前缀行的引用。前缀行仅当块中尚未包含相同键值时才写入，包含引用它们的后缀行计数。前缀行永远不会被锁定。每个前缀行有4字节开销，每个后缀行每引用一个前缀行有2字节开销。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1539185
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B*-Tree Key Compression（B*-树键压缩）
+      键压缩可用于IOT和常规索引。键压缩将索引键拆分为两部分：前缀（分组部分）和后缀（唯一部分）。仅对B-tree的叶块中的键进行压缩，分支块仍使用后缀截断。用户通过COMPRESS选项指定前缀列数。压缩后，后缀行引用同一块内的前缀行，前缀行存储在后缀行中，且只在块中不存在相同前缀时才写入前缀行。前缀行包含对其引用的后缀行计数。前缀行从不加锁。每个前缀行有4字节开销，每个后缀行有2字节开销。非唯一索引中ROWID被附加到键中使键唯一。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:151509
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] B*树键压缩的实现细节
+      键压缩将索引键分解为前缀（分组部分）和后缀（唯一部分）。后缀行包含对前缀行的引用，且保证与引用的前缀行位于同一索引块内。前缀行仅被引用，不会被锁定。每个前缀行有4字节的开销，每个后缀行有2字节的开销。分支块中的键会进行后缀截断，但不进行键压缩。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1546638
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 键压缩内部结构：前缀槽数组和后缀槽数组，前缀行不锁定
+      文档描述：压缩后，索引键分为前缀（分组部分）和后缀（唯一部分）。后缀行存储在块中，并引用前缀行。前缀行只在同块内，通过前缀槽数组管理，包含引用计数（被多少个后缀行引用）。前缀行从不锁定，因此共享不会引起并发问题。隐含假设：前缀行不会被修改（因为键值分组部分不变），所以无需锁保护。边界条件：如果前缀行引用计数变为零，理论上可以重用，但文档未明确回收机制。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:320648
+  🔍 [bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed] 2.3 索引压缩
+      索引压缩技术主要包括三种类型：前缀压缩默认对唯一索引压缩除最后一列外的所有列，非唯一索引则压缩全部列；高级索引压缩LOW模式自适应每块进行最佳压缩，支持唯一和非唯一索引；高级索引压缩HIGH模式（默认）采用更复杂算法和Compression Unit格式，可实现更高压缩比。创建索引时可指定`COMPRESS ADVANCED`选项，默认采用HIGH压缩方式。| 压缩类型 | 说明 | |----------|------| | Prefix Compression(前缀压缩) | 消除叶块中重复键前缀。默认:唯一索引压缩除最后列外的所有列;非唯一压缩所有列 | | Advanced Index Compression LOW | 自适应每块最佳压缩，支持唯一和非唯一索引 | | Advanced Index Compression HIGH(默认) | 更复杂算法，更高压缩比，使用Compression Unit格式 | sql CREATE INDEX idx ON t(c1,c2) COMPRESS ADVANCED;-- HIGH压缩(默...
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:363881
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] 索引键压缩前缀行开销
+      键压缩虽然可以节省空间，但存在开销：每个前缀行有4字节的开销，每个后缀行每引用一个前缀行有2字节的开销。这些开销必须在评估压缩收益时考虑。前缀行仅从前缀槽数组和后缀行内部引用，不包含对后缀行或其他前缀行的引用。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1544956
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
