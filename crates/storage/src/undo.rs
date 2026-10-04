@@ -21,7 +21,10 @@ use bicdb_common::seq::CommitSeq;
 
 use crate::page::{Page, PageType, ITL_ENTRY_LEN};
 use crate::rowid::RowId;
-use crate::segment::{SegType, Segment, SegmentSpaceError, SEG_EXTENSION_OFFSET};
+use crate::segment::{
+    read_header, write_header, SegType, Segment, SegmentSpaceError, BITMAP_PAGE_COVERAGE,
+    SEG_EXTENSION_OFFSET,
+};
 
 /// 事务表槽数（§14 第 28 项：V1.0 单段、N = 256）。
 pub const TXN_SLOTS: usize = 256;
@@ -54,6 +57,10 @@ pub enum UndoError {
     UnknownOp(u8),
     /// 段类型不是 Undo。
     WrongSegType,
+    /// 页不是 undo 页（put/get 记录用）。
+    NotUndoPage,
+    /// 页内放不下（需新开 undo 页）。
+    PageFull,
 }
 
 impl std::fmt::Display for UndoError {
@@ -65,6 +72,8 @@ impl std::fmt::Display for UndoError {
             UndoError::MalformedRecord => f.write_str("撤销记录载荷非法"),
             UndoError::UnknownOp(op) => write!(f, "撤销记录操作码 {op} 未知"),
             UndoError::WrongSegType => f.write_str("段类型不是 Undo"),
+            UndoError::NotUndoPage => f.write_str("不是 undo 页"),
+            UndoError::PageFull => f.write_str("undo 页已满"),
         }
     }
 }
@@ -662,6 +671,281 @@ pub fn create_undo_segment<'io, 'f>(
     Ok(segment)
 }
 
+// ---------------------------------------------------------------------------
+// Undo 页写入与链（§4.6.1 / §4.6.2）
+// ---------------------------------------------------------------------------
+
+fn require_undo_page(page: &Page) -> Result<(), UndoError> {
+    match page.header() {
+        Some(h) if h.page_type == PageType::Undo => Ok(()),
+        _ => Err(UndoError::NotUndoPage),
+    }
+}
+
+/// undo 页初始的 `free_end`（第一条记录的上界；页尾 4B）。
+fn initial_free_end() -> usize {
+    crate::page::PAGE_SIZE - PageType::Undo.tail_len()
+}
+
+/// 页内还能放下 `len` 字节记录吗（含可能新增的 2B 槽位目录）。
+fn fits(page: &Page, len: usize) -> bool {
+    page.free_end() >= page.free_start() + len + crate::page::SLOT_ENTRY_LEN
+}
+
+/// **追加一条撤销记录**进 undo 页（槽号递增、记录向下生长；**只追加、不复用槽**）。
+///
+/// 记载长度**不存**（§4.6.2）：追加严格向下生长，故第 k 条的长度 =
+/// 上一条的偏移 − 本条偏移；第 1 条的上界 = 页初始 `free_end`。
+pub fn put_record(page: &mut Page, record: &UndoRecord) -> Result<u16, UndoError> {
+    require_undo_page(page)?;
+    let bytes = record.encode();
+    if !fits(page, bytes.len()) {
+        return Err(UndoError::PageFull);
+    }
+    let slot_count = page.slot_count() as usize;
+    let offset = page.free_end() - bytes.len();
+    page.as_bytes_mut()[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    page.set_free_end(offset);
+    page.set_slot_count(u16::try_from(slot_count + 1).map_err(|_| UndoError::PageFull)?)
+        .map_err(|_| UndoError::PageFull)?;
+    let entry = crate::page::SlotEntry::new(offset as u16, crate::page::SlotStatus::Normal)
+        .ok_or(UndoError::MalformedRecord)?;
+    page.set_slot(slot_count, entry);
+    Ok(slot_count as u16 + 1) // 槽号从 1 起（D-06）
+}
+
+/// 读一条撤销记录（槽号从 1 起）。
+pub fn get_record(page: &Page, slot: u16) -> Result<UndoRecord, UndoError> {
+    require_undo_page(page)?;
+    let index = crate::heap::slot_index(slot).ok_or(UndoError::SlotOutOfRange(slot))?;
+    let entry = page.slot(index).ok_or(UndoError::SlotOutOfRange(slot))?;
+    if entry.status() == crate::page::SlotStatus::Free {
+        return Err(UndoError::SlotOutOfRange(slot));
+    }
+    let top = if index == 0 {
+        initial_free_end()
+    } else {
+        page.slot(index - 1)
+            .ok_or(UndoError::MalformedRecord)?
+            .offset() as usize
+    };
+    let offset = entry.offset() as usize;
+    if top < offset || top > crate::page::PAGE_SIZE {
+        return Err(UndoError::MalformedRecord);
+    }
+    UndoRecord::decode(&page.as_bytes()[offset..top])
+}
+
+/// Undo 链错误。
+#[derive(Debug)]
+pub enum UndoChainError {
+    /// 事务表/记录格式错误。
+    Undo(UndoError),
+    /// 段空间错误。
+    Space(SegmentSpaceError),
+    /// 该槽空闲（事务尚未开始）。
+    SlotNotActive(u16),
+    /// 段内位图覆盖不足（多页位图随后）。
+    BitmapCoverage,
+    /// 段内位图操作错误。
+    Bitmap(crate::bitmap::BitmapError),
+    /// 页内 ITL 操作错误。
+    Itl(crate::itl::ItlError),
+}
+
+impl std::fmt::Display for UndoChainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UndoChainError::Undo(e) => write!(f, "{e}"),
+            UndoChainError::Space(e) => write!(f, "{e}"),
+            UndoChainError::SlotNotActive(s) => write!(f, "事务表槽 {s} 空闲——事务尚未开始"),
+            UndoChainError::BitmapCoverage => f.write_str("段内位图覆盖不足（多页位图随后）"),
+            UndoChainError::Bitmap(e) => write!(f, "段内位图：{e}"),
+            UndoChainError::Itl(e) => write!(f, "ITL：{e}"),
+        }
+    }
+}
+
+impl std::error::Error for UndoChainError {}
+
+impl From<UndoError> for UndoChainError {
+    fn from(e: UndoError) -> Self {
+        UndoChainError::Undo(e)
+    }
+}
+
+impl From<SegmentSpaceError> for UndoChainError {
+    fn from(e: SegmentSpaceError) -> Self {
+        UndoChainError::Space(e)
+    }
+}
+
+impl From<crate::bitmap::BitmapError> for UndoChainError {
+    fn from(e: crate::bitmap::BitmapError) -> Self {
+        UndoChainError::Bitmap(e)
+    }
+}
+
+impl From<crate::itl::ItlError> for UndoChainError {
+    fn from(e: crate::itl::ItlError) -> Self {
+        UndoChainError::Itl(e)
+    }
+}
+
+impl From<crate::segment::SegmentError> for UndoChainError {
+    fn from(e: crate::segment::SegmentError) -> Self {
+        UndoChainError::Space(SegmentSpaceError::Format(e))
+    }
+}
+
+/// **Undo 页写入器与链**：绑定 undo 段，把撤销记录追加进 undo 页并维护
+/// 事务表槽的链头。**一个 undo 页同一时刻只服务一个事务**（§4.6.1）——
+/// 换事务即换新页（旧事务的记录仍在该页上，沿链可达）。
+pub struct UndoChain<'io, 'f> {
+    segment: Segment<'io, 'f>,
+    current_logical: Option<u32>,
+    current_txn: Option<TxnId>,
+}
+
+impl std::fmt::Debug for UndoChain<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UndoChain")
+            .field("current_logical", &self.current_logical)
+            .field("current_txn", &self.current_txn)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'io, 'f> UndoChain<'io, 'f> {
+    /// 打开 undo 段上的链写入器（当前页留空——首次 `append` 时分配）。
+    pub fn open(segment: Segment<'io, 'f>) -> Self {
+        Self {
+            segment,
+            current_logical: None,
+            current_txn: None,
+        }
+    }
+
+    /// 只读段视图（诊断/测试）。
+    #[must_use]
+    pub fn segment(&self) -> &Segment<'io, 'f> {
+        &self.segment
+    }
+
+    /// **分配一个事务表槽**（事务开始；持久化段头页）。
+    pub fn allocate_slot(&mut self) -> Result<u16, UndoChainError> {
+        let mut page = self.segment.read_page(0)?;
+        let (index, _) = allocate_slot(&mut page)?;
+        self.segment.write_page(0, &mut page)?;
+        Ok(index)
+    }
+
+    /// **追加一条撤销记录**：链头来自事务表槽的 `undo_current`；
+    /// 页归属不符或放不下则新开 undo 页；最后更新槽的链头与计数。
+    pub fn append(
+        &mut self,
+        slot_index: u16,
+        op: UndoOp,
+        flags: u8,
+        rowid: RowId,
+        payload: UndoPayload,
+    ) -> Result<RowId, UndoChainError> {
+        let mut header = self.segment.read_page(0)?;
+        let mut txn_slot = read_slot(&header, slot_index)?;
+        if txn_slot.state == TxnState::Free {
+            return Err(UndoChainError::SlotNotActive(slot_index));
+        }
+        let txn_id = txn_id_of(slot_index, &txn_slot);
+        let record = UndoRecord {
+            prev: txn_slot.undo_current,
+            op,
+            flags,
+            rowid,
+            payload,
+        };
+        let len = record.encode().len();
+
+        // 复用当前页（限于同一事务）或新开一页。
+        let reuse = match (self.current_logical, self.current_txn) {
+            (Some(logical), Some(txn)) if txn == txn_id => {
+                let page = self.segment.read_page(logical)?;
+                fits(&page, len)
+            }
+            _ => false,
+        };
+        let (logical, mut page) = if reuse {
+            let logical = self.current_logical.expect("已判定存在");
+            let page = self.segment.read_page(logical)?;
+            (logical, page)
+        } else {
+            // 新页：逻辑页号 = 段头 `追加位置`；必要时扩展段。
+            let mut seg_header = read_header(&header)?;
+            let logical = seg_header.append_pos;
+            if logical >= BITMAP_PAGE_COVERAGE {
+                return Err(UndoChainError::BitmapCoverage);
+            }
+            if self.segment.logical_block(logical).is_none() {
+                self.segment.extend()?;
+            }
+            let block = self
+                .segment
+                .logical_block(logical)
+                .ok_or(SegmentSpaceError::BitmapCoverage)?;
+            let mut page = Page::new(
+                PageType::Undo,
+                self.segment.workspace_ref(),
+                self.segment.file_id(),
+                block,
+            );
+            crate::itl::write_itl(
+                &mut page,
+                0,
+                &crate::itl::ItlEntry {
+                    txn_id,
+                    undo_ptr: None,
+                    commit_seq: None,
+                    lock_cnt: 0,
+                    state: crate::itl::ItlState::Active,
+                },
+            )?;
+            seg_header.append_pos = logical + 1;
+            write_header(&mut header, &seg_header)?;
+            // 段内位图：新页 → High（仍在首个位图页覆盖内）。
+            let mut bmp = self.segment.read_page(1)?;
+            crate::bitmap::set_free_level(&mut bmp, logical, crate::bitmap::FreeLevel::High)?;
+            self.segment.write_page(1, &mut bmp)?;
+            self.current_logical = Some(logical);
+            self.current_txn = Some(txn_id);
+            (logical, page)
+        };
+
+        let slot_no = put_record(&mut page, &record)?;
+        let block = self
+            .segment
+            .logical_block(logical)
+            .ok_or(SegmentSpaceError::BitmapCoverage)?;
+        self.segment.write_page(logical, &mut page)?;
+
+        let rid = RowId::from_parts(self.segment.file_id(), block, slot_no)
+            .map_err(|_| UndoError::MalformedRecord)?;
+        txn_slot.undo_current = Some(rid);
+        txn_slot.rec_count = txn_slot.rec_count.saturating_add(1);
+        write_slot(&mut header, slot_index, &txn_slot)?;
+        self.segment.write_page(0, &mut header)?;
+        Ok(rid)
+    }
+
+    /// **按位置读一条撤销记录**（经区映射反查逻辑页）。
+    pub fn read(&self, at: RowId) -> Result<UndoRecord, UndoChainError> {
+        let logical = self
+            .segment
+            .logical_of_block(at.block_id())
+            .ok_or(UndoChainError::Undo(UndoError::MalformedRecord))?;
+        let page = self.segment.read_page(logical)?;
+        Ok(get_record(&page, at.row_id())?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -898,5 +1182,201 @@ mod tests {
         };
         crate::segment::write_header(&mut page, &header).unwrap();
         assert_eq!(init_extension(&mut page), Err(UndoError::WrongSegType));
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use std::path::Path;
+
+    use bicdb_workspace::io::MemFileIo;
+
+    use super::*;
+    use crate::datafile::DataFile;
+    use crate::itl;
+    use crate::page::PageType;
+
+    const F: &str = "/mem/undo1.dat";
+    const WS: [u8; 8] = [2u8; 8];
+
+    fn rid(block: u32, slot: u16) -> RowId {
+        RowId::from_parts(1, block, slot).unwrap()
+    }
+
+    fn insert_rec(prev: Option<RowId>, row: u16, payload: &[u8]) -> (UndoOp, UndoPayload) {
+        let _ = prev;
+        let _ = row;
+        (UndoOp::Delete, UndoPayload::FullRow(payload.to_vec()))
+    }
+
+    #[test]
+    fn chain_appends_links_and_reads_back() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+
+        let slot = chain.allocate_slot().unwrap();
+        assert_eq!(slot, 0);
+        let (op, payload) = insert_rec(None, 1, &[0x11; 20]);
+        let r1 = chain.append(slot, op, 0, rid(3, 1), payload).unwrap();
+        let r2 = chain
+            .append(slot, UndoOp::Insert, 0, rid(3, 2), UndoPayload::None)
+            .unwrap();
+        let (op, payload) = insert_rec(None, 3, &[0x33; 5]);
+        let r3 = chain.append(slot, op, 0, rid(3, 3), payload).unwrap();
+        assert_ne!(r1, r2);
+        assert_ne!(r2, r3);
+
+        // 链：r3 → r2 → r1 → 链首；载荷逐条原样。
+        let a = chain.read(r3).unwrap();
+        assert_eq!(a.prev, Some(r2));
+        assert_eq!(a.payload, UndoPayload::FullRow(vec![0x33; 5]));
+        let b = chain.read(r2).unwrap();
+        assert_eq!(b.prev, Some(r1));
+        assert_eq!(b.op, UndoOp::Insert);
+        let c = chain.read(r1).unwrap();
+        assert_eq!(c.prev, None);
+        assert_eq!(c.payload, UndoPayload::FullRow(vec![0x11; 20]));
+
+        // 事务表槽：链头 = r3、计数 3。
+        let page = chain.segment().read_page(0).unwrap();
+        let txn = read_slot(&page, slot).unwrap();
+        assert_eq!(txn.undo_current, Some(r3));
+        assert_eq!(txn.rec_count, 3);
+        assert_eq!(txn.wrap, 0, "首用槽：wrap = 0");
+
+        // 记录落在逻辑页 2；页 ITL[0] 归属该事务。
+        assert_eq!(chain.segment().logical_of_block(r1.block_id()), Some(2));
+        let undo_page = chain.segment().read_page(2).unwrap();
+        assert_eq!(undo_page.header().unwrap().page_type, PageType::Undo);
+        let e = itl::read_itl(&undo_page, 0).unwrap();
+        assert_eq!(e.txn_id, txn_id_of(slot, &txn));
+        assert_eq!(e.state, itl::ItlState::Active);
+    }
+
+    #[test]
+    fn second_transaction_gets_its_own_page() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+
+        let t0 = chain.allocate_slot().unwrap();
+        let t1 = chain.allocate_slot().unwrap();
+        assert_eq!((t0, t1), (0, 1));
+        let a = chain
+            .append(t0, UndoOp::Insert, 0, rid(3, 1), UndoPayload::None)
+            .unwrap();
+        let b = chain
+            .append(t1, UndoOp::Insert, 0, rid(4, 1), UndoPayload::None)
+            .unwrap();
+        assert_eq!(chain.segment().logical_of_block(a.block_id()), Some(2));
+        assert_eq!(
+            chain.segment().logical_of_block(b.block_id()),
+            Some(3),
+            "换事务 ⇒ 换新页（一页同一时刻只服务一个事务）"
+        );
+        // 两条链各自独立、互不干扰。
+        assert_eq!(chain.read(a).unwrap().prev, None);
+        assert_eq!(chain.read(b).unwrap().prev, None);
+        let page = chain.segment().read_page(0).unwrap();
+        assert_eq!(read_slot(&page, 0).unwrap().undo_current, Some(a));
+        assert_eq!(read_slot(&page, 1).unwrap().undo_current, Some(b));
+    }
+
+    #[test]
+    fn page_rollover_keeps_chain_continuous() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let slot = chain.allocate_slot().unwrap();
+
+        // 每条 400B 载荷（编码 ≈ 414B）；页可用 16312B ⇒ 约 39 条翻页。
+        let mut rids = Vec::new();
+        for i in 0..80u8 {
+            let rid_rec = chain
+                .append(
+                    slot,
+                    UndoOp::Delete,
+                    0,
+                    rid(3, u16::from(i) + 1),
+                    UndoPayload::FullRow(vec![i; 400]),
+                )
+                .unwrap();
+            rids.push(rid_rec);
+        }
+        // 跨了三张页（2、3、4）。
+        let pages: Vec<Option<u32>> = rids
+            .iter()
+            .map(|r| chain.segment().logical_of_block(r.block_id()))
+            .collect();
+        assert_eq!(pages[0], Some(2));
+        assert!(pages.contains(&Some(3)) && pages.contains(&Some(4)), "跨页");
+
+        // 从链头往回走：80 条全在、逆序、载荷原样。
+        let page = chain.segment().read_page(0).unwrap();
+        let head = read_slot(&page, slot).unwrap().undo_current.unwrap();
+        assert_eq!(head, *rids.last().unwrap());
+        let mut at = Some(head);
+        let mut walked = 0usize;
+        while let Some(pos) = at {
+            let rec = chain.read(pos).unwrap();
+            let expect = 79 - walked as u8;
+            assert_eq!(rec.payload, UndoPayload::FullRow(vec![expect; 400]));
+            at = rec.prev;
+            walked += 1;
+        }
+        assert_eq!(walked, 80);
+    }
+
+    #[test]
+    fn append_requires_active_slot() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let err = chain
+            .append(0, UndoOp::Insert, 0, rid(3, 1), UndoPayload::None)
+            .unwrap_err();
+        assert!(matches!(err, UndoChainError::SlotNotActive(0)), "{err}");
+    }
+
+    #[test]
+    fn record_length_derivation_is_exact() {
+        let mut page = crate::page::Page::new(PageType::Undo, WS, 1, 9);
+        let r1 = UndoRecord {
+            prev: None,
+            op: UndoOp::Forward,
+            flags: 0,
+            rowid: rid(3, 1),
+            payload: UndoPayload::Forward(rid(4, 2)),
+        };
+        let r2 = UndoRecord {
+            prev: Some(rid(9, 1)),
+            op: UndoOp::Delete,
+            flags: 0,
+            rowid: rid(3, 2),
+            payload: UndoPayload::FullRow(vec![7u8; 9]),
+        };
+        let s1 = put_record(&mut page, &r1).unwrap();
+        let s2 = put_record(&mut page, &r2).unwrap();
+        assert_eq!((s1, s2), (1, 2));
+        assert_eq!(
+            get_record(&page, 1).unwrap(),
+            r1,
+            "长度 = 初始 free_end − 偏移"
+        );
+        assert_eq!(
+            get_record(&page, 2).unwrap(),
+            r2,
+            "长度 = 上一条偏移 − 本条偏移"
+        );
+        assert_eq!(get_record(&page, 3), Err(UndoError::SlotOutOfRange(3)));
     }
 }

@@ -662,10 +662,39 @@ impl<'io, 'f> Segment<'io, 'f> {
         self.page0
     }
 
+    /// 段所在文件的文件号。
+    #[must_use]
+    pub fn file_id(&self) -> u16 {
+        self.file.file_id()
+    }
+
+    /// 工作区受校验标识。
+    #[must_use]
+    pub fn workspace_ref(&self) -> [u8; 8] {
+        self.file.workspace_ref()
+    }
+
     /// **逻辑页号 → 物理块**（经区映射；`None` = 该逻辑页尚未分配）。
     #[must_use]
     pub fn logical_block(&self, logical: u32) -> Option<u32> {
         logical_to_rdba(&self.map, logical).map(|r| r.block_id())
+    }
+
+    /// **物理块 → 逻辑页号**（区映射反查；`None` = 该块不属于本段）。
+    ///
+    /// 用途：undo 链上存的是**物理 ROWID**（§4.6.2），回读时经此还原
+    /// 逻辑页号再走 `read_page`。
+    #[must_use]
+    pub fn logical_of_block(&self, block: u32) -> Option<u32> {
+        let mut base = 0u32;
+        for e in &self.map {
+            let len = u32::from(e.extents) * EXTENT_BLOCKS;
+            if block >= e.start.block_id() && block < e.start.block_id() + len {
+                return Some(base + (block - e.start.block_id()));
+            }
+            base += len;
+        }
+        None
     }
 
     /// 读一个逻辑页（两层完整性校验——**未格式化的数据页读会失败**，
