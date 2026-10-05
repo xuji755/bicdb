@@ -295,6 +295,21 @@ pub fn mark_committed(page: &mut Page, index: u16, seq: CommitSeq) -> Result<(),
     write_itl(page, index, &entry)
 }
 
+/// **延迟块清除**（§11.1.1）：把一个"已提交但未清除"（外观仍 `Active`）的槽
+/// 落成 `Committed` + **准确提交序号**、行锁计数归零——此后即可被复用
+/// （[`ItlEntry::reusable`]）。
+///
+/// 清除由**后续 DML** 在该页上执行（读路径永不写块）；清除字节随后续语句的
+/// 页差异一并进入 redo（比"清除不生成 redo"更保守，语义等价——清除本身
+/// 可重导，丢了也会有下一次清除）。
+pub fn cleanout(page: &mut Page, index: u16, seq: CommitSeq) -> Result<(), ItlError> {
+    let mut entry = read_itl(page, index)?;
+    entry.state = ItlState::Committed;
+    entry.commit_seq = Some(seq);
+    entry.lock_cnt = 0;
+    write_itl(page, index, &entry)
+}
+
 /// 标记已回滚。
 pub fn mark_rolled_back(page: &mut Page, index: u16) -> Result<(), ItlError> {
     let mut entry = read_itl(page, index)?;

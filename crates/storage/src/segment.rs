@@ -882,6 +882,15 @@ impl<'io, 'f> Segment<'io, 'f> {
         None
     }
 
+    /// 段文件的**持久性点**（`fdatasync`）。
+    ///
+    /// 用途：新开撤销页的"**先落盘、后进 redo**"次序（§11.5.4 的实现注记）
+    /// ——物理增量 redo 无法重建一个不存在的页，所以新页必须先持久化。
+    pub fn sync(&self) -> Result<(), SegmentSpaceError> {
+        self.file.sync()?;
+        Ok(())
+    }
+
     /// 读一个逻辑页（两层完整性校验——**未格式化的数据页读会失败**，
     /// 这是"未初始化页不得使用"的落点）。
     pub fn read_page(&self, logical: u32) -> Result<Page, SegmentSpaceError> {

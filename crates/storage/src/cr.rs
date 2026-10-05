@@ -165,7 +165,7 @@ pub fn reconstruct(
                 // 本块；防御性跳过（不置 `undone`，避免空转）。
                 continue;
             };
-            if !undo_txn_on_block(&mut cr, head, file_id, block_id, chain, budget)? {
+            if !undo_txn_on_block(&mut cr, head, file_id, block_id, index, chain, budget)? {
                 return Err(CrError::NoItlUndo { itl_slot: index });
             }
             undone = true;
@@ -210,14 +210,18 @@ fn classify(
 
 /// 沿事务链撤销**本块**的修改（链是事务全局的：别的块的记录跳过）。
 ///
-/// 撤销到**本块的"ITL 覆盖"记录**即止——它把 ITL 还原成该事务占用前的
+/// 撤销到**本块"该 ITL 槽"的覆盖记录**即止——它把 ITL 还原成该事务占用前的
 /// 状态，交外层重新判定；找不到它说明数据不一致，返回 `false`。
+/// 终止符按 `payload.itl_slot == expected_slot` 匹配：一个事务理论上每块只占
+/// 一个槽，但匹配到**具体槽**才能保证"一轮回溯 = 一个条目严格回退"（否则
+/// 遇到更早的别的槽的覆盖记录会空转，§12.3.1 的收敛保证）。
 /// 步数超过 `budget`（`rec_count + 1`）说明 `prev` 成环。
 fn undo_txn_on_block(
     page: &mut Page,
     head: RowId,
     file_id: u16,
     block_id: u32,
+    expected_slot: u16,
     chain: &UndoChain<'_, '_>,
     budget: u64,
 ) -> Result<bool, CrError> {
@@ -233,9 +237,22 @@ fn undo_txn_on_block(
         if record.rowid.file_id() != file_id || record.rowid.block_id() != block_id {
             continue; // 别的块的修改：不动，但继续沿链走
         }
+        if record.op == UndoOp::ItlOverwrite {
+            let target = match &record.payload {
+                crate::undo::UndoPayload::ItlOverwrite { itl_slot, .. } => u16::from(*itl_slot),
+                _ => {
+                    return Err(CrError::Rollback(RollbackError::Undo(
+                        crate::undo::UndoError::MalformedRecord,
+                    )))
+                }
+            };
+            if target != expected_slot {
+                continue; // 别的槽的覆盖记录（更早的占用）：不动，继续沿链走
+            }
+        }
         apply_undo_to_page(page, &record)?;
         if record.op == UndoOp::ItlOverwrite {
-            return Ok(true); // 本块的 ITL 已还原 → 外层重评估
+            return Ok(true); // 本槽的 ITL 已还原 → 外层重评估
         }
     }
     Ok(false)
@@ -253,7 +270,9 @@ mod tests {
     use crate::itl::{ItlEntry, ItlState};
     use crate::page::{Page, WORKSPACE_REF_LEN};
     use crate::row::assemble_row;
-    use crate::undo::{create_undo_segment, free_slot, read_slot, write_slot, UndoPayload};
+    use crate::undo::{
+        create_undo_segment, free_slot, read_slot, txn_id_of, write_slot, UndoPayload,
+    };
 
     const UNDO_F: &str = "/mem/undo1.dat";
     const WS: [u8; 8] = [5u8; 8];
@@ -303,13 +322,19 @@ mod tests {
         itl_slot: u8,
         old: Option<[u8; crate::page::ITL_ENTRY_LEN]>,
     ) -> RowId {
+        let header = chain.segment().read_page(0).unwrap();
+        let txn_id = txn_id_of(slot, &read_slot(&header, slot).unwrap());
         chain
             .append(
                 slot,
                 UndoOp::ItlOverwrite,
                 0,
                 RowId::from_parts(3, 0, 1).unwrap(),
-                UndoPayload::ItlOverwrite { itl_slot, old },
+                UndoPayload::ItlOverwrite {
+                    txn_id,
+                    itl_slot,
+                    old,
+                },
             )
             .unwrap()
     }

@@ -374,6 +374,7 @@ mod tests {
                 0,
                 RowId::from_parts(3, 0, 1).unwrap(),
                 UndoPayload::ItlOverwrite {
+                    txn_id: owner,
                     itl_slot: 0,
                     old: None,
                 },
@@ -555,6 +556,7 @@ mod tests {
                 0,
                 RowId::from_parts(3, 0, 1).unwrap(),
                 UndoPayload::ItlOverwrite {
+                    txn_id: owner,
                     itl_slot: 0,
                     old: None,
                 },

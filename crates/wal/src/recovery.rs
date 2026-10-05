@@ -645,6 +645,7 @@ mod recover_tests {
                 0,
                 RowId::from_parts(3, 0, 1).unwrap(),
                 UndoPayload::ItlOverwrite {
+                    txn_id: TxnId::from_parts(0, loser_slot as u8, 0),
                     itl_slot: 0,
                     old: None,
                 },
@@ -913,6 +914,7 @@ mod pitr_tests {
                 0,
                 RowId::from_parts(3, 0, 1).unwrap(),
                 UndoPayload::ItlOverwrite {
+                    txn_id: TxnId::from_parts(0, w_slot as u8, 0),
                     itl_slot: 0,
                     old: None,
                 },
@@ -952,6 +954,7 @@ mod pitr_tests {
                 0,
                 RowId::from_parts(3, 0, 1).unwrap(),
                 UndoPayload::ItlOverwrite {
+                    txn_id: TxnId::from_parts(0, l_slot as u8, 0),
                     itl_slot: 1,
                     old: None,
                 },
@@ -991,6 +994,7 @@ mod pitr_tests {
                 0,
                 RowId::from_parts(3, 0, 1).unwrap(),
                 UndoPayload::ItlOverwrite {
+                    txn_id: TxnId::from_parts(0, w2_slot as u8, 0),
                     itl_slot: 2,
                     old: None,
                 },

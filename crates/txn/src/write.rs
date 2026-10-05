@@ -1,12 +1,17 @@
 //! **写路径**（§11.1.1 的提交流程、§4.6.6 的事务生命周期）：DML 经缓冲池落地。
 //!
 //! ```text
-//! 一次修改（insert/delete/…，本切片刻 insert）：
+//! 一次修改（insert/delete/update）：
+//!   ⓪ **可失败预检**（行头/空间/等长）——先于任何链上追加，失败不留幽灵记录
 //!   ① 取数据页（缓冲池钉住）——**写先入缓存**
-//!   ② 占用 ITL 槽：捕获前像 → 记"ITL 覆盖"撤销记录（经池、带 redo）
-//!   ③ 改页（插行）→ 记"插入"撤销记录（经池、带 redo）
+//!   ② 占用 ITL 条目（`occupy_itl`）：
+//!        延迟块清除（已提交旧条目 → `Committed` + 准确序号、锁清零）
+//!        → 本事务已有条目则复用（每块至多一个）→ 否则新占用：
+//!          记"ITL 覆盖"撤销记录（带 `txn_id`，CR 的终止符）→ 写 `Active` 条目
+//!   ③ 改页（插/删/改，行头 `itl_slot` 回填）→ 记对应撤销记录（经池、带 redo）
 //!   ④ 数据页差异 → 追加 redo → 推进 page_lsn → **标脏**（写列表排队）
-//! 提交：提交记录入流 → **等 LGWR 刷到该记录** → 事务表槽置已提交 → 返回
+//! 提交：提交记录入流 → **等 LGWR 刷到该记录**（提交点）→ 事务表槽置已提交
+//!       （此步失败不回滚——恢复的前滚补标记兜底）
 //! 回滚：沿链从新到旧补偿（每条都经池、带 redo）→ 释放槽
 //! ```
 //!
@@ -186,35 +191,20 @@ pub fn insert_row(
         (*g.as_bytes(), Page::from_bytes(Box::new(*g.as_bytes())))
     };
 
-    // ② 占用 ITL 槽（在快照上，捕获前像）。
-    let (slot, old) = acquire_itl_slot(&mut local, txn.txn_id)?;
-    let block_rowid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), 1)?;
-    let head = append_undo_via_pool(
-        pool,
-        log,
-        chain,
-        txn,
-        UndoOp::ItlOverwrite,
-        block_rowid,
-        UndoPayload::ItlOverwrite {
-            itl_slot: slot as u8,
-            old,
-        },
-    )?;
-    itl::write_itl(
-        &mut local,
-        slot,
-        &ItlEntry {
-            txn_id: txn.txn_id,
-            undo_ptr: Some(head),
-            commit_seq: None,
-            lock_cnt: 1,
-            state: ItlState::Active,
-        },
-    )?;
+    // ① 预检（**先于任何链上追加**）：在丢弃副本上走一遍插入——行头、空间、
+    //    槽位任何一项不满足都发生在"记记录"之前，不留幽灵撤消记录。
+    {
+        let mut probe = Page::from_bytes(Box::new(*local.as_bytes()));
+        heap::insert_row(&mut probe, row, policy)?;
+    }
 
-    // ③ 插行（快照上）+ 记"插入"撤销记录。
-    let n = heap::insert_row(&mut local, row, policy)?;
+    // ② 占用 ITL 槽（复用/清除/新占用都在 `occupy_itl` 里，§5.4.1）。
+    let slot = occupy_itl(pool, log, chain, txn, &mut local, block)?;
+
+    // ③ 插行（快照上，**回填行头的 `itl_slot`**）+ 记"插入"撤销记录。
+    let mut patched = row.to_vec();
+    patched[1] = slot as u8;
+    let n = heap::insert_row(&mut local, &patched, policy)?;
     let rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), n)?;
     append_undo_via_pool(
         pool,
@@ -255,33 +245,10 @@ pub fn delete_row(
     let old_row = heap::row(&local, row_no)
         .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
         .to_vec();
-    let block_rowid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), 1)?;
-    let (slot, old) = ensure_itl_entry(&mut local, txn.txn_id)?;
-    if let Some(old) = old {
-        let head = append_undo_via_pool(
-            pool,
-            log,
-            chain,
-            txn,
-            UndoOp::ItlOverwrite,
-            block_rowid,
-            UndoPayload::ItlOverwrite {
-                itl_slot: slot as u8,
-                old: Some(old),
-            },
-        )?;
-        itl::write_itl(
-            &mut local,
-            slot,
-            &ItlEntry {
-                txn_id: txn.txn_id,
-                undo_ptr: Some(head),
-                commit_seq: None,
-                lock_cnt: 1,
-                state: ItlState::Active,
-            },
-        )?;
-    }
+    // 占用 ITL 条目（含清除/复用/新占用的记录与条目写入）——行锁与可见性
+    // 的落点，**不能省**（本切片修复：此前 delete/update 在空槽上什么都不写，
+    // 未提交删除/更新对所有快照可见）。
+    let _slot = occupy_itl(pool, log, chain, txn, &mut local, block)?;
     let rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?;
     append_undo_via_pool(
         pool,
@@ -331,33 +298,14 @@ pub fn update_row(
             new: new_row.len(),
         });
     }
-    let block_rowid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), 1)?;
-    let (slot, old) = ensure_itl_entry(&mut local, txn.txn_id)?;
-    if let Some(old) = old {
-        let head = append_undo_via_pool(
-            pool,
-            log,
-            chain,
-            txn,
-            UndoOp::ItlOverwrite,
-            block_rowid,
-            UndoPayload::ItlOverwrite {
-                itl_slot: slot as u8,
-                old: Some(old),
-            },
-        )?;
-        itl::write_itl(
-            &mut local,
-            slot,
-            &ItlEntry {
-                txn_id: txn.txn_id,
-                undo_ptr: Some(head),
-                commit_seq: None,
-                lock_cnt: 1,
-                state: ItlState::Active,
-            },
-        )?;
+    // 新行必须是**结构合法**的完整行（等长之外还要行头自洽）——否则写进读不回。
+    let header = bicdb_storage::row::RowHeader::read_from(new_row)
+        .map_err(|_| TxnError::Heap(HeapError::BadRow))?;
+    if usize::from(header.row_len) != new_row.len() {
+        return Err(TxnError::Heap(HeapError::BadRow));
     }
+    // 占用 ITL 条目（同 delete：此前空槽上什么都不写，是可见性缺陷的落点）。
+    let slot = occupy_itl(pool, log, chain, txn, &mut local, block)?;
 
     // 行内差异（连续的变更段；旧值随记录）——**先 undo 后变更**。
     let patches = row_patches(&old_row, new_row);
@@ -446,22 +394,118 @@ fn ensure_undo_capacity(
     Ok(())
 }
 
-/// 保证本事务在该块有一个 ITL 条目：
-/// - 已有本事务的活动条目 ⇒ `(slot, None)`（不必记"ITL 覆盖"）；
-/// - 占用空槽/可复用槽 ⇒ `(slot, Some(前像))`（调用方先记 "ITL 覆盖"）。
-fn ensure_itl_entry(page: &mut Page, txn_id: TxnId) -> Result<(u16, Option<[u8; 24]>), TxnError> {
-    let count = itl::itl_count(page)?;
-    for i in 0..count {
+/// ITL 条目的获取结果——写路径据此决定"要不要记 `ITL 覆盖`"。
+#[derive(Debug)]
+enum ItlAcquire {
+    /// 本事务在该块**已有**活动条目：直接用，不记记录、不写条目。
+    Existing(u16),
+    /// **新占用**了一个槽：必须记 `ITL 覆盖`（`old` = 前像；`None` = 原为空闲
+    /// ——CR 的终止符，§12.3.1）并把条目写成 `Active`。
+    Fresh {
+        /// 槽号。
+        slot: u16,
+        /// 被覆盖条目的原始 24B（`None` = 原为空闲）。
+        old: Option<[u8; bicdb_storage::page::ITL_ENTRY_LEN]>,
+    },
+}
+
+/// **延迟块清除**（§11.1.1）：把本块上"事务表已提交"的旧条目清成
+/// `Committed` + 准确序号、锁计数归零——已提交的槽从此**可复用**（这是 ITL
+/// 槽回收的唯一路径；没有它，同一页 32 个写事务后就是死路）。
+///
+/// 只清 `Some(Committed)` 的事务表槽：查不到（槽已复用）的条目**不猜**——
+/// 宁可让它占着不可复用，也不把可能的活动事务误判成已提交。
+/// 清除字节随后续语句的页差异一并入 redo（比"清除不生成 redo"保守，语义等价）。
+fn cleanout_committed(page: &mut Page, chain: &UndoChain<'_, '_>) -> Result<(), TxnError> {
+    let header = chain.segment().read_page(0)?;
+    for i in 0..itl::itl_count(page)? {
+        let e = itl::read_itl(page, i)?;
+        if e.state != ItlState::Active {
+            continue;
+        }
+        if let Some(slot) = bicdb_storage::undo::find_slot(&header, e.txn_id)? {
+            if slot.state == TxnState::Committed {
+                itl::cleanout(page, i, slot.commit_seq)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 保证本事务在该块有一个 ITL 条目（**先清除、再复用、至多一个**）：
+/// - 先做延迟块清除，让已提交的旧槽回到可复用集合；
+/// - 已有本事务的活动条目 ⇒ [`ItlAcquire::Existing`]（不重复占槽）；
+/// - 否则占用空槽/可复用槽 ⇒ [`ItlAcquire::Fresh`]。
+fn ensure_itl_entry(
+    page: &mut Page,
+    chain: &UndoChain<'_, '_>,
+    txn_id: TxnId,
+) -> Result<ItlAcquire, TxnError> {
+    cleanout_committed(page, chain)?;
+    for i in 0..itl::itl_count(page)? {
         let e = itl::read_itl(page, i)?;
         if e.state == ItlState::Active && e.txn_id == txn_id {
-            return Ok((i, None));
+            return Ok(ItlAcquire::Existing(i));
         }
     }
     acquire_itl_slot(page, txn_id)
 }
 
-/// **提交**（§11.1.1 的次序）：提交记录入流 → **等它身持久化** → 事务表槽置
-/// 已提交（经池、带 redo）→ 返回提交序号。
+/// **占用入口**（insert/delete/update 共用）：返回槽号；新占用时先记
+/// `ITL 覆盖`（旧值为前像，`None` = 原为空闲）再写 `Active` 条目。
+/// 四条纪律都收在这一处：
+/// ① 清除先行（可复用集合）；② 一个事务每块**至多一个**条目；
+/// ③ 新占用**必记**终止符记录；④ 只改页快照——页回写由调用方在本语句的
+///    `write_page_change` 里统一做（含清除字节与本次修改）。
+fn occupy_itl(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    txn: &Txn,
+    local: &mut Page,
+    block: BufferKey,
+) -> Result<u16, TxnError> {
+    match ensure_itl_entry(local, chain, txn.txn_id)? {
+        ItlAcquire::Existing(slot) => Ok(slot),
+        ItlAcquire::Fresh { slot, old } => {
+            // `ITL 覆盖` 是**块级**动作：记录里的行号只借它的 file/block 定位块。
+            let block_rowid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), 1)?;
+            let head = append_undo_via_pool(
+                pool,
+                log,
+                chain,
+                txn,
+                UndoOp::ItlOverwrite,
+                block_rowid,
+                UndoPayload::ItlOverwrite {
+                    txn_id: txn.txn_id,
+                    itl_slot: slot as u8,
+                    old,
+                },
+            )?;
+            itl::write_itl(
+                local,
+                slot,
+                &ItlEntry {
+                    txn_id: txn.txn_id,
+                    undo_ptr: Some(head),
+                    commit_seq: None,
+                    lock_cnt: 1,
+                    state: ItlState::Active,
+                },
+            )?;
+            Ok(slot)
+        }
+    }
+}
+
+/// **提交**（§11.1.1 的次序）：提交记录入流 → **等它身持久化**（**提交点**）
+/// → 事务表槽置已提交（经池、带 redo）→ 返回。
+///
+/// **提交记录一旦耐久，事务即已提交**：其后的槽标记是"尽快可见/可回收"的
+/// 优化状态——这一步失败**不返回 Err**（调用方若据此回滚，会把日志里已提交
+/// 的事务回滚掉 = 已提交数据丢失）；恢复的分析阶段会用**前滚补标记**把槽补成
+/// `Committed` + 准确序号（§4.6.6 ⑤），语义不丢。
 pub fn commit(
     pool: &BufferPool<'_>,
     log: &mut GroupWriter<'_, '_>,
@@ -470,8 +514,23 @@ pub fn commit(
     commit_seq: CommitSeq,
 ) -> Result<(), TxnError> {
     let lsn = log.append(|l| RedoRecord::commit(l, txn.raw(), commit_seq.as_raw()))?;
-    log.flush(lsn)?; // 提交在"提交记录耐久"之后才算成功
+    log.flush(lsn)?; // **提交点**：此后事务已提交（不可再回滚）
 
+    // 槽标记：尽力而为；失败由恢复的前滚补标记兜底（见函数文档）。
+    let marked = mark_slot_committed(pool, log, chain, txn, commit_seq);
+    txn.state = TxnState::Committed;
+    let _ = marked; // 不因槽标记失败把已提交事务变成"可回滚的失败"
+    Ok(())
+}
+
+/// 事务表槽置"已提交 + 准确提交序号"（经池、带 redo）。
+fn mark_slot_committed(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    txn: &Txn,
+    commit_seq: CommitSeq,
+) -> Result<(), TxnError> {
     let header_before = chain.segment().read_page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     let mut slot = read_slot(&header_after, txn.slot)?;
@@ -487,10 +546,7 @@ pub fn commit(
         header_before.as_bytes(),
         header_after.as_bytes(),
         false,
-    )?;
-
-    txn.state = TxnState::Committed;
-    Ok(())
+    )
 }
 
 /// **回滚**：沿链从新到旧补偿（每条经池、带 redo），最后释放事务表槽。
@@ -570,8 +626,9 @@ fn workspace_of(chain: &UndoChain<'_, '_>) -> [u8; 8] {
     chain.segment().workspace_ref()
 }
 
-/// 在数据页上占用 ITL 槽：返回（槽号、前像字节；`None` = 原为空闲）。
-fn acquire_itl_slot(page: &mut Page, _txn_id: TxnId) -> Result<(u16, Option<[u8; 24]>), TxnError> {
+/// 在数据页上占用一个 **ITL 槽**（复用优先；否则扩展）。
+/// 前像：原为空闲（`Free`）⇒ `None`（"原为空闲"的编码）。
+fn acquire_itl_slot(page: &mut Page, _txn_id: TxnId) -> Result<ItlAcquire, TxnError> {
     if let Some(slot) = itl::find_reusable(page)? {
         let old = itl::snapshot(page, slot)?;
         let entry = itl::read_itl(page, slot)?;
@@ -581,11 +638,11 @@ fn acquire_itl_slot(page: &mut Page, _txn_id: TxnId) -> Result<(u16, Option<[u8;
         } else {
             Some(old)
         };
-        return Ok((slot, old));
+        return Ok(ItlAcquire::Fresh { slot, old });
     }
     // 没有可复用槽 → 扩展（itl_max 由调用方经段/表选项控制；此处用上限 32）。
     let slot = itl::grow(page, itl::ITL_MAX_LIMIT)?;
-    Ok((slot, None))
+    Ok(ItlAcquire::Fresh { slot, old: None })
 }
 
 /// **记一条撤销记录并经池落地**（计划页 → 每页 redo + 标脏）。
@@ -602,6 +659,16 @@ fn append_undo_via_pool(
     // 撤销段容量：下一个追加页未映射 ⇒ **经池扩展**（redo 保护，镜像先写后读）。
     ensure_undo_capacity(pool, log, chain, txn)?;
     let plan = chain.plan_append(txn.slot, op, 0, rowid, payload)?;
+    // ⓪ **新撤销页：先格式化落盘（fsync）、再让它进 redo**（§11.5.4 实现注记）。
+    //    物理增量重放**无法重建一个不存在的页**：若只有 redo 耐久而页从未
+    //    落盘，掉电后重放会以"页不存在/校验失败"中止恢复。次序反过来则安全：
+    //    页先于 redo 耐久——崩溃只可能留下"无人引用的已格式化页"（append_pos
+    //    未推进，下次原样重写）。
+    if plan.opened {
+        let mut formatted = Page::from_bytes(Box::new(*plan.undo_page.0.as_bytes()));
+        chain.segment().write_page(plan.logical, &mut formatted)?;
+        chain.segment().sync()?;
+    }
     // ① 撤销页（可能新开）。
     let key = undo_page_key(chain, plan.logical)?;
     write_undo_page_change(
@@ -744,6 +811,14 @@ mod tests {
         assemble_row(0, 1, &[false], &[], &[payload])
     }
 
+    /// 期望的"落盘行"：行头 `itl_slot` 由写路径回填为**实际占用的 ITL 槽号**
+    /// （调用方给的字节会被改写——见 `insert_row`）。
+    fn stored_row(row: &[u8], itl_slot: u8) -> Vec<u8> {
+        let mut r = row.to_vec();
+        r[1] = itl_slot;
+        r
+    }
+
     /// 假 WAL：水位视为已全落盘（池不催刷；提交路径单独 flush）。
     struct FakeWal;
     impl WalGuard for FakeWal {
@@ -817,7 +892,11 @@ mod tests {
         // 写回工作区（DBWR 角色）→ 文件里能看到行。
         pool.flush_workspace(WS).unwrap();
         let page = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
-        assert_eq!(heap::row(&page, 1), Some(&row[..]), "行已落盘");
+        assert_eq!(
+            heap::row(&page, 1),
+            Some(&stored_row(&row, 0)[..]),
+            "行已落盘（itl_slot 回填为实际占用的槽 0）"
+        );
         // ITL[0] 归该事务（延迟块清除：条目仍是"活动"外观）。
         let entry = bicdb_storage::itl::read_itl(&page, 0).unwrap();
         assert_eq!(entry.txn_id, txn.txn_id);
@@ -995,7 +1074,7 @@ mod tests {
         let page = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
         assert_eq!(
             heap::row(&page, win_rid.row_id()),
-            Some(&win_row[..]),
+            Some(&stored_row(&win_row, 0)[..]),
             "胜者的行被重做出来"
         );
         assert_eq!(heap::row(&page, lose_rid.row_id()), None, "输家的行被撤销");
@@ -1120,6 +1199,328 @@ mod tests {
         // 行头 itl_slot 指向 t2 的槽（更新时改写）；其余字节 = 新行。
         assert_eq!(stored[1], t2.slot as u8, "itl_slot 归本事务");
         assert_eq!(&stored[2..], &row_v2[2..], "行体 = 更新后的内容");
+    }
+
+    /// 页快照（经池钉住后拷贝——测试读 ITL 条目用）。
+    fn page_snapshot(pool: &BufferPool<'_>, key: BufferKey) -> Page {
+        let g = pool.pin(key).unwrap();
+        Page::from_bytes(Box::new(*g.as_bytes()))
+    }
+
+    fn itl_of(page: &Page, slot: u16) -> bicdb_storage::itl::ItlEntry {
+        bicdb_storage::itl::read_itl(page, slot).unwrap()
+    }
+
+    #[test]
+    fn uncommitted_delete_is_marked_and_invisible_to_cr() {
+        // 审核修复回归（A1）：**第二个事务的删除**必须在页上留下自己的 ITL
+        // 条目——没有它，未提交删除对所有快照可见（脏读）。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let row = row_bytes(b"del");
+        let mut t0 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t0,
+            key,
+            &row,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+
+        // T1：删除，不提交。
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(2)).unwrap();
+        delete_row(&pool, &mut log, &mut chain, &mut t1, key, rid.row_id()).unwrap();
+
+        let page = page_snapshot(&pool, key);
+        let count = bicdb_storage::itl::itl_count(&page).unwrap();
+        assert!(
+            (0..count).any(|i| {
+                let e = itl_of(&page, i);
+                e.state == bicdb_storage::itl::ItlState::Active && e.txn_id == t1.txn_id
+            }),
+            "删除者必须在本页有活动 ITL 条目"
+        );
+        // 能看见 T0 插入（seq 1）、看不见 T1 删除的快照：行仍在。
+        let cr = bicdb_storage::cr::reconstruct(&page, seq(1), &chain).unwrap();
+        assert_eq!(
+            heap::row(&cr, rid.row_id()),
+            Some(&stored_row(&row, 0)[..]),
+            "未提交删除：看见插入的旧快照必须仍看到该行"
+        );
+        // 比 T0 还旧的快照：连插入都不可见——行不存在（两段回溯都生效）。
+        let cr_ancient = bicdb_storage::cr::reconstruct(&page, seq(0), &chain).unwrap();
+        assert_eq!(
+            heap::row(&cr_ancient, rid.row_id()),
+            None,
+            "更旧的快照看不到插入"
+        );
+        // 提交后：旧快照（seq 1 < 提交序号）仍可见——删除靠 undo 撤销回去。
+        commit(&pool, &mut log, &mut chain, &mut t1, seq(2)).unwrap();
+        let page = page_snapshot(&pool, key);
+        let cr_old = bicdb_storage::cr::reconstruct(&page, seq(1), &chain).unwrap();
+        assert_eq!(
+            heap::row(&cr_old, rid.row_id()),
+            Some(&stored_row(&row, 0)[..]),
+            "提交后：旧快照（含等号之下）仍看到删除前的行"
+        );
+        let cr_new = bicdb_storage::cr::reconstruct(&page, seq(2), &chain).unwrap();
+        assert_eq!(heap::row(&cr_new, rid.row_id()), None, "新快照看不到已删行");
+    }
+
+    #[test]
+    fn one_transaction_uses_one_itl_entry_per_block() {
+        // 审核修复回归（A2）：同一事务在同一页插两次 ⇒ **只占一个** ITL 条目，
+        // CR 一轮即可回溯（此前两个条目会把 CR 卡进 TooManyRounds）。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let row = row_bytes(b"two");
+        let mut txn = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let r1 = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut txn,
+            key,
+            &row,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+        let r2 = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut txn,
+            key,
+            &row,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+
+        let page = page_snapshot(&pool, key);
+        assert_eq!(
+            bicdb_storage::itl::itl_count(&page).unwrap(),
+            1,
+            "一个事务每块只占一个 ITL 条目"
+        );
+        // 未提交：CR 把两行都抹掉（不再 TooManyRounds）。
+        let cr = bicdb_storage::cr::reconstruct(&page, seq(0), &chain).unwrap();
+        assert_eq!(heap::row(&cr, r1.row_id()), None);
+        assert_eq!(heap::row(&cr, r2.row_id()), None);
+        // 提交后可见。
+        commit(&pool, &mut log, &mut chain, &mut txn, seq(1)).unwrap();
+        let page = page_snapshot(&pool, key);
+        let cr = bicdb_storage::cr::reconstruct(&page, seq(1), &chain).unwrap();
+        assert!(heap::row(&cr, r1.row_id()).is_some());
+        assert!(heap::row(&cr, r2.row_id()).is_some());
+    }
+
+    #[test]
+    fn committed_itl_entries_are_reused_across_transactions() {
+        // 审核修复回归（A6）：延迟块清除让**已提交**的条目回到可复用集合——
+        // 同一页连续 40 个写事务不应把 32 个 ITL 槽用尽。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let row = row_bytes(b"x");
+        for i in 0..40u64 {
+            let mut txn = begin(&pool, &mut log, &mut chain, seq(i + 1)).unwrap();
+            insert_row(
+                &pool,
+                &mut log,
+                &mut chain,
+                &mut txn,
+                key,
+                &row,
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+            commit(&pool, &mut log, &mut chain, &mut txn, seq(i + 1)).unwrap();
+        }
+        let page = page_snapshot(&pool, key);
+        assert_eq!(
+            bicdb_storage::itl::itl_count(&page).unwrap(),
+            1,
+            "清除 + 复用：40 个事务仍只占 1 个 ITL 槽"
+        );
+        // 40 行都在（各事务各插一行）。
+        assert_eq!(page.slot_count(), 40);
+    }
+
+    #[test]
+    fn failed_insert_leaves_no_ghost_undo_record() {
+        // 审核修复回归（A3）：插入失败的输入/空间检查发生在**记记录之前**——
+        // 链头不被推进（幽灵 `ITL 覆盖` 记录会在他处回滚时覆盖他人条目）。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let mut txn = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        // ① 行头非法（row_len 与长度不符）⇒ 失败且不留记录。
+        let mut bad = row_bytes(b"ghost");
+        bad[2] = bad[2].wrapping_add(7); // 改 row_len 低字节
+        assert!(insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut txn,
+            key,
+            &bad,
+            &InsertPolicy::in_place(0)
+        )
+        .is_err());
+        // ② 一次超过整页的行 ⇒ PageFull 且不留记录。
+        let big = row_bytes(&vec![b'z'; 20000]);
+        let _ = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut txn,
+            key,
+            &big,
+            &InsertPolicy::in_place(0),
+        );
+        let header = chain.segment().read_page(0).unwrap();
+        assert_eq!(
+            read_slot(&header, txn.slot).unwrap().undo_current,
+            None,
+            "失败的插入不得在链上留下任何记录"
+        );
+        // 页也一个字节未动。
+        let page = page_snapshot(&pool, key);
+        assert_eq!(page.slot_count(), 0);
     }
 
     #[test]

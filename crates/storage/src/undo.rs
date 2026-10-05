@@ -497,7 +497,7 @@ pub enum UndoOp {
     Insert = 0,
     /// 1：删除（载荷 = 整行旧值，含行头）。
     Delete = 1,
-    /// 2：更新（载荷 = 旧 `itl_slot` + 列前像列表）。
+    /// 2：更新（载荷 = 旧 `itl_slot` + **行内偏移**前像补丁列表）。
     Update = 2,
     /// 3：转发指针更新（载荷 = 旧的转发目标 6B）。
     Forward = 3,
@@ -546,11 +546,15 @@ pub enum UndoPayload {
     },
     /// 转发指针更新：旧的转发目标。
     Forward(RowId),
-    /// ITL 覆盖：**被覆盖的 ITL 槽号** + 旧内容（`None` = 原为空闲）。
+    /// ITL 覆盖：**占用者** + 被覆盖的 ITL 槽号 + 旧内容（`None` = 原为空闲）。
     ///
     /// 槽号是回滚的落点（§4.6.2 的"ITL 覆盖"是**块级**动作——不针对某行，
-    /// 记录里的 `rowid` 只借它的 file/block 定位块）。
+    /// 记录里的 `rowid` 只借它的 file/block 定位块）；`txn_id` 是补偿的
+    /// **归属判据**——只有"该槽当前仍是本事务的 `Active` 占用"才还原，
+    /// 否则空操作（防空记录/槽已复用时误覆盖他人条目）。
     ItlOverwrite {
+        /// 占用者（本记录所属事务；补偿归属校验用）。
+        txn_id: TxnId,
         /// 被覆盖的 ITL 槽号。
         itl_slot: u8,
         /// 旧内容（`None` = 原为空闲）。
@@ -597,7 +601,12 @@ impl UndoRecord {
                 }
             }
             UndoPayload::Forward(target) => out.extend_from_slice(&target.to_bytes()),
-            UndoPayload::ItlOverwrite { itl_slot, old } => {
+            UndoPayload::ItlOverwrite {
+                txn_id,
+                itl_slot,
+                old,
+            } => {
+                out.extend_from_slice(&txn_id.to_bytes());
                 out.push(*itl_slot);
                 match old {
                     Some(entry) => out.extend_from_slice(entry),
@@ -668,12 +677,16 @@ impl UndoRecord {
                 UndoPayload::Forward(RowId::from_bytes(body.try_into().expect("6 字节")))
             }
             UndoOp::ItlOverwrite => {
-                if body.len() != 1 + ITL_ENTRY_LEN {
+                if body.len() != 6 + 1 + ITL_ENTRY_LEN {
                     return Err(UndoError::MalformedRecord);
                 }
-                let itl_slot = body[0];
-                let entry: [u8; ITL_ENTRY_LEN] = body[1..].try_into().expect("24 字节");
+                let mut id = [0u8; 6];
+                id.copy_from_slice(&body[0..6]);
+                let txn_id = TxnId::from_bytes(&id);
+                let itl_slot = body[6];
+                let entry: [u8; ITL_ENTRY_LEN] = body[7..].try_into().expect("24 字节");
                 UndoPayload::ItlOverwrite {
+                    txn_id,
                     itl_slot,
                     old: (entry != [0u8; ITL_ENTRY_LEN]).then_some(entry),
                 }
@@ -1285,8 +1298,12 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
             page.set_slot(index, restored);
         }
         UndoOp::ItlOverwrite => {
-            let (itl_slot, old) = match &record.payload {
-                UndoPayload::ItlOverwrite { itl_slot, old } => (*itl_slot, old),
+            let (txn_id, itl_slot, old) = match &record.payload {
+                UndoPayload::ItlOverwrite {
+                    txn_id,
+                    itl_slot,
+                    old,
+                } => (*txn_id, *itl_slot, old),
                 _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
             };
             // 该 ITL 槽不在本页（`itl_count` 之外）：页状态早于"占用记录"
@@ -1298,6 +1315,19 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
                 })
             })?;
             if u16::from(itl_slot) >= count {
+                return Ok(());
+            }
+            // **归属校验**：只有"该槽当前仍属于本事务"才还原——`Active`
+            // （常规占用）或 `Committed`（已清除，但 CR 重建更旧快照时仍要
+            // 沿它回溯）皆可。其余（空闲 = 已还原过/从未落页；属于**别的**
+            // 事务 = 空记录或槽已换人）一律空操作，**不得覆盖他人条目**。
+            let current = crate::itl::read_itl(page, u16::from(itl_slot)).map_err(|e| {
+                RollbackError::Page(match e {
+                    crate::itl::ItlError::SlotOutOfRange(_) => "ITL 槽越界",
+                    _ => "ITL 字段越界",
+                })
+            })?;
+            if current.state == crate::itl::ItlState::Free || current.txn_id != txn_id {
                 return Ok(());
             }
             match old {
@@ -1569,6 +1599,7 @@ mod tests {
             flags: 0,
             rowid: rid(9, 3),
             payload: UndoPayload::ItlOverwrite {
+                txn_id: TxnId::from_parts(0, 3, 7),
                 itl_slot: 3,
                 old: Some([7u8; ITL_ENTRY_LEN]),
             },
@@ -1576,6 +1607,7 @@ mod tests {
         assert_eq!(UndoRecord::decode(&itl.encode()).unwrap(), itl);
         let itl_free = UndoRecord {
             payload: UndoPayload::ItlOverwrite {
+                txn_id: TxnId::from_parts(0, 3, 7),
                 itl_slot: 0,
                 old: None,
             },
@@ -2095,6 +2127,7 @@ mod rollback_tests {
                 &rec(
                     UndoOp::ItlOverwrite,
                     UndoPayload::ItlOverwrite {
+                        txn_id: crate::undo::TxnId::from_parts(0, 1, 0),
                         itl_slot: 0,
                         old: Some(snap),
                     },
@@ -2127,6 +2160,7 @@ mod rollback_tests {
                 &rec(
                     UndoOp::ItlOverwrite,
                     UndoPayload::ItlOverwrite {
+                        txn_id: crate::undo::TxnId::from_parts(0, 2, 0),
                         itl_slot: 0,
                         old: None,
                     },
@@ -2318,6 +2352,7 @@ mod rollback_tests {
             flags: 0,
             rowid: RowId::from_parts(3, 0, 1).unwrap(),
             payload: UndoPayload::ItlOverwrite {
+                txn_id: TxnId::from_parts(0, 1, 0),
                 itl_slot: 3,
                 old: None,
             },
@@ -2335,6 +2370,71 @@ mod rollback_tests {
         };
         apply_undo_to_page(&mut page, &rec).unwrap();
         assert_eq!(heap::row(&page, 1), None, "存在的行被撤销");
+    }
+
+    #[test]
+    fn itl_overwrite_never_touches_another_txns_entry() {
+        // 归属守卫（P3 审核修复）：记录属于 T1，但该槽当前被 **T2** 占着
+        // （幽灵记录/槽已换人）⇒ 空操作，绝不覆盖他人条目。
+        let io = mem();
+        let h = data_file(&io);
+        let t2 = TxnId::from_parts(0, 2, 0);
+        {
+            let mut page = load(&io, h);
+            crate::itl::write_itl(
+                &mut page,
+                0,
+                &crate::itl::ItlEntry {
+                    txn_id: t2,
+                    undo_ptr: None,
+                    commit_seq: None,
+                    lock_cnt: 1,
+                    state: crate::itl::ItlState::Active,
+                },
+            )
+            .unwrap();
+            store(&io, h, &mut page);
+        }
+        let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
+        rollback_record(
+            &io,
+            &rec(
+                UndoOp::ItlOverwrite,
+                UndoPayload::ItlOverwrite {
+                    txn_id: TxnId::from_parts(0, 1, 0),
+                    itl_slot: 0,
+                    old: None,
+                },
+                1,
+            ),
+            &mut resolve,
+        )
+        .unwrap();
+        let page = load(&io, h);
+        let entry = crate::itl::read_itl(&page, 0).unwrap();
+        assert_eq!(entry.txn_id, t2, "他人条目原样保留");
+        assert_eq!(entry.state, crate::itl::ItlState::Active);
+
+        // 回归：**本事务**的条目照常还原（守卫不是放大化的空操作）。
+        rollback_record(
+            &io,
+            &rec(
+                UndoOp::ItlOverwrite,
+                UndoPayload::ItlOverwrite {
+                    txn_id: t2,
+                    itl_slot: 0,
+                    old: None,
+                },
+                1,
+            ),
+            &mut resolve,
+        )
+        .unwrap();
+        let page = load(&io, h);
+        assert_eq!(
+            crate::itl::read_itl(&page, 0).unwrap(),
+            crate::itl::ItlEntry::FREE
+        );
     }
 }
 
