@@ -18,6 +18,16 @@
 //! - **自旋是参数化权衡**：自旋过高在无 CAS 平台/高争用下烧 CPU（Note 433631.1）
 //!   ——默认 **40**（≈1 µs 量级的 try_lock 轮次），`with_spin(0)` 即纯睡眠；
 //!   先用统计量化，再调参数。
+//! - **退避形状照 PG**（《Oracle Latch 与 PostgreSQL LWLock 算法对照》§3.1：
+//!   `perform_spin_delay` 的"每段自旋次数指数增长"）：自旋预算按 1,2,4,8,… 分段，
+//!   **段间 `yield_now()`**——把大量短暂争用吸收在用户态，同时降低 N 个自旋者对
+//!   同一 cache line 的连续 RMW 频率。PG 的 **TAS_SPIN（只读轮询）**在 std
+//!   `Mutex` 上不可达（没有 unsafe 就观察不到状态字）——以"降频"近似它的一半意图。
+//! - **判读口径照 `V$LATCH`**（同文档 §2.7/§5.1）：**`misses()/gets` = 争用强度**
+//!   （首次探测失败占比；自旋够用的健康形态是"前者高、后者低"）；
+//!   **`sleeps/gets` = 是否真打进内核**。两个比率就是"要不要加深分片（O3）"的度量。
+//!   **`sleep_gets ≡ sleeps`**（本实现的睡眠只在**拿到**后才返回——std `Mutex`
+//!   不暴露伪唤醒），故不另设计数。
 //!
 //! # 与 `Mutex` 的关系
 //!
@@ -34,6 +44,9 @@ use std::time::Instant;
 /// 默认真自旋次数（见模块文档的权衡说明）。
 pub const DEFAULT_SPIN: u32 = 40;
 
+/// 单段自旋次数上限（PG `MAX_SPINS_PER_DELAY` 的同位物——段长指数增长到这里封顶）。
+pub const MAX_SPINS_PER_DELAY: u32 = 16;
+
 /// 闩锁统计快照（诊断口径：`V$LATCH` 的 gets/immediate/spin/sleeps）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatchStats {
@@ -49,6 +62,47 @@ pub struct LatchStats {
     pub sleeps: u64,
     /// 睡眠等待累计纳秒。
     pub wait_ns: u64,
+}
+
+impl LatchStats {
+    /// **`misses`**（`V$LATCH` 口径：willing-to-wait 的**首次探测失败**次数）。
+    ///
+    /// 本实现里 `try_lock` 不计数 ⇒ `misses ≡ gets − immediate`——显式化这个
+    /// 导出量，免得到处手算（判读见 [`LatchStats::contention`]）。
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.gets.saturating_sub(self.immediate)
+    }
+
+    /// **判读三比率**（文档《Oracle vs PG Latch/LWLock》§2.7/§5.1 的口径）：
+    /// `（争用强度 = misses/gets，内核路径占比 = sleeps/gets，自旋成功率 = spin_gets/misses）`。
+    /// "前者高、后者低" = 自旋够用（健康）；两者都高 = 临界区过长或闩锁过少
+    /// ⇒ 加深分片（O3）的信号。
+    #[must_use]
+    pub fn contention(&self) -> LatchContention {
+        let gets = self.gets.max(1);
+        let misses = self.misses();
+        LatchContention {
+            intensity: misses as f64 / gets as f64,
+            sleep_ratio: self.sleeps as f64 / gets as f64,
+            spin_success: if misses == 0 {
+                0.0
+            } else {
+                self.spin_gets as f64 / misses as f64
+            },
+        }
+    }
+}
+
+/// 闩锁争用的三个判读比率（见 [`LatchStats::contention`]）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LatchContention {
+    /// `misses / gets`：争用强度。
+    pub intensity: f64,
+    /// `sleeps / gets`：真打进内核的比例。
+    pub sleep_ratio: f64,
+    /// `spin_gets / misses`：自旋阶段的成功率。
+    pub spin_success: f64,
 }
 
 /// 具名闩锁（先自旋、后睡眠）。
@@ -100,11 +154,26 @@ impl<T> Latch<T> {
             self.immediate.fetch_add(1, Ordering::Relaxed);
             return LatchGuard { guard };
         }
-        for _ in 0..self.spin {
-            std::hint::spin_loop();
-            if let Ok(guard) = self.inner.try_lock() {
-                self.spin_gets.fetch_add(1, Ordering::Relaxed);
-                return LatchGuard { guard };
+        // **分段退避**（PG `perform_spin_delay` 形态）：段长 1,2,4,…,16 封顶，
+        // 段间 `yield_now()` 让出 CPU——短暂争用被吸收在用户态，且降低同一
+        // cache line 上的 RMW 频率（PG 用 TAS_SPIN 只读轮询达成，std Mutex
+        // 上不可达，以段间让出近似）。
+        let mut budget = self.spin;
+        let mut per_delay = 1u32;
+        while budget > 0 {
+            let mut n = per_delay.min(budget);
+            while n > 0 {
+                std::hint::spin_loop();
+                if let Ok(guard) = self.inner.try_lock() {
+                    self.spin_gets.fetch_add(1, Ordering::Relaxed);
+                    return LatchGuard { guard };
+                }
+                n -= 1;
+                budget -= 1;
+            }
+            per_delay = (per_delay * 2).min(MAX_SPINS_PER_DELAY);
+            if budget > 0 {
+                std::thread::yield_now();
             }
         }
         self.sleeps.fetch_add(1, Ordering::Relaxed);
@@ -232,5 +301,41 @@ mod tests {
         assert!(latch.try_lock().is_some());
         let s = latch.stats();
         assert_eq!((s.gets, s.immediate, s.spin_gets, s.sleeps), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn misses_and_contention_ratios_follow_vlatch() {
+        let latch = Latch::new("ratios", 0u32);
+        {
+            let _g = latch.lock(); // immediate
+        }
+        let s = latch.stats();
+        assert_eq!(s.misses(), 0, "无竞争 ⇒ 零 misses");
+        let c = s.contention();
+        assert_eq!(c.intensity, 0.0);
+        assert_eq!(c.sleep_ratio, 0.0);
+        assert_eq!(c.spin_success, 0.0);
+    }
+
+    #[test]
+    fn staged_backoff_still_finds_the_lock_within_the_spin_budget() {
+        // 退避是"形状"不是"语义"：预算内拿到就计 spin_gets，不睡眠。
+        let latch = Arc::new(Latch::new("staged", 0u32).with_spin(32));
+        let held = latch.lock();
+        let l2 = Arc::clone(&latch);
+        let t = std::thread::spawn(move || {
+            let mut g = l2.lock();
+            *g += 1;
+        });
+        // 自旋预算内释放：子线程应当走 spin_gets（不是 sleeps）。
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        drop(held);
+        t.join().unwrap();
+        let s = latch.stats();
+        assert_eq!(s.gets, 2);
+        assert_eq!(s.immediate, 1);
+        assert_eq!(s.spin_gets + s.sleeps, 1, "第二次走自旋或睡眠");
+        assert_eq!(s.misses(), 1, "第二次的首次探测失败");
+        assert!(s.contention().intensity > 0.0);
     }
 }
