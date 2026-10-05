@@ -221,10 +221,25 @@ pub fn grow(page: &mut Page, itl_max: u16) -> Result<u16, ItlError> {
         return Err(ItlError::NoSlotAvailable);
     }
     // 新固定头末尾 = 68 + (count+1−1)×24；其后还有槽位目录 2B×slot_count。
-    let new_fixed_end = crate::page::FIXED_HEADER_LEN + (usize::from(count)) * ITL_ENTRY_LEN;
+    let old_fixed_end = crate::page::FIXED_HEADER_LEN + (usize::from(count) - 1) * ITL_ENTRY_LEN;
+    let new_fixed_end = crate::page::FIXED_HEADER_LEN + usize::from(count) * ITL_ENTRY_LEN;
     let need = new_fixed_end + usize::from(header.slot_count) * SLOT_ENTRY_LEN;
     if need > usize::from(header.free_end) {
         return Err(ItlError::NotEnoughSpace);
+    }
+    // **槽位目录随固定头后移**（§5.4.1 第 2 条"页头向后推移"的完整含义）：
+    // 目录紧跟在固定头之后，不搬它，读者就会把行区字节当槽位读——行看起来
+    // "消失"。从后往前搬（向上地址复制，须防自覆盖）。
+    let slots = usize::from(header.slot_count);
+    {
+        let bytes = page.as_bytes_mut();
+        for i in (0..slots).rev() {
+            let src = old_fixed_end + i * SLOT_ENTRY_LEN;
+            let dst = new_fixed_end + i * SLOT_ENTRY_LEN;
+            let (lo, hi) = (bytes[src], bytes[src + 1]);
+            bytes[dst] = lo;
+            bytes[dst + 1] = hi;
+        }
     }
     header.itl_count = count + 1;
     page.write_header(&header);
@@ -439,5 +454,36 @@ mod tests {
         ItlEntry::FREE.encode(&mut out);
         assert_eq!(out, [0u8; ITL_ENTRY_LEN]);
         assert_eq!(ItlEntry::decode(&out).unwrap(), ItlEntry::FREE);
+    }
+
+    #[test]
+    fn grow_relocates_the_slot_directory() {
+        use crate::heap::{self, InsertPolicy};
+        use crate::page::{SlotStatus, WORKSPACE_REF_LEN};
+
+        let mut p = Page::new(
+            crate::page::PageType::HeapTable,
+            [0u8; WORKSPACE_REF_LEN],
+            3,
+            0,
+        );
+        let row = crate::row::assemble_row(0, 1, &[false], &[], &[b"alpha".as_slice()]);
+        let n1 = heap::insert_row(&mut p, &row, &InsertPolicy::in_place(0)).unwrap();
+        let n2 = heap::insert_row(&mut p, &row, &InsertPolicy::in_place(0)).unwrap();
+        assert_eq!((n1, n2), (1, 2));
+
+        let grown = grow(&mut p, 8).unwrap();
+        assert_eq!(grown, 1, "返回值 = 新槽号");
+        assert_eq!(itl_count(&p).unwrap(), 2);
+        // 行仍可读（槽位目录随固定头后移——不搬就会"消失"）。
+        assert_eq!(heap::row(&p, n1), Some(&row[..]));
+        assert_eq!(heap::row(&p, n2), Some(&row[..]));
+        assert_eq!(p.slot(0).unwrap().status(), SlotStatus::Normal);
+        // 新槽可写、空闲。
+        write_itl(&mut p, 1, &ItlEntry::FREE).unwrap();
+        assert_eq!(read_itl(&p, 1).unwrap(), ItlEntry::FREE);
+        // 再次增长后仍可读。
+        grow(&mut p, 8).unwrap();
+        assert_eq!(heap::row(&p, n2), Some(&row[..]));
     }
 }

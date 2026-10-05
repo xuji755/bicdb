@@ -1,11 +1,17 @@
-//! 恢复的**重做阶段**驱动（§11.2 第 2 步）：从检查点 LSN 起，按**日志流顺序**
-//! 扫描在线组、逐条应用（[`crate::apply`]）。
+//! 恢复驱动（§11.2 的**三阶段**）：[`redo_from`] 是重做阶段本身；
+//! [`recover`] 把分析 → 重做 → 撤销装成**一个入口**（工作区打开路径调用它）。
 //!
 //! ```text
-//! ① 分析：从最近检查点重建事务状态表与脏页表，确定重做起点
-//! ② 重做：从重做起点重放；按 page_lsn 判定已包含的修改并跳过（幂等）   ← 本模块
-//! ③ 撤销：回滚未提交事务
+//! ① 分析（analyze_from）：事务结局判定；起点 = 控制文件检查点 LSN（低水位）
+//! ② 重做（redo_from）：从起点重放；按 page_lsn 判定已包含的修改并跳过（幂等）
+//! ③ 撤销（repair_committed_slots + rollback_losers）：
+//!      事务表**前滚补标记**（胜者）→ 输家 = 槽扫描 ∪（日志侧由分析给出）
+//!      → 整链回滚（补偿生成 redo 并刷盘后才写页）
 //! ```
+//!
+//! **次序不可变**（§11.2）：先重做再撤销——撤销要读 undo 页与事务表，
+//! 而它们自己也要先被重做出来；且"补标记"必须在重做把事务表页恢复到
+//! 崩溃前状态**之后**做（否则会被重放覆盖）。
 //!
 //! # 流顺序从哪来
 //!
@@ -63,6 +69,14 @@ pub enum RecoveryError {
     Apply(ApplyError),
     /// 记录结构自洽但语义不完整（如提交记录缺 `commit_seq` 主段）。
     Malformed(&'static str),
+    /// 撤销阶段错误。
+    UndoPhase(crate::undo_phase::UndoPhaseError),
+    /// 事务表修复错误。
+    Undo(bicdb_storage::undo::UndoError),
+    /// 组发现错误。
+    Group(crate::group::GroupError),
+    /// undo 段访问错误。
+    Segment(bicdb_storage::segment::SegmentSpaceError),
 }
 
 impl std::fmt::Display for RecoveryError {
@@ -72,6 +86,10 @@ impl std::fmt::Display for RecoveryError {
             RecoveryError::File(e) => write!(f, "恢复扫描：{e}"),
             RecoveryError::Apply(e) => write!(f, "恢复应用：{e}"),
             RecoveryError::Malformed(s) => write!(f, "恢复：记录不完整——{s}"),
+            RecoveryError::UndoPhase(e) => write!(f, "{e}"),
+            RecoveryError::Undo(e) => write!(f, "恢复的事务表修复：{e}"),
+            RecoveryError::Group(e) => write!(f, "恢复的组发现：{e}"),
+            RecoveryError::Segment(e) => write!(f, "恢复的 undo 段访问：{e}"),
         }
     }
 }
@@ -93,6 +111,30 @@ impl From<LogFileError> for RecoveryError {
 impl From<ApplyError> for RecoveryError {
     fn from(e: ApplyError) -> Self {
         RecoveryError::Apply(e)
+    }
+}
+
+impl From<crate::undo_phase::UndoPhaseError> for RecoveryError {
+    fn from(e: crate::undo_phase::UndoPhaseError) -> Self {
+        RecoveryError::UndoPhase(e)
+    }
+}
+
+impl From<bicdb_storage::undo::UndoError> for RecoveryError {
+    fn from(e: bicdb_storage::undo::UndoError) -> Self {
+        RecoveryError::Undo(e)
+    }
+}
+
+impl From<crate::group::GroupError> for RecoveryError {
+    fn from(e: crate::group::GroupError) -> Self {
+        RecoveryError::Group(e)
+    }
+}
+
+impl From<bicdb_storage::segment::SegmentSpaceError> for RecoveryError {
+    fn from(e: bicdb_storage::segment::SegmentSpaceError) -> Self {
+        RecoveryError::Segment(e)
     }
 }
 
@@ -130,6 +172,91 @@ pub fn redo_from(
         }
     }
     Ok(report)
+}
+
+/// 三阶段恢复的执行报告。
+#[derive(Debug)]
+pub struct RecoveryReport {
+    /// 恢复起点（控制文件检查点 LSN = 低水位）。
+    pub start_lsn: Lsn,
+    /// ① 分析。
+    pub analysis: crate::analysis::AnalysisReport,
+    /// ② 重做。
+    pub redo: RedoReport,
+    /// ③ 日志里**已提交、参与前滚补标记**的事务数（幂等：已标记的槽不再改写）。
+    pub committed_txns: usize,
+    /// ③ 输家回滚。
+    pub undo: crate::undo_phase::UndoReport,
+    /// 恢复后的**续写位置**（补偿 redo 之后）。
+    pub log_end: Lsn,
+}
+
+/// **三阶段恢复**（§11.2）：工作区打开路径的入口。
+///
+/// ```text
+/// ① analyze_from       起点 = 控制文件检查点 LSN（低水位）
+/// ② redo_from          重放（幂等：page_lsn 判重）
+/// ③ repair_committed_slots + rollback_losers
+///      补标记（胜者）→ 输家整链回滚（补偿写 redo）
+/// ```
+///
+/// - `groups` 与 `writer` 来自同一日志目录：`groups` 只读扫描，`writer` 用于
+///   撤销阶段的补偿 redo 与恢复后的续写（调用方保证 `writer` 已 `open` 到
+///   日志末端）；
+/// - `chain` 是 undo 段的链视图（调用方已打开 undo 文件）；
+/// - `resolve` 覆盖**全部**涉及的块（数据页与 undo 段头页）。
+///
+/// **顺序不可换**：补标记在重做**之后**（否则被重放覆盖）；撤销在最后
+/// （它要读已重做出来的 undo 页与事务表）。重跑本函数是安全的（三个阶段的
+/// 幂等性各自成立）。
+pub fn recover(
+    io: &dyn FileIo,
+    groups: &[OnlineGroup],
+    start_lsn: Lsn,
+    chain: &bicdb_storage::undo::UndoChain<'_, '_>,
+    writer: &mut crate::group::GroupWriter<'_, '_>,
+    resolver: &mut BlockResolver<'_>,
+) -> Result<RecoveryReport, RecoveryError> {
+    // ① 分析（纯日志流判定）。
+    let analysis = crate::analysis::analyze_from(io, groups, start_lsn)?;
+
+    // ② 重做。
+    let redo = redo_from(io, groups, start_lsn, resolver)?;
+
+    // ③ 事务表修复：胜者补标记 + 输家槽扫描（**在重做之后**——事务表页已被
+    //    重放到崩溃前状态；补标记本身是从日志可重导的幂等动作，不需 redo）。
+    let committed: Vec<(bicdb_storage::undo::TxnId, bicdb_common::seq::CommitSeq)> = analysis
+        .committed()
+        .into_iter()
+        .map(|(raw, seq)| {
+            let mut b = [0u8; 6];
+            b.copy_from_slice(&raw.to_le_bytes()[..6]);
+            (
+                bicdb_storage::undo::TxnId::from_bytes(&b),
+                bicdb_common::seq::CommitSeq::from_raw(seq).expect("48 位域内"),
+            )
+        })
+        .collect();
+    let mut header = chain.segment().read_page(0)?;
+    let before = *header.as_bytes();
+    let losers = bicdb_storage::undo::repair_committed_slots(&mut header, &committed)?;
+    if *header.as_bytes() != before {
+        // 补标记只是**从日志可重导**的幂等动作（重跑恢复会重算），
+        // 因此不需要为它生成 redo；页内容变了才落盘。
+        chain.segment().write_page(0, &mut header)?;
+    }
+
+    // ③ 撤销：输家整链回滚（补偿生成 redo 并刷盘后才写页）。
+    let undo = crate::undo_phase::rollback_losers(io, writer, chain, &losers, resolver)?;
+
+    Ok(RecoveryReport {
+        start_lsn,
+        analysis,
+        redo,
+        committed_txns: committed.len(),
+        undo,
+        log_end: writer.appended_lsn(),
+    })
 }
 
 #[cfg(test)]
@@ -330,5 +457,239 @@ mod tests {
         assert_eq!(again.skipped_blocks, first.applied_blocks);
         let after = pagefile::read_page_verified(&io, h1, 0).unwrap();
         assert_eq!(before.as_bytes(), after.as_bytes(), "页逐字节不变");
+    }
+}
+
+/// **三阶段恢复的端到端用例**：崩溃现场 = 数据页停在旧版本、日志里
+/// 有胜者与输家的页修改、undo 段里有两条链。
+#[cfg(test)]
+mod recover_tests {
+    use std::path::Path;
+
+    use bicdb_common::seq::{CommitSeq, Lsn};
+    use bicdb_storage::controlfile::{ArchiveRecord, ControlFile, RedoEntries, WorkspaceEntry};
+    use bicdb_storage::cr;
+    use bicdb_storage::datafile::DataFile;
+    use bicdb_storage::heap::{self, InsertPolicy};
+    use bicdb_storage::itl::{self, ItlEntry, ItlState};
+    use bicdb_storage::page::{Page, PageType};
+    use bicdb_storage::pagefile;
+    use bicdb_storage::row::assemble_row;
+    use bicdb_storage::rowid::RowId;
+    use bicdb_storage::undo::{
+        create_undo_segment, read_slot, TxnId, TxnState, UndoChain, UndoOp, UndoPayload,
+    };
+    use bicdb_workspace::id::WorkspaceId;
+    use bicdb_workspace::io::MemFileIo;
+
+    use super::*;
+    use crate::group::{online_groups, GroupSpec, GroupWriter};
+    use crate::record::{page_diff, BlockRef, Change, Rdba, RedoRecord};
+
+    const UNDO_F: &str = "/mem/undo1.dat";
+    const DATA_F: &str = "/mem/data.dat";
+    const A: &str = "/mem/control01.ctl";
+    const B: &str = "/mem/control02.ctl";
+    const WAL: &str = "/mem/wal";
+    const WS: [u8; 8] = [4u8; 8];
+
+    fn lsn(v: u64) -> Lsn {
+        Lsn::from_raw(v).unwrap()
+    }
+
+    fn rdba(file_id: u16, block: u32) -> Rdba {
+        Rdba::from_parts(file_id, block).unwrap()
+    }
+
+    fn ws_entry() -> WorkspaceEntry {
+        WorkspaceEntry {
+            workspace_id: WorkspaceId::from_raw(1).unwrap(),
+            created_at: 0,
+            derived_from: None,
+            derived_at_seq: CommitSeq::from_raw(0).unwrap(),
+        }
+    }
+
+    fn mem() -> MemFileIo {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        io.add_dir(WAL);
+        io
+    }
+
+    /// 一页的每个变更集（before → after 的差异）——真实的写路径也就这么生成。
+    fn changes(before: &Page, after: &Page) -> Vec<Change> {
+        page_diff(before.as_bytes(), after.as_bytes())
+    }
+
+    #[test]
+    fn recovers_winner_and_rolls_back_loser_end_to_end() {
+        let io = mem();
+        let spec = GroupSpec::new(2, 1, 64).unwrap();
+
+        // ---- 夹具：undo 段（两个事务）+ 数据文件（块 0，初始为空页） ----
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let loser_slot = chain.allocate_slot().unwrap();
+        let winner_slot = chain.allocate_slot().unwrap();
+        let loser_raw = TxnId::from_parts(0, loser_slot as u8, 0).as_raw();
+        let winner_raw = TxnId::from_parts(0, winner_slot as u8, 0).as_raw();
+
+        let data = pagefile::create(&io, Path::new(DATA_F), 1).unwrap();
+        let before = Page::new(PageType::HeapTable, WS, 3, 0);
+        pagefile::write_page(&io, data, 0, &mut before.clone()).unwrap();
+
+        // 输家：插入一行（ITL[0] = 活动，链上 = 占用 + 插入）。
+        let loser_bytes = assemble_row(0, 1, &[false], &[], &[b"loser".as_slice()]);
+        let mut after1 = before.clone();
+        let loser_row =
+            heap::insert_row(&mut after1, &loser_bytes, &InsertPolicy::in_place(0)).unwrap();
+        let loser_rid = RowId::from_parts(3, 0, loser_row).unwrap();
+        chain
+            .append(
+                loser_slot,
+                UndoOp::ItlOverwrite,
+                0,
+                RowId::from_parts(3, 0, 1).unwrap(),
+                UndoPayload::ItlOverwrite {
+                    itl_slot: 0,
+                    old: None,
+                },
+            )
+            .unwrap();
+        let loser_head = chain
+            .append(loser_slot, UndoOp::Insert, 0, loser_rid, UndoPayload::None)
+            .unwrap();
+        itl::write_itl(
+            &mut after1,
+            0,
+            &ItlEntry {
+                txn_id: TxnId::from_parts(0, loser_slot as u8, 0),
+                undo_ptr: Some(loser_head),
+                commit_seq: None,
+                lock_cnt: 1,
+                state: ItlState::Active,
+            },
+        )
+        .unwrap();
+
+        // 胜者：插入一行并提交（ITL[1] 留"活动"外观——延迟块清除）。
+        let winner_bytes = assemble_row(0, 2, &[false], &[], &[b"winner".as_slice()]);
+        let mut after2 = after1.clone();
+        let winner_row =
+            heap::insert_row(&mut after2, &winner_bytes, &InsertPolicy::in_place(0)).unwrap();
+        itl::grow(&mut after2, 8).unwrap(); // ITL 动态扩展：槽 1 就位
+        itl::write_itl(
+            &mut after2,
+            1,
+            &ItlEntry {
+                txn_id: TxnId::from_parts(0, winner_slot as u8, 0),
+                undo_ptr: None,
+                commit_seq: None,
+                lock_cnt: 1,
+                state: ItlState::Active,
+            },
+        )
+        .unwrap();
+
+        // ---- 日志：两条页修改（含页头字段与 ITL 的差异）+ 胜者的提交 ----
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut writer = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec, lsn(0)).unwrap();
+        writer
+            .append(|l| {
+                RedoRecord::page_modification(
+                    l,
+                    loser_raw,
+                    vec![BlockRef {
+                        flags: 0,
+                        rdba: rdba(3, 0),
+                        changes: changes(&before, &after1),
+                    }],
+                )
+            })
+            .unwrap();
+        writer
+            .append(|l| {
+                RedoRecord::page_modification(
+                    l,
+                    winner_raw,
+                    vec![BlockRef {
+                        flags: 0,
+                        rdba: rdba(3, 0),
+                        changes: changes(&after1, &after2),
+                    }],
+                )
+            })
+            .unwrap();
+        writer
+            .append(|l| RedoRecord::commit(l, winner_raw, 7))
+            .unwrap();
+        writer.flush(writer.appended_lsn()).unwrap();
+
+        // ---- 恢复 ----
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let groups = online_groups(&io, &cf_ro, Path::new(WAL), spec).unwrap();
+        let mut resolve = |r: Rdba| match r.file_id() {
+            1 => Some((undo_handle, r.block_id())),
+            3 => Some((data, r.block_id())),
+            _ => None,
+        };
+        let report = recover(&io, &groups, lsn(0), &chain, &mut writer, &mut resolve).unwrap();
+
+        // ① 分析：胜者带序号、输家 = 全零 txn（第一个事务）。
+        assert_eq!(report.analysis.committed(), vec![(winner_raw, 7)]);
+        assert_eq!(report.analysis.losers(), vec![loser_raw]);
+        assert_eq!(report.committed_txns, 1);
+        // ② 重做：4 条记录（组激活的切换 + 两条页修改 + 提交），
+        //    其中 2 个块真正落盘（两条页修改；含输家的——顺序不可颠倒）。
+        assert_eq!(report.redo.records_applied, 4);
+        assert_eq!(report.redo.applied_blocks, 2);
+        // ③ 撤销：只回滚输家。
+        assert_eq!(report.undo.txns_rolled_back, 1);
+
+        // ---- 结果 ----
+        let page = pagefile::read_page_verified(&io, data, 0).unwrap();
+        assert_eq!(heap::row(&page, loser_row), None, "输家的行已回滚");
+        assert_eq!(
+            heap::row(&page, winner_row),
+            Some(&winner_bytes[..]),
+            "胜者的行保留"
+        );
+        assert_eq!(
+            itl::read_itl(&page, 0).unwrap().state,
+            ItlState::Free,
+            "ITL 还原"
+        );
+        // 胜者：槽已前滚补标记（提交序号准确）；ITL 条目仍"活动"外观。
+        let hdr = chain.segment().read_page(0).unwrap();
+        let w = read_slot(&hdr, winner_slot).unwrap();
+        assert_eq!(w.state, TxnState::Committed);
+        assert_eq!(w.commit_seq, CommitSeq::from_raw(7).unwrap());
+        let l = read_slot(&hdr, loser_slot).unwrap();
+        assert_eq!(l.state, TxnState::Free, "输家槽已释放");
+        assert_eq!(l.wrap, 1);
+
+        // 快照 ≥ 7 的一致性读：胜者的行可见（ITL 活动 + 事务表补标记救回来）。
+        let snapshot = CommitSeq::from_raw(8).unwrap();
+        let cr_page = cr::reconstruct(&page, snapshot, &chain).unwrap();
+        assert_eq!(heap::row(&cr_page, winner_row), Some(&winner_bytes[..]));
+
+        // ---- 重跑恢复：幂等（无输家、重做全跳过） ----
+        let groups2 = online_groups(&io, &cf_ro, Path::new(WAL), spec).unwrap();
+        let again = recover(&io, &groups2, lsn(0), &chain, &mut writer, &mut resolve).unwrap();
+        assert_eq!(again.undo.txns_rolled_back, 0, "已回滚的不再回滚");
+        assert_eq!(again.redo.applied_blocks, 0, "重做全跳过");
+        let page2 = pagefile::read_page_verified(&io, data, 0).unwrap();
+        assert_eq!(page2.as_bytes(), page.as_bytes(), "页逐字节不变");
     }
 }
