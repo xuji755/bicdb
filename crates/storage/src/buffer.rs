@@ -148,7 +148,10 @@ pub trait WalGuard: Send {
     /// 当前**已持久化**的 LSN 水位。
     fn durable_lsn(&self) -> Lsn;
     /// 把 redo 持久化到 `target`；**失败即错误**——页不得写出。
-    fn ensure_durable(&mut self, target: Lsn) -> std::io::Result<()>;
+    ///
+    /// `&self`（而非 `&mut self`）：池把它放在 `redo_write` 闩锁里，**WAL 自己
+    /// 是线程安全的**——同一个口可交给后台 DBWR 线程用（P4 线程化）。
+    fn ensure_durable(&self, target: Lsn) -> std::io::Result<()>;
 }
 
 /// 缓冲池错误。
@@ -222,6 +225,15 @@ impl std::fmt::Display for BufferError {
 }
 
 impl std::error::Error for BufferError {}
+
+impl<T: WalGuard + Sync + ?Sized> WalGuard for std::sync::Arc<T> {
+    fn durable_lsn(&self) -> Lsn {
+        (**self).durable_lsn()
+    }
+    fn ensure_durable(&self, target: Lsn) -> std::io::Result<()> {
+        (**self).ensure_durable(target)
+    }
+}
 
 impl From<std::io::Error> for BufferError {
     fn from(e: std::io::Error) -> Self {
@@ -484,6 +496,12 @@ impl<'io> BufferPool<'io> {
             .write_list
             .get(&workspace)
             .map_or(0, BTreeSet::len)
+    }
+
+    /// **有脏页的工作区**（DBWR 后台线程的入口：按此逐个 `flush_workspace`）。
+    #[must_use]
+    pub fn dirty_workspaces(&self) -> Vec<[u8; 8]> {
+        self.lock().write_list.keys().copied().collect()
     }
 
     /// **低水位**：该工作区最老脏块的（首次变脏 LSN）；`None` = 无脏页。
@@ -834,7 +852,7 @@ impl<'io> BufferPool<'io> {
     fn perform_write(&self, job: &WriteJob) -> Result<bool, BufferError> {
         let mut wal_synced = false;
         {
-            let mut wal = self.wal.lock();
+            let wal = self.wal.lock();
             if job.page_lsn > wal.durable_lsn() {
                 wal.ensure_durable(job.page_lsn)
                     .map_err(BufferError::WalFlush)?;
@@ -1415,16 +1433,16 @@ mod tests {
 
     /// 假 WAL 协调口。
     struct FakeWal {
-        durable: Lsn,
+        durable: std::sync::atomic::AtomicU64,
         fail: bool,
         log: Arc<Mutex<Vec<String>>>,
     }
 
     impl WalGuard for FakeWal {
         fn durable_lsn(&self) -> Lsn {
-            self.durable
+            Lsn::from_raw(self.durable.load(std::sync::atomic::Ordering::SeqCst)).unwrap()
         }
-        fn ensure_durable(&mut self, target: Lsn) -> std::io::Result<()> {
+        fn ensure_durable(&self, target: Lsn) -> std::io::Result<()> {
             if self.fail {
                 return Err(std::io::Error::other("假刷盘失败"));
             }
@@ -1432,9 +1450,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("wal:ensure:{}", target.as_raw()));
-            if target > self.durable {
-                self.durable = target;
-            }
+            self.durable
+                .fetch_max(target.as_raw(), std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1505,7 +1522,7 @@ mod tests {
         }
         fn fake_wal(&self) -> FakeWal {
             FakeWal {
-                durable: lsn(0),
+                durable: std::sync::atomic::AtomicU64::new(0),
                 fail: false,
                 log: Arc::clone(&self.log),
             }
@@ -2065,7 +2082,7 @@ mod tests {
                     }
                 },
                 FakeWal {
-                    durable: lsn(0),
+                    durable: std::sync::atomic::AtomicU64::new(0),
                     fail: false,
                     log: Arc::new(Mutex::new(Vec::new())),
                 },
@@ -2120,7 +2137,7 @@ mod tests {
                     }
                 },
                 FakeWal {
-                    durable: lsn(0),
+                    durable: std::sync::atomic::AtomicU64::new(0),
                     fail: false,
                     log: Arc::new(Mutex::new(Vec::new())),
                 },

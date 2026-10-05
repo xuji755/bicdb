@@ -39,12 +39,18 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use bicdb_common::latch::{Latch, LatchGuard};
 use bicdb_common::seq::{CommitSeq, Lsn};
 use bicdb_storage::controlfile::{
     ArchiveMode, CheckpointProgress, ControlFile, ControlFileError, LogArchiveState, LogRunState,
     RedoEntries, RedoGroup, MAX_REDO_GROUPS, NO_CURRENT_GROUP,
 };
 use bicdb_workspace::io::{FileHandle, FileIo, OpenOptions};
+
+use bicdb_storage::buffer::WalGuard;
 
 use crate::buffer::{LogBuffer, LogSink, WalError};
 use crate::file::{scan_log, FileLogSink, LogFileError};
@@ -251,26 +257,210 @@ impl From<LogFileError> for GroupError {
     }
 }
 
-/// 日志组写者。
-pub struct GroupWriter<'io, 'cf> {
+/// **可共享的 WAL 刷盘核心**（§11.7 的 LGWR 角色；P4 线程化）。
+///
+/// 与 [`GroupWriter`] 的分工：**控制文件的发布（组切换、检查点降级、采样）
+/// 仍是单写者**（`cf: &mut ControlFile`），留在 `GroupWriter`；而
+/// **追加与刷盘**只需要"缓冲区 + 组文件 + 写盘账"——那三样在这里，经 `Arc`
+/// 共享：
+///
+/// - 前台提交：`flush_to(目标 LSN)`（组提交：`synced_lsn ≥ target` 即返回）；
+/// - 后台 DBWR 的 WAL 规则 2：同一个口（`impl WalGuard`）——池把 `Arc` 克隆
+///   交给后台线程，于是"页写前 redo 必须耐久"在**任意线程**都能成立；
+/// - 周期 LGWR（3 秒兜底）：同口。
+///
+/// 同步由内部两把闩锁完成：`buffer` 自己的 `redo_buffer`/`redo_io`，
+/// 以及这里的 `state`（文件侧写盘账：当前组、每组成员已刷页数、组尾 LSN、
+/// 成员健康位）——**刷盘可来自任意线程，切换/发布仍由持有控制文件的一方做**。
+pub struct WalShared<'io> {
     io: &'io dyn FileIo,
-    cf: &'cf mut ControlFile<'io>,
     spec: GroupSpec,
-    dir: PathBuf,
-    /// `files[组][成员]`。
+    /// `files[组][成员]`（建立后不变）。
     files: Vec<Vec<FileHandle>>,
-    /// 控制文件 Redo 条目的**内存镜像**（单写者；每次发布后更新）。
-    entries: RedoEntries,
-    archive_mode: ArchiveMode,
     buffer: LogBuffer,
+    /// 文件侧写盘账（闩锁："redo_write" 的宿主）。
+    state: Latch<WalState>,
+    /// 当前组的起始 LSN（原子量：刷盘快路径与追加预检都要读）。
+    current_start: AtomicU64,
+}
+
+/// 文件侧写盘账（[`WalShared`] 的可变部分）。
+#[derive(Debug)]
+pub struct WalState {
     /// 当前组（0 起）。
     current: u8,
-    /// 当前组的起始 LSN（= 其首张页的位置）。
-    current_start: Lsn,
     /// 每组成员已刷出的页数（单成员先行）。
     written_pages: Vec<u64>,
     /// 各组的结尾 LSN（最后一张已写页的终点；未用过的组为 `None`）。
     group_ends: [Option<Lsn>; MAX_REDO_GROUPS],
+    /// 每组的成员 `STALE` 位（与控制文件里的 Redo 条目同步——由持有控制文件
+    /// 的一方在发布时回写；后台刷盘标脏后由下一次前台发布带上）。
+    member_stale: [u8; MAX_REDO_GROUPS],
+}
+
+/// 一次刷盘的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushOutcome {
+    /// 已持久化的位置。
+    pub synced: Lsn,
+    /// 本次刷盘是否**新标了成员 `STALE`**（调用方持有控制文件时需发布）。
+    pub stale_changed: bool,
+}
+
+impl std::fmt::Debug for WalShared<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalShared")
+            .field("current", &self.state.lock().current)
+            .field("appended_lsn", &self.buffer.appended_lsn())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'io> WalShared<'io> {
+    /// 追加位置（下一字节 LSN）。
+    #[must_use]
+    pub fn appended_lsn(&self) -> Lsn {
+        self.buffer.appended_lsn()
+    }
+
+    /// 已持久化位置。
+    #[must_use]
+    pub fn synced_lsn(&self) -> Lsn {
+        self.buffer.synced_lsn()
+    }
+
+    /// 当前组的起始 LSN。
+    #[must_use]
+    pub fn current_start(&self) -> Lsn {
+        Lsn::from_raw(self.current_start.load(Ordering::SeqCst)).expect("48 位域内")
+    }
+
+    /// 当前组的容量边界（= 起始 + 组字节数；**判满用**）。
+    #[must_use]
+    pub fn group_end(&self) -> Lsn {
+        lsn_add(self.current_start(), self.spec().group_bytes()).expect("48 位域内")
+    }
+
+    /// 某组的结尾 LSN（诊断/检查点降级用）。
+    #[must_use]
+    pub fn group_end_lsn(&self, group: u8) -> Option<Lsn> {
+        self.state.lock().group_ends[usize::from(group)]
+    }
+
+    /// 当前组号。
+    #[must_use]
+    pub fn current(&self) -> u8 {
+        self.state.lock().current
+    }
+
+    /// 规格。
+    #[must_use]
+    pub fn spec(&self) -> GroupSpec {
+        self.spec
+    }
+
+    /// 写盘账的闩锁（组切换/发布路径用；**不跨 I/O 持有**）。
+    #[must_use]
+    pub fn state(&self) -> LatchGuard<'_, WalState> {
+        self.state.lock()
+    }
+
+    /// **刷盘到 `target`**（组提交语义：已覆盖即直接返回；失败 ⇒ `synced_lsn`
+    /// 不前进）。**这是 LGWR 的全部工作**——可从任意线程调用。
+    pub fn flush_to(&self, target: Lsn) -> Result<FlushOutcome, GroupError> {
+        if self.buffer.synced_lsn() >= target {
+            return Ok(FlushOutcome {
+                synced: self.buffer.synced_lsn(),
+                stale_changed: false,
+            });
+        }
+        let mut st = self.state.lock();
+        let g = usize::from(st.current);
+        let pages = st.written_pages[g];
+        // **只写健康成员**：已置 `STALE` 的成员在重建前不再接收写入——否则
+        // 落后成员会写出空洞、被位置校验拒绝，进而把健康成员也拖垮。
+        let stale = st.member_stale[g];
+        let start = self.current_start();
+        let group_pages = self.spec().group_pages as u64;
+        let member_count = usize::from(self.spec().member_count);
+        let active: Vec<usize> = (0..member_count)
+            .filter(|m| stale & (1 << m) == 0)
+            .collect();
+        if active.is_empty() {
+            return Err(GroupError::Damaged {
+                group: st.current,
+                reason: "全部成员已置 STALE——先重建成员镜像",
+            });
+        }
+        let mut tee = TeeSink {
+            sinks: active
+                .iter()
+                .map(|&m| FileLogSink::resume(self.io, self.files[g][m], start, group_pages, pages))
+                .collect(),
+            failed: vec![false; active.len()],
+        };
+        let synced = self.buffer.flush_to(target, &mut tee)?;
+        // 组已写页数 = **未失败成员**的最大值（成员 0 一次瞬时失败会把统一基准
+        // 拖回落后值 ⇒ WAL 永久写不出去——实测复现，P3 审核修复）。
+        st.written_pages[g] = tee
+            .sinks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !tee.failed[*i])
+            .map(|(_, s)| s.written_pages())
+            .max()
+            .unwrap_or(pages);
+        st.group_ends[g] = Some(lsn_add(start, st.written_pages[g] * LOG_PAGE_SIZE as u64)?);
+        // 成员失败 ⇒ 标 STALE（记在共享账里；持有控制文件的一方随后发布）。
+        let mut changed = false;
+        for (i, bad) in tee.failed.iter().enumerate() {
+            if *bad {
+                st.member_stale[g] |= 1 << active[i];
+                changed = true;
+            }
+        }
+        Ok(FlushOutcome {
+            synced,
+            stale_changed: changed,
+        })
+    }
+}
+
+/// **WAL 规则 2 的共享口**（§5.10/§11.7）：池把 `Arc<WalShared>` 当
+/// `WalGuard` 用——**后台线程也能"页写前先把 redo 刷到 page_lsn"**。
+impl WalGuard for WalShared<'_> {
+    fn durable_lsn(&self) -> Lsn {
+        self.buffer.synced_lsn()
+    }
+
+    fn ensure_durable(&self, target: Lsn) -> std::io::Result<()> {
+        self.flush_to(target)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // **到没到位的核对**：`flush_to` 只保证"把已有的写出去"——若 `target`
+        // 超过追加位（页的 `page_lsn` 不该超过它，除非调用方用错了），
+        // 这里必须**报错而不是放行**：页的 WAL 规则 2 靠这条兜底。
+        let synced = self.buffer.synced_lsn();
+        if synced < target {
+            return Err(std::io::Error::other(format!(
+                "WAL 未持久化到目标：synced={} target={}（追加位 {}）",
+                synced.as_raw(),
+                target.as_raw(),
+                self.buffer.appended_lsn().as_raw()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// 日志组写者。
+pub struct GroupWriter<'io, 'cf> {
+    cf: &'cf mut ControlFile<'io>,
+    dir: PathBuf,
+    /// 控制文件 Redo 条目的**内存镜像**（单写者；每次发布后更新）。
+    entries: RedoEntries,
+    archive_mode: ArchiveMode,
+    /// **可共享的刷盘核心**（追加/刷盘/文件账都在里面；见 [`WalShared`]）。
+    wal: Arc<WalShared<'io>>,
     /// 本组自激活以来追加的记录数（0 ⇒ 强制切换无需刷盘）。
     records_in_group: u64,
     /// **最近一次提交记录**的提交序号（切换点采样的"当前提交序号"来源——
@@ -293,10 +483,10 @@ fn system_clock_ms() -> u64 {
 impl std::fmt::Debug for GroupWriter<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupWriter")
-            .field("spec", &self.spec)
-            .field("current", &self.current)
-            .field("current_start", &self.current_start)
-            .field("appended_lsn", &self.buffer.appended_lsn())
+            .field("spec", &self.wal.spec())
+            .field("current", &self.wal.current())
+            .field("current_start", &self.wal.current_start())
+            .field("appended_lsn", &self.wal.appended_lsn())
             .finish_non_exhaustive()
     }
 }
@@ -336,19 +526,29 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             files.push(members);
         }
         let archive_mode = cf.archive_record()?.mode;
-        let mut writer = Self {
+        let member_stale = core::array::from_fn(|g| entries.groups[g].member_stale);
+        let wal = Arc::new(WalShared {
             io,
-            cf,
             spec,
-            dir: dir.to_path_buf(),
             files,
+            buffer: LogBuffer::new(start_lsn),
+            state: Latch::new(
+                "redo_write",
+                WalState {
+                    current: 0,
+                    written_pages: vec![0; spec.group_count as usize],
+                    group_ends: [None; MAX_REDO_GROUPS],
+                    member_stale,
+                },
+            ),
+            current_start: AtomicU64::new(start_lsn.as_raw()),
+        });
+        let mut writer = Self {
+            cf,
+            dir: dir.to_path_buf(),
             entries,
             archive_mode,
-            buffer: LogBuffer::new(start_lsn),
-            current: 0,
-            current_start: start_lsn,
-            written_pages: vec![0; spec.group_count as usize],
-            group_ends: [None; MAX_REDO_GROUPS],
+            wal,
             records_in_group: 0,
             last_commit_seq: None,
             clock_ms: system_clock_ms,
@@ -426,19 +626,29 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             reason: "当前组无内容（切换记录缺失）",
         })?;
 
-        Ok(Self {
+        let member_stale = core::array::from_fn(|g| entries.groups[g].member_stale);
+        let wal = Arc::new(WalShared {
             io,
-            cf,
             spec,
-            dir: dir.to_path_buf(),
             files,
+            buffer: LogBuffer::new(resume),
+            state: Latch::new(
+                "redo_write",
+                WalState {
+                    current,
+                    written_pages,
+                    group_ends,
+                    member_stale,
+                },
+            ),
+            current_start: AtomicU64::new(current_start.as_raw()),
+        });
+        Ok(Self {
+            cf,
+            dir: dir.to_path_buf(),
             entries,
             archive_mode,
-            buffer: LogBuffer::new(resume),
-            current,
-            current_start,
-            written_pages,
-            group_ends,
+            wal,
             records_in_group: 0,
             last_commit_seq: None,
             clock_ms: system_clock_ms,
@@ -453,15 +663,17 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// 在切换路径上会被调用**两次**，必须是**纯构造**（无副作用）。
     pub fn append(&mut self, build: impl Fn(Lsn) -> RedoRecord) -> Result<Lsn, GroupError> {
         // **1/3 触发**（§11.5.5）：占用达阈值先刷盘——单次刷盘体量有界。
-        if self.buffer.flush_recommended() {
-            self.flush(self.buffer.appended_lsn())?;
+        if self.wal.buffer.flush_recommended() {
+            let at = self.wal.appended_lsn();
+            self.flush(at)?;
         }
         let mut attempt = 0u32;
         loop {
             match self.try_append(&build) {
                 // **满则刷 + 重试**（单写者的空间等待形态）。
                 Err(GroupError::Buffer(WalError::BufferFull { .. })) if attempt < 2 => {
-                    self.flush(self.buffer.appended_lsn())?;
+                    let at = self.wal.appended_lsn();
+                    self.flush(at)?;
                     attempt += 1;
                 }
                 other => return other,
@@ -472,13 +684,15 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// 追加的实际路径（容量不足时返回 [`WalError::BufferFull`]，由
     /// [`GroupWriter::append`] 刷盘后重试）。
     fn try_append(&mut self, build: &impl Fn(Lsn) -> RedoRecord) -> Result<Lsn, GroupError> {
-        let probe = self.buffer.appended_lsn();
+        let probe = self.wal.appended_lsn();
         let record = build(probe);
-        let record = if self.buffer.end_lsn_if_appended(record.encoded_len()) > self.group_end() {
+        let record = if self.wal.buffer.end_lsn_if_appended(record.encoded_len())
+            > self.wal.group_end()
+        {
             self.switch_group()?;
-            let lsn = self.buffer.appended_lsn();
+            let lsn = self.wal.appended_lsn();
             let rebuilt = build(lsn);
-            if self.buffer.end_lsn_if_appended(rebuilt.encoded_len()) > self.group_end() {
+            if self.wal.buffer.end_lsn_if_appended(rebuilt.encoded_len()) > self.wal.group_end() {
                 return Err(GroupError::RecordTooLarge {
                     encoded_len: rebuilt.encoded_len(),
                 });
@@ -492,7 +706,7 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         // 提交记录的序号顺手记下（**落盘成功才生效**）——切换点采样用它。
         let commit_seq = record.commit_seq();
         let mut reuse = Some(record);
-        let lsn = self.buffer.append(|lsn| match reuse.take() {
+        let lsn = self.wal.buffer.append(|lsn| match reuse.take() {
             Some(r) if r.lsn == lsn => r,
             _ => build(lsn),
         })?;
@@ -507,65 +721,26 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
 
     /// **刷盘到 `target`**（组提交语义由 [`LogBuffer`] 承担）：把当前组的
     /// 未刷页写入其成员文件并 sync；失败时页被放回（重试可继续）。
+    /// **刷盘到 `target`**（组提交语义；LGWR 的全部工作——实现见
+    /// [`WalShared::flush_to`]，这里只做"标脏后发布控制文件"的收尾）。
     pub fn flush(&mut self, target: Lsn) -> Result<Lsn, GroupError> {
-        let g = self.current as usize;
-        let pages = self.written_pages[g];
-        // **只写健康成员**：已置 `STALE` 的成员在重建前不再接收写入——否则
-        // 落后成员会写出空洞、被位置校验拒绝，进而把健康成员也拖垮。
-        let stale = self.entries.groups[g].member_stale;
-        let active: Vec<usize> = (0..usize::from(self.spec.member_count))
-            .filter(|m| stale & (1 << m) == 0)
-            .collect();
-        if active.is_empty() {
-            return Err(GroupError::Damaged {
-                group: self.current,
-                reason: "全部成员已置 STALE——先重建成员镜像",
-            });
-        }
-        let mut tee = TeeSink {
-            sinks: active
-                .iter()
-                .map(|&m| {
-                    FileLogSink::resume(
-                        self.io,
-                        self.files[g][m],
-                        self.current_start,
-                        self.spec.group_pages as u64,
-                        pages,
-                    )
-                })
-                .collect(),
-            failed: vec![false; active.len()],
-        };
-        let synced = self.buffer.flush_to(target, &mut tee)?;
-        // 组已写页数 = **未失败成员**的最大值。取成员 0 的计数会让"成员 0
-        // 一次瞬时写失败"把所有人的续写基准拖回落后值（下一次 flush 位置
-        // 不符 ⇒ WAL 永久写不出去——实测复现）。
-        self.written_pages[g] = tee
-            .sinks
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !tee.failed[*i])
-            .map(|(_, s)| s.written_pages())
-            .max()
-            .unwrap_or(pages);
-        self.group_ends[g] = Some(lsn_add(
-            self.current_start,
-            self.written_pages[g] * LOG_PAGE_SIZE as u64,
-        )?);
-
-        // **成员失败 ⇒ 标 STALE**（降级为其余成员继续；发布进控制文件）。
-        let mut changed = false;
-        for (i, bad) in tee.failed.iter().enumerate() {
-            if *bad {
-                self.entries.groups[g].member_stale |= 1 << active[i];
-                changed = true;
+        let out = self.wal.flush_to(target)?;
+        if out.stale_changed {
+            // 成员降级要发布进控制文件（下一次 open/诊断看得到）。
+            let st = self.wal.state();
+            for (g, entry) in self.entries.groups.iter_mut().enumerate() {
+                entry.member_stale = st.member_stale[g];
             }
-        }
-        if changed {
+            drop(st);
             self.cf.write_redo_entries(&self.entries)?;
         }
-        Ok(synced)
+        Ok(out.synced)
+    }
+
+    /// **可共享的刷盘核心**（交给池当 `WalGuard`、交给后台 DBWR/LGWR 线程）。
+    #[must_use]
+    pub fn shared(&self) -> Arc<WalShared<'io>> {
+        Arc::clone(&self.wal)
     }
 
     /// **重建成员镜像**（§11.9 的 `STALE` 恢复）：从健康成员复制已用前缀，
@@ -573,30 +748,37 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     pub fn rebuild_member(&mut self, group: u8, member: u8) -> Result<(), GroupError> {
         let g = usize::from(group);
         let m = usize::from(member);
-        if g >= self.spec.group_count as usize || m >= self.spec.member_count as usize {
+        if g >= self.wal.spec().group_count as usize || m >= self.wal.spec().member_count as usize {
             return Err(GroupError::Spec("组号/成员号越界"));
         }
         if self.entries.groups[g].member_stale & (1 << m) == 0 {
             return Ok(()); // 没坏，不用重建
         }
-        let source = (0..self.spec.member_count as usize)
+        let source = (0..self.wal.spec().member_count as usize)
             .find(|&k| k != m && self.entries.groups[g].member_stale & (1 << k) == 0)
             .ok_or(GroupError::Spec("没有健康成员可作重建源"))?;
-        let bytes = self.written_pages[g] * LOG_PAGE_SIZE as u64;
+        let bytes = self.wal.state().written_pages[g] * LOG_PAGE_SIZE as u64;
         let mut buf = vec![0u8; LOG_PAGE_SIZE];
         let mut copied = 0u64;
         while copied < bytes {
             let n = (bytes - copied).min(LOG_PAGE_SIZE as u64) as usize;
-            self.io
-                .read_exact_at(self.files[g][source], &mut buf[..n], copied)?;
-            self.io.write_at(self.files[g][m], &buf[..n], copied)?;
+            self.wal
+                .io
+                .read_exact_at(self.wal.files[g][source], &mut buf[..n], copied)?;
+            self.wal
+                .io
+                .write_at(self.wal.files[g][m], &buf[..n], copied)?;
             copied += n as u64;
         }
         // 目标尾部可能残留上一周期的旧页——截到已复制前缀，避免"重建好的
         // 成员"再被扫描判成"中部坏页"。
-        self.io.set_len(self.files[g][m], bytes)?;
-        self.io.sync_data(self.files[g][m])?;
+        self.wal.io.set_len(self.wal.files[g][m], bytes)?;
+        self.wal.io.sync_data(self.wal.files[g][m])?;
         self.entries.groups[g].member_stale &= !(1 << m);
+        // **共享账同步**：健康位是刷盘挑成员的依据（`WalShared::flush_to` 读
+        // 的是共享副本）——不同步会让重建好的成员被永久跳过（实测：双成员
+        // 逐字节一致性用例抓到的正是这一条）。
+        self.wal.state().member_stale[g] &= !(1 << m);
         self.cf.write_redo_entries(&self.entries)?;
         Ok(())
     }
@@ -620,9 +802,10 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     fn pick_reusable(&self) -> Result<u8, GroupError> {
         let mut blocked_archive = false;
         let mut blocked_checkpoint = false;
-        for step in 1..=self.spec.group_count {
-            let g = (self.current + step) % self.spec.group_count;
-            if g == self.current {
+        let current = self.wal.current();
+        for step in 1..=self.wal.spec().group_count {
+            let g = (current + step) % self.wal.spec().group_count;
+            if g == current {
                 continue;
             }
             let e = self.entries.groups[g as usize];
@@ -653,13 +836,14 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// 激活 `next`：刷尽旧组 → 写切换记录（**先落盘**）→ 发布控制文件。
     fn activate(&mut self, next: u8) -> Result<u8, GroupError> {
         let first = self.entries.current_group == NO_CURRENT_GROUP;
-        let old = self.current;
+        let old = self.wal.current();
 
         // 1) 刷尽旧组（末页的尾部空位留在原处；新组从下一张页起）。
         if !first && self.records_in_group > 0 {
-            self.flush(self.buffer.appended_lsn())?;
+            let at = self.wal.appended_lsn();
+            self.flush(at)?;
         }
-        let new_start = self.buffer.current_page_start();
+        let new_start = self.wal.buffer.current_page_start();
         let seq = if first {
             1
         } else {
@@ -672,23 +856,34 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         //    截断后的空文件对 `open/online_groups` 是合法的"无内容"态
         //    （`Inactive` 组的旧内容不参与恢复）——崩溃在切换记录落盘前，
         //    也只是留下一个空组，不产生"损坏"。
-        for h in &self.files[next as usize] {
-            self.io.set_len(*h, 0)?;
+        {
+            let files = &self.wal.files[next as usize];
+            for h in files {
+                self.wal.io.set_len(*h, 0)?;
+            }
         }
-        self.current = next;
-        self.current_start = new_start;
-        self.written_pages[next as usize] = 0;
-        self.group_ends[next as usize] = Some(new_start);
+        {
+            let mut st = self.wal.state();
+            st.current = next;
+            st.written_pages[next as usize] = 0;
+            st.group_ends[next as usize] = Some(new_start);
+            // 新激活的组：镜像视为健康（旧位随序列号换代清零）、成员位同步。
+            st.member_stale[next as usize] = 0;
+        }
+        self.wal
+            .current_start
+            .store(new_start.as_raw(), Ordering::SeqCst);
         self.records_in_group = 0;
-        self.buffer
+        self.wal
+            .buffer
             .append(|l| RedoRecord::log_switch(l, next, seq))?;
-        let end = self.buffer.appended_lsn();
+        let end = self.wal.appended_lsn();
         self.flush(end)?;
         self.records_in_group = 1;
 
         // 3) 控制文件发布。
         if !first {
-            self.group_ends[old as usize] = Some(new_start);
+            self.wal.state().group_ends[usize::from(old)] = Some(new_start);
             let old_entry = &mut self.entries.groups[old as usize];
             old_entry.run = LogRunState::Active;
             if self.archive_mode == ArchiveMode::ArchiveLog {
@@ -732,11 +927,11 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         progress: &CheckpointProgress,
     ) -> Result<usize, GroupError> {
         let mut demoted = 0usize;
-        for g in 0..self.spec.group_count as usize {
+        for g in 0..self.wal.spec().group_count as usize {
             if self.entries.groups[g].run != LogRunState::Active {
                 continue;
             }
-            if let Some(end) = self.group_ends[g] {
+            if let Some(end) = self.wal.state().group_ends[g] {
                 if end <= progress.checkpoint_lsn {
                     self.entries.groups[g].run = LogRunState::Inactive;
                     demoted += 1;
@@ -768,14 +963,14 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// 某组的结尾 LSN（已写前缀的下一页边界；未用过的组为 `None`）。
     #[must_use]
     pub fn group_end_lsn(&self, group: u8) -> Option<Lsn> {
-        self.group_ends[usize::from(group)]
+        self.wal.group_end_lsn(group)
     }
 
     /// **归档完成发布**（ARCn 角色的替身，归档切片接管）：
     /// 组归档状态 `NEEDED` → `DONE`，并推进归档记录的"最后归档序列号"。
     pub fn archive_done(&mut self, group: u8) -> Result<(), GroupError> {
         let idx = usize::from(group);
-        if idx >= self.spec.group_count as usize {
+        if idx >= self.wal.spec().group_count as usize {
             return Err(GroupError::Spec("组号超出组数"));
         }
         if self.entries.groups[idx].archive != LogArchiveState::Needed {
@@ -796,31 +991,31 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// 当前组号（0 起）。
     #[must_use]
     pub fn current_group(&self) -> u8 {
-        self.current
+        self.wal.current()
     }
 
     /// 当前组的日志序列号。
     #[must_use]
     pub fn current_sequence(&self) -> u32 {
-        self.entries.groups[self.current as usize].sequence
+        self.entries.groups[usize::from(self.wal.current())].sequence
     }
 
     /// 当前组的结尾 LSN（= 起始 + 组字节大小）。
     #[must_use]
     pub fn group_end(&self) -> Lsn {
-        lsn_add(self.current_start, self.spec.group_bytes()).expect("48 位域内")
+        self.wal.group_end()
     }
 
     /// 追加位置（下一字节 LSN）。
     #[must_use]
     pub fn appended_lsn(&self) -> Lsn {
-        self.buffer.appended_lsn()
+        self.wal.buffer.appended_lsn()
     }
 
     /// 已刷盘位置。
     #[must_use]
     pub fn synced_lsn(&self) -> Lsn {
-        self.buffer.synced_lsn()
+        self.wal.buffer.synced_lsn()
     }
 
     /// Redo 条目的内存镜像（诊断/测试）。
@@ -832,7 +1027,7 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// 规格。
     #[must_use]
     pub fn spec(&self) -> GroupSpec {
-        self.spec
+        self.wal.spec()
     }
 
     /// 组目录。
@@ -843,9 +1038,9 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
 
     /// 关闭所有成员文件句柄。
     pub fn close(self) -> Result<(), GroupError> {
-        for members in &self.files {
+        for members in &self.wal.files {
             for &h in members {
-                self.io.close(h)?;
+                self.wal.io.close(h)?;
             }
         }
         Ok(())

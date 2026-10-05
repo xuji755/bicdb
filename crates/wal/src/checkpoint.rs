@@ -234,15 +234,18 @@ mod tests {
     }
 
     struct FakeWal {
-        durable: Lsn,
+        durable: std::sync::atomic::AtomicU64,
     }
     impl WalGuard for FakeWal {
         fn durable_lsn(&self) -> Lsn {
-            self.durable
+            Lsn::from_raw(self.durable.load(std::sync::atomic::Ordering::SeqCst)).unwrap()
         }
-        fn ensure_durable(&mut self, target: Lsn) -> std::io::Result<()> {
-            if target > self.durable {
-                self.durable = target;
+        fn ensure_durable(&self, target: Lsn) -> std::io::Result<()> {
+            let durable =
+                Lsn::from_raw(self.durable.load(std::sync::atomic::Ordering::SeqCst)).unwrap();
+            if target > durable {
+                self.durable
+                    .fetch_max(target.as_raw(), std::sync::atomic::Ordering::SeqCst);
             }
             Ok(())
         }
@@ -476,7 +479,9 @@ mod tests {
             &io,
             4,
             move |ws, r| (*ws == WS && r.file_id() == 9).then_some((data, r.block_id())),
-            FakeWal { durable: lsn(0) },
+            FakeWal {
+                durable: std::sync::atomic::AtomicU64::new(0),
+            },
         )
         .unwrap();
         {

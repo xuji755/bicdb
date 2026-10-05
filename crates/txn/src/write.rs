@@ -1182,7 +1182,7 @@ mod tests {
         fn durable_lsn(&self) -> Lsn {
             lsn(u64::MAX >> 16)
         }
-        fn ensure_durable(&mut self, _t: Lsn) -> std::io::Result<()> {
+        fn ensure_durable(&self, _t: Lsn) -> std::io::Result<()> {
             Ok(())
         }
     }

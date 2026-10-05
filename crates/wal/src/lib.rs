@@ -57,6 +57,7 @@ pub mod group;
 pub mod logpage;
 pub mod record;
 pub mod recovery;
+pub mod thread;
 pub mod undo_phase;
 
 pub use apply::{apply_record, ApplyError, ApplyReport, BlockResolver};

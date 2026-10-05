@@ -71,6 +71,7 @@ pub mod buffer;
 pub mod controlfile;
 pub mod cr;
 pub mod datafile;
+pub mod dbwr;
 pub mod fragment;
 pub mod heap;
 pub mod itl;
