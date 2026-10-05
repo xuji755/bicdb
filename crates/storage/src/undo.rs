@@ -1556,7 +1556,13 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
                 // 行本来就不在 ⇒ 已在前像，空操作。
                 return Ok(());
             };
-            if entry.status() != crate::page::SlotStatus::Free {
+            if entry.status() == crate::page::SlotStatus::Forwarding {
+                // **本事务的"删除"实为行迁移**（§6.2/§12.4："迁移 = 删除旧位置
+                // + 插入新位置"）：槽位现在是 6B 转发指针，把它整体还原为原行
+                // 字节 + 状态 Normal（下面的写回与置位照走）。安全性依据：
+                // 记录链属于同一事务、该槽位的历史由它独占（P4 行锁钉住）；
+                // 撤销从新到旧——新位置的行已先被 `Insert` 补偿清掉。
+            } else if entry.status() != crate::page::SlotStatus::Free {
                 // 槽被占着：**行字节与要恢复的旧值逐字节相同** ⇒ 是本补偿
                 // 已生效过（幂等）；否则是**槽已复用**——拒绝，不猜。
                 if crate::heap::row(page, row_no) == Some(bytes.as_slice()) {

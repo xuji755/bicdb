@@ -178,6 +178,81 @@ fn find_free_slot(page: &Page) -> Option<usize> {
     })
 }
 
+/// **迁移到同页是否可行**（§6.2）：把 `row_no` 的旧行**收缩为 6B 转发指针**
+/// 后腾出的空间能否再放下 `new_len` 字节的新行（PCTFREE 与槽位目录照常记账；
+/// 旧槽位被转发指针复用，新行另占一个槽）。
+///
+/// 迁移 = 旧行（`old_len` 字节）→ 6B 指针：净增 `new_len + slot − (old_len − 6)`。
+#[must_use]
+pub fn can_migrate_in_page(
+    page: &Page,
+    row_no: u16,
+    new_len: usize,
+    policy: &InsertPolicy,
+) -> bool {
+    let Ok(index) = slot_index(row_no).ok_or(HeapError::NoSuchRow) else {
+        return false;
+    };
+    let Some(entry) = page.slot(index) else {
+        return false;
+    };
+    if entry.status() == SlotStatus::Free {
+        return false;
+    }
+    let old_len = match entry.status() {
+        SlotStatus::Forwarding => crate::rowid::ROWID_LEN,
+        _ => match row(page, row_no) {
+            Some(r) => r.len(),
+            None => return false,
+        },
+    };
+    let freed = old_len.saturating_sub(crate::rowid::ROWID_LEN);
+    let need = new_len + slot_cost(page, policy);
+    require_data_page(page).is_ok()
+        && page.free_space() + freed >= need + policy.reserved_bytes()
+        && has_slot_room(page, policy)
+}
+
+/// **把行迁移出去：原槽位改为转发指针**（§6.2——行体只放 6B 新 ROWID，
+/// 槽位状态 2；原 ROWID 是稳定入口，索引不动）。
+///
+/// 行字节**就地覆盖**为 6B 目标（原行字节的偏移不动——"删除"式记账：槽位
+/// 偏移保留，回滚"迁移"按原位整行写回，见 undo 的"删除"补偿）。
+pub fn migrate_row(page: &mut Page, row_no: u16, target: RowId) -> Result<(), HeapError> {
+    require_data_page(page)?;
+    let index = slot_index(row_no).ok_or(HeapError::NoSuchRow)?;
+    let slot = page.slot(index).ok_or(HeapError::NoSuchRow)?;
+    if slot.status() == SlotStatus::Free {
+        return Err(HeapError::NoSuchRow);
+    }
+    let offset = slot.offset() as usize;
+    if offset + crate::rowid::ROWID_LEN > crate::page::PAGE_SIZE {
+        return Err(HeapError::BadRow);
+    }
+    page.as_bytes_mut()[offset..offset + crate::rowid::ROWID_LEN]
+        .copy_from_slice(&target.to_bytes());
+    let entry = SlotEntry::new(slot.offset(), SlotStatus::Forwarding).ok_or(HeapError::BadRow)?;
+    page.set_slot(index, entry);
+    Ok(())
+}
+
+/// **读一个槽位的转发目标**（`None` = 不是转发指针/槽不存在）。
+#[must_use]
+pub fn forwarding_target(page: &Page, row_no: u16) -> Option<RowId> {
+    let index = slot_index(row_no)?;
+    let slot = page.slot(index)?;
+    if slot.status() != SlotStatus::Forwarding {
+        return None;
+    }
+    let offset = slot.offset() as usize;
+    let bytes: [u8; crate::rowid::ROWID_LEN] = page
+        .as_bytes()
+        .get(offset..offset + crate::rowid::ROWID_LEN)?
+        .try_into()
+        .ok()?;
+    Some(RowId::from_bytes(&bytes))
+}
+
 /// 插入一条行字节（**已编码的完整行**，但不含任何页内包装）。
 ///
 /// 返回行号（1 起；= 槽位下标 + 1）。页内字段已改（含 `free_end` 与槽位），

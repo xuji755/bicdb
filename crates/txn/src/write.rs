@@ -67,12 +67,16 @@ pub enum TxnError {
     StaleCache,
     /// 段访问。
     Segment(bicdb_storage::segment::SegmentSpaceError),
-    /// **更新非等长**（行迁移/成链留给后续切片）——明确拒绝。
-    UpdateNotInPlace {
-        /// 旧行长。
-        old: usize,
-        /// 新行长。
-        new: usize,
+    /// **新行超过单页可容纳**（就地转链路径——片段链的池实现随后续切片，
+    /// 明确报错，不给半套）。
+    UpdateTooLong {
+        /// 新行长度。
+        len: usize,
+    },
+    /// **迁移需要一个放得下的目标页，但分配口给不出**（段满/无可用页）。
+    NoMigrationTarget {
+        /// 需要的字节数。
+        need: usize,
     },
 }
 
@@ -89,10 +93,13 @@ impl std::fmt::Display for TxnError {
             TxnError::RowId(e) => write!(f, "写路径行号：{e}"),
             TxnError::StaleCache => f.write_str("写路径：缓存页与预期前像不符"),
             TxnError::Segment(e) => write!(f, "写路径段访问：{e}"),
-            TxnError::UpdateNotInPlace { old, new } => write!(
+            TxnError::UpdateTooLong { len } => write!(
                 f,
-                "更新改行长度（{old} → {new}）：等长就地更新之外留给行迁移切片"
+                "更新后行长 {len} 超过单页可容纳（就地转链路径随后续切片）"
             ),
+            TxnError::NoMigrationTarget { need } => {
+                write!(f, "行迁移需要 {need} 字节的可用页，分配口给不出")
+            }
         }
     }
 }
@@ -272,10 +279,29 @@ pub fn delete_row(
     Ok(())
 }
 
-/// **更新一行**（v1 限**等长就地**）：行内差异进 undo（补偿 = 按偏移写回旧值）。
+/// **更新一行的结果**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateOutcome {
+    /// **稳定入口**（原地/迁移后都不变——索引与外键引用仍指它，§6.2）。
+    pub rowid: RowId,
+    /// 是否发生了**行迁移**（改长且原页放不下 ⇒ 新位置 + 原槽位转发指针）。
+    pub migrated: bool,
+}
+
+/// **更新一行**（§6.2/§6.8）：
 ///
-/// 新行长度 ≠ 旧行长度的更新（变长、行迁移）留给"行迁移"切片——**明确报错**，
-/// 不给半套。
+/// - **不增（等长或收缩）** ⇒ **就地重写**：行内差异（含收缩时的尾部旧字节）
+///   进 undo，补偿 = 按偏移写回旧值；
+/// - **增长** ⇒ **行迁移**：新行写入目的页（同页放得下则同页，否则由分配口
+///   `alloc` 给一页），原槽位改为**转发指针**（6B 新 ROWID）；**原 ROWID 不变**
+///   （索引不动）。记录与设计一致：**迁移 = "删除旧位置" + "插入新位置"**
+///   （§12.4——回滚先删新行、再把转发指针还原成原行）；
+/// - **新行超过单页可容纳** ⇒ 就地转链（片段链）随"片段链的池实现"切片——
+///   [`TxnError::UpdateTooLong`]，不给半套。
+///
+/// `alloc`：迁移目标页的分配口（执行器/段层提供——段内找一个放得下的页或
+/// 新开一页；返回与源同页也合法，函数本身已先试同页）。
+#[allow(clippy::too_many_arguments)]
 pub fn update_row(
     pool: &BufferPool<'_>,
     log: &mut GroupWriter<'_, '_>,
@@ -284,63 +310,150 @@ pub fn update_row(
     block: BufferKey,
     row_no: u16,
     new_row: &[u8],
-) -> Result<(), TxnError> {
-    let (data_before, mut local) = {
+    policy: &InsertPolicy,
+    alloc: &mut dyn FnMut(usize) -> Result<BufferKey, TxnError>,
+) -> Result<UpdateOutcome, TxnError> {
+    let (src_before, mut src_local) = {
         let g = pool.pin(block)?;
         (*g.as_bytes(), Page::from_bytes(Box::new(*g.as_bytes())))
     };
-    let old_row = heap::row(&local, row_no)
+    let old_row = heap::row(&src_local, row_no)
         .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
         .to_vec();
-    if old_row.len() != new_row.len() {
-        return Err(TxnError::UpdateNotInPlace {
-            old: old_row.len(),
-            new: new_row.len(),
-        });
-    }
-    // 新行必须是**结构合法**的完整行（等长之外还要行头自洽）——否则写进读不回。
+    // 新行必须是**结构合法**的完整行——否则写进读不回。
     let header = bicdb_storage::row::RowHeader::read_from(new_row)
         .map_err(|_| TxnError::Heap(HeapError::BadRow))?;
     if header.row_len as usize != new_row.len() {
         return Err(TxnError::Heap(HeapError::BadRow));
     }
-    // 占用 ITL 条目（同 delete：此前空槽上什么都不写，是可见性缺陷的落点）。
-    let slot = occupy_itl(pool, log, chain, txn, &mut local, block)?;
+    let src_rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?;
 
-    // 行内差异（连续的变更段；旧值随记录）——**先 undo 后变更**。
-    let patches = row_patches(&old_row, new_row);
-    let rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?;
+    if new_row.len() <= old_row.len() {
+        // 不增：就地重写（等长到收缩同径——收缩时尾部旧字节一并进补丁，
+        // 撤销按偏移写回即恢复原长；行区留下的洞由 defrag 处理，§6.8）。
+        let slot = occupy_itl(pool, log, chain, txn, &mut src_local, block)?;
+        let patches = row_patches(&old_row, new_row);
+        append_undo_via_pool(
+            pool,
+            log,
+            chain,
+            txn,
+            UndoOp::Update,
+            src_rid,
+            UndoPayload::Update {
+                old_itl_slot: old_row[1],
+                patches,
+            },
+        )?;
+        let offset = src_local
+            .slot(heap::slot_index(row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?)
+            .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
+            .offset() as usize;
+        let mut patched = new_row.to_vec();
+        patched[1] = slot as u8;
+        src_local.as_bytes_mut()[offset..offset + patched.len()].copy_from_slice(&patched);
+        write_page_change(
+            pool,
+            log,
+            txn.raw(),
+            block,
+            &src_before,
+            src_local.as_bytes(),
+            false,
+        )?;
+        return Ok(UpdateOutcome {
+            rowid: src_rid,
+            migrated: false,
+        });
+    }
+
+    // 增长：先看"单页放得下吗"（放不下 ⇒ 转链路径，未接）。
+    let page_type = src_local
+        .header()
+        .map(|h| h.page_type)
+        .ok_or(TxnError::StaleCache)?;
+    let fresh = Page::new(page_type, block.workspace, block.rdba.file_id(), 0);
+    if new_row.len() > heap::capacity_for_row(&fresh, policy) {
+        return Err(TxnError::UpdateTooLong { len: new_row.len() });
+    }
+
+    // 目的页：同页放得下 ⇒ 同页（省一次随机 I/O）；否则向分配口要一页。
+    let dest_same = heap::can_migrate_in_page(&src_local, row_no, new_row.len(), policy);
+    let dest_key = if dest_same {
+        block
+    } else {
+        alloc(new_row.len())?
+    };
+    let mut dest_local = if dest_same {
+        Page::from_bytes(Box::new(src_before))
+    } else {
+        let g = pool.pin(dest_key)?;
+        Page::from_bytes(Box::new(*g.as_bytes()))
+    };
+    let dest_before = *dest_local.as_bytes();
+
+    // ① 源页：占用 ITL + "删除"记录（= 迁移的"旧位置"半边）。
+    let src_slot = occupy_itl(pool, log, chain, txn, &mut src_local, block)?;
     append_undo_via_pool(
         pool,
         log,
         chain,
         txn,
-        UndoOp::Update,
-        rid,
-        UndoPayload::Update {
-            old_itl_slot: old_row[1],
-            patches,
-        },
+        UndoOp::Delete,
+        src_rid,
+        UndoPayload::FullRow(old_row),
     )?;
-
-    // 就地写新行（等长）：行头 `itl_slot` 指向本事务的槽。
-    let offset = local
-        .slot(heap::slot_index(row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?)
-        .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
-        .offset() as usize;
+    // ② 目的页：占用 ITL（换页时是另一页的 ITL 条目）+ 插入新行 + "插入"记录。
+    let dest_slot = if dest_same {
+        src_slot
+    } else {
+        occupy_itl(pool, log, chain, txn, &mut dest_local, dest_key)?
+    };
     let mut patched = new_row.to_vec();
-    patched[1] = slot as u8;
-    local.as_bytes_mut()[offset..offset + patched.len()].copy_from_slice(&patched);
+    patched[1] = dest_slot as u8;
+    let insert_into = if dest_same {
+        &mut src_local
+    } else {
+        &mut dest_local
+    };
+    let new_no = heap::insert_row(insert_into, &patched, policy)?;
+    let new_rid = RowId::from_parts(dest_key.rdba.file_id(), dest_key.rdba.block_id(), new_no)?;
+    append_undo_via_pool(
+        pool,
+        log,
+        chain,
+        txn,
+        UndoOp::Insert,
+        new_rid,
+        UndoPayload::None,
+    )?;
+    // ③ 源槽位 → 转发指针（ROWID 稳定入口不变）。同页时 `src_local` 已是
+    //    含 ITL/新行/指针的权威镜像，一次写页即可。
+    heap::migrate_row(&mut src_local, row_no, new_rid)?;
     write_page_change(
         pool,
         log,
         txn.raw(),
         block,
-        &data_before,
-        local.as_bytes(),
+        &src_before,
+        src_local.as_bytes(),
         false,
     )?;
-    Ok(())
+    if !dest_same {
+        write_page_change(
+            pool,
+            log,
+            txn.raw(),
+            dest_key,
+            &dest_before,
+            dest_local.as_bytes(),
+            false,
+        )?;
+    }
+    Ok(UpdateOutcome {
+        rowid: src_rid,
+        migrated: true,
+    })
 }
 
 /// 行内连续差异段（（行内偏移, 旧值）列表）。
@@ -1007,7 +1120,12 @@ mod tests {
     fn harness(
         io: &MemFileIo,
         archive: ArchiveMode,
-    ) -> (DataFile<'_>, BufferPool<'_>, ControlFile<'_>) {
+    ) -> (
+        DataFile<'_>,
+        bicdb_workspace::io::FileHandle,
+        BufferPool<'_>,
+        ControlFile<'_>,
+    ) {
         let undo_file = DataFile::create(io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let data_handle = {
@@ -1037,7 +1155,7 @@ mod tests {
             &ArchiveRecord::new(archive),
         )
         .unwrap();
-        (undo_file, pool, cf)
+        (undo_file, data_handle, pool, cf)
     }
 
     #[test]
@@ -1045,7 +1163,7 @@ mod tests {
         // #34：判据 = 已提交 且 commit_seq < 最老快照 ——
         // 低于水位的槽释放、可再分配；高处的保留；水位单调、幂等。
         let io = mem();
-        let (mut undo_file, pool, mut cf) = harness(&io, ArchiveMode::ArchiveLog);
+        let (mut undo_file, _data_handle, pool, mut cf) = harness(&io, ArchiveMode::ArchiveLog);
         let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let mut t1 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
@@ -1086,7 +1204,7 @@ mod tests {
         // 稳态回收（每轮把低于当前序号的全部回收）让事务表**永续**。
         let io = mem();
         // 非归档模式：本用例只关心回收与组复用，归档由 group 的专门用例覆盖。
-        let (mut undo_file, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let (mut undo_file, _data_handle, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
         let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -1330,7 +1448,7 @@ mod tests {
         // 在其 rdba 上还有上一轮生命周期的 redo 记录——重放必须按 `page_lsn`
         // 跳过它们，否则旧字节会被"复活"到新内容里，输家回滚会读到损坏链。
         let io = mem();
-        let (mut undo_file, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let (mut undo_file, _data_handle, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
         let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -1466,6 +1584,8 @@ mod tests {
             key,
             rid.row_id(),
             &row_v2,
+            &InsertPolicy::in_place(0),
+            &mut no_alloc,
         )
         .unwrap();
         delete_row(&pool, &mut log, &mut chain, &mut t1, key, rid.row_id()).unwrap();
@@ -1495,29 +1615,339 @@ mod tests {
             key,
             rid2.row_id(),
             &row_v2,
+            &InsertPolicy::in_place(0),
+            &mut no_alloc,
         )
         .unwrap();
-        // 非等长更新：明确拒绝。
+        // **改长**更新：走**行迁移**（同页放得下——"bbb"→"ccccc" 只差 2 字节）。
         let row_long = row_bytes(b"ccccc");
-        assert!(matches!(
-            update_row(
-                &pool,
-                &mut log,
-                &mut chain,
-                &mut t2,
-                key,
-                rid2.row_id(),
-                &row_long
-            ),
-            Err(TxnError::UpdateNotInPlace { .. })
-        ));
+        let outcome = update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            rid2.row_id(),
+            &row_long,
+            &InsertPolicy::in_place(0),
+            &mut no_alloc,
+        )
+        .unwrap();
+        assert!(outcome.migrated, "改长 ⇒ 迁移");
+        assert_eq!(outcome.rowid, rid2, "ROWID 稳定入口不变");
+        // 原槽位成了转发指针，指向新位置。
+        let src = page_snapshot(&pool, key);
+        assert_eq!(heap::row(&src, rid2.row_id()), None, "原槽位不再直接是行");
+        let target = heap::forwarding_target(&src, rid2.row_id()).expect("转发指针");
+        // 新行的 `itl_slot` 由写路径回填为**目的页上本事务的 ITL 槽**（与 insert 同规）。
+        let owner_slot = (0..bicdb_storage::itl::itl_count(&src).unwrap())
+            .find(|&i| itl_of(&src, i).txn_id == t2.txn_id)
+            .expect("t2 的 ITL 条目");
+        assert_eq!(
+            heap::row(&src, target.row_id()),
+            Some(&stored_row(&row_long, owner_slot as u8)[..]),
+            "新位置的完整行（itl_slot 已回填）"
+        );
         commit(&pool, &mut log, &mut chain, &mut t2, seq(2)).unwrap();
         pool.flush_workspace(WS).unwrap();
         let page = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
-        let stored = heap::row(&page, rid2.row_id()).expect("更新后的行");
-        // 行头 itl_slot 指向 t2 的槽（更新时改写）；其余字节 = 新行。
-        assert_eq!(stored[1], t2.slot as u8, "itl_slot 归本事务");
-        assert_eq!(&stored[2..], &row_v2[2..], "行体 = 更新后的内容");
+        // 稳定入口是**转发指针**：读者沿它取到新位置的完整行（§6.2/§12.4）。
+        let target = heap::forwarding_target(&page, rid2.row_id()).expect("盘上转发指针");
+        let stored = heap::row(&page, target.row_id()).expect("更新后的行（经转发指针）");
+        // 行头 itl_slot 指向 t2 的槽（写路径回填）；其余字节 = 改长后的新行。
+        assert_eq!(
+            usize::from(stored[1]),
+            owner_slot.into(),
+            "itl_slot 归本事务"
+        );
+        assert_eq!(&stored[2..], &row_long[2..], "行体 = 改长后的内容");
+    }
+
+    #[test]
+    fn growing_update_migrates_across_pages_and_rolls_back() {
+        // §6.2：增长且原页放不下 ⇒ 迁移（新位置 + 原槽位转发指针）；
+        // §12.4：迁移 = "删除旧位置 + 插入新位置"——回滚先删新行、
+        // 再把转发指针还原成原行（undo 的"删除"补偿接受 Forwarding 槽）。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        // 两页数据文件：第 2 页作为迁移目标。
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            for block in 1..=2u32 {
+                let mut page = Page::new(PageType::HeapTable, WS, 3, block);
+                pagefile::write_page(&io, h, block, &mut page).unwrap();
+            }
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key1 = BufferKey::new(WS, rdba(3, 1));
+        let key2 = BufferKey::new(WS, rdba(3, 2));
+
+        // 先填满第 1 页（10 × 1500B ≈ 15KB），只留下不足 4KB 空位——
+        // 让"同页迁移"不可能，逼出跨页路径（分配口必须被调用）。
+        // **目标行由前一个已提交事务放入**：这样"回滚本次更新"才应恢复它
+        // （若目标行也是本事务插入的，回滚整条链的净效果是"无此行"——那是
+        // 另一个用例覆盖的语义）。
+        let old_row = row_bytes(b"aaaa");
+        let mut filler = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        for k in 0..10u8 {
+            let f = row_bytes(&vec![k; 1500]);
+            insert_row(&pool, &mut log, &mut chain, &mut filler, key1, &f, &policy).unwrap();
+        }
+        let rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut filler,
+            key1,
+            &old_row,
+            &policy,
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut filler, seq(1)).unwrap();
+
+        let mut t = begin(&pool, &mut log, &mut chain, seq(2)).unwrap();
+
+        // 改长到 4KB：第 1 页放不下 ⇒ 分配口给第 2 页。
+        let big = row_bytes(&vec![7u8; 4000]);
+        let mut alloc = move |need: usize| -> Result<BufferKey, TxnError> {
+            assert!(need <= 4200, "分配口只被要求放得下的页");
+            Ok(key2)
+        };
+        let out = update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t,
+            key1,
+            rid.row_id(),
+            &big,
+            &policy,
+            &mut alloc,
+        )
+        .unwrap();
+        assert!(out.migrated);
+        assert_eq!(out.rowid, rid, "稳定入口（ROWID）不变");
+        let src = page_snapshot(&pool, key1);
+        let dst = page_snapshot(&pool, key2);
+        assert_eq!(heap::row(&src, rid.row_id()), None, "原槽位 = 转发指针");
+        let target = heap::forwarding_target(&src, rid.row_id()).expect("转发指针");
+        assert_eq!(target.block_id(), 2, "指向第 2 页");
+        assert!(heap::row(&dst, target.row_id()).is_some(), "新位置有完整行");
+
+        // **回滚**：新行删除、原行原位还原、槽位状态回 Normal。
+        rollback(&pool, &mut log, &mut chain, &mut t).unwrap();
+        let src = page_snapshot(&pool, key1);
+        let dst = page_snapshot(&pool, key2);
+        assert_eq!(
+            heap::row(&src, rid.row_id()),
+            Some(&stored_row(&old_row, 0)[..]),
+            "原行原位还原（字节 = 落盘形态）"
+        );
+        assert_eq!(
+            heap::forwarding_target(&src, rid.row_id()),
+            None,
+            "指针已还原"
+        );
+        assert_eq!(heap::row(&dst, target.row_id()), None, "新行已撤销");
+    }
+
+    #[test]
+    fn cr_sees_the_pre_migration_row_through_the_chain() {
+        // CR（§12.4）：旧快照看原页 —— 迁移被撤销（转发指针还原成原行）、
+        // 新页上的插入被撤销；新快照看原页 —— 仍是指针。
+        let io = mem();
+        let (mut undo_file, data_handle, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        // 第 2 页格式化为数据页（迁移目标）。
+        {
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 2);
+            pagefile::write_page(&io, data_handle, 2, &mut page).unwrap();
+        }
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key1 = BufferKey::new(WS, rdba(3, 1));
+        let key2 = BufferKey::new(WS, rdba(3, 2));
+
+        // 填满第 1 页，逼出跨页迁移（同"回滚"用例的构造）。
+        let old_row = row_bytes(b"orig");
+        let mut t = begin(&pool, &mut log, &mut chain, seq(5)).unwrap();
+        for k in 0..10u8 {
+            let f = row_bytes(&vec![k; 1500]);
+            insert_row(&pool, &mut log, &mut chain, &mut t, key1, &f, &policy).unwrap();
+        }
+        let rid = insert_row(&pool, &mut log, &mut chain, &mut t, key1, &old_row, &policy).unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t, seq(5)).unwrap();
+
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(6)).unwrap();
+        let big = row_bytes(&vec![9u8; 4000]);
+        let mut alloc = move |_need: usize| -> Result<BufferKey, TxnError> { Ok(key2) };
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key1,
+            rid.row_id(),
+            &big,
+            &policy,
+            &mut alloc,
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t2, seq(6)).unwrap();
+
+        let src = page_snapshot(&pool, key1);
+        let dst = page_snapshot(&pool, key2);
+        // 快照 5（迁移之前）：原页 = 原行；新页 = 无此行。
+        let cr_old = bicdb_storage::cr::reconstruct(&src, seq(5), &chain).unwrap();
+        assert_eq!(
+            heap::row(&cr_old, rid.row_id()),
+            Some(&stored_row(&old_row, 0)[..]),
+            "旧快照见原行（迁移被撤销；字节 = 落盘形态）"
+        );
+        assert_eq!(heap::forwarding_target(&cr_old, rid.row_id()), None);
+        let dst_old = bicdb_storage::cr::reconstruct(&dst, seq(5), &chain).unwrap();
+        let target = heap::forwarding_target(&src, rid.row_id()).expect("物理指针");
+        assert_eq!(heap::row(&dst_old, target.row_id()), None, "旧快照不见新行");
+        // 快照 6（迁移可见）：原页仍是指针。
+        let cr_new = bicdb_storage::cr::reconstruct(&src, seq(6), &chain).unwrap();
+        assert_eq!(heap::forwarding_target(&cr_new, rid.row_id()), Some(target));
+    }
+
+    #[test]
+    fn crash_during_migration_rolls_back_to_the_source_row() {
+        // 端到端（§6.2 + §11.2）：一个**未提交的迁移**在崩溃后被撤销——
+        // 源槽位恢复为原行（Normal），目的页上的新行消失。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            for block in 1..=2u32 {
+                let mut page = Page::new(PageType::HeapTable, WS, 3, block);
+                pagefile::write_page(&io, h, block, &mut page).unwrap();
+            }
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key1 = BufferKey::new(WS, rdba(3, 1));
+        let key2 = BufferKey::new(WS, rdba(3, 2));
+
+        // 胜者：放一行（并填页，逼出跨页迁移）后提交。
+        let old_row = row_bytes(b"survivor");
+        let mut w = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        for k in 0..10u8 {
+            let f = row_bytes(&vec![k; 1500]);
+            insert_row(&pool, &mut log, &mut chain, &mut w, key1, &f, &policy).unwrap();
+        }
+        let rid = insert_row(&pool, &mut log, &mut chain, &mut w, key1, &old_row, &policy).unwrap();
+        commit(&pool, &mut log, &mut chain, &mut w, seq(1)).unwrap();
+
+        // 输家：迁移（改长 4KB，跨页）后**不提交**。
+        let big = row_bytes(&vec![7u8; 4000]);
+        let mut l = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let mut alloc = move |_need: usize| -> Result<BufferKey, TxnError> { Ok(key2) };
+        let out = update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut l,
+            key1,
+            rid.row_id(),
+            &big,
+            &policy,
+            &mut alloc,
+        )
+        .unwrap();
+        assert!(out.migrated);
+        let target = {
+            let src = page_snapshot(&pool, key1);
+            heap::forwarding_target(&src, rid.row_id()).expect("迁移指针")
+        };
+
+        // **崩溃**：日志耐久；数据页/undo 页留在池里（no-force）。
+        log.flush(log.appended_lsn()).unwrap();
+        drop(pool);
+
+        // 恢复：分析/重做/撤销。
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let groups = online_groups(&io, &cf_ro, Path::new(WAL), spec()).unwrap();
+        let mut resolve = |rd: Rdba| match rd.file_id() {
+            1 => Some((undo_handle, rd.block_id())),
+            3 => Some((data_handle, rd.block_id())),
+            _ => None,
+        };
+        let report = recover(&io, &groups, lsn(0), &chain, &mut log, &mut resolve).unwrap();
+        assert_eq!(report.undo.txns_rolled_back, 1, "迁移事务是输家");
+
+        let src = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
+        let dst = pagefile::read_page_verified(&io, data_handle, 2).unwrap();
+        assert_eq!(
+            heap::row(&src, rid.row_id()),
+            Some(&stored_row(&old_row, 0)[..]),
+            "源槽位恢复为原行"
+        );
+        assert_eq!(
+            heap::forwarding_target(&src, rid.row_id()),
+            None,
+            "指针已还原"
+        );
+        assert_eq!(heap::row(&dst, target.row_id()), None, "新行被撤销");
+    }
+
+    /// 迁移分配口：**拒绝换页**（用例里的改长都应同页完成；跨页迁移由专门
+    /// 用例给出真实的分配口）。
+    fn no_alloc(need: usize) -> Result<BufferKey, TxnError> {
+        Err(TxnError::NoMigrationTarget { need })
     }
 
     /// 页快照（经池钉住后拷贝——测试读 ITL 条目用）。
@@ -1846,6 +2276,8 @@ mod tests {
                 key,
                 rid.row_id(),
                 &variant,
+                &InsertPolicy::in_place(0),
+                &mut no_alloc,
             )
             .unwrap_or_else(|e| panic!("第 {i} 个事务 update 失败：{e}"));
             commit(&pool, &mut log, &mut chain, &mut txn, seq(i + 2)).unwrap();
