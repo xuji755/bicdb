@@ -680,6 +680,16 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         Ok(demoted)
     }
 
+    /// **追加墙钟采样对**（§11.10：时间点目标点的插值用；检查点周期调用）。
+    pub fn append_sample_pair(
+        &mut self,
+        seq: bicdb_common::seq::CommitSeq,
+        timestamp_ms: u64,
+    ) -> Result<(), GroupError> {
+        self.cf.append_sample_pair(seq, timestamp_ms)?;
+        Ok(())
+    }
+
     /// 控制文件里当前的检查点进度（检查点的单调性守卫用）。
     pub fn checkpoint_progress(&self) -> Result<CheckpointProgress, GroupError> {
         Ok(self.cf.checkpoint_progress()?)

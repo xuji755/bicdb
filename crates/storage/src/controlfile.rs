@@ -96,6 +96,15 @@ pub const ARCHIVE_RECORD_LEN: usize = 320;
 pub const FIXED_SEGMENT_LEN: usize =
     WORKSPACE_ENTRY_LEN + CHECKPOINT_PROGRESS_LEN + REDO_ENTRIES_LEN + ARCHIVE_RECORD_LEN;
 
+/// **墙钟采样对**（§11.10 的目标点插值用）：环容量 256 对。
+pub const SAMPLE_PAIRS: usize = 256;
+/// 单个采样对：`commit_seq 6B │ 时刻毫秒 6B`（各 48 位小端）。
+pub const SAMPLE_PAIR_LEN: usize = 12;
+/// 采样环头（`count 2B │ next 2B`，紧随固定段；随检查点区间一起发布）。
+pub const SAMPLE_HEAD_OFFSET: usize = FIXED_SEGMENT_LEN;
+/// 采样对数组起点。
+pub const SAMPLE_PAIRS_OFFSET: usize = SAMPLE_HEAD_OFFSET + 4;
+
 /// 数据文件记录长度。
 pub const DATA_FILE_RECORD_LEN: usize = 280;
 /// 数据文件记录上限（与 ROWID 的 `file_id` 10 位对齐）。
@@ -699,6 +708,28 @@ impl CheckpointProgress {
     }
 }
 
+/// 采样环头：已写对数（≤256）与下一个写入槽。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SampleHead {
+    /// 已写入的对数（到达 256 后恒 256）。
+    pub count: u16,
+    /// 下一个写入槽（环）。
+    pub next: u16,
+}
+
+impl SampleHead {
+    fn encode(&self, out: &mut [u8]) {
+        out[0..2].copy_from_slice(&self.count.to_le_bytes());
+        out[2..4].copy_from_slice(&self.next.to_le_bytes());
+    }
+    fn decode(b: &[u8]) -> Self {
+        Self {
+            count: u16::from_le_bytes([b[0], b[1]]),
+            next: u16::from_le_bytes([b[2], b[3]]),
+        }
+    }
+}
+
 /// 工作区条目（页 1 固定段，64 B）：身份与克隆血缘（§2.7）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceEntry {
@@ -1123,6 +1154,63 @@ impl<'a> ControlFile<'a> {
     /// Redo 条目。
     pub fn redo_entries(&self) -> Result<RedoEntries, ControlFileError> {
         RedoEntries::decode(&self.read_fixed::<REDO_ENTRIES_LEN>(1, REDO_ENTRIES_OFFSET)?)
+    }
+
+    /// 归档记录。
+    /// **读采样环头**。
+    pub fn sample_head(&self) -> Result<SampleHead, ControlFileError> {
+        let b = self.read_fixed::<4>(1, SAMPLE_HEAD_OFFSET)?;
+        Ok(SampleHead::decode(&b))
+    }
+
+    /// **读全部采样对**（按写入顺序：最老 → 最新）。
+    pub fn sample_pairs(&self) -> Result<Vec<(CommitSeq, u64)>, ControlFileError> {
+        let head = self.sample_head()?;
+        let page = self.read_page(1, 1)?;
+        let mut out = Vec::with_capacity(usize::from(head.count));
+        let n = usize::from(head.count).min(SAMPLE_PAIRS);
+        // 环：count = 256 时的起点 = next（最老）；否则从 0 起。
+        let start = if n == SAMPLE_PAIRS {
+            head.next as usize % SAMPLE_PAIRS
+        } else {
+            0
+        };
+        for k in 0..n {
+            let idx = (start + k) % SAMPLE_PAIRS;
+            let off = CF_PAGE_HEADER_LEN + SAMPLE_PAIRS_OFFSET + idx * SAMPLE_PAIR_LEN;
+            let seq = get_u48(page.as_ref(), off);
+            let ts = get_u48(page.as_ref(), off + 6);
+            out.push((
+                CommitSeq::from_raw(seq).ok_or(ControlFileError::OutOfDomain {
+                    field: "采样对提交序号",
+                })?,
+                ts,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// **追加一对采样**（环写；头也随之更新——两次小更新，各在 512B 内）。
+    pub fn append_sample_pair(
+        &mut self,
+        seq: CommitSeq,
+        timestamp_ms: u64,
+    ) -> Result<(), ControlFileError> {
+        let mut head = self.sample_head()?;
+        let idx = usize::from(head.next) % SAMPLE_PAIRS;
+        let mut buf = [0u8; SAMPLE_PAIR_LEN];
+        put_u48(&mut buf, 0, seq.as_raw());
+        put_u48(&mut buf, 6, timestamp_ms & 0x0000_FFFF_FFFF_FFFF);
+        self.update_interval(
+            file_offset(1, SAMPLE_PAIRS_OFFSET + idx * SAMPLE_PAIR_LEN),
+            &buf,
+        )?;
+        head.count = head.count.saturating_add(1).min(SAMPLE_PAIRS as u16);
+        head.next = ((idx + 1) % SAMPLE_PAIRS) as u16;
+        let mut hb = [0u8; 4];
+        head.encode(&mut hb);
+        self.update_interval(file_offset(1, SAMPLE_HEAD_OFFSET), &hb)?;
+        Ok(())
     }
 
     /// 归档记录。
@@ -1884,6 +1972,44 @@ mod tests {
     }
 
     // -- 记录编解码 ----------------------------------------------------------
+
+    #[test]
+    fn sample_pairs_roundtrip_and_wrap() {
+        let io = new_mem();
+        let mut cf = format_cf(&io);
+        assert!(cf.sample_pairs().unwrap().is_empty());
+        for k in 1..=3u64 {
+            cf.append_sample_pair(CommitSeq::from_raw(k * 10).unwrap(), k * 1_000)
+                .unwrap();
+        }
+        assert_eq!(
+            cf.sample_pairs().unwrap(),
+            vec![
+                (CommitSeq::from_raw(10).unwrap(), 1_000),
+                (CommitSeq::from_raw(20).unwrap(), 2_000),
+                (CommitSeq::from_raw(30).unwrap(), 3_000),
+            ]
+        );
+        // 环写满：只剩最后 256 对，按写入顺序（最老 → 最新）。
+        for k in 4..=260u64 {
+            cf.append_sample_pair(CommitSeq::from_raw(k * 10).unwrap(), k * 1_000)
+                .unwrap();
+        }
+        let pairs = cf.sample_pairs().unwrap();
+        assert_eq!(pairs.len(), SAMPLE_PAIRS);
+        assert_eq!(
+            pairs[0],
+            (CommitSeq::from_raw(50).unwrap(), 5_000),
+            "最老的已回卷"
+        );
+        assert_eq!(
+            pairs[SAMPLE_PAIRS - 1],
+            (CommitSeq::from_raw(2600).unwrap(), 260_000)
+        );
+        let head = cf.sample_head().unwrap();
+        assert_eq!(head.count, SAMPLE_PAIRS as u16);
+        assert_eq!(head.next, (260 % SAMPLE_PAIRS) as u16);
+    }
 
     #[test]
     fn redo_entries_validation_and_roundtrip() {

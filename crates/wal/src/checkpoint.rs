@@ -133,6 +133,10 @@ pub fn publish_checkpoint(
         });
     }
     let groups_demoted = writer.publish_checkpoint(&progress)?;
+    // §11.10 的墙钟采样对：随检查点记录一对（时间点目标点的插值用）。
+    if progress.timestamp != 0 {
+        writer.append_sample_pair(progress.current_commit_seq, progress.timestamp)?;
+    }
     let record_lsn = writer.append(|l| {
         RedoRecord::checkpoint(
             l,
@@ -379,6 +383,45 @@ mod tests {
         assert_eq!(decode(6), 4096, "检查点 LSN");
         assert_eq!(decode(12), 12, "当前提交序号");
         assert_eq!(decode(18), 2, "最老快照提交序号");
+    }
+
+    #[test]
+    fn checkpoint_records_a_wall_clock_sample() {
+        let io = mem();
+        let spec = GroupSpec::new(2, 1, 64).unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec, lsn(0)).unwrap();
+        publish_checkpoint(
+            &mut w,
+            CheckpointProgress {
+                checkpoint_commit_seq: seq(3),
+                checkpoint_lsn: lsn(0),
+                current_commit_seq: seq(7),
+                oldest_snapshot_commit_seq: seq(0),
+                timestamp: 12_345,
+            },
+        )
+        .unwrap();
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let pairs = cf_ro.sample_pairs().unwrap();
+        assert_eq!(
+            pairs,
+            vec![(seq(7), 12_345)],
+            "（当前提交序号, 时刻）成对落控制文件"
+        );
+        // 墙钟目标点可直接解析（配合 pitr 的按目标恢复）。
+        assert_eq!(
+            crate::analysis::resolve_wall_clock(&pairs, 12_345).unwrap(),
+            seq(7)
+        );
     }
 
     #[test]

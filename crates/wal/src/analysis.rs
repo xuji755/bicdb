@@ -120,6 +120,72 @@ pub fn pitr_stop(
     Ok(stop)
 }
 
+/// 墙钟目标点的解析错误（§11.10：超出采样窗口**明确报错**）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallClockError {
+    /// 采样对为空（还没打过检查点）。
+    Empty,
+    /// 目标早于采样窗口下界。
+    BeforeWindow {
+        /// 窗口下界（毫秒）。
+        earliest: u64,
+    },
+    /// 目标晚于采样窗口上界。
+    AfterWindow {
+        /// 窗口上界（毫秒）。
+        latest: u64,
+    },
+}
+
+impl std::fmt::Display for WallClockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WallClockError::Empty => f.write_str("墙钟目标点：采样对为空（先取一次检查点）"),
+            WallClockError::BeforeWindow { earliest } => {
+                write!(f, "墙钟目标点早于采样窗口（下界 {earliest} ms）")
+            }
+            WallClockError::AfterWindow { latest } => {
+                write!(f, "墙钟目标点晚于采样窗口（上界 {latest} ms）")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WallClockError {}
+
+/// **墙钟 → 提交序号**（§11.10 的"采样对线性内插"）：`pairs` 为
+/// （提交序号, 时刻毫秒）升序；落在窗口外**明确报错**。
+pub fn resolve_wall_clock(
+    pairs: &[(bicdb_common::seq::CommitSeq, u64)],
+    target_ms: u64,
+) -> Result<bicdb_common::seq::CommitSeq, WallClockError> {
+    let Some(&(first_seq, first_ms)) = pairs.first() else {
+        return Err(WallClockError::Empty);
+    };
+    if target_ms < first_ms {
+        return Err(WallClockError::BeforeWindow { earliest: first_ms });
+    }
+    let (last_seq, last_ms) = *pairs.last().expect("非空");
+    if target_ms > last_ms {
+        return Err(WallClockError::AfterWindow { latest: last_ms });
+    }
+    for w in pairs.windows(2) {
+        let (s0, t0) = w[0];
+        let (s1, t1) = w[1];
+        if target_ms >= t0 && target_ms <= t1 {
+            if t1 <= t0 {
+                return Ok(s1);
+            }
+            let span = u128::from(t1 - t0);
+            let frac = u128::from(target_ms - t0);
+            let delta = u128::from(s1.as_raw().saturating_sub(s0.as_raw()));
+            let seq = u128::from(s0.as_raw()) + delta * frac / span;
+            return Ok(bicdb_common::seq::CommitSeq::from_raw(seq as u64).unwrap_or(first_seq));
+        }
+    }
+    Ok(last_seq)
+}
+
 impl AnalysisReport {
     /// 日志流里出现的输家（**不含**"检查点前就活动、之后无记录"的当事务——
     /// 那要由事务表槽扫描补齐，见模块文档）。
@@ -420,6 +486,41 @@ mod tests {
         assert!(matches!(
             analyze_from(&io, &groups, lsn(0)),
             Err(RecoveryError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn wall_clock_interpolates_and_bounds_the_window() {
+        use bicdb_common::seq::CommitSeq;
+        let seq = |v: u64| CommitSeq::from_raw(v).unwrap();
+        let pairs = vec![(seq(10), 1_000u64), (seq(20), 2_000)];
+        assert_eq!(
+            resolve_wall_clock(&pairs, 1_000).unwrap(),
+            seq(10),
+            "下界精确"
+        );
+        assert_eq!(
+            resolve_wall_clock(&pairs, 2_000).unwrap(),
+            seq(20),
+            "上界精确"
+        );
+        assert_eq!(
+            resolve_wall_clock(&pairs, 1_500).unwrap(),
+            seq(15),
+            "中点线性内插"
+        );
+        assert_eq!(resolve_wall_clock(&pairs, 1_250).unwrap(), seq(12));
+        assert!(matches!(
+            resolve_wall_clock(&pairs, 999),
+            Err(WallClockError::BeforeWindow { earliest: 1_000 })
+        ));
+        assert!(matches!(
+            resolve_wall_clock(&pairs, 2_001),
+            Err(WallClockError::AfterWindow { latest: 2_000 })
+        ));
+        assert!(matches!(
+            resolve_wall_clock(&[], 1),
+            Err(WallClockError::Empty)
         ));
     }
 }
