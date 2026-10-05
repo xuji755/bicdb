@@ -660,6 +660,13 @@ impl<'io> BufferPool<'io> {
         out
     }
 
+    /// **某分区里有脏页的工作区**（按分区写线程的扫描面：一个写线程只看
+    /// 自己分区的写列表——§5.10"一个分区只由一个写线程负责"）。
+    #[must_use]
+    pub fn dirty_workspaces_in(&self, partition: usize) -> Vec<[u8; 8]> {
+        self.lock(partition).write_list.keys().copied().collect()
+    }
+
     /// **低水位**：该工作区最老脏块的（首次变脏 LSN）；`None` = 无脏页。
     #[must_use]
     pub fn low_water(&self, workspace: [u8; 8]) -> Option<Lsn> {

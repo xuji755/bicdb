@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bicdb_common::seq::Lsn;
 use bicdb_daemon::numa::{BindMode, BindOutcome, NumaStatus};
@@ -383,5 +383,74 @@ fn rebinding_drains_the_pool_then_moves_the_cgroup_binding() {
     drop(g);
     assert_eq!(pool.allocated_frames(p), 1, "帧缓冲按需重新分配");
 
+    fs::remove_dir_all(&base).expect("清理测试目录");
+}
+
+#[test]
+fn writer_threads_bind_at_creation_through_the_hook() {
+    // 详设 §5 阶段 B：**线程创建时即入组**——`DbwrGroup` 的 prestart 钩子在
+    // 每条写线程体内、写回之前执行；创建方（这里 = 监督器的替身）在钩子里
+    // 调 `NumaBinder::bind_to_node`。断言：两条写线程的 tid 都落进了该节点组。
+    use bicdb_daemon::numa::NumaBinder;
+    use bicdb_storage::buffer::{BufferPool, CacheConfig, SystemClock};
+    use bicdb_storage::dbwr::DbwrGroup;
+    use bicdb_workspace::io::MemFileIo;
+
+    let base = unique_base("writer-bind");
+    preprovision(&base, 0);
+    let ws1 = WorkspaceId::from_raw(1).unwrap();
+    let numa = NumaConfig {
+        enabled: true,
+        mode: BindMode::AttachExisting,
+        cgroup_root: base.join("cg"),
+        sysfs_root: fake_sysfs(&base),
+        probe: fake_probe(&base),
+        assignments: vec![(ws1, 0)],
+    };
+    let binder = std::sync::Arc::new(NumaBinder::start(&numa).expect("绑定器就绪"));
+
+    // `'static` 池（生产上池随实例存在；测试里泄一个空 I/O）。
+    let mem = MemFileIo::new();
+    mem.add_dir("/mem");
+    let io: &'static MemFileIo = Box::leak(Box::new(mem));
+    let pool = std::sync::Arc::new(
+        BufferPool::with_partitions(
+            io,
+            2,
+            4,
+            |_, _| None,
+            NoWal,
+            SystemClock,
+            CacheConfig::for_capacity(4),
+        )
+        .unwrap(),
+    );
+
+    let tids: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tids2 = std::sync::Arc::clone(&tids);
+    let binder2 = std::sync::Arc::clone(&binder);
+    let group = DbwrGroup::start(pool, Duration::from_secs(60), move |_p| {
+        // 创建时绑定点：**本线程**（刚创建、缓存为空）绑到 node0 组。
+        binder2.bind_to_node(0);
+        tids2.lock().unwrap().push(current_tid());
+    });
+
+    let file = base.join("cg/bicdb-node0/threads/cgroup.threads");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while tids.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let tids = tids.lock().unwrap().clone();
+    assert_eq!(tids.len(), 2, "两条写线程各跑一次钩子");
+    let content = fs::read_to_string(&file).expect("绑定落点文件");
+    let (a, b) = (tids[0].to_string(), tids[1].to_string());
+    assert!(
+        content == format!("{a}{b}") || content == format!("{b}{a}"),
+        "两条写线程的 tid 都写进了节点组：{content} vs {tids:?}"
+    );
+    assert_eq!(binder.failures(), 0);
+
+    group.shutdown();
     fs::remove_dir_all(&base).expect("清理测试目录");
 }

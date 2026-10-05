@@ -68,6 +68,12 @@
   映射 = `H(工作区) mod N`（FNV-1a + splitmix64 收尾——低位雪崩）；
   `capacity` 是**每分区**帧数；pin/flush/make_free 零跨分区协调；
   统计与闩锁统计为逐分区聚合。
+- **按分区写线程**（`dbwr::DbwrGroup`，§5.10："一个分区只由一个写线程负责"）：
+  每分区一条 DBWR 线程，各自只扫本分区写列表（`dirty_workspaces_in`）——
+  分区之间并行写回，每条写列表仍只有一个写者；`Dbwr::start_scoped` 是线程体
+  （`Some(p)` = 只写分区 p），`Dbwr::start`（全局）保留给 N=1。
+  **`prestart(partition)` 钩子在线程体内、写回之前执行**——NUMA 线程创建时
+  绑定的注入点（创建方在闭包里绑本线程；入参 = 该线程的分区号）。
 - **NUMA 重绑定原语**（详设 `doc/numa绑定设计_v0.1.md` §7）：帧的**页缓冲
   惰性分配**（装页线程 = 首次触碰者，"首次触碰落本地"零额外代码成立；
   未用帧不占 16 KiB）与 **Draining**——`drain_partition`（按写列表序刷尽 →

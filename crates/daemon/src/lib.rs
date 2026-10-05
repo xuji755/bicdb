@@ -11,7 +11,8 @@
 //!   （v0.2）[`numa`]（**NUMA 第二级绑定**：拓扑/cgroup 探测、cpuset 组
 //!   准备、线程绑定落点——零 unsafe 的文件路径；详设
 //!   `doc/numa绑定设计_v0.1.md`；本地性是优化不是正确性）；
-//!   （v0.3）**重绑定**（详设 §7 的 Rebinding 步）——`NumaBinder::rebind`
+//!   （v0.3）**重绑定与线程创建时绑定**（详设 §7 Rebinding + §5 阶段 B：
+//!   `NumaBinder::{rebind, bind_to_node}`）——`NumaBinder::rebind`
 //!   按需准备新节点组、更新映射、**世代号自增**失效全线程的绑定缓存
 //!   （缓存键 = 绑定器实例号 + 节点 + 世代）；池侧 Draining 原语在
 //!   `bicdb-storage`（`drain_partition`）。

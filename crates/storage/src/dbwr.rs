@@ -61,7 +61,26 @@ impl std::fmt::Debug for Dbwr {
 
 impl Dbwr {
     /// **启动**（要求池可 `'static` 共享：生产上池随实例存在）。
+    ///
+    /// **全局**形态：一条线程扫**所有**分区的脏工作区（N=1 的常规形态；
+    /// N>1 用 [`DbwrGroup`]——一个分区一条线程）。
     pub fn start(pool: Arc<BufferPool<'static>>, tick: Duration) -> Self {
+        Self::start_scoped(pool, None, tick, |_| {})
+    }
+
+    /// **启动（作用域形态）**：`partition = Some(p)` ⇒ 本线程**只**写分区 `p`
+    /// 的脏工作区（§5.10："一个分区只由一个写线程负责"——分区之间零争用，
+    /// 写列表/链/闩锁都按分区）。
+    ///
+    /// `prestart(partition)` 在**线程体内、任何写回之前**执行一次——它是
+    /// **NUMA 绑定的注入点**（详设 §5 阶段 B："线程创建时即入组"：创建方在
+    /// 闭包里把本线程绑进该工作集的节点组；绑定失败只诊断，不阻止写回）。
+    pub fn start_scoped(
+        pool: Arc<BufferPool<'static>>,
+        partition: Option<usize>,
+        tick: Duration,
+        prestart: impl FnOnce(Option<usize>) + Send + 'static,
+    ) -> Self {
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(StatsInner {
@@ -76,9 +95,14 @@ impl Dbwr {
             Arc::clone(&stop),
             Arc::clone(&pool),
         );
+        let name = match partition {
+            Some(p) => format!("bicdb-dbwr-{p}"),
+            None => "bicdb-dbwr".to_string(),
+        };
         let handle = std::thread::Builder::new()
-            .name("bicdb-dbwr".into())
+            .name(name)
             .spawn(move || {
+                prestart(partition);
                 loop {
                     {
                         let (lock, cv) = &*sig;
@@ -94,10 +118,10 @@ impl Dbwr {
                     if stp.load(Ordering::SeqCst) {
                         break;
                     }
-                    write_back_once(&pool2, &st);
+                    write_back_once(&pool2, &st, partition);
                 }
                 // 退出前最后一轮：把脏页交干（尽力而为）。
-                write_back_once(&pool2, &st);
+                write_back_once(&pool2, &st, partition);
             })
             .expect("创建 DBWR 线程");
         Self {
@@ -151,11 +175,94 @@ impl Drop for Dbwr {
     }
 }
 
-/// 一轮写回：**每个有脏页的工作区**按写列表从头按序写（`flush_workspace`）。
-fn write_back_once(pool: &BufferPool<'static>, stats: &StatsInner) {
+/// **按分区的一组 DBWR**（§5.10 层级："一个分区只由一个写线程负责"）：
+/// 每个分区一条线程，各自只写本分区的脏页；`prestart(partition)` 在每条
+/// 线程体内先于写回执行（**NUMA 绑定的注入点**，详设 §5 阶段 B）。
+///
+/// 与全局 [`Dbwr`] 的关系：N=1 时二者等价（一条线程）；N>1 时分区的
+/// 写列表/链/闩锁本就互不相干——分线程后**写回在分区之间并行**，而
+/// 每一条写列表仍只有**一个**写者（协议不变：按（首次变脏 LSN, rdba）升序）。
+pub struct DbwrGroup {
+    writers: Vec<Dbwr>,
+}
+
+impl std::fmt::Debug for DbwrGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbwrGroup")
+            .field("writers", &self.writers.len())
+            .field("stats", &self.stats())
+            .finish()
+    }
+}
+
+impl DbwrGroup {
+    /// 启动：线程数 = 池的**分区数**；`prestart` 被每条线程各调用一次
+    /// （入参 = 该线程负责的分区号）。闭包需要 `Send + Sync`——它被各线程
+    /// 共享（NUMA 绑定器本身是 `Arc<NumaBinder>`，满足）。
+    pub fn start(
+        pool: Arc<BufferPool<'static>>,
+        tick: Duration,
+        prestart: impl Fn(usize) + Send + Sync + 'static,
+    ) -> Self {
+        let partitions = pool.partition_count();
+        let prestart = Arc::new(prestart);
+        let writers = (0..partitions)
+            .map(|p| {
+                let pre = Arc::clone(&prestart);
+                Dbwr::start_scoped(Arc::clone(&pool), Some(p), tick, move |_| pre(p))
+            })
+            .collect();
+        Self { writers }
+    }
+
+    /// 分区数（= 写线程数）。
+    #[must_use]
+    pub fn writers(&self) -> usize {
+        self.writers.len()
+    }
+
+    /// 叫醒**全部**写线程（写线程各自只扫自己的分区，叫醒不会跨分区做无用功
+    /// ——真正无侧效的按分区叫醒留待"分区写列表到达"的钩子接入时细化）。
+    pub fn wake(&self) {
+        for w in &self.writers {
+            w.wake();
+        }
+    }
+
+    /// 聚合统计（各写线程之和；`last_error` 取任一非空）。
+    #[must_use]
+    pub fn stats(&self) -> DbwrStats {
+        let mut out = DbwrStats::default();
+        for w in &self.writers {
+            let s = w.stats();
+            out.passes += s.passes;
+            out.pages_written += s.pages_written;
+            out.failures += s.failures;
+            if out.last_error.is_none() {
+                out.last_error = s.last_error;
+            }
+        }
+        out
+    }
+
+    /// 停止并 join 全部写线程（各自含最后一轮收尾写回）。
+    pub fn shutdown(self) {
+        for w in self.writers {
+            w.shutdown();
+        }
+    }
+}
+
+/// 一轮写回：作用域内**每个有脏页的工作区**按写列表从头按序写
+/// （`flush_workspace`）；`Some(p)` = 只看分区 p（按分区写线程）。
+fn write_back_once(pool: &BufferPool<'static>, stats: &StatsInner, partition: Option<usize>) {
     let mut wrote = 0u64;
     let mut failed = false;
-    for ws in pool.dirty_workspaces() {
+    let workspaces = match partition {
+        Some(p) => pool.dirty_workspaces_in(p),
+        None => pool.dirty_workspaces(),
+    };
+    for ws in workspaces {
         match pool.flush_workspace(ws) {
             Ok(report) => wrote += report.pages_written,
             Err(e) => {
@@ -322,5 +429,92 @@ mod tests {
         assert!(wal_at < io_at, "次序必须是先 WAL 后页：{events:?}");
         assert!(stats.pages_written >= 1);
         assert_eq!(stats.failures, 0);
+    }
+
+    #[test]
+    fn partitioned_writers_flush_their_own_partition_and_run_the_binding_hook() {
+        // §5.10："一个分区只由一个写线程负责"——每分区一条线程，各自只扫
+        // 本分区的脏工作区；`prestart` 钩子在线程体内、写回之前执行
+        // （NUMA 绑定的注入点，入参 = 该线程负责的分区号）。
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let io = leaked_io(Arc::clone(&log));
+        // 两个工作区、两个文件（file 3 = WS_A、file 4 = WS_B），各一页。
+        const WS_B: [u8; 8] = [4u8; 8];
+        let (ha, hb) = {
+            let fa = Box::leak(Box::new(
+                crate::datafile::DataFile::create(io, Path::new("/mem/pa.dat"), 3, 3, WS, 512)
+                    .unwrap(),
+            ));
+            let fb = Box::leak(Box::new(
+                crate::datafile::DataFile::create(io, Path::new("/mem/pb.dat"), 4, 3, WS_B, 512)
+                    .unwrap(),
+            ));
+            for (h, ws, fid) in [(fa.handle(), WS, 3u16), (fb.handle(), WS_B, 4)] {
+                let mut page = Page::new(PageType::HeapTable, ws, fid, 1);
+                pagefile::write_page(io, h, 1, &mut page).unwrap();
+            }
+            (fa.handle(), fb.handle())
+        };
+        let pool = Arc::new(
+            BufferPool::with_partitions(
+                io,
+                2,
+                4,
+                move |ws, r| match (*ws, r.file_id()) {
+                    (w, 3) if w == WS => Some((ha, r.block_id())),
+                    (w, 4) if w == WS_B => Some((hb, r.block_id())),
+                    _ => None,
+                },
+                OrderWal {
+                    durable: AtomicU64::new(0),
+                    log: Arc::clone(&log),
+                },
+                SystemClock,
+                CacheConfig::for_capacity(4),
+            )
+            .unwrap(),
+        );
+        let (pa, pb) = (pool.partition_of(&WS), pool.partition_of(&WS_B));
+        assert_ne!(pa, pb, "夹具必须落两个不同分区");
+        for (ws, fid, lsn_v) in [(WS, 3u16, 8u64), (WS_B, 4, 4)] {
+            let key = BufferKey::new(ws, Rdba::from_parts(fid, 1).unwrap());
+            let mut g = pool.pin(key).unwrap();
+            g.as_bytes_mut()[4096] = 0x5A;
+            let mut header = g.header().unwrap();
+            header.page_lsn = Lsn::from_raw(lsn_v).unwrap();
+            g.write_header(&header);
+            g.mark_dirty(Lsn::from_raw(lsn_v).unwrap());
+        }
+        assert_eq!(pool.dirty_workspaces_in(pa), vec![WS]);
+        assert_eq!(pool.dirty_workspaces_in(pb), vec![WS_B]);
+
+        // 钩子记录"哪个分区在哪个线程里启动"——线程体先于写回。
+        let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let group = DbwrGroup::start(Arc::clone(&pool), Duration::from_secs(60), move |p| {
+            seen2.lock().unwrap().push(p)
+        });
+        assert_eq!(group.writers(), 2, "每分区一条写线程");
+        group.wake();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (pool.dirty_len(WS) > 0 || pool.dirty_len(WS_B) > 0)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(pool.dirty_len(WS), 0, "分区 0 的脏页写回");
+        assert_eq!(pool.dirty_len(WS_B), 0, "分区 1 的脏页写回");
+        let stats = group.stats();
+        group.shutdown();
+        assert_eq!(stats.pages_written, 2, "两页都写出（聚合统计）");
+        assert_eq!(stats.failures, 0);
+
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![pa.min(pb), pa.max(pb)],
+            "每条线程各跑一次钩子（自己的分区号）"
+        );
     }
 }

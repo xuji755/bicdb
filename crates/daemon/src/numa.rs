@@ -674,8 +674,11 @@ impl NumaBinder {
                 reason: "节点组未就绪",
             })?;
         let path = group.bind_dir.join(group.bind_file);
+        // **追加**打开：cgroupfs 的写入是"追加一条命令"，文件位置无意义
+        // （内核按整段缓冲解析）——用 append 让普通文件的替身行为与之一致
+        // （否则假 fs 上第二次写会从偏移 0 覆盖掉第一个 tid）。
         let mut f = fs::OpenOptions::new()
-            .write(true)
+            .append(true)
             .open(&path)
             .map_err(|e| NumaError::io(&path, e))?;
         f.write_all(tid.to_string().as_bytes())
@@ -692,6 +695,17 @@ impl NumaBinder {
         let Some(node) = self.node_of(workspace) else {
             return BindOutcome::Unassigned;
         };
+        self.bind_to_node(node)
+    }
+
+    /// **把当前线程绑到指定节点组**（按节点直绑；写线程/后台角色的
+    /// **创建时绑定点**，详设 §5 阶段 B）。
+    ///
+    /// 与 [`NumaBinder::bind_current_thread`] 的关系：那边按工作区查映射，
+    /// 这边由创建方直接给出节点（写线程天然属于"某个工作集 → 某个节点"）。
+    /// 组未就绪 ⇒ `Failed` 并记录原因（**任务照常**——本地性是优化）；
+    /// 就绪性由启动或 [`NumaBinder::rebind`] 负责。
+    pub fn bind_to_node(&self, node: u32) -> BindOutcome {
         let epoch = self.epoch.load(Ordering::Acquire);
         if BOUND_NODE.with(|c| *c.borrow()) == Some((self.instance, node, epoch)) {
             return BindOutcome::Bound; // 缓存命中：本线程已在目标组（且未重绑定）
