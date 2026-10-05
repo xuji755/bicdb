@@ -294,7 +294,7 @@ pub fn delete_row(
     // **加锁 + 占用 ITL 条目**（清除/复用/新占用 + `ITL 覆盖` 记录）——
     // 行锁与可见性的落点；行被他人活动事务锁住 ⇒ `RowLocked`（调用方登记
     // 等待后重试，§5.4.2 ①），**不得静默失败**。
-    lock_and_occupy(pool, log, chain, txn, &mut local, block, row_no)?;
+    let (_slot, _reentrant) = lock_and_occupy(pool, log, chain, txn, &mut local, block, row_no)?;
     let rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?;
     append_undo_via_pool(
         pool,
@@ -371,7 +371,7 @@ pub fn update_row(
         // 不增：就地重写（等长到收缩同径——收缩时尾部旧字节一并进补丁，
         // 撤销按偏移写回即恢复原长；行区留下的洞由 defrag 处理，§6.8）。
         // 加锁 + 占用 ITL（行被他人锁住 ⇒ `RowLocked`，同 delete）。
-        let slot = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
+        let (slot, _) = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
         let patches = row_patches(&old_row, new_row);
         append_undo_via_pool(
             pool,
@@ -433,7 +433,7 @@ pub fn update_row(
     let dest_before = *dest_local.as_bytes();
 
     // ① 源页：占用 ITL + "删除"记录（= 迁移的"旧位置"半边）。
-    let src_slot = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
+    let (src_slot, _) = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
     append_undo_via_pool(
         pool,
         log,
@@ -785,7 +785,7 @@ fn lock_and_occupy(
     local: &mut Page,
     block: BufferKey,
     row_no: u16,
-) -> Result<u16, TxnError> {
+) -> Result<(u16, bool), TxnError> {
     match decide_row_lock(local, chain, txn, block, row_no)? {
         LockOutcome::WouldWait { holder } => Err(TxnError::RowLocked {
             holder,
@@ -794,7 +794,7 @@ fn lock_and_occupy(
         LockOutcome::Acquired { reentrant: true } => {
             // 同一行的重入：槽已就位，不重复计 `lock_cnt`。
             let row = heap::row(local, row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
-            Ok(u16::from(row[1]))
+            Ok((u16::from(row[1]), true))
         }
         LockOutcome::Acquired { reentrant: false } => {
             let (slot, fresh) = occupy_itl(pool, log, chain, txn, local, block)?;
@@ -804,7 +804,7 @@ fn lock_and_occupy(
                 // 本事务在该块已有条目（锁的是**另一行**）：行数 +1。
                 itl::lock(local, slot)?;
             }
-            Ok(slot)
+            Ok((slot, false))
         }
     }
 }
@@ -903,6 +903,73 @@ pub fn rollback(
     Ok(count)
 }
 
+/// **只加锁不改行**（REQ-ENG-002 的 `lock`）：pin 页 → 判定 → 占用 ITL
+/// （经池 + redo——占用本身要记 `ITL 覆盖`）→ 放卫兵。**不改任何行字节**。
+///
+/// `RowLocked` ⇒ 调用方走"登记等待 → 挂起 → 重试"（[`execute_with_wait`]
+/// 是现成驱动，返回 `Acquired`/`DeadlockVictim` 即 REQ-ENG-002 的"获得/牺牲"）。
+/// 返回 `true` = **重入**（本事务本就锁着这一行，不重复计 `lock_cnt`）。
+pub fn lock_row(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    txn: &Txn,
+    block: BufferKey,
+    row_no: u16,
+) -> Result<bool, TxnError> {
+    let guard = pool.pin(block)?;
+    let before = *guard.as_bytes();
+    let mut local = Page::from_bytes(Box::new(before));
+    drop(guard); // 单卫兵纪律：先取前像、放卫兵，再在副本上做占用
+    let row = heap::row(&local, row_no)
+        .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
+        .to_vec();
+    let old_slot = row[1];
+    let (slot, reentrant) = lock_and_occupy(pool, log, chain, txn, &mut local, block, row_no)?;
+    // **锁也落行级痕**（§4.6.2："占用时旧字节随本行第一条 undo 记录"）：
+    // 行头 `itl_slot` 从旧值改写为本事务的槽——这条 `Update` 记录（补丁可为空，
+    // 当旧字节恰好已是本槽）就是"**锁与修改同源**"判据
+    // （`holder_locked_this_row`）的证据。没有它，纯加锁对他人**不可见**
+    // （会被当作陈旧字节放行）；有它，重入与冲突判定都成立。
+    let mut patched = row.clone();
+    patched[1] = slot as u8;
+    let patches = row_patches(&row, &patched);
+    let rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?;
+    append_undo_via_pool(
+        pool,
+        log,
+        chain,
+        txn,
+        UndoOp::Update,
+        rid,
+        UndoPayload::Update {
+            old_itl_slot: old_slot,
+            patches,
+        },
+    )?;
+    if u16::from(old_slot) != slot {
+        let index = heap::slot_index(row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
+        let offset = local
+            .slot(index)
+            .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
+            .offset() as usize;
+        local.as_bytes_mut()[offset + 1] = slot as u8;
+    }
+    if local.as_bytes() != before.as_slice() {
+        // 占用（或延迟块清除/行头回填）改了页：随 redo 写回（§11.1.2）。
+        write_page_change(
+            pool,
+            log,
+            txn.raw(),
+            block,
+            &before,
+            local.as_bytes(),
+            false,
+        )?;
+    }
+    Ok(reentrant)
+}
+
 /// **语句回滚点**（§4.6.6 ②）：语句开始时记录的 `undo_current` 快照——
 /// **纯内存**（真值在事务表槽里；回滚点只是它的一份拷贝，"建立回滚点"本身
 /// 不需要任何持久化动作）。
@@ -989,58 +1056,143 @@ pub fn rollback_to_mark(
     Ok(count)
 }
 
-/// **语句执行的等待-重试驱动**（§5.4.2 ①/④ 的会话层落点）。
+/// **语句执行上下文**（驱动与具体资源形态之间的缝）。
 ///
-/// 进入时取**语句回滚点**；把 `op` 反复执行：
-///
-/// ```text
-/// op 成功            ⇒ 返回结果
-/// op 报 `RowLocked`  ⇒ 登记等待（按持锁者）→ 挂起 → 醒来**从头重试** op
-///                       （不假设行还在原地/槽没换人/行还存在，§5.4.2）
-/// 死锁环上我是牺牲者 ⇒ **语句级回滚到回滚点**（不释锁、不动此前语句）
-///                       + 取消等待（牺牲者不再等待 ⇒ 环即解开）→ 返回
-///                       `DeadlockVictim`（会话层重启语句）
-/// 其他错误           ⇒ 原样上抛（语句边界由调用方处置：先 `rollback_to_mark`）
-/// ```
-///
-/// **等待只在 latch 之外发生**（§5.4.2：latch 持有以页访问为界，持有 latch
-/// 时不得等待业务锁）——`op` 每次调用自行把 latch 取放完；本函数在两次调用
-/// 之间挂起。
-///
-/// `now` 是单调毫秒时钟（死锁阈值与等待时长都用它；测试可注入）。
+/// 驱动只认三个动作：**试一次**、**判死锁**、**牺牲者回滚**——资源怎么加锁
+/// 由实现决定：单会话形态直接借用（`SingleSessionCtx`）；引擎形态**每次尝试
+/// 自取**日志/撤销链两把锁（**挂起期间不持锁**——否则持锁者进不来，等待即
+/// 死锁）。
+pub trait StatementContext {
+    /// 一次尝试的产物。
+    type Item;
+
+    /// 试一次（背靠资源）。
+    fn attempt(&mut self, txn: &mut Txn) -> Result<Self::Item, TxnError>;
+
+    /// 死锁检测（等待图由驱动给出；"我的链"由实现接）。
+    fn detect(
+        &mut self,
+        registry: &crate::lock::WaitRegistry,
+        now_ms: u64,
+        threshold_ms: u64,
+    ) -> Result<Option<crate::lock::Deadlock>, TxnError>;
+
+    /// 牺牲者路径的**语句级回滚**（到回滚点）。
+    fn rollback_to_mark(&mut self, txn: &mut Txn, mark: StatementMark) -> Result<u64, TxnError>;
+}
+
+/// **单会话形态的上下文**（借用形态：日志与撤销链由调用方持有；
+/// 一次尝试 = 调一次 `attempt` 闭包）。
+pub struct SingleSessionCtx<'a, 'b, 'p, 'io, 'f, T, F> {
+    pool: &'a BufferPool<'b>,
+    log: &'p mut GroupWriter<'io, 'f>,
+    chain: &'p mut UndoChain<'io, 'f>,
+    attempt: F,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, 'b, 'p, 'io, 'f, T, F> StatementContext for SingleSessionCtx<'a, 'b, 'p, 'io, 'f, T, F>
+where
+    F: FnMut(
+        &BufferPool<'b>,
+        &mut GroupWriter<'io, 'f>,
+        &mut UndoChain<'io, 'f>,
+        &mut Txn,
+    ) -> Result<T, TxnError>,
+{
+    type Item = T;
+
+    fn attempt(&mut self, txn: &mut Txn) -> Result<T, TxnError> {
+        let (pool, log, chain, f) = (
+            self.pool,
+            &mut *self.log,
+            &mut *self.chain,
+            &mut self.attempt,
+        );
+        f(pool, log, chain, txn)
+    }
+
+    fn detect(
+        &mut self,
+        registry: &crate::lock::WaitRegistry,
+        now_ms: u64,
+        threshold_ms: u64,
+    ) -> Result<Option<crate::lock::Deadlock>, TxnError> {
+        Ok(crate::lock::detect_deadlock(
+            registry,
+            self.chain,
+            now_ms,
+            threshold_ms,
+        )?)
+    }
+
+    fn rollback_to_mark(&mut self, txn: &mut Txn, mark: StatementMark) -> Result<u64, TxnError> {
+        rollback_to_mark(self.pool, self.log, self.chain, txn, mark)
+    }
+}
+
+/// **单会话/单写者形态的驱动**（借用形态；引擎形态见 `engine` 模块）。
 #[allow(clippy::too_many_arguments)]
-pub fn execute_with_wait<T>(
-    pool: &BufferPool<'_>,
-    log: &mut GroupWriter<'_, '_>,
-    chain: &mut UndoChain<'_, '_>,
+pub fn execute_with_wait<'a, 'b, 'p, 'io, 'f, T>(
+    pool: &'a BufferPool<'b>,
+    log: &'p mut GroupWriter<'io, 'f>,
+    chain: &'p mut UndoChain<'io, 'f>,
     txn: &mut Txn,
     gate: &crate::lock::WaitGate,
     policy: &WaitPolicy,
     now: impl Fn() -> u64,
-    mut op: impl FnMut(
-        &BufferPool<'_>,
-        &mut GroupWriter<'_, '_>,
-        &mut UndoChain<'_, '_>,
+    attempt: impl FnMut(
+        &BufferPool<'b>,
+        &mut GroupWriter<'io, 'f>,
+        &mut UndoChain<'io, 'f>,
         &mut Txn,
     ) -> Result<T, TxnError>,
 ) -> Result<T, TxnError> {
     let mark = statement_mark(chain, txn)?;
+    let mut ctx = SingleSessionCtx {
+        pool,
+        log,
+        chain,
+        attempt,
+        _marker: std::marker::PhantomData,
+    };
+    drive(&mut ctx, txn, mark, gate, policy, now, |c, t| c.attempt(t))
+}
+
+/// **驱动的核心循环**（§5.4.2 的会话层落点）：
+///
+/// ```text
+/// attempt 成功        ⇒ 返回结果
+/// attempt 报 RowLocked ⇒ 登记等待（按持锁者）→ 挂起 → 醒来**从头重试**
+///                         （不假设行还在原地/槽没换人/行还存在）
+/// 死锁环上我是牺牲者   ⇒ 语句级回滚到回滚点（不释锁、不动此前语句）
+///                         + 取消等待（牺牲者不再等待 ⇒ 环即解开）→ DeadlockVictim
+/// 其他错误            ⇒ 原样上抛（语句边界由调用方处置）
+/// ```
+pub fn drive<C: StatementContext>(
+    ctx: &mut C,
+    txn: &mut Txn,
+    mark: StatementMark,
+    gate: &crate::lock::WaitGate,
+    policy: &WaitPolicy,
+    now: impl Fn() -> u64,
+    mut attempt: impl FnMut(&mut C, &mut Txn) -> Result<C::Item, TxnError>,
+) -> Result<C::Item, TxnError> {
     let mut waits: u32 = 0;
     loop {
-        match op(pool, log, chain, txn) {
+        match attempt(ctx, txn) {
             Ok(v) => return Ok(v),
             Err(TxnError::RowLocked { holder, row }) => {
                 gate.register(txn.txn_id, holder, row, now());
-                let deadlock = gate.with_registry(|r| {
-                    crate::lock::detect_deadlock(r, chain, now(), policy.deadlock_threshold_ms)
-                })?;
+                let deadlock =
+                    gate.with_registry(|r| ctx.detect(r, now(), policy.deadlock_threshold_ms))?;
                 if let Some(dl) = deadlock {
                     if dl.victim == txn.txn_id {
                         let _ = gate.cancel(txn.txn_id);
-                        rollback_to_mark(pool, log, chain, txn, mark)?;
+                        ctx.rollback_to_mark(txn, mark)?;
                         return Err(TxnError::DeadlockVictim { cycle: dl.cycle });
                     }
-                    // 我不是牺牲者：继续等待（牺牲者回滚后会释放/不再等待）。
+                    // 我不是牺牲者：继续等待（牺牲者回滚后不再等待 ⇒ 环解开）。
                 }
                 waits = waits.saturating_add(1);
                 if let Some(max) = policy.max_waits {

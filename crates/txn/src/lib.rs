@@ -4,7 +4,9 @@
 //!
 //! - 设计依据：§8 崩溃恢复契约（§4.6.6 事务生命周期、§11.1.1 提交流程）
 //! - 对应阶段：**P3**（已启动；本片 = `写路径`——**DML 经缓冲池落地**）
-//! - 当前状态：**v0.5**——[`write`]（写路径：`Txn` 生命周期 + `insert`/`commit`/
+//! - 当前状态：**v0.6**——[`engine`]（**事务引擎门面**，REQ-ENG-002：
+//!   `begin`/`snapshot`/`commit`/`rollback`/`语句回滚点`/`lock_row`，**句柄不透明**；
+//!   `lock_row` 纯加锁落行级痕）、[`write`]（写路径：`Txn` 生命周期 + `insert`/`commit`/
 //!   `rollback` 经缓冲池；undo 页**受 redo 保护**；提交 = 提交记录刷盘后返回）；
 //!   **语句回滚点与等待-重试驱动**（P4）：`statement_mark`/`rollback_to_mark`
 //!   （§4.6.6 ②：不释锁、不回滚此前语句；链头置回回滚点 ⇒ 孤链不可达）、
@@ -34,6 +36,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod engine;
 pub mod lock;
 pub mod snapshot;
 pub mod write;
