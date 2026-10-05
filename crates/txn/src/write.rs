@@ -1212,4 +1212,85 @@ mod tests {
         assert!(touches(3, 1), "数据页有 redo");
         let _ = rid;
     }
+
+    #[test]
+    fn live_cr_reads_the_chain_directly_after_dml() {
+        // 撤销页"经池写 + 立即 flush"的直接回报：**活系统的 CR/回滚直读链**即可
+        // 看到刚写下的记录（池里没有脏的 undo 页）。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let row = row_bytes(b"cr");
+        let mut txn = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut txn,
+            key,
+            &row,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+
+        // 直读链：槽的链头可读、两条记录类别正确（undo 页已 flush，直读可见）。
+        let header = chain.segment().read_page(0).unwrap();
+        let head = read_slot(&header, txn.slot).unwrap().undo_current.unwrap();
+        let rec = chain.read(head).unwrap();
+        assert_eq!(rec.op, UndoOp::Insert);
+        assert_eq!(rec.rowid, rid);
+        let prev = chain.read(rec.prev.unwrap()).unwrap();
+        assert_eq!(prev.op, UndoOp::ItlOverwrite);
+
+        // 活系统 CR（直读链）：未提交 ⇒ 行不可见；提交后 ⇒ 可见。
+        let snapshot_page = {
+            let g = pool.pin(key).unwrap();
+            bicdb_storage::page::Page::from_bytes(Box::new(*g.as_bytes()))
+        };
+        let uncommitted = bicdb_storage::cr::reconstruct(&snapshot_page, seq(0), &chain).unwrap();
+        assert_eq!(
+            heap::row(&uncommitted, rid.row_id()),
+            None,
+            "未提交：CR 抹掉"
+        );
+        commit(&pool, &mut log, &mut chain, &mut txn, seq(1)).unwrap();
+        let committed = bicdb_storage::cr::reconstruct(&snapshot_page, seq(1), &chain).unwrap();
+        assert_eq!(
+            heap::row(&committed, rid.row_id()).map(|b| b.len()),
+            Some(row.len()),
+            "提交后：CR 可见"
+        );
+    }
 }
