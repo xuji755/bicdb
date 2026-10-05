@@ -48,7 +48,7 @@
 //! 临界区纪律（**闩锁内不做 I/O**等四条）与闩锁统计口径见 §5.10"闩锁形态与纪律"。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bicdb_common::latch::{Latch, LatchGuard, LatchStats};
@@ -142,6 +142,9 @@ pub struct CacheConfig {
     pub hot_criteria: u32,
     /// 前台扫空闲缓冲的上限 = 容量 / 该值（Oracle `db_block_max_scan_cnt` 默认 缓冲数/4）。
     pub max_scan_fraction: usize,
+    /// **桶闩锁数**（O3 桶分片：一组桶一把闩锁——`kcbz.h` 的"桶在 latch 间轮转"）。
+    /// 默认 ≈ 桶数/8（夹取 1..=64）；= 1 即退回"单闩锁"形态（对照/测试可用）。
+    pub bucket_latches: usize,
 }
 
 impl CacheConfig {
@@ -156,6 +159,8 @@ impl CacheConfig {
             stay_count: 2,
             hot_criteria: 2,
             max_scan_fraction: 4,
+            // **2 的幂**：桶→分片的换算退化为位运算（热路径不背除法）。
+            bucket_latches: ((capacity / 4).max(1) / 8).clamp(1, 64).next_power_of_two(),
         }
     }
 }
@@ -344,6 +349,84 @@ impl BufferStats {
     }
 }
 
+/// **统计分片数**（O3；与 `Latch` 计数同法：线程按栈地址选片）。
+const STAT_SHARDS: usize = 8;
+
+/// **一片统计计数**（原子 + 一行 cache line）：线程只写自己那片，
+/// 读取时逐片求和——**仍然精确**（不是采样）。P0 实测：两个共享计数器
+/// 单独吃掉 ~38% 吞吐（证据包 `latch-ab-20261005/`），O3 把它应用到池统计。
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct StatsShard {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    writes: AtomicU64,
+    wal_syncs: AtomicU64,
+    fb_wait: AtomicU64,
+    free_inspected: AtomicU64,
+    dirty_inspected: AtomicU64,
+    pinned_inspected: AtomicU64,
+    hot_moved: AtomicU64,
+    aging_steps: AtomicU64,
+    run_reads: AtomicU64,
+    run_pages: AtomicU64,
+    aux_moved: AtomicU64,
+}
+
+/// **分片统计集**（每分区一份；`BufferPool::stats` 再跨分区聚合）。
+#[derive(Debug)]
+struct StatsShards {
+    shards: Vec<StatsShard>,
+}
+
+impl StatsShards {
+    fn new() -> Self {
+        Self {
+            shards: (0..STAT_SHARDS).map(|_| StatsShard::default()).collect(),
+        }
+    }
+
+    /// 本线程的片（栈地址 → 片号；零成本、零 unsafe——同 `Latch`）。
+    fn shard(&self) -> &StatsShard {
+        let x = 0u8;
+        let tag = std::ptr::addr_of!(x) as usize;
+        &self.shards[(tag >> 6) % self.shards.len()]
+    }
+
+    /// 记一次（本线程片）。
+    fn inc<F: Fn(&StatsShard) -> &AtomicU64>(&self, field: F) {
+        field(self.shard()).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记 n 次（本线程片）。
+    fn add<F: Fn(&StatsShard) -> &AtomicU64>(&self, n: u64, field: F) {
+        field(self.shard()).fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// **逐片求和**（精确）。
+    fn sum(&self) -> BufferStats {
+        let mut out = BufferStats::default();
+        for sh in &self.shards {
+            out.hits += sh.hits.load(Ordering::Relaxed);
+            out.misses += sh.misses.load(Ordering::Relaxed);
+            out.evictions += sh.evictions.load(Ordering::Relaxed);
+            out.writes += sh.writes.load(Ordering::Relaxed);
+            out.wal_syncs += sh.wal_syncs.load(Ordering::Relaxed);
+            out.fb_wait += sh.fb_wait.load(Ordering::Relaxed);
+            out.free_inspected += sh.free_inspected.load(Ordering::Relaxed);
+            out.dirty_inspected += sh.dirty_inspected.load(Ordering::Relaxed);
+            out.pinned_inspected += sh.pinned_inspected.load(Ordering::Relaxed);
+            out.hot_moved += sh.hot_moved.load(Ordering::Relaxed);
+            out.aging_steps += sh.aging_steps.load(Ordering::Relaxed);
+            out.run_reads += sh.run_reads.load(Ordering::Relaxed);
+            out.run_pages += sh.run_pages.load(Ordering::Relaxed);
+            out.aux_moved += sh.aux_moved.load(Ordering::Relaxed);
+        }
+        out
+    }
+}
+
 /// 一次 `flush_workspace` 的报告。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlushReport {
@@ -378,6 +461,10 @@ pub struct DrainReport {
 struct FrameSlot {
     /// 原子 pin 计数（卫兵的增减**不经过**分区闩锁）。
     pins: AtomicU32,
+    /// **TCH（触摸计数）**（O3：命中路径直接原子更新，不再进结构闩锁）。
+    touches: AtomicU32,
+    /// 上次计数递增的墙钟毫秒（**三秒规则**；同前——原子）。
+    last_touch_ms: AtomicU64,
     /// **页内容**（首次装入时分配；未用过的帧不占 16 KiB）。
     ///
     /// 为什么惰性（§5.10 NUMA 第二级绑定）：帧内存的**首次触碰决定它落在哪个
@@ -391,13 +478,36 @@ impl FrameSlot {
     fn empty() -> Self {
         Self {
             pins: AtomicU32::new(0),
+            touches: AtomicU32::new(0),
+            last_touch_ms: AtomicU64::new(0),
             content: RwLock::new(None),
         }
     }
+
+    /// **三秒规则下的触摸计数**（命中路径；闩外原子更新——O3）。
+    /// 返回"已达热判据"——命中路径据此决定**是否值得**去试提升（拿不到结构
+    /// 闩锁的 `try` 也是一次 CAS：绝大多数命中不该付它）。
+    fn bump_touch(&self, now: u64, cfg: &CacheConfig) -> bool {
+        let last = self.last_touch_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= cfg.touch_interval_ms {
+            let t = self.touches.fetch_add(1, Ordering::Relaxed) + 1;
+            self.last_touch_ms.store(now, Ordering::Relaxed);
+            return t >= cfg.hot_criteria;
+        }
+        self.touches.load(Ordering::Relaxed) >= cfg.hot_criteria
+    }
+
+    /// 重置触摸计数（装入/提升/退回 冷段时用）。
+    fn reset_touch(&self, value: u32, now: u64) {
+        self.touches.store(value, Ordering::Relaxed);
+        self.last_touch_ms.store(now, Ordering::Relaxed);
+    }
 }
 
-/// 帧的**归属与记账**（由分区的结构闩锁保护——临界区短；桶分片 O3 落地时
-/// 再往细拆）。
+/// 帧的**归属与记账**（由分区的结构闩锁保护——临界区短）。
+/// **O3 已把命中路径的字段移出**：`touches`/`last_touch_ms` 进了 [`FrameSlot`]
+/// （原子）；`hits` 等统计进了 [`StatsShards`]（分片原子）——结构闩锁上只剩
+/// "键 + 脏/首次变脏 LSN"（键的变更规则见 `BucketShard` 的文档）。
 #[derive(Debug, Clone)]
 struct FrameMeta {
     key: Option<BufferKey>,
@@ -405,9 +515,6 @@ struct FrameMeta {
     dirty: bool,
     /// **首次变脏的 LSN**（写列表/检查点队列排序键）。
     first_dirty: Option<Lsn>,
-    /// 触摸计数与上次递增时刻（三秒规则）。
-    touches: u32,
-    last_touch_ms: u64,
 }
 
 impl FrameMeta {
@@ -416,8 +523,6 @@ impl FrameMeta {
             key: None,
             dirty: false,
             first_dirty: None,
-            touches: 0,
-            last_touch_ms: 0,
         }
     }
 }
@@ -429,8 +534,6 @@ struct Structure {
     meta: Vec<FrameMeta>,
     /// 从未用过的帧（首次装入后帧就长期挂在链上）。
     virgin: Vec<usize>,
-    /// 哈希桶：桶号 → 帧号链（找块）。
-    buckets: Vec<Vec<usize>>,
     /// 热段（头 = 最热）。
     hot: VecDeque<usize>,
     /// 冷段（头 = 刚重用；尾 = 最先淘汰）。
@@ -440,15 +543,61 @@ struct Structure {
     /// 写列表：**每工作区一条**（= 检查点队列），按（首次变脏 LSN, rdba）升序。
     write_list: BTreeMap<[u8; 8], BTreeSet<(Lsn, Rdba)>>,
     cfg: CacheConfig,
-    stats: BufferStats,
+}
+
+/// **桶分片**（O3）：一片闩锁保护的一组桶链。
+///
+/// **链上条目 `(键, 帧号)`——键随链走**：命中路径只在这一把闩锁下完成
+/// "定位 + pin"，**不读**结构闩锁下的帧元数据。
+///
+/// **键变更规则**（O3 不变量，与"内容锁 ⇒ pin > 0"并列）：
+/// ① 帧的键只由**持结构闩锁者**变更（于是 `FrameMeta::key` 的读写都在结构
+///    闩下，无需第三把锁）；
+/// ② 摘/挂桶链都要持**该链的桶闩锁**。
+/// 于是"持桶闩 + 在链上看到 `(K, idx)`" ⇒ 帧 idx 此刻不可能正被换键
+/// （换键者必须先摘旧链 = 先持这把闩）——命中路径的读取因此无需再验证。
+#[derive(Debug)]
+struct BucketShard {
+    /// 本片桶链（局部桶号 → 条目链）。
+    chains: Vec<Vec<(BufferKey, usize)>>,
+}
+
+/// 桶号 = **DBA（rdba）对桶数取模**（Oracle `_DB_BLOCK_HASH_BUCKETS` 原文
+/// 口径："hash the required DBA by this number"）；跨工作区的同址块落同桶
+/// ——链上再按完整键比对。
+fn bucket_of(cfg: &CacheConfig, key: BufferKey) -> usize {
+    let dba = (u64::from(key.rdba.file_id()) << 28) | u64::from(key.rdba.block_id());
+    (dba % cfg.buckets as u64) as usize
+}
+
+/// 桶 → 分片（**相邻桶轮转**到不同闩锁——`kcbz.h` 的"桶在 latch 间轮转"）。
+fn shard_of(cfg: &CacheConfig, bucket: usize) -> usize {
+    bucket % cfg.bucket_latches.max(1)
+}
+
+/// 桶在本片内的局部号。
+fn local_bucket(cfg: &CacheConfig, bucket: usize) -> usize {
+    bucket / cfg.bucket_latches.max(1)
+}
+
+/// 每片的桶数（向上取整）。
+fn chains_per_shard(cfg: &CacheConfig) -> usize {
+    let n = cfg.bucket_latches.max(1);
+    cfg.buckets.div_ceil(n).max(1)
 }
 
 /// **一个工作集分区**（§5.10）：帧槽数组（稳定地址、自带同步原语）+
-/// 结构闩锁。`slots` 与 `structure` 是**不相交的字段**——同一个方法里可以
-/// 同时持有"结构闩锁"与"帧槽的共享借用"。
+/// 桶分片（O3）+ 结构闩锁 + 分片统计（O3）。`slots` 与其余字段是**不相交
+/// 的字段**——同一个方法里可以同时持有"闩锁卫兵"与"帧槽的共享借用"。
 struct Partition {
+    /// 桶换算所需的配置副本（与 `structure.cfg` 同源）。
+    cfg: CacheConfig,
     slots: Box<[FrameSlot]>,
+    /// **桶分片闩锁组**（O3）：命中路径只碰这里。
+    buckets: Vec<Latch<BucketShard>>,
     structure: Latch<Structure>,
+    /// 分片统计（O3；与结构闩锁分离）。
+    stats: StatsShards,
 }
 
 /// 写回目标（`flush` / 写列表头 / 全局最老头）。
@@ -460,6 +609,14 @@ enum WriteTarget {
     WorkspaceHead([u8; 8]),
     /// 所有工作区里"最老首次变脏 LSN"最小的头（Make Free）。
     OldestHead,
+}
+
+/// 候选帧"声明"结果（O3：腾帧前必须在旧键桶闩下复核 pins）。
+enum Detach {
+    /// 已摘链：`Some(旧键)` = 摘到旧桶链条目；`None` = 帧本来无键（virgin）。
+    Done(Option<BufferKey>),
+    /// 被并发钉住：放弃候选（调用方重选）。
+    Pinned,
 }
 
 /// 选页结果。
@@ -586,21 +743,31 @@ impl<'io> BufferPool<'io> {
             return Err(BufferError::BadPartitionCount { partitions });
         }
         let mk = |_| Partition {
+            cfg,
             slots: (0..capacity).map(|_| FrameSlot::empty()).collect(),
+            buckets: (0..cfg.bucket_latches.max(1))
+                .map(|_| {
+                    Latch::new(
+                        "db_bucket",
+                        BucketShard {
+                            chains: vec![Vec::new(); chains_per_shard(&cfg)],
+                        },
+                    )
+                })
+                .collect(),
             structure: Latch::new(
                 "db_cache",
                 Structure {
                     meta: (0..capacity).map(|_| FrameMeta::empty()).collect(),
                     virgin: (0..capacity).rev().collect(),
-                    buckets: vec![Vec::new(); cfg.buckets],
                     hot: VecDeque::new(),
                     cold: VecDeque::new(),
                     aux: VecDeque::new(),
                     write_list: BTreeMap::new(),
                     cfg,
-                    stats: BufferStats::default(),
                 },
             ),
+            stats: StatsShards::new(),
         };
         Ok(Self {
             io,
@@ -630,7 +797,28 @@ impl<'io> BufferPool<'io> {
     pub fn partition_latch_stats(&self) -> Vec<LatchStats> {
         self.partitions
             .iter()
-            .map(|p| p.structure.stats())
+            .flat_map(|p| {
+                let mut out = vec![p.structure.stats()];
+                // 桶分片（O3）：逐片求和为一个 "db_bucket" 项（V$LATCH 口径）。
+                let mut b = LatchStats {
+                    name: "db_bucket",
+                    gets: 0,
+                    immediate: 0,
+                    spin_gets: 0,
+                    sleeps: 0,
+                    wait_ns: 0,
+                };
+                for shard in &p.buckets {
+                    let s = shard.stats();
+                    b.gets += s.gets;
+                    b.immediate += s.immediate;
+                    b.spin_gets += s.spin_gets;
+                    b.sleeps += s.sleeps;
+                    b.wait_ns += s.wait_ns;
+                }
+                out.push(b);
+                out
+            })
             .collect()
     }
 
@@ -652,7 +840,7 @@ impl<'io> BufferPool<'io> {
     /// 哈希桶数（每分区同值）。
     #[must_use]
     pub fn bucket_count(&self) -> usize {
-        self.partitions[0].structure.lock().buckets.len()
+        self.partitions[0].cfg.buckets
     }
 
     /// 某桶的链长（诊断；**全部分区之和**——单分区时即该桶链长）。
@@ -660,7 +848,11 @@ impl<'io> BufferPool<'io> {
     pub fn bucket_len(&self, bucket: usize) -> usize {
         self.partitions
             .iter()
-            .map(|p| p.structure.lock().buckets.get(bucket).map_or(0, Vec::len))
+            .map(|p| {
+                let s = shard_of(&p.cfg, bucket);
+                let local = local_bucket(&p.cfg, bucket);
+                p.buckets[s].lock().chains.get(local).map_or(0, Vec::len)
+            })
             .sum()
     }
 
@@ -670,7 +862,7 @@ impl<'io> BufferPool<'io> {
     pub fn stats(&self) -> BufferStats {
         let mut out = BufferStats::default();
         for p in &self.partitions {
-            out.merge(&p.structure.lock().stats);
+            out.merge(&p.stats.sum()); // 分片原子逐片求和（精确；O3）
         }
         out
     }
@@ -714,15 +906,23 @@ impl<'io> BufferPool<'io> {
     /// Oracle 侧即"TCH 越高，块被访问越频繁"）。
     #[must_use]
     pub fn touch_count(&self, key: BufferKey) -> Option<u32> {
-        let st = self.lock_of(&key.workspace);
-        st.find_frame(key).map(|idx| st.meta[idx].touches)
+        let partition = self.partition_of(&key.workspace);
+        let idx = {
+            let (_s, local, g) = self.lock_bucket(partition, key);
+            Self::chain_find(&g, local, key)?
+        };
+        Some(self.slots(partition)[idx].touches.load(Ordering::Relaxed))
     }
 
     /// 某帧在哪条链上（`hot` / `cold` / `aux`；诊断与测试）。
     #[must_use]
     pub fn chain_of(&self, key: BufferKey) -> Option<&'static str> {
-        let st = self.lock_of(&key.workspace);
-        let idx = st.find_frame(key)?;
+        let partition = self.partition_of(&key.workspace);
+        let st = self.lock(partition);
+        let idx = {
+            let (_s, local, g) = self.lock_bucket(partition, key);
+            Self::chain_find(&g, local, key)?
+        };
         Some(if st.hot.contains(&idx) {
             "hot"
         } else if st.cold.contains(&idx) {
@@ -743,24 +943,30 @@ impl<'io> BufferPool<'io> {
     pub fn pin(&self, key: BufferKey) -> Result<PageGuard<'_>, BufferError> {
         let partition = self.partition_of(&key.workspace);
         let slots = self.slots(partition);
+        let stats = self.stats_of(partition);
+        // **命中路径（O3）**：只要这把桶闩锁——结构闩锁不再参与。
         let hit = {
-            let mut st = self.lock(partition);
-            match st.find_frame(key) {
+            let (_s, local, g) = self.lock_bucket(partition, key);
+            match Self::chain_find(&g, local, key) {
                 Some(idx) => {
-                    st.stats.hits += 1;
-                    st.touch(idx, &*self.clock);
                     slots[idx].pins.fetch_add(1, Ordering::AcqRel);
-                    Some(idx)
+                    let hot =
+                        slots[idx].bump_touch(self.clock.now_ms(), &self.partitions[partition].cfg);
+                    Some((idx, hot))
                 }
-                None => {
-                    st.stats.misses += 1;
-                    None
-                }
+                None => None,
             }
         };
         let idx = match hit {
-            Some(idx) => idx,
+            Some((idx, hot)) => {
+                stats.inc(|s| &s.hits);
+                if hot {
+                    self.try_promote(partition, idx); // 尽力（持桶闩只 try 结构闩）
+                }
+                idx
+            }
             None => {
+                stats.inc(|s| &s.misses);
                 let (handle, block) = (self.resolve)(&key.workspace, key.rdba)
                     .ok_or(BufferError::Unresolved { rdba: key.rdba })?;
                 // 闩锁外：读盘 + 身份核对。
@@ -790,14 +996,18 @@ impl<'io> BufferPool<'io> {
     pub fn pin_shared(&self, key: BufferKey) -> Option<PageReadGuard<'_>> {
         let partition = self.partition_of(&key.workspace);
         let slots = self.slots(partition);
-        let idx = {
-            let mut st = self.lock(partition);
-            let idx = st.find_frame(key)?;
-            st.stats.hits += 1;
-            st.touch(idx, &*self.clock);
+        // **命中路径（O3）**：桶闩锁 + 原子（不碰结构闩锁）。
+        let (idx, hot) = {
+            let (_s, local, g) = self.lock_bucket(partition, key);
+            let idx = Self::chain_find(&g, local, key)?;
             slots[idx].pins.fetch_add(1, Ordering::AcqRel);
-            idx
+            let hot = slots[idx].bump_touch(self.clock.now_ms(), &self.partitions[partition].cfg);
+            (idx, hot)
         };
+        self.stats_of(partition).inc(|s| &s.hits);
+        if hot {
+            self.try_promote(partition, idx);
+        }
         let slot = &slots[idx];
         let content = content_read(&slot.content);
         Some(PageReadGuard {
@@ -811,30 +1021,198 @@ impl<'io> BufferPool<'io> {
     /// 一次，仍无 ⇒ `FreeBufferWait`。
     fn install(&self, partition: usize, key: BufferKey, page: Page) -> Result<usize, BufferError> {
         let slots = self.slots(partition);
+        let stats = self.stats_of(partition);
         let mut page = Some(page);
         let mut made_free = false;
+        let mut claim_misses = 0u32;
         loop {
             let mut st = self.lock(partition);
-            if let Some(idx) = st.find_frame(key) {
-                st.stats.hits += 1;
-                st.touch(idx, &*self.clock);
-                slots[idx].pins.fetch_add(1, Ordering::AcqRel);
+            // ① 先到者为准（**桶闩下复核**——与命中路径的 pins++ 串行）。
+            if let Some(idx) = self.pin_existing(partition, key) {
+                drop(st);
+                stats.inc(|s| &s.hits);
+                self.try_promote(partition, idx);
                 return Ok(idx);
             }
-            if let Some(victim) = st.find_reusable(slots) {
-                let p = page.take().expect("页只装一次");
-                st.attach(slots, victim, key, p, &*self.clock);
-                return Ok(victim);
+            // ② 选候选帧 + **声明**（旧键桶闩下复核 pins==0；被并发钉住则重选）。
+            if let Some(victim) = st.find_reusable(slots, stats) {
+                match self.detach_for_reuse(partition, &mut st, victim) {
+                    Detach::Pinned => {
+                        claim_misses += 1;
+                        if claim_misses >= 4 {
+                            drop(st);
+                            self.make_free(partition)?; // 腾干净页给下一轮
+                            claim_misses = 0;
+                            made_free = true;
+                        }
+                        continue;
+                    }
+                    Detach::Done(_old) => {
+                        let p = page.take().expect("页只装一次");
+                        match self.publish_into(partition, &mut st, victim, key, p) {
+                            Ok(idx) => return Ok(idx),
+                            // 先到者已在（罕见竞态）：本帧退回未分配（净帧 ⇒ 安全）。
+                            Err(_existing) => {
+                                self.discard_claimed(partition, &mut st, victim);
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
             drop(st);
             if made_free {
-                let mut st = self.lock(partition);
-                st.stats.fb_wait += 1;
+                stats.inc(|s| &s.fb_wait);
                 return Err(BufferError::FreeBufferWait);
             }
             self.make_free(partition)?; // I/O 在闩外
             made_free = true;
         }
+    }
+
+    /// **命中即钉住**（桶闩下 `pins++`）；未命中 ⇒ `None`。调用者常已持结构闩
+    /// （"结构 → 桶"的正向序——见 [`BucketShard`]）。
+    fn pin_existing(&self, partition: usize, key: BufferKey) -> Option<usize> {
+        let slots = self.slots(partition);
+        let (_s, local, g) = self.lock_bucket(partition, key);
+        let idx = Self::chain_find(&g, local, key)?;
+        slots[idx].pins.fetch_add(1, Ordering::AcqRel);
+        let _ = slots[idx].bump_touch(self.clock.now_ms(), &self.partitions[partition].cfg);
+        Some(idx)
+    }
+
+    /// **声明一个候选帧供复用**（结构闩下）：
+    /// 在**旧键的桶闩**下复核 `pins == 0`（命中路径的 `pins++` 也在这把闩下
+    /// ⇒ 两者串行——这是 O3 新增的竞态关），随后摘替换链与旧桶链。
+    /// 被并发钉住 ⇒ [`Detach::Pinned`]（放弃候选，调用方重选）。
+    fn detach_for_reuse(&self, partition: usize, st: &mut Structure, idx: usize) -> Detach {
+        let old = st.meta[idx].key;
+        match old {
+            // 未用过的帧：不在任何链上（命中路径不可达） ⇒ 无并发窗口。
+            None => {
+                Structure::detach_from_chains(&mut st.hot, &mut st.cold, &mut st.aux, idx);
+                Detach::Done(None)
+            }
+            Some(k) => {
+                let (_s, local, mut g) = self.lock_bucket(partition, k);
+                if self.slots(partition)[idx].pins.load(Ordering::Acquire) != 0 {
+                    return Detach::Pinned;
+                }
+                Structure::detach_from_chains(&mut st.hot, &mut st.cold, &mut st.aux, idx);
+                Self::chain_remove(&mut g, local, k, idx);
+                st.meta[idx].key = None;
+                Detach::Done(Some(k))
+            }
+        }
+    }
+
+    /// **发布**一个已声明的帧：**新键桶闩下**查重 → 装内容 → 挂链 → 落冷段头。
+    /// 内容先换、链后挂（挂上即可被命中看到，不能给它旧内容）。
+    /// 重复键（先到者已在）⇒ `Err(先到者帧号)`。
+    fn publish_into(
+        &self,
+        partition: usize,
+        st: &mut Structure,
+        idx: usize,
+        key: BufferKey,
+        page: Page,
+    ) -> Result<usize, usize> {
+        let cfg = &self.partitions[partition].cfg;
+        let slots = self.slots(partition);
+        let (_s, local, mut g) = self.lock_bucket(partition, key);
+        if let Some(existing) = Self::chain_find(&g, local, key) {
+            return Err(existing);
+        }
+        {
+            let mut content = slots[idx]
+                .content
+                .try_write()
+                .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
+            *content = Some(page);
+        }
+        st.meta[idx] = FrameMeta {
+            key: Some(key),
+            dirty: false,
+            first_dirty: None,
+        };
+        slots[idx].reset_touch(cfg.cool_count, self.clock.now_ms());
+        slots[idx].pins.store(1, Ordering::Release); // 装入者持有（`pin` 语义）
+        Self::chain_push(&mut g, local, key, idx);
+        st.cold.push_front(idx); // 新读入/重用 ⇒ 冷段头（不是热段）
+        Ok(idx)
+    }
+
+    /// 发布撞到重复键时把已声明的帧**退回未分配态**（净帧 ⇒ 丢弃安全；
+    /// 罕见竞态下损失一次缓存，换来"绝无同键双帧"）。
+    fn discard_claimed(&self, partition: usize, st: &mut Structure, idx: usize) {
+        let slots = self.slots(partition);
+        debug_assert_eq!(slots[idx].pins.load(Ordering::Acquire), 0);
+        {
+            let mut content = slots[idx]
+                .content
+                .try_write()
+                .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
+            *content = None;
+        }
+        st.meta[idx] = FrameMeta::empty();
+        st.virgin.push(idx);
+    }
+
+    /// **同键原位替换**（权威镜像路径；调用者持结构闩 + 该键的桶闩、已复核
+    /// `pins==0`）：帧在链上位置不变，只换内容与记账。
+    fn replace_in_place(
+        &self,
+        partition: usize,
+        st: &mut Structure,
+        idx: usize,
+        key: BufferKey,
+        page: Page,
+    ) {
+        let cfg = &self.partitions[partition].cfg;
+        let slots = self.slots(partition);
+        debug_assert_eq!(
+            slots[idx].pins.load(Ordering::Acquire),
+            0,
+            "同键重装时不应有在途卫兵（权威镜像路径）"
+        );
+        if let Some(lsn) = st.meta[idx].first_dirty.take() {
+            st.drop_write_entry(key.workspace, lsn, key.rdba);
+        }
+        {
+            let mut content = slots[idx]
+                .content
+                .try_write()
+                .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
+            *content = Some(page);
+        }
+        st.meta[idx] = FrameMeta {
+            key: Some(key),
+            dirty: false,
+            first_dirty: None,
+        };
+        slots[idx].reset_touch(cfg.cool_count, self.clock.now_ms());
+        slots[idx].pins.store(1, Ordering::Release);
+    }
+
+    /// **释放一帧**（Draining ② 的丢净帧；调用者持结构闩、且已在桶闩下复核
+    /// `pins==0`）：摘链、清桶、释放页缓冲，帧回"未分配"态（virgin）。
+    fn release_frame(&self, partition: usize, st: &mut Structure, idx: usize) {
+        let slots = self.slots(partition);
+        debug_assert!(!st.meta[idx].dirty);
+        debug_assert_eq!(slots[idx].pins.load(Ordering::Acquire), 0);
+        match self.detach_for_reuse(partition, st, idx) {
+            Detach::Done(_) => {}
+            Detach::Pinned => return, // 防御：调用方已体检，不应发生
+        }
+        {
+            let mut content = slots[idx]
+                .content
+                .try_write()
+                .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
+            *content = None; // 释放 16 KiB（重绑定后按新绑定重新分配）
+        }
+        st.meta[idx] = FrameMeta::empty();
+        st.virgin.push(idx);
     }
 
     /// 身份核对（页头自述与键逐项相符——串页防线）。
@@ -888,31 +1266,47 @@ impl<'io> BufferPool<'io> {
         page: Page,
     ) -> Result<usize, BufferError> {
         let slots = self.slots(partition);
+        let stats = self.stats_of(partition);
         let mut page = Some(page);
         let mut made_free = false;
         loop {
             let mut st = self.lock(partition);
-            if let Some(idx) = st.find_frame(key) {
-                if slots[idx].pins.load(Ordering::Acquire) == 0 {
-                    let p = page.take().expect("页只装一次");
-                    st.replace_in_place(slots, idx, key, p, &*self.clock);
-                    return Ok(idx);
+            // 同键在池 ⇒ **桶闩下复核 `pins==0`**（与命中路径串行）后原位替换。
+            {
+                let (_s, local, g) = self.lock_bucket(partition, key);
+                if let Some(idx) = Self::chain_find(&g, local, key) {
+                    if slots[idx].pins.load(Ordering::Acquire) == 0 {
+                        let p = page.take().expect("页只装一次");
+                        self.replace_in_place(partition, &mut st, idx, key, p);
+                        return Ok(idx);
+                    }
+                    drop(g);
+                    // 有人钉着：闩外等它（读者退场后重入替换）。
+                    drop(st);
+                    let content = content_write(&slots[idx].content);
+                    drop(content);
+                    continue;
                 }
-                // 有人钉着：闩外等它（读者退场后重入替换）。
-                drop(st);
-                let content = content_write(&slots[idx].content);
-                drop(content);
-                continue;
             }
-            if let Some(victim) = st.find_reusable(slots) {
+            if let Some(victim) = st.find_reusable(slots, stats) {
+                if !matches!(
+                    self.detach_for_reuse(partition, &mut st, victim),
+                    Detach::Done(_)
+                ) {
+                    continue;
+                }
                 let p = page.take().expect("页只装一次");
-                st.attach(slots, victim, key, p, &*self.clock);
-                return Ok(victim);
+                match self.publish_into(partition, &mut st, victim, key, p) {
+                    Ok(idx) => return Ok(idx),
+                    Err(_existing) => {
+                        self.discard_claimed(partition, &mut st, victim);
+                        continue;
+                    }
+                }
             }
             drop(st);
             if made_free {
-                let mut st = self.lock(partition);
-                st.stats.fb_wait += 1;
+                stats.inc(|s| &s.fb_wait);
                 return Err(BufferError::FreeBufferWait);
             }
             self.make_free(partition)?; // I/O 在闩外
@@ -928,12 +1322,9 @@ impl<'io> BufferPool<'io> {
         let partition = self.partition_of(&key.workspace);
         let slots = self.slots(partition);
         let idx = {
-            let st = self.lock(partition);
-            // **pin 必须在闩锁内递增**：闩外取内容锁的窗口里，帧可能已被腾出
-            // 换人（pins=0 ⇒ 可淘汰）——那会读到**别的块**的内容。
-            let idx = st.find_frame(key)?;
-            slots[idx].pins.fetch_add(1, Ordering::AcqRel);
-            idx
+            // **pin 必须在（桶）闩锁内递增**：闩外取内容锁的窗口里，帧可能已被
+            // 腾出换人（pins=0 ⇒ 可淘汰）——那会读到**别的块**的内容。
+            self.pin_existing(partition, key)?
         };
         let slot = &slots[idx];
         let content = content_read(&slot.content);
@@ -1012,9 +1403,9 @@ impl<'io> BufferPool<'io> {
             PageFileError::Io(e) => BufferError::Io(e),
         })?;
         {
-            let mut st = self.lock(partition);
-            st.stats.run_reads += 1;
-            st.stats.run_pages += u64::from(count);
+            let stats = self.stats_of(partition);
+            stats.inc(|s| &s.run_reads);
+            stats.add(u64::from(count), |s| &s.run_pages);
         }
         // ③ 逐缺失页装入（insert_clean 自带两阶段）；副本**以池内为准**
         //    （期间可能已有先到者）。
@@ -1108,7 +1499,7 @@ impl<'io> BufferPool<'io> {
         let mut dropped = 0usize;
         for idx in 0..st.meta.len() {
             if st.meta[idx].key.is_some() {
-                st.release_frame(slots, idx);
+                self.release_frame(partition, &mut st, idx);
                 dropped += 1;
             }
         }
@@ -1162,7 +1553,11 @@ impl<'io> BufferPool<'io> {
         // ① 闩内选页（不取内容锁——"持结构闩不等待内容锁"）。
         let (idx, key, handle, block) = {
             let mut st = self.lock(partition);
-            match st.pick_for_write(target, &*self.resolve)? {
+            let mut lookup = |k: BufferKey| {
+                let (_s, local, g) = self.lock_bucket(partition, k);
+                Self::chain_find(&g, local, k)
+            };
+            match st.pick_for_write(target, &*self.resolve, &mut lookup)? {
                 Pick::None => return Ok(None),
                 Pick::Stale => return Ok(Some(false)),
                 Pick::Ready {
@@ -1211,7 +1606,13 @@ impl<'io> BufferPool<'io> {
                 .map_or(0, |h| h.mod_seq)
         };
         let mut st = self.lock(partition);
-        st.finish_write(slots, &job, current_mod_seq, wal_synced);
+        st.finish_write(
+            slots,
+            &job,
+            current_mod_seq,
+            wal_synced,
+            self.stats_of(partition),
+        );
         Ok(Some(true))
     }
 
@@ -1243,9 +1644,62 @@ impl<'io> BufferPool<'io> {
         self.lock(self.partition_of(workspace))
     }
 
-    /// 某分区的**帧槽**（内容锁 + 原子 pin；不经过闩锁）。
+    /// 某分区的**帧槽**（内容锁 + 原子 pin + TCH；不经过闩锁）。
     fn slots(&self, partition: usize) -> &[FrameSlot] {
         &self.partitions[partition].slots
+    }
+
+    /// 某分区的**分片统计**（注意与公开的 [`BufferPool::stats`] 聚合口区分）。
+    fn stats_of(&self, partition: usize) -> &StatsShards {
+        &self.partitions[partition].stats
+    }
+
+    /// 锁某键所在的**桶分片**：返回（分片号, 局部桶号, 卫兵）。
+    ///
+    /// **次序**：调用者若持结构闩锁，这里是"结构 → 桶"的正向序；持桶闩时
+    /// **不得**再取结构闩锁（只准 `try_lock`）——见 [`BucketShard`] 的规则。
+    fn lock_bucket(
+        &self,
+        partition: usize,
+        key: BufferKey,
+    ) -> (usize, usize, LatchGuard<'_, BucketShard>) {
+        let cfg = &self.partitions[partition].cfg;
+        let b = bucket_of(cfg, key);
+        let s = shard_of(cfg, b);
+        let local = local_bucket(cfg, b);
+        (s, local, self.partitions[partition].buckets[s].lock())
+    }
+
+    /// 桶链上找帧（**调用者须持对应桶闩**；键随链走 ⇒ 不读结构闩下的元数据）。
+    fn chain_find(shard: &BucketShard, local: usize, key: BufferKey) -> Option<usize> {
+        shard.chains[local]
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, i)| *i)
+    }
+
+    /// 桶链上挂帧（**须持对应桶闩**）。
+    fn chain_push(shard: &mut BucketShard, local: usize, key: BufferKey, idx: usize) {
+        shard.chains[local].push((key, idx));
+    }
+
+    /// **命中路径的尽力提升**（O3）：拿不到结构闩锁就作罢——提升是启发式
+    /// （下次命中或扫描者会补），**绝不在此阻塞**（持桶闩时只准 `try_lock`）。
+    fn try_promote(&self, partition: usize, idx: usize) {
+        if let Some(mut st) = self.partitions[partition].structure.try_lock() {
+            st.promote(idx, self.slots(partition), self.stats_of(partition));
+        }
+    }
+
+    /// 桶链上摘帧（**须持对应桶闩**）；返回是否摘到。
+    fn chain_remove(shard: &mut BucketShard, local: usize, key: BufferKey, idx: usize) -> bool {
+        let chain = &mut shard.chains[local];
+        if let Some(p) = chain.iter().position(|&(k, i)| k == key && i == idx) {
+            chain.remove(p);
+            true
+        } else {
+            false
+        }
     }
 
     /// 某分区的结构闩锁（卫兵持有它以便做元数据操作）。
@@ -1268,12 +1722,17 @@ impl<'io> BufferPool<'io> {
             wait_ns: 0,
         };
         for p in &self.partitions {
-            let s = p.structure.stats();
-            out.gets += s.gets;
-            out.immediate += s.immediate;
-            out.spin_gets += s.spin_gets;
-            out.sleeps += s.sleeps;
-            out.wait_ns += s.wait_ns;
+            let mut merge = |s: LatchStats| {
+                out.gets += s.gets;
+                out.immediate += s.immediate;
+                out.spin_gets += s.spin_gets;
+                out.sleeps += s.sleeps;
+                out.wait_ns += s.wait_ns;
+            };
+            merge(p.structure.stats());
+            for shard in &p.buckets {
+                merge(shard.stats()); // O3：桶闩锁并入同一判读口径
+            }
         }
         out
     }
@@ -1284,48 +1743,29 @@ impl Structure {
         self.meta.len() - self.virgin.len()
     }
 
-    /// 桶号 = **DBA（rdba）对桶数取模**（Oracle `_DB_BLOCK_HASH_BUCKETS` 的原文
-    /// 口径："hash the required DBA by this number"）；跨工作区的同址块落同桶
-    /// ——链上再按完整键比对。
-    fn bucket_of(&self, key: BufferKey) -> usize {
-        let dba = (u64::from(key.rdba.file_id()) << 28) | u64::from(key.rdba.block_id());
-        (dba % self.buckets.len() as u64) as usize
-    }
-
-    /// 桶内找帧（元数据在结构闩锁下 ⇒ 命中即稳定；帧的**内容**由其内容锁
-    /// 单独保护——见 [`FrameSlot`]）。
-    fn find_frame(&self, key: BufferKey) -> Option<usize> {
-        let b = self.bucket_of(key);
-        self.buckets[b]
-            .iter()
-            .copied()
-            .find(|&i| self.meta[i].key == Some(key))
-    }
-
-    /// 命中时的 touch count（三秒规则）与冷→热提升。
-    fn touch(&mut self, idx: usize, clock: &dyn Clock) {
-        let now = clock.now_ms();
-        {
-            let f = &mut self.meta[idx];
-            if now.saturating_sub(f.last_touch_ms) >= self.cfg.touch_interval_ms {
-                f.touches = f.touches.saturating_add(1);
-                f.last_touch_ms = now;
-            }
+    /// **冷→热提升**（触摸计数达热判据 ⇒ 换链；热段超限 ⇒ 尾部退回冷段）。
+    ///
+    /// **O3**：计数在 [`FrameSlot::touches`]（原子、命中路径直接更新）——本函数
+    /// 只做链的搬迁，可由**持结构闩者**调用，也可由命中路径 `try_lock` 后调用
+    /// （拿不到就作罢：提升是启发式，下次命中或扫描者会补）。
+    fn promote(&mut self, idx: usize, slots: &[FrameSlot], stats: &StatsShards) {
+        if slots[idx].touches.load(Ordering::Relaxed) < self.cfg.hot_criteria {
+            return;
         }
-        // 冷段中计数达热判据 ⇒ 提升到热段头（计数置驻留值——`_STAY_COUNT` 语义）；
-        // 热段超限 ⇒ 热段尾退回冷段头（计数置冷却值——`_COOL_COUNT` 语义）。
-        if self.meta[idx].touches >= self.cfg.hot_criteria {
-            if let Some(p) = self.cold.iter().position(|&i| i == idx) {
-                self.cold.remove(p);
-                self.hot.push_front(idx);
-                self.meta[idx].touches = self.cfg.stay_count;
-                self.stats.hot_moved += 1;
-                let hot_max = (self.meta.len() / self.cfg.hot_fraction).max(1);
-                while self.hot.len() > hot_max {
-                    if let Some(back) = self.hot.pop_back() {
-                        self.meta[back].touches = self.cfg.cool_count;
-                        self.cold.push_front(back);
-                    }
+        if let Some(p) = self.cold.iter().position(|&i| i == idx) {
+            self.cold.remove(p);
+            self.hot.push_front(idx);
+            slots[idx]
+                .touches
+                .store(self.cfg.stay_count, Ordering::Relaxed);
+            stats.inc(|s| &s.hot_moved);
+            let hot_max = (self.meta.len() / self.cfg.hot_fraction).max(1);
+            while self.hot.len() > hot_max {
+                if let Some(back) = self.hot.pop_back() {
+                    slots[back]
+                        .touches
+                        .store(self.cfg.cool_count, Ordering::Relaxed);
+                    self.cold.push_front(back);
                 }
             }
         }
@@ -1338,7 +1778,7 @@ impl Structure {
     /// 把帧丢在任何链之外——容量不会随失败单调泄漏。（选与摘同处**一个**
     /// 闩锁临界区——读盘的 I/O 在闩外，但"选空闲帧 → attach"不再跨临界区，
     /// 之间没有并发窗口。）
-    fn find_reusable(&mut self, slots: &[FrameSlot]) -> Option<usize> {
+    fn find_reusable(&mut self, slots: &[FrameSlot], stats: &StatsShards) -> Option<usize> {
         // 0) 从未用过的帧最便宜（不在任何链上，attach 时无需摘链）。
         if let Some(idx) = self.virgin.pop() {
             return Some(idx);
@@ -1352,31 +1792,32 @@ impl Structure {
             .iter()
             .find(|&&i| slots[i].pins.load(Ordering::Acquire) == 0 && !self.meta[i].dirty)
         {
-            self.stats.free_inspected += 1;
-            self.stats.evictions += 1;
+            stats.inc(|s| &s.free_inspected);
+            stats.inc(|s| &s.evictions);
             return Some(idx);
         }
         // 2) 冷段尾：遇到脏帧计数跳过（它们在写列表里排队），上限 = 容量/分数。
         let limit = (self.meta.len() / self.cfg.max_scan_fraction).max(1);
         for k in 0..self.cold.len().min(limit) {
             let idx = self.cold[self.cold.len() - 1 - k];
-            self.stats.free_inspected += 1;
+            stats.inc(|s| &s.free_inspected);
             if slots[idx].pins.load(Ordering::Acquire) > 0 {
-                self.stats.pinned_inspected += 1;
+                stats.inc(|s| &s.pinned_inspected);
                 continue;
             }
             if self.meta[idx].dirty {
-                self.stats.dirty_inspected += 1;
+                stats.inc(|s| &s.dirty_inspected);
                 continue; // 脏帧不直接写回——交 Make Free 按序写
             }
             // **老化减半**（Note 104937.1）：计数高于冷却值 ⇒ 不立即淘汰，
             // 减半后继续扫——"计数够高的块即使位于列表尾也不被重用"。
-            if self.meta[idx].touches > self.cfg.cool_count {
-                self.meta[idx].touches /= 2;
-                self.stats.aging_steps += 1;
+            let t = slots[idx].touches.load(Ordering::Relaxed);
+            if t > self.cfg.cool_count {
+                slots[idx].touches.store(t / 2, Ordering::Relaxed);
+                stats.inc(|s| &s.aging_steps);
                 continue;
             }
-            self.stats.evictions += 1;
+            stats.inc(|s| &s.evictions);
             return Some(idx);
         }
         None
@@ -1393,10 +1834,11 @@ impl Structure {
         &mut self,
         target: WriteTarget,
         resolve: &PoolResolver<'_>,
+        lookup: &mut dyn FnMut(BufferKey) -> Option<usize>,
     ) -> Result<Pick, BufferError> {
         let candidate: Option<(Lsn, [u8; 8], Rdba)> = match target {
             WriteTarget::Key(key) => {
-                let Some(idx) = self.find_frame(key) else {
+                let Some(idx) = lookup(key) else {
                     return Ok(Pick::None);
                 };
                 if !self.meta[idx].dirty {
@@ -1427,7 +1869,7 @@ impl Structure {
             return Ok(Pick::None);
         };
         let key = BufferKey::new(ws, rdba);
-        let Some(idx) = self.find_frame(key) else {
+        let Some(idx) = lookup(key) else {
             self.drop_write_entry(ws, lsn, rdba);
             return Ok(Pick::Stale);
         };
@@ -1457,17 +1899,6 @@ impl Structure {
         }
     }
 
-    /// **从三条链与桶里摘除一帧**（装页/释放的共用前段；结构闩锁内）。
-    fn unlink(&mut self, idx: usize) {
-        Self::detach_from_chains(&mut self.hot, &mut self.cold, &mut self.aux, idx);
-        if let Some(old) = self.meta[idx].key.take() {
-            let ob = self.bucket_of(old);
-            if let Some(p) = self.buckets[ob].iter().position(|&i| i == idx) {
-                self.buckets[ob].remove(p);
-            }
-        }
-    }
-
     /// **写回收尾**（闩锁内）：`mod_seq` 未变 ⇒ 清脏、出写列表、干净未钉住
     /// 帧入 AUX；**变过（期间被再改脏）⇒ 保持脏与条目**，留给下一轮——
     /// 绝不把"更新过的版本"当"已落盘"（PG `BM_JUST_DIRTIED` 的同款判据）。
@@ -1480,10 +1911,11 @@ impl Structure {
         job: &WriteJob,
         current_mod_seq: u8,
         wal_synced: bool,
+        stats: &StatsShards,
     ) {
-        self.stats.writes += 1;
+        stats.inc(|s| &s.writes);
         if wal_synced {
-            self.stats.wal_syncs += 1;
+            stats.inc(|s| &s.wal_syncs);
         }
         let idx = job.idx;
         if self.meta[idx].key != Some(job.key) {
@@ -1504,97 +1936,8 @@ impl Structure {
                 self.cold.remove(p);
             }
             self.aux.push_front(idx);
-            self.stats.aux_moved += 1;
+            stats.inc(|s| &s.aux_moved);
         }
-    }
-
-    /// **把一个帧装上新键与内容**：出旧链、换内容、入桶、落**冷段头**。
-    ///
-    /// 前置：该帧 `pins = 0`（⇒ 内容锁空闲，"内容锁 ⇒ pin > 0"不变量的逆否）
-    /// ——所以这里的 `try_write` **不会阻塞**（结构闩锁内不得等待内容锁）。
-    fn attach(
-        &mut self,
-        slots: &[FrameSlot],
-        idx: usize,
-        key: BufferKey,
-        page: Page,
-        clock: &dyn Clock,
-    ) {
-        self.unlink(idx);
-        {
-            let mut content = slots[idx]
-                .content
-                .try_write()
-                .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
-            *content = Some(page);
-        }
-        self.meta[idx] = FrameMeta {
-            key: Some(key),
-            dirty: false,
-            first_dirty: None,
-            touches: self.cfg.cool_count,
-            last_touch_ms: clock.now_ms(),
-        };
-        slots[idx].pins.store(1, Ordering::Release); // 装入者持有（`pin` 语义）
-        let b = self.bucket_of(key);
-        self.buckets[b].push(idx);
-        self.cold.push_front(idx); // 新读入/重用 ⇒ 冷段头（不是热段）
-    }
-
-    /// **原位替换一个已驻留帧的内容**（同键重新装入）：帧在桶/链上的位置不变
-    /// （键未变），只换内容与记账——写列表里的旧条目按旧 `first_dirty` 摘除
-    /// （旧内容被权威镜像取代，不再需要写回）。
-    ///
-    /// 前置同 [`Structure::attach`]：`pins = 0` ⇒ `try_write` 不阻塞。
-    fn replace_in_place(
-        &mut self,
-        slots: &[FrameSlot],
-        idx: usize,
-        key: BufferKey,
-        page: Page,
-        clock: &dyn Clock,
-    ) {
-        debug_assert_eq!(
-            slots[idx].pins.load(Ordering::Acquire),
-            0,
-            "同键重装时不应有在途卫兵（权威镜像路径）"
-        );
-        if let Some(lsn) = self.meta[idx].first_dirty.take() {
-            self.drop_write_entry(key.workspace, lsn, key.rdba);
-        }
-        {
-            let mut content = slots[idx]
-                .content
-                .try_write()
-                .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
-            *content = Some(page);
-        }
-        self.meta[idx] = FrameMeta {
-            key: Some(key),
-            dirty: false,
-            first_dirty: None,
-            touches: self.cfg.cool_count,
-            last_touch_ms: clock.now_ms(),
-        };
-        slots[idx].pins.store(1, Ordering::Release);
-    }
-
-    /// **释放一帧**（Draining ② 的丢净帧）：摘链、清桶、**释放页缓冲**，
-    /// 帧回"未分配"态（virgin）。前置：干净且未钉住（`drop_clean_frames`
-    /// 已整体体检——这里再核就当不变量）。
-    fn release_frame(&mut self, slots: &[FrameSlot], idx: usize) {
-        debug_assert!(!self.meta[idx].dirty);
-        debug_assert_eq!(slots[idx].pins.load(Ordering::Acquire), 0);
-        self.unlink(idx);
-        {
-            let mut content = slots[idx]
-                .content
-                .try_write()
-                .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
-            *content = None; // 释放 16 KiB（重绑定后按新绑定重新分配）
-        }
-        self.meta[idx] = FrameMeta::empty();
-        self.virgin.push(idx);
     }
 
     /// 从三条链里去重移除（顺序：热 → 冷 → AUX）。
@@ -2704,6 +3047,79 @@ mod tests {
         assert_eq!(report.pages_written, 2);
     }
 
+    /// **O3 竞态关**：腾帧候选被并发钉住 ⇒ 声明失败（`Detach::Pinned`），
+    /// 不得摘链、不得覆盖内容。确定性构造：持着卫兵（pins > 0）再声明。
+    #[test]
+    fn claiming_a_pinned_frame_is_refused() {
+        let h = harness();
+        let pool = h.pool(4, h.fake_wal());
+        let key = BufferKey::new(WS_A, rdba(7, 0));
+        let partition = pool.partition_of(&WS_A);
+        let g = pool.pin(key).unwrap(); // pins = 1
+        let st = pool.lock(partition);
+        let idx = {
+            let (_s, local, gb) = pool.lock_bucket(partition, key);
+            BufferPool::chain_find(&gb, local, key).expect("已驻留")
+        };
+        let mut st = st;
+        assert!(
+            matches!(
+                pool.detach_for_reuse(partition, &mut st, idx),
+                Detach::Pinned
+            ),
+            "被钉住的帧不得被声明复用"
+        );
+        drop(g);
+        // 卫兵退场后可以声明（帧仍在池里）。
+        assert!(matches!(
+            pool.detach_for_reuse(partition, &mut st, idx),
+            Detach::Done(Some(_))
+        ));
+    }
+
+    /// **O3 并发压力回归**（串页防线）：多线程对**超过容量**的键集反复
+    /// pin/drop——腾帧（声明 → 发布）与命中路径在桶闩下交错。每个拿到的卫兵
+    /// 都必须"页头自述 = 请求的键"（读错帧的经典症状是块号不符）。
+    #[test]
+    fn concurrent_pin_churn_never_returns_the_wrong_page() {
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal()); // 容量 2 < 4 键 ⇒ 持续腾帧
+                                            // 夹具：WS_A → 文件 7、WS_B → 文件 8，各 2 块（harness）——4 个键；
+                                            // **容量取 2**（< 键数）⇒ 持续"装入即腾帧"，声明/发布与命中路径交错。
+        let keys: Vec<BufferKey> = [(WS_A, 7u16, 0u32), (WS_A, 7, 1), (WS_B, 8, 0), (WS_B, 8, 1)]
+            .into_iter()
+            .map(|(ws, f, b)| BufferKey::new(ws, rdba(f, b)))
+            .collect();
+        std::thread::scope(|scope| {
+            for t in 0..4usize {
+                let pool = &pool;
+                let keys = &keys;
+                scope.spawn(move || {
+                    for i in 0..3_000usize {
+                        let key = keys[(i * 7 + t * 13) % keys.len()];
+                        // 容量 2 + 4 线程：全部帧被钉住时**允许** `free buffer
+                        // waits`（§5.10 的既有语义，`fb_wait` 计数即此项）——
+                        // 只对**成功**的钉住做串页断言。
+                        let g = match pool.pin(key) {
+                            Ok(g) => g,
+                            Err(BufferError::FreeBufferWait) => continue,
+                            Err(e) => panic!("钉住 {key:?}: {e}"),
+                        };
+                        let header = g.header().expect("页头");
+                        assert_eq!(header.file_id, key.rdba.file_id(), "串页：文件号不符");
+                        assert_eq!(header.block_id, key.rdba.block_id(), "串页：块号不符");
+                        assert_eq!(header.workspace_ref, key.workspace, "串页：工作区不符");
+                        drop(g);
+                    }
+                });
+            }
+        });
+        // 结局分布合理：容量 2 < 键数 ⇒ 既有命中也有未命中。
+        let stats = pool.stats();
+        assert!(stats.hits > 0, "有命中");
+        assert!(stats.misses > 0, "有未命中");
+    }
+
     #[test]
     fn partition_counters_aggregate_and_split_by_latch() {
         let h = harness();
@@ -2719,12 +3135,13 @@ mod tests {
         let stats = pool.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
-        // 闩锁统计：和 ≥ 逐分区之和（聚合读取）；逐分区条数与分区数一致。
+        // 闩锁统计（O3 起每分区两项：`db_cache` 结构闩 + `db_bucket` 桶闩聚合）。
         let per = pool.partition_latch_stats();
-        assert_eq!(per.len(), 4);
+        assert_eq!(per.len(), 4 * 2);
+        assert_eq!(per.iter().filter(|s| s.name == "db_bucket").count(), 4);
         let sum: u64 = per.iter().map(|s| s.gets).sum();
         let agg = pool.latch_stats();
-        assert_eq!(agg.gets, sum, "聚合 = 逐分区之和");
+        assert_eq!(agg.gets, sum, "聚合 = 逐分区（结构 + 桶）之和");
         assert_eq!(agg.name, "db_cache");
         assert!(sum >= 2, "至少两次取闩锁（命中 + 未命中）");
     }
