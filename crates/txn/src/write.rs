@@ -3332,6 +3332,137 @@ mod tests {
         );
     }
 
+    /// **计页写（pwrite）次数的 I/O 包装**——优化方案 P1 的基线/验收探针
+    /// （前台 pwrite 数；redo 追加走 WAL，不计入）。
+    struct CountingIo {
+        inner: MemFileIo,
+        writes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl bicdb_workspace::io::FileIo for CountingIo {
+        fn open(
+            &self,
+            path: &Path,
+            opts: bicdb_workspace::io::OpenOptions,
+        ) -> std::io::Result<bicdb_workspace::io::FileHandle> {
+            self.inner.open(path, opts)
+        }
+        fn open_dir(&self, path: &Path) -> std::io::Result<bicdb_workspace::io::FileHandle> {
+            self.inner.open_dir(path)
+        }
+        fn read_at(
+            &self,
+            h: bicdb_workspace::io::FileHandle,
+            buf: &mut [u8],
+            off: u64,
+        ) -> std::io::Result<usize> {
+            self.inner.read_at(h, buf, off)
+        }
+        fn write_at(
+            &self,
+            h: bicdb_workspace::io::FileHandle,
+            buf: &[u8],
+            off: u64,
+        ) -> std::io::Result<()> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.write_at(h, buf, off)
+        }
+        fn size(&self, h: bicdb_workspace::io::FileHandle) -> std::io::Result<u64> {
+            self.inner.size(h)
+        }
+        fn set_len(&self, h: bicdb_workspace::io::FileHandle, len: u64) -> std::io::Result<()> {
+            self.inner.set_len(h, len)
+        }
+        fn sync_data(&self, h: bicdb_workspace::io::FileHandle) -> std::io::Result<()> {
+            self.inner.sync_data(h)
+        }
+        fn sync_all(&self, h: bicdb_workspace::io::FileHandle) -> std::io::Result<()> {
+            self.inner.sync_all(h)
+        }
+        fn sync_dir(&self, h: bicdb_workspace::io::FileHandle) -> std::io::Result<()> {
+            self.inner.sync_dir(h)
+        }
+        fn close(&self, h: bicdb_workspace::io::FileHandle) -> std::io::Result<()> {
+            self.inner.close(h)
+        }
+    }
+
+    #[test]
+    #[ignore = "探针：数前台 pwrite 数（优化方案 P1 的基线/验收）"]
+    fn probe_frontend_pwrites_per_record() {
+        let raw = mem();
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let io = CountingIo {
+            inner: raw,
+            writes: std::sync::Arc::clone(&writes),
+        };
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::with_config(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+            bicdb_storage::buffer::SystemClock,
+            bicdb_storage::buffer::CacheConfig::for_capacity(8),
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::new(ArchiveMode::NoArchive),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let mut t = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        // 三条 insert（**数据页不回写**：只数前台 pwrite）；区分首条（含开新页）
+        // 与稳态（同页追加）。
+        writes.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut rids = Vec::new();
+        for i in 0..3u8 {
+            rids.push(
+                insert_row(
+                    &pool,
+                    &mut log,
+                    &mut chain,
+                    &mut t,
+                    key,
+                    &row_bytes(&[b'a' + i]),
+                    &policy,
+                )
+                .unwrap(),
+            );
+            let n = writes.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[probe] 第 {} 条 insert 累计前台 pwrite = {n}", i + 1);
+        }
+        let total = writes.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[probe] 首条（含开新页）= 见上；稳态 ≈ ({total} − 首条)/2（P1 目标：稳态 0）");
+        assert!(
+            total > 0,
+            "当前形态应有前台 pwrite（P1 落地后此断言改为稳态 == 0）"
+        );
+        let _ = rids;
+    }
+
     #[test]
     fn statement_rollback_keeps_earlier_statements_and_locks() {
         // §4.6.6 ②：语句失败 ⇒ 沿链补偿到回滚点——**不释放锁**、
