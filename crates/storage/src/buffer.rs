@@ -47,7 +47,7 @@
 //! **内容锁在闩锁外取**——两条纪律合起来 ⇒ 无环、无死锁。
 //! 临界区纪律（**闩锁内不做 I/O**等四条）与闩锁统计口径见 §5.10"闩锁形态与纪律"。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -458,9 +458,18 @@ pub struct DrainReport {
 /// 于是 pins = 0 的帧其内容锁必空闲，`attach`/`replace_in_place` 等**在结构
 /// 闩锁内**的装页路径可以用 `try_write()` **不阻塞**地拿内容锁（"持结构闩
 /// 不等待内容锁"的纪律由此成立）。
+/// **脏状态字**（O4）：bit0 = DIRTY；bit16.. = **首次变脏 LSN**（48 位恰好铺满）。
+/// 对照 PG `BufferDesc.state` 的 `BM_DIRTY`（KB：`MarkBufferDirty` 在缓冲自己的
+/// header 锁下置位；写回清位要过 `TerminateBufferIO` 的 clear_dirty 分支）。
+const ST_DIRTY: u64 = 1;
+/// `first_dirty` 在状态字里的移位（48 位 LSN 域）。
+const ST_LSN_SHIFT: u32 = 16;
+
 struct FrameSlot {
     /// 原子 pin 计数（卫兵的增减**不经过**分区闩锁）。
     pins: AtomicU32,
+    /// **脏状态 + 首次变脏 LSN**（O4：写路径的记账不再经结构闩锁）。
+    state: AtomicU64,
     /// **TCH（触摸计数）**（O3：命中路径直接原子更新，不再进结构闩锁）。
     touches: AtomicU32,
     /// 上次计数递增的墙钟毫秒（**三秒规则**；同前——原子）。
@@ -478,10 +487,53 @@ impl FrameSlot {
     fn empty() -> Self {
         Self {
             pins: AtomicU32::new(0),
+            state: AtomicU64::new(0),
             touches: AtomicU32::new(0),
             last_touch_ms: AtomicU64::new(0),
             content: RwLock::new(None),
         }
+    }
+
+    /// **标脏**（O4；写路径：一次 CAS，无闩锁）。首次变脏的 LSN 只记一次
+    /// （已脏 ⇒ 不动排序键——与写列表时代的语义一致）。
+    fn mark_dirty_state(&self, lsn: Lsn) {
+        let mut cur = self.state.load(Ordering::Relaxed);
+        loop {
+            if cur & ST_DIRTY != 0 {
+                return;
+            }
+            let new = ST_DIRTY | (lsn.as_raw() << ST_LSN_SHIFT);
+            match self
+                .state
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// 是否脏。
+    fn is_dirty_state(&self) -> bool {
+        self.state.load(Ordering::Acquire) & ST_DIRTY != 0
+    }
+
+    /// **首次变脏 LSN**（脏帧的排序键；不脏 ⇒ `None`）。
+    fn first_dirty_lsn(&self) -> Option<Lsn> {
+        let s = self.state.load(Ordering::Acquire);
+        if s & ST_DIRTY == 0 {
+            return None;
+        }
+        Lsn::from_raw(s >> ST_LSN_SHIFT)
+    }
+
+    /// **清脏**（写回收尾）：仅当状态仍是"这条记录的首次变脏 LSN"时清——
+    /// 与 `replace_in_place`（权威重装）互斥；返回是否清成功。
+    fn clear_dirty_state(&self, expect: Lsn) -> bool {
+        let want = ST_DIRTY | (expect.as_raw() << ST_LSN_SHIFT);
+        self.state
+            .compare_exchange(want, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// **三秒规则下的触摸计数**（命中路径；闩外原子更新——O3）。
@@ -511,19 +563,11 @@ impl FrameSlot {
 #[derive(Debug, Clone)]
 struct FrameMeta {
     key: Option<BufferKey>,
-    /// 脏标志（同时在写列表里）。
-    dirty: bool,
-    /// **首次变脏的 LSN**（写列表/检查点队列排序键）。
-    first_dirty: Option<Lsn>,
 }
 
 impl FrameMeta {
     fn empty() -> Self {
-        Self {
-            key: None,
-            dirty: false,
-            first_dirty: None,
-        }
+        Self { key: None }
     }
 }
 
@@ -540,8 +584,6 @@ struct Structure {
     cold: VecDeque<usize>,
     /// 可重用候选（干净、未钉住；前台优先扫它）。
     aux: VecDeque<usize>,
-    /// 写列表：**每工作区一条**（= 检查点队列），按（首次变脏 LSN, rdba）升序。
-    write_list: BTreeMap<[u8; 8], BTreeSet<(Lsn, Rdba)>>,
     cfg: CacheConfig,
 }
 
@@ -611,6 +653,29 @@ enum WriteTarget {
     OldestHead,
 }
 
+/// **脏帧快照**（O4；调用者持结构闩）：`(首次变脏 LSN, 键, 帧号)` 按 LSN 升序
+/// ——"最老优先"由**快照后排序**给出（对照 PG 检查点的 `CkptSortItem` 预扫描，
+/// bufmgr.c:3407；我们不再维护 per-DML 的有序脏表）。`only` 限某工作区
+/// （`None` = 全部）。
+fn dirty_snapshot(
+    st: &Structure,
+    slots: &[FrameSlot],
+    only: Option<[u8; 8]>,
+) -> Vec<(Lsn, BufferKey, usize)> {
+    let mut out: Vec<(Lsn, BufferKey, usize)> = Vec::new();
+    for (i, m) in st.meta.iter().enumerate() {
+        let Some(k) = m.key else { continue };
+        if only.is_some_and(|ws| ws != k.workspace) {
+            continue;
+        }
+        if let Some(l) = slots[i].first_dirty_lsn() {
+            out.push((l, k, i));
+        }
+    }
+    out.sort_unstable_by_key(|(l, k, _)| (*l, k.rdba.file_id(), k.rdba.block_id()));
+    out
+}
+
 /// 候选帧"声明"结果（O3：腾帧前必须在旧键桶闩下复核 pins）。
 enum Detach {
     /// 已摘链：`Some(旧键)` = 摘到旧桶链条目；`None` = 帧本来无键（virgin）。
@@ -619,12 +684,10 @@ enum Detach {
     Pinned,
 }
 
-/// 选页结果。
+/// 选页结果（O4：没有独立脏表条目 ⇒ 不存在"失步条目已清理"这一态）。
 enum Pick {
     /// 无候选。
     None,
-    /// 失步条目已清理（有进展、没写页）。
-    Stale,
     /// 可写：帧与定位信息。
     Ready {
         idx: usize,
@@ -645,6 +708,8 @@ struct WriteJob {
     /// 快照时的 `mod_seq`（收尾比对：变了 = 期间被再改脏）。
     mod_seq: u8,
     page_lsn: Lsn,
+    /// 快照时的**首次变脏 LSN**（O4：收尾清状态字的"期待值"）。
+    first_dirty: Lsn,
 }
 
 /// **DB Cache**（§5.10；本切片 N = 1 分区）。
@@ -763,7 +828,6 @@ impl<'io> BufferPool<'io> {
                     hot: VecDeque::new(),
                     cold: VecDeque::new(),
                     aux: VecDeque::new(),
-                    write_list: BTreeMap::new(),
                     cfg,
                 },
             ),
@@ -867,39 +931,79 @@ impl<'io> BufferPool<'io> {
         out
     }
 
-    /// 某工作区写列表长度（= 脏块数）。
+    /// 某工作区的**脏块数**（O4：扫描状态字——诊断/测试口径，语义不变）。
     #[must_use]
     pub fn dirty_len(&self, workspace: [u8; 8]) -> usize {
-        self.lock_of(&workspace)
-            .write_list
-            .get(&workspace)
-            .map_or(0, BTreeSet::len)
+        let partition = self.partition_of(&workspace);
+        let st = self.lock(partition);
+        let slots = self.slots(partition);
+        st.meta
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.key.is_some_and(|k| k.workspace == workspace) && slots[*i].is_dirty_state()
+            })
+            .count()
+    }
+
+    /// 某分区里某工作区的**脏块数**（分区口径的诊断/测试；O4 扫描）。
+    #[must_use]
+    pub fn dirty_len_in(&self, workspace: [u8; 8], partition: usize) -> usize {
+        let st = self.lock(partition);
+        let slots = self.slots(partition);
+        st.meta
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.key.is_some_and(|k| k.workspace == workspace) && slots[*i].is_dirty_state()
+            })
+            .count()
     }
 
     /// **有脏页的工作区**（DBWR 后台线程的入口：按此逐个 `flush_workspace`）。
     #[must_use]
     pub fn dirty_workspaces(&self) -> Vec<[u8; 8]> {
         let mut out = Vec::new();
-        for p in &self.partitions {
-            out.extend(p.structure.lock().write_list.keys().copied());
+        for p in 0..self.partitions.len() {
+            out.extend(self.dirty_workspaces_in(p));
         }
         out
     }
 
     /// **某分区里有脏页的工作区**（按分区写线程的扫描面：一个写线程只看
-    /// 自己分区的写列表——§5.10"一个分区只由一个写线程负责"）。
+    /// 自己分区的帧——§5.10"一个分区只由一个写线程负责"。O4：扫描而非脏表，
+    /// 对 DBWR 的节奏（毫秒级轮询）而言 O(容量) 无感）。
     #[must_use]
     pub fn dirty_workspaces_in(&self, partition: usize) -> Vec<[u8; 8]> {
-        self.lock(partition).write_list.keys().copied().collect()
+        let st = self.lock(partition);
+        let slots = self.slots(partition);
+        let mut out: Vec<[u8; 8]> = Vec::new();
+        for (i, m) in st.meta.iter().enumerate() {
+            if let Some(k) = m.key {
+                if slots[i].is_dirty_state() && !out.contains(&k.workspace) {
+                    out.push(k.workspace);
+                }
+            }
+        }
+        out
     }
 
     /// **低水位**：该工作区最老脏块的（首次变脏 LSN）；`None` = 无脏页。
+    /// O4：扫描求 min（写列表时代的"链头"——语义不变，WAL 检查点口径照旧）。
     #[must_use]
     pub fn low_water(&self, workspace: [u8; 8]) -> Option<Lsn> {
-        self.lock_of(&workspace)
-            .write_list
-            .get(&workspace)
-            .and_then(|s| s.iter().next().map(|(lsn, _)| *lsn))
+        let partition = self.partition_of(&workspace);
+        let st = self.lock(partition);
+        let slots = self.slots(partition);
+        let mut best: Option<Lsn> = None;
+        for (i, m) in st.meta.iter().enumerate() {
+            if m.key.is_some_and(|k| k.workspace == workspace) {
+                if let Some(l) = slots[i].first_dirty_lsn() {
+                    best = Some(best.map_or(l, |b: Lsn| b.min(l)));
+                }
+            }
+        }
+        best
     }
 
     /// 某帧的 **TCH**（touch count——对应 `x$bh` 的 `TCH` 列；热块诊断在
@@ -985,7 +1089,7 @@ impl<'io> BufferPool<'io> {
         Ok(PageGuard {
             content: Some(content),
             pins: &slot.pins,
-            structure: self.structure(partition),
+            slot,
             key,
             idx,
         })
@@ -1130,11 +1234,11 @@ impl<'io> BufferPool<'io> {
                 .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
             *content = Some(page);
         }
-        st.meta[idx] = FrameMeta {
-            key: Some(key),
-            dirty: false,
-            first_dirty: None,
-        };
+        debug_assert!(
+            !slots[idx].is_dirty_state(),
+            "复用候选必为净帧（find_reusable 的判据）"
+        );
+        st.meta[idx] = FrameMeta { key: Some(key) };
         slots[idx].reset_touch(cfg.cool_count, self.clock.now_ms());
         slots[idx].pins.store(1, Ordering::Release); // 装入者持有（`pin` 语义）
         Self::chain_push(&mut g, local, key, idx);
@@ -1154,6 +1258,7 @@ impl<'io> BufferPool<'io> {
                 .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
             *content = None;
         }
+        slots[idx].state.store(0, Ordering::Relaxed);
         st.meta[idx] = FrameMeta::empty();
         st.virgin.push(idx);
     }
@@ -1175,9 +1280,9 @@ impl<'io> BufferPool<'io> {
             0,
             "同键重装时不应有在途卫兵（权威镜像路径）"
         );
-        if let Some(lsn) = st.meta[idx].first_dirty.take() {
-            st.drop_write_entry(key.workspace, lsn, key.rdba);
-        }
+        // 旧内容被权威镜像取代：脏状态一并作废（O4：清状态字即可——
+        // 没有独立的脏表条目需要摘）。
+        slots[idx].state.store(0, Ordering::Release);
         {
             let mut content = slots[idx]
                 .content
@@ -1185,11 +1290,7 @@ impl<'io> BufferPool<'io> {
                 .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
             *content = Some(page);
         }
-        st.meta[idx] = FrameMeta {
-            key: Some(key),
-            dirty: false,
-            first_dirty: None,
-        };
+        st.meta[idx] = FrameMeta { key: Some(key) };
         slots[idx].reset_touch(cfg.cool_count, self.clock.now_ms());
         slots[idx].pins.store(1, Ordering::Release);
     }
@@ -1198,7 +1299,7 @@ impl<'io> BufferPool<'io> {
     /// `pins==0`）：摘链、清桶、释放页缓冲，帧回"未分配"态（virgin）。
     fn release_frame(&self, partition: usize, st: &mut Structure, idx: usize) {
         let slots = self.slots(partition);
-        debug_assert!(!st.meta[idx].dirty);
+        debug_assert!(!slots[idx].is_dirty_state());
         debug_assert_eq!(slots[idx].pins.load(Ordering::Acquire), 0);
         match self.detach_for_reuse(partition, st, idx) {
             Detach::Done(_) => {}
@@ -1211,6 +1312,7 @@ impl<'io> BufferPool<'io> {
                 .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
             *content = None; // 释放 16 KiB（重绑定后按新绑定重新分配）
         }
+        slots[idx].state.store(0, Ordering::Relaxed);
         st.meta[idx] = FrameMeta::empty();
         st.virgin.push(idx);
     }
@@ -1251,7 +1353,7 @@ impl<'io> BufferPool<'io> {
         Ok(PageGuard {
             content: Some(content),
             pins: &slot.pins,
-            structure: self.structure(partition),
+            slot,
             key,
             idx,
         })
@@ -1488,7 +1590,9 @@ impl<'io> BufferPool<'io> {
     pub fn drop_clean_frames(&self, partition: usize) -> Result<usize, BufferError> {
         let slots = self.slots(partition);
         let mut st = self.lock(partition);
-        let dirty = st.meta.iter().filter(|f| f.dirty).count();
+        let dirty = (0..st.meta.len())
+            .filter(|&i| slots[i].is_dirty_state())
+            .count();
         let pinned = slots
             .iter()
             .filter(|s| s.pins.load(Ordering::Acquire) > 0)
@@ -1557,9 +1661,8 @@ impl<'io> BufferPool<'io> {
                 let (_s, local, g) = self.lock_bucket(partition, k);
                 Self::chain_find(&g, local, k)
             };
-            match st.pick_for_write(target, &*self.resolve, &mut lookup)? {
+            match st.pick_for_write(slots, target, &*self.resolve, &mut lookup)? {
                 Pick::None => return Ok(None),
-                Pick::Stale => return Ok(Some(false)),
                 Pick::Ready {
                     idx,
                     key,
@@ -1586,6 +1689,9 @@ impl<'io> BufferPool<'io> {
             }
             let page_lsn = header.page_lsn;
             let mod_seq = header.mod_seq;
+            let first_dirty = slots[idx]
+                .first_dirty_lsn()
+                .ok_or(BufferError::FreeBufferWait)?; // 已在选页时复核；防御
             WriteJob {
                 idx,
                 key,
@@ -1594,6 +1700,7 @@ impl<'io> BufferPool<'io> {
                 image: page.clone(),
                 mod_seq,
                 page_lsn,
+                first_dirty,
             }
         };
         let wal_synced = self.perform_write(&job)?;
@@ -1637,11 +1744,6 @@ impl<'io> BufferPool<'io> {
     /// 取某分区的**结构闩锁**（`partition` 由 [`BufferPool::partition_of`] 给出）。
     fn lock(&self, partition: usize) -> LatchGuard<'_, Structure> {
         self.partitions[partition].structure.lock()
-    }
-
-    /// 按工作区取它所在分区的结构闩锁（一个工作区不被拆分 ⇒ 一次定位）。
-    fn lock_of(&self, workspace: &[u8; 8]) -> LatchGuard<'_, Structure> {
-        self.lock(self.partition_of(workspace))
     }
 
     /// 某分区的**帧槽**（内容锁 + 原子 pin + TCH；不经过闩锁）。
@@ -1700,11 +1802,6 @@ impl<'io> BufferPool<'io> {
         } else {
             false
         }
-    }
-
-    /// 某分区的结构闩锁（卫兵持有它以便做元数据操作）。
-    fn structure(&self, partition: usize) -> &Latch<Structure> {
-        &self.partitions[partition].structure
     }
 
     /// **闩锁统计**（诊断：gets/immediate/spin/sleeps/wait_ns——
@@ -1790,7 +1887,7 @@ impl Structure {
         if let Some(&idx) = self
             .aux
             .iter()
-            .find(|&&i| slots[i].pins.load(Ordering::Acquire) == 0 && !self.meta[i].dirty)
+            .find(|&&i| slots[i].pins.load(Ordering::Acquire) == 0 && !slots[i].is_dirty_state())
         {
             stats.inc(|s| &s.free_inspected);
             stats.inc(|s| &s.evictions);
@@ -1805,7 +1902,7 @@ impl Structure {
                 stats.inc(|s| &s.pinned_inspected);
                 continue;
             }
-            if self.meta[idx].dirty {
+            if slots[idx].is_dirty_state() {
                 stats.inc(|s| &s.dirty_inspected);
                 continue; // 脏帧不直接写回——交 Make Free 按序写
             }
@@ -1823,63 +1920,45 @@ impl Structure {
         None
     }
 
-    /// **选一个写回候选**（闩锁内；不写盘）：
-    /// - `Key`：指定页（`flush` 用；不存在/不脏 ⇒ `None`）；
-    /// - `WorkspaceHead`：该工作区写列表头；
-    /// - `OldestHead`：所有工作区里"最老首次变脏 LSN"最小的头（Make Free）。
+    /// **选一个写回候选**（O4：闩锁内做快照；不写盘）：
+    /// - `Key`：指定页（`flush` 用；不脏/不驻留 ⇒ `None`）；
+    /// - `WorkspaceHead` / `OldestHead`：**扫描 + 排序取最老**
+    ///   （[`dirty_snapshot`]——对照 PG 检查点的 `CkptSortItem` 预扫描）。
     ///
-    /// 失步条目（帧已不在池中/已干净）就地清理并返回 [`Pick::Stale`]——按
-    /// **条目自己的 LSN** 删除（用 `Lsn(0)` 当键删不掉 ⇒ 死循环，前台挂起）。
+    /// 失步（快照与复核之间被写掉/被重装）⇒ `Pick::None`：O4 没有独立脏表
+    /// 条目，"孤儿条目"这一类失步**从构造上消掉**了。
     fn pick_for_write(
         &mut self,
+        slots: &[FrameSlot],
         target: WriteTarget,
         resolve: &PoolResolver<'_>,
         lookup: &mut dyn FnMut(BufferKey) -> Option<usize>,
     ) -> Result<Pick, BufferError> {
-        let candidate: Option<(Lsn, [u8; 8], Rdba)> = match target {
+        let candidate: Option<(Lsn, BufferKey, usize)> = match target {
             WriteTarget::Key(key) => {
                 let Some(idx) = lookup(key) else {
                     return Ok(Pick::None);
                 };
-                if !self.meta[idx].dirty {
-                    return Ok(Pick::None);
-                }
-                self.meta[idx]
-                    .first_dirty
-                    .map(|l| (l, key.workspace, key.rdba))
+                slots[idx].first_dirty_lsn().map(|l| (l, key, idx))
             }
-            WriteTarget::WorkspaceHead(ws) => self
-                .write_list
-                .get(&ws)
-                .and_then(|c| c.iter().next().copied())
-                .map(|(l, r)| (l, ws, r)),
-            WriteTarget::OldestHead => {
-                let mut best: Option<(Lsn, [u8; 8], Rdba)> = None;
-                for (ws, chain) in &self.write_list {
-                    if let Some((lsn, rdba)) = chain.iter().next().copied() {
-                        if best.map_or(true, |(l, _, _)| lsn < l) {
-                            best = Some((lsn, *ws, rdba));
-                        }
-                    }
-                }
-                best
+            WriteTarget::WorkspaceHead(ws) => {
+                dirty_snapshot(self, slots, Some(ws)).into_iter().next()
             }
+            WriteTarget::OldestHead => dirty_snapshot(self, slots, None).into_iter().next(),
         };
-        let Some((lsn, ws, rdba)) = candidate else {
+        let Some((lsn, key, idx)) = candidate else {
             return Ok(Pick::None);
         };
-        let key = BufferKey::new(ws, rdba);
-        let Some(idx) = lookup(key) else {
-            self.drop_write_entry(ws, lsn, rdba);
-            return Ok(Pick::Stale);
-        };
-        if !self.meta[idx].dirty {
-            self.drop_write_entry(ws, lsn, rdba); // 防呆（不应发生）
-            return Ok(Pick::Stale);
+        // 复核：快照与现在之间可能已被写掉（清脏）或被重装（换人）。
+        if slots[idx].first_dirty_lsn() != Some(lsn) {
+            return Ok(Pick::None);
         }
         let Some(fkey) = self.meta[idx].key else {
             return Ok(Pick::None);
         };
+        if fkey != key {
+            return Ok(Pick::None);
+        }
         let (handle, block) = resolve(&fkey.workspace, fkey.rdba)
             .ok_or(BufferError::Unresolved { rdba: fkey.rdba })?;
         Ok(Pick::Ready {
@@ -1888,15 +1967,6 @@ impl Structure {
             handle,
             block,
         })
-    }
-
-    fn drop_write_entry(&mut self, ws: [u8; 8], lsn: Lsn, rdba: Rdba) {
-        if let Some(chain) = self.write_list.get_mut(&ws) {
-            chain.remove(&(lsn, rdba));
-            if chain.is_empty() {
-                self.write_list.remove(&ws);
-            }
-        }
     }
 
     /// **写回收尾**（闩锁内）：`mod_seq` 未变 ⇒ 清脏、出写列表、干净未钉住
@@ -1924,10 +1994,8 @@ impl Structure {
         if current_mod_seq != job.mod_seq {
             return; // 期间被再改脏：保持脏
         }
-        if let Some(lsn) = self.meta[idx].first_dirty.take() {
-            self.drop_write_entry(job.key.workspace, lsn, job.key.rdba);
-        }
-        self.meta[idx].dirty = false;
+        // O4：清状态字（带"期待的首脏 LSN"——与权威重装互斥）。
+        let _ = slots[idx].clear_dirty_state(job.first_dirty);
         if slots[idx].pins.load(Ordering::Acquire) == 0 && !self.aux.contains(&idx) {
             if let Some(p) = self.hot.iter().position(|&i| i == idx) {
                 self.hot.remove(p);
@@ -1983,8 +2051,8 @@ pub struct PageGuard<'a> {
     content: Option<RwLockWriteGuard<'a, Option<Page>>>,
     /// 帧的 pin 计数（`Drop` 递减）。
     pins: &'a AtomicU32,
-    /// 分区的结构闩锁（元数据操作；**临界区短**，不嵌套内容锁的等待）。
-    structure: &'a Latch<Structure>,
+    /// **本帧的状态字**（O4：脏记账无闩锁）。
+    slot: &'a FrameSlot,
     /// 本帧的键（构造时快照——卫兵期间帧不会被换人：pin > 0）。
     key: BufferKey,
     idx: usize,
@@ -2006,27 +2074,16 @@ impl PageGuard<'_> {
         self.key
     }
 
-    /// 页是否脏。
+    /// 页是否脏（O4：读状态字——**无闩锁**）。
     #[must_use]
     pub fn is_dirty(&self) -> bool {
-        self.structure.lock().meta[self.idx].dirty
+        self.slot.is_dirty_state()
     }
 
-    /// **标脏**（写路径在追加完 redo 后调用）：`first_dirty_lsn` 只在**首次**
-    /// 变脏时记入——写列表按它排序，重复标脏不改变排序键。
+    /// **标脏**（O4：写路径在追加完 redo 后调用——**一次 CAS，无闩锁**）。
+    /// `first_dirty_lsn` 只在**首次**变脏时记入（排序键不因重复标脏而变）。
     pub fn mark_dirty(&mut self, first_dirty_lsn: Lsn) {
-        let mut st = self.structure.lock();
-        let m = &mut st.meta[self.idx];
-        if m.dirty {
-            return;
-        }
-        m.dirty = true;
-        m.first_dirty = Some(first_dirty_lsn);
-        let key = m.key.expect("钉住的帧必有主");
-        st.write_list
-            .entry(key.workspace)
-            .or_default()
-            .insert((first_dirty_lsn, key.rdba));
+        self.slot.mark_dirty_state(first_dirty_lsn);
     }
 }
 
@@ -2860,27 +2917,15 @@ mod tests {
     }
 
     #[test]
-    fn make_free_terminates_with_stale_write_list_entries() {
-        // 审核修复回归（C2）：帧已不在池中的**失步条目**必须按条目自身的
-        // LSN 删除——用 `Lsn(0)` 当键删不掉，make_free 每轮重选同一条且
-        // 什么都不写 ⇒ 死循环（前台 pin 永久挂起）。
+    fn make_free_terminates_without_candidates() {
+        // O4 起脏状态在帧里、**没有独立的脏表**——"帧已不在池中/已干净"
+        // 这一类失步条目**从构造上不存在**（旧回归 C2 的场景被消掉）。
+        // 这里守住替代不变式：无脏帧时 make_free 立即终止且幂等。
         let h = harness();
         let pool = h.pool(2, h.fake_wal());
-        {
-            let mut inner = pool.lock(0);
-            inner
-                .write_list
-                .entry(WS_A)
-                .or_default()
-                .insert((lsn(7), rdba(7, 1)));
-        }
-        pool.make_free(0).unwrap();
-        assert!(
-            !pool.lock(0).write_list.contains_key(&WS_A),
-            "失步条目按自身 LSN 清除"
-        );
-        // 再跑一次也不挂（幂等）。
-        pool.make_free(0).unwrap();
+        assert!(!pool.make_free(0).unwrap(), "无脏帧：没写任何页");
+        pool.make_free(0).unwrap(); // 再跑一次也不挂（幂等）
+        assert_eq!(pool.dirty_len(WS_A), 0);
     }
 
     /// 分区池（多工作集；§5.10 的 P4 形态）。
@@ -3023,22 +3068,23 @@ mod tests {
             g.mark_dirty(lsn(1 + u64::from(block)));
         }
         assert_eq!(pool.dirty_len(WS_A), 2);
-        // 该工作区的两个帧都在同一个分区里（其它分区没有任何属于它的帧）。
+        // 该工作区的两个帧都在同一个分区里（其它分区没有任何属于它的脏帧）。
         assert_eq!(
-            pool.partitions[p]
-                .structure
-                .lock()
-                .write_list
-                .get(&WS_A)
-                .map(BTreeSet::len),
-            Some(2),
-            "写列表整体落在一个分区"
+            dirty_snapshot(
+                &pool.partitions[p].structure.lock(),
+                &pool.partitions[p].slots,
+                Some(WS_A)
+            )
+            .len(),
+            2,
+            "脏帧整体落在一个分区"
         );
-        for (i, part) in pool.partitions.iter().enumerate() {
+        for i in 0..pool.partitions.len() {
             if i != p {
-                assert!(
-                    !part.structure.lock().write_list.contains_key(&WS_A),
-                    "分区 {i} 不该有该工作区的写列表"
+                assert_eq!(
+                    pool.dirty_len_in(WS_A, i),
+                    0,
+                    "分区 {i} 不该有该工作区的脏帧"
                 );
             }
         }

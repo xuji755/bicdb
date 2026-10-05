@@ -109,6 +109,41 @@ fn pool_paths_contention() {
     let secs = 1.0;
     println!("| 路径 | 线程 | 吞吐（万次/秒） | `db_cache` 判读（§2.7 口径） |");
     println!("| --- | --- | --- | --- |");
+    // E：**写路径**（各自独占块）：pin → 改页 → `mark_dirty` → drop
+    //    ——O3 后写侧仍经结构闩锁（写列表），这是它的当前上限。
+    for threads in [1usize, 2, 4, 8, 16, 32] {
+        let poole = fixture(1, threads);
+        // 先预脏（写列表插入是**首次**才做；稳态是"已在写列表"的快路径
+        // ——真实负载里两者交替，这里取稳态口径并把首次插入摊薄到测窗外）。
+        for t in 0..threads {
+            let key = BufferKey::new(
+                WS,
+                Rdba::from_parts(7, (t % BLOCKS as usize) as u32).expect("域内"),
+            );
+            let mut g = poole.pin(key).expect("驻留");
+            g.mark_dirty(Lsn::from_raw(1).expect("域内"));
+        }
+        let e = bench(threads, secs, &move |t, stop| {
+            let key = BufferKey::new(
+                WS,
+                Rdba::from_parts(7, (t % BLOCKS as usize) as u32).expect("域内"),
+            );
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let mut g = poole.pin(key).expect("命中");
+                g.bump_mod_seq();
+                g.mark_dirty(Lsn::from_raw(2).expect("域内"));
+                std::hint::black_box(&g);
+                drop(g);
+                n += 1;
+            }
+            n
+        });
+        println!(
+            "| E `mark_dirty`（写路径，结构闩锁） | {threads} | {:.1} | — |",
+            e / 1e4
+        );
+    }
     for threads in [1usize, 2, 4, 8, 16, 32] {
         let pool = fixture(1, threads);
         // A：不同块 pin（各自独占；共享点 = 结构闩锁）。
