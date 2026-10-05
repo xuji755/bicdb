@@ -86,6 +86,40 @@ impl Default for AnalysisReport {
     }
 }
 
+/// **PITR 目标点 → 重放上界**（§11.10 的终止条件）：
+/// 返回"**最后一条 `commit_seq ≤ target` 的提交记录**"的 LSN（含该条）——
+/// 其后不再重放。范围内没有这样的提交 ⇒ `None`（不重放任何记录）。
+pub fn pitr_stop(
+    io: &dyn FileIo,
+    groups: &[OnlineGroup],
+    start_lsn: Lsn,
+    target: u64,
+) -> Result<Option<Lsn>, RecoveryError> {
+    let mut stop = None;
+    for g in groups {
+        if g.end_lsn <= start_lsn {
+            continue;
+        }
+        let scan = scan_log(io, g.handle, g.start_lsn, u64::from(g.file_pages))?;
+        for record in &scan.records {
+            if record.lsn < start_lsn {
+                continue;
+            }
+            if RecordOp::from_u8(record.op) != Some(RecordOp::Commit) {
+                continue;
+            }
+            let seq = record
+                .commit_seq()
+                .ok_or(RecoveryError::Malformed("提交记录缺 commit_seq 主段"))?;
+            if seq <= target {
+                // 提交序号随流单增——后面的只会更大，但取"最后一条"更防流损坏。
+                stop = Some(record.lsn);
+            }
+        }
+    }
+    Ok(stop)
+}
+
 impl AnalysisReport {
     /// 日志流里出现的输家（**不含**"检查点前就活动、之后无记录"的当事务——
     /// 那要由事务表槽扫描补齐，见模块文档）。
@@ -130,6 +164,17 @@ pub fn analyze_from(
     groups: &[OnlineGroup],
     start_lsn: Lsn,
 ) -> Result<AnalysisReport, RecoveryError> {
+    analyze_until(io, groups, start_lsn, crate::recovery::ReplayBound::ToEnd)
+}
+
+/// **有界分析**（PITR 用）：只判到 `stop_lsn`（含）为止——目标点之后发生的
+/// 提交**不得**被算进来（否则按目标点回滚时会把"当时还没提交的"当成胜者）。
+pub fn analyze_until(
+    io: &dyn FileIo,
+    groups: &[OnlineGroup],
+    start_lsn: Lsn,
+    bound: crate::recovery::ReplayBound,
+) -> Result<AnalysisReport, RecoveryError> {
     let mut report = AnalysisReport {
         log_end: start_lsn,
         ..AnalysisReport::default()
@@ -146,6 +191,15 @@ pub fn analyze_from(
         for record in &scan.records {
             if record.lsn < start_lsn {
                 continue; // 起点之前的记录：不判定
+            }
+            match bound {
+                crate::recovery::ReplayBound::ToEnd => {}
+                crate::recovery::ReplayBound::Through(stop) => {
+                    if record.lsn > stop {
+                        continue; // 目标点之后的记录：不判定（PITR）
+                    }
+                }
+                crate::recovery::ReplayBound::Nothing => continue,
             }
             report.records_scanned += 1;
             match RecordOp::from_u8(record.op) {

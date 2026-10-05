@@ -1151,9 +1151,12 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
                 UndoPayload::FullRow(bytes) if !bytes.is_empty() => bytes,
                 _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
             };
-            let entry = page
-                .slot(index)
-                .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;
+            let Some(entry) = page.slot(index) else {
+                // 槽不在本页（`slot_count` 之外）：这个页状态**早于本记录**
+                // （PITR 的有界重放会让页停在目标点，而链覆盖到目标点之后），
+                // 行本来就不在 ⇒ 已在前像，空操作。
+                return Ok(());
+            };
             if entry.status() != crate::page::SlotStatus::Free {
                 // 槽被占着：**行字节与要恢复的旧值逐字节相同** ⇒ 是本补偿
                 // 已生效过（幂等）；否则是**槽已复用**——拒绝，不猜。
@@ -1185,9 +1188,9 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
                 UndoPayload::Forward(t) => *t,
                 _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
             };
-            let entry = page
-                .slot(index)
-                .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;
+            let Some(entry) = page.slot(index) else {
+                return Ok(()); // 页状态早于本记录（同"删除"的说明）：空操作
+            };
             let offset = entry.offset() as usize;
             if offset + crate::rowid::ROWID_LEN > crate::page::PAGE_SIZE {
                 return Err(RollbackError::Undo(UndoError::MalformedRecord));
@@ -1204,6 +1207,17 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
                 UndoPayload::ItlOverwrite { itl_slot, old } => (*itl_slot, old),
                 _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
             };
+            // 该 ITL 槽不在本页（`itl_count` 之外）：页状态早于"占用记录"
+            // ——占用（连同可能的槽扩展）没有被重放到这个页 ⇒ 已在前像，空操作。
+            let count = crate::itl::itl_count(page).map_err(|e| {
+                RollbackError::Page(match e {
+                    crate::itl::ItlError::SlotOutOfRange(_) => "ITL 槽越界",
+                    _ => "ITL 字段越界",
+                })
+            })?;
+            if u16::from(itl_slot) >= count {
+                return Ok(());
+            }
             match old {
                 Some(bytes) => {
                     crate::itl::restore(page, u16::from(itl_slot), bytes).map_err(|e| {
@@ -2124,6 +2138,67 @@ mod rollback_tests {
         rollback_record(&io, &head_rec, &mut resolve).unwrap();
         let page = load(&io, h);
         assert_eq!(heap::row(&page, n), Some(&bytes[..]), "删除被撤销、行恢复");
+    }
+
+    #[test]
+    fn compensations_are_noops_on_pre_image_page_states() {
+        // PITR 的有界重放会让页停在目标点（比链覆盖的范围旧）：槽/ITL 槽
+        // 都可能"还不存在"——补偿必须是空操作，而不是报错或凭空造行。
+        let io = mem();
+        let h = data_file(&io);
+        {
+            // 页上只有 0 行、1 个 ITL 槽。
+            let mut page = load(&io, h);
+            let bytes = row_bytes(1, b"x");
+            let mut p2 = page.clone();
+            heap::insert_row(&mut p2, &bytes, &InsertPolicy::in_place(0)).unwrap();
+            let _ = &mut page;
+            store(&io, h, &mut p2);
+        }
+
+        // 槽 5 不存在：插入/删除/转发补偿都空操作。
+        let mut page = load(&io, h);
+        let before = *page.as_bytes();
+        for op in [UndoOp::Insert, UndoOp::Delete, UndoOp::Forward] {
+            let rec = UndoRecord {
+                prev: None,
+                op,
+                flags: 0,
+                rowid: RowId::from_parts(3, 0, 6).unwrap(), // 槽 5（1 起）
+                payload: match op {
+                    UndoOp::Delete => UndoPayload::FullRow(row_bytes(1, b"old")),
+                    UndoOp::Forward => UndoPayload::Forward(RowId::from_parts(3, 0, 2).unwrap()),
+                    _ => UndoPayload::None,
+                },
+            };
+            apply_undo_to_page(&mut page, &rec).unwrap();
+        }
+        assert_eq!(page.as_bytes(), &before, "页一字节未动");
+
+        // ITL 槽 3 不存在（itl_count = 1）：ITL 覆盖补偿空操作。
+        let rec = UndoRecord {
+            prev: None,
+            op: UndoOp::ItlOverwrite,
+            flags: 0,
+            rowid: RowId::from_parts(3, 0, 1).unwrap(),
+            payload: UndoPayload::ItlOverwrite {
+                itl_slot: 3,
+                old: None,
+            },
+        };
+        apply_undo_to_page(&mut page, &rec).unwrap();
+        assert_eq!(page.as_bytes(), &before);
+
+        // 但**存在**的槽/ITL 槽仍照常补偿（回归：别把空操作判据放大）。
+        let rec = UndoRecord {
+            prev: None,
+            op: UndoOp::Insert,
+            flags: 0,
+            rowid: RowId::from_parts(3, 0, 1).unwrap(),
+            payload: UndoPayload::None,
+        };
+        apply_undo_to_page(&mut page, &rec).unwrap();
+        assert_eq!(heap::row(&page, 1), None, "存在的行被撤销");
     }
 }
 
