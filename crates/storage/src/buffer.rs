@@ -652,7 +652,14 @@ impl Inner<'_> {
             return Some(idx);
         }
         // 1) AUX：干净、未钉住者直接取用（**复用**——计入 evictions）。
-        if let Some(p) = self.aux.iter().position(|&i| self.frames[i].pins == 0) {
+        //    **脏帧必须排除**：AUX 的语义是"写完的干净候选"，而 pin 命中与
+        //    `mark_dirty` 都不会把帧移出 AUX——漏了这个判据，再次改脏的帧会被
+        //    前台无写回直接覆盖（已提交更新静默丢失 + 写列表孤儿）。
+        if let Some(p) = self
+            .aux
+            .iter()
+            .position(|&i| self.frames[i].pins == 0 && !self.frames[i].dirty)
+        {
             let idx = self.aux.remove(p).expect("位置在界内");
             self.stats.free_inspected += 1;
             self.stats.evictions += 1;
@@ -701,13 +708,16 @@ impl Inner<'_> {
                     }
                 }
             }
-            let Some((_, ws, rdba)) = pick else {
+            let Some((lsn, ws, rdba)) = pick else {
                 break;
             };
             let key = BufferKey::new(ws, rdba);
             let Some(idx) = self.find_frame(key) else {
+                // 失步条目（帧已不在池中）：按**条目自己的 LSN** 删除。
+                // 用 `Lsn(0)` 当键会删不掉（LSN ≠ 0 的孤儿每轮被重新选中且
+                // 什么都不写 ⇒ 死循环，前台 pin 永久挂起）。
                 if let Some(chain) = self.write_list.get_mut(&ws) {
-                    chain.remove(&(Lsn::from_raw(0).expect("0 合法"), rdba));
+                    chain.remove(&(lsn, rdba));
                     if chain.is_empty() {
                         self.write_list.remove(&ws);
                     }
@@ -1449,5 +1459,72 @@ mod tests {
         assert_eq!(pool.stats().aging_steps, 1, "发生过一次老化减半");
         assert_eq!(pool.stats().evictions, 1);
         assert_eq!(pool.stats().writes, 0, "干净块不需写回");
+    }
+
+    #[test]
+    fn aux_dirty_frame_is_not_reused_without_write_back() {
+        // 审核修复回归（C1）：写回后进 AUX 的帧**再次改脏**时，前台找空闲帧
+        // 不得无写回直接覆盖它（pin 命中与 mark_dirty 都不把帧移出 AUX）。
+        let h = harness();
+        let pool = h.pool(1, h.fake_wal());
+        let k0 = BufferKey::new(WS_A, rdba(7, 0));
+        let k1 = BufferKey::new(WS_A, rdba(7, 1));
+
+        // 1) 用 k0 → 改 → 标脏 → flush：帧干净、进 AUX。
+        {
+            let mut g = pool.pin(k0).unwrap();
+            g.as_bytes_mut()[4096] = 0x77;
+            g.mark_dirty(lsn(1));
+        }
+        pool.flush(k0).unwrap();
+        assert_eq!(h.read_byte(7, 0), 0x77, "第一次写回");
+
+        // 2) 再钉住同一页 → 再改 → 再标脏（帧留在 AUX、且是脏的）。
+        {
+            let mut g = pool.pin(k0).unwrap();
+            g.as_bytes_mut()[4096] = 0x88;
+            g.mark_dirty(lsn(2));
+        }
+
+        // 3) 容量 1：读 k1 必须先把 k0 写回（Make Free → 写回 → 入 AUX），
+        //    而不是把脏的 k0 直接覆盖。
+        {
+            let g = pool.pin(k1).unwrap();
+            assert_eq!(g.as_bytes()[4096], 0xA1, "k1 内容来自文件");
+        }
+        assert_eq!(
+            h.read_byte(7, 0),
+            0x88,
+            "再次改脏的内容必须写回，不得被丢弃"
+        );
+        assert_eq!(pool.dirty_len(WS_A), 0, "写列表无孤儿条目");
+    }
+
+    #[test]
+    fn make_free_terminates_with_stale_write_list_entries() {
+        // 审核修复回归（C2）：帧已不在池中的**失步条目**必须按条目自身的
+        // LSN 删除——用 `Lsn(0)` 当键删不掉，make_free 每轮重选同一条且
+        // 什么都不写 ⇒ 死循环（前台 pin 永久挂起）。
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        {
+            let mut inner = pool.lock();
+            inner
+                .write_list
+                .entry(WS_A)
+                .or_default()
+                .insert((lsn(7), rdba(7, 1)));
+        }
+        {
+            let mut inner = pool.lock();
+            inner.make_free(&h.io).unwrap();
+            assert!(
+                inner.write_list.get(&WS_A).is_none(),
+                "失步条目按自身 LSN 清除"
+            );
+        }
+        // 再跑一次也不挂（幂等）。
+        let mut inner = pool.lock();
+        inner.make_free(&h.io).unwrap();
     }
 }
