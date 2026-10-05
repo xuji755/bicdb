@@ -451,6 +451,20 @@ pub struct PlannedExtend {
     pub images: Vec<(Rdba, Page, Page)>,
 }
 
+/// **计划推进过位图页**（append_pos 落在窗口首位时）：要写的页分两类——
+/// `images`（既有页：扩展的文件位图/段头页、窗口内其余位图页）经池写 redo；
+/// `fresh`（**全新位图页自身**：`before` 为零页）必须先**格式化落盘 + fsync**
+/// 再让别处引用它（物理增量无法重建一个不存在的页——与"新撤销页"同规）。
+pub struct PlannedAdvance {
+    /// 要写的既有页：（rdba, 前像, 后像）。
+    pub images: Vec<(Rdba, Page, Page)>,
+    /// 全新的位图页：（rdba, 初始化后的页）。
+    pub fresh: Vec<(Rdba, Page)>,
+    /// 段头页的**后像**（`append_pos` 已推进、`bitmap_pages` 已 +1）——
+    /// 调用方在其上继续做本次的槽更新（否则会把这两个字段写回旧值）。
+    pub header_after: Page,
+}
+
 /// 第 `index` 个段内位图页覆盖的逻辑页区间 `[起, 止)`（**诊断/测试用**；
 /// 生产路径用 [`Segment::bitmap_slot`]）。`index × coverage` 以 u64 计算后
 /// 收窄——大 index 不会回绕。
@@ -641,9 +655,14 @@ impl<'io, 'f> Segment<'io, 'f> {
         })
     }
 
-    /// 缩小位图覆盖（**仅测试**：走到跨位图页的路径）。
-    #[cfg(test)]
-    pub fn with_coverage_for_test(mut self, coverage: u32) -> Self {
+    /// 缩小段内位图页的覆盖（**仅供测试/诊断**：让"append_pos 走到位图页"
+    /// 的路径在几页之内可达）。
+    ///
+    /// **警告**：生产布局固定为 [`BITMAP_PAGE_COVERAGE`]（65216）——覆盖与
+    /// 磁盘上已落定的位图页落点绑定，改变它会让既有段的布局解释错位。
+    /// 只允许在"全新段、且只用于内存/测试文件"上调用。
+    #[must_use]
+    pub fn with_coverage(mut self, coverage: u32) -> Self {
         self.coverage = coverage;
         self
     }
@@ -764,8 +783,14 @@ impl<'io, 'f> Segment<'io, 'f> {
             }
             let (_, bit, bmp_logical) = self.bitmap_slot(k);
             if self.logical_block(bmp_logical).is_none() {
-                // 跨到尚未物化的位图页：本切片不在此路径物化（生产 coverage
-                // 下不可达；多页位图已有独立物化口）。
+                // 该位图页**落在本次新增的区里**（窗口首位 = 位图页自身，
+                // 如 `k = 65217` 的位图页在 65216）：不需要逐位标记——
+                // 位图页的**初始化**会把本窗口的非位图页统一标 `High`
+                // （bit0 自指 `Full`）。物化由调用方随后执行。
+                if bmp_logical >= first_logical && bmp_logical < first_logical + EXTENT_BLOCKS {
+                    continue;
+                }
+                // 更远窗口的位图页：不在本次扩展的落点内——仍按覆盖不足拒绝。
                 return Err(SegmentSpaceError::BitmapCoverage);
             }
             let idx = bmp_images.iter().position(|(l, _, _)| *l == bmp_logical);
@@ -815,6 +840,85 @@ impl<'io, 'f> Segment<'io, 'f> {
             extent: planned.extent,
             images,
         })
+    }
+
+    /// **计划物化第 `i` 个段内位图页**（**不写盘**；`i ≥ 1` 时它位于逻辑页
+    /// `i×coverage`，即窗口首位——`append_pos` 恰走到它时需要先物化再前进）。
+    ///
+    /// 步骤：必要时先**计划扩展**（可多次）直到该逻辑页落入区映射；然后给出
+    /// 位图页镜像（`fresh`：初始化 = bit0 自指 `Full`、本窗口其余位 `High`）
+    /// 与段头页镜像（`append_pos = 位图页 + 1`、`bitmap_pages += 1`）。
+    /// 内存状态随即推进（与 [`Segment::plan_extend`] 同规）。
+    pub fn plan_materialize_bitmap_page(
+        &mut self,
+        i: u32,
+    ) -> Result<PlannedAdvance, SegmentSpaceError> {
+        let (_, _, bmp_logical) = self.bitmap_slot(i * self.coverage);
+        let mut images: Vec<(Rdba, Page, Page)> = Vec::new();
+        while self.logical_block(bmp_logical).is_none() {
+            let planned = self.plan_extend()?;
+            images.extend(planned.images);
+        }
+        let block = self
+            .logical_block(bmp_logical)
+            .ok_or(SegmentSpaceError::BitmapCoverage)?;
+        let rdba = Rdba::from_parts(self.file.file_id(), block)
+            .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?;
+
+        // 全新位图页：bit0 自指 Full（窗口首位），其余位 High（空白数据页）。
+        let mut bmp = Page::new(
+            PageType::Bitmap,
+            self.file.workspace_ref(),
+            self.file.file_id(),
+            block,
+        );
+        crate::bitmap::init(&mut bmp, crate::bitmap::BitmapKind::FreeLevel, i as u16)?;
+        crate::bitmap::set_free_level(&mut bmp, 0, crate::bitmap::FreeLevel::Full)?;
+        let window_first = i * self.coverage;
+        for k in 1..self.coverage {
+            if window_first + k == bmp_logical {
+                continue; // 不会发生（位图页恒在窗口首位）；防御
+            }
+            crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::High)?;
+        }
+
+        // 段头页：append_pos 跳过位图页、bitmap_pages +1。
+        let header_before = self.file.read_page(self.page0)?;
+        let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
+        let mut h = read_header(&header_after)?;
+        h.append_pos = bmp_logical + 1;
+        h.bitmap_pages = h.bitmap_pages.saturating_add(1);
+        write_header(&mut header_after, &h)?;
+        let header_after_state = read_header(&header_after)?;
+        let header_after_copy = Page::from_bytes(Box::new(*header_after.as_bytes()));
+        images.push((
+            Rdba::from_parts(self.file.file_id(), self.page0)
+                .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?,
+            header_before,
+            header_after,
+        ));
+        self.header = header_after_state;
+
+        Ok(PlannedAdvance {
+            images,
+            fresh: vec![(rdba, bmp)],
+            header_after: header_after_copy,
+        })
+    }
+
+    /// **当前追加位置**（只读：直读段头页的 `append_pos`）。
+    pub fn append_position(&self) -> Result<u32, SegmentSpaceError> {
+        Ok(read_header(&self.file.read_page(self.page0)?)?.append_pos)
+    }
+
+    /// **按物理块号直写一页**（不经区映射/逻辑页——"先格式化落盘"用）。
+    pub fn write_physical_page(
+        &self,
+        block: u32,
+        page: &mut Page,
+    ) -> Result<(), SegmentSpaceError> {
+        self.file.write_page(block, page)?;
+        Ok(())
     }
 
     /// **准备下一个可写的追加逻辑页**：跳过（并物化）跨到的位图页本身。
@@ -1250,7 +1354,7 @@ mod space_tests {
         // 位图页 1 管 [8,16)，落在逻辑页 8（窗口首位、自指）。
         let mut seg = Segment::create(&mut file, SegType::Heap, 1, 2, 4, 10, 0)
             .unwrap()
-            .with_coverage_for_test(8);
+            .with_coverage(8);
         seg.extend().unwrap(); // 第二区：逻辑页 8..16 就位
         assert!(seg.is_bitmap_page(1) && seg.is_bitmap_page(8));
         assert!(!seg.is_bitmap_page(0), "逻辑页 0 是段头页（不是位图页）");

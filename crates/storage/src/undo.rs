@@ -898,6 +898,10 @@ pub struct UndoAppend {
     pub header: (Page, Page),
     /// **新链头**（本记录的地址）。
     pub head: RowId,
+    /// **推进过位图页**的计划（`append_pos` 落在窗口首位时）：镜像由调用方
+    /// 落盘——池路径对 `fresh` 先格式化 fsync、对 `images` 经池写 redo；
+    /// 直写路径逐页直写。`None` = 本次未跨位图页。
+    pub advance: Option<crate::segment::PlannedAdvance>,
 }
 
 /// undo 段上的链写入器（当前页与归属事务的写作状态）。
@@ -980,14 +984,34 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             _ => false,
         };
         let mut bitmap = None;
+        let mut advance = None;
         let (logical, undo_before, opened) = if reuse {
             let logical = self.current_logical.expect("已判定存在");
             let page = self.segment.read_page(logical)?;
             (logical, page, false)
         } else {
-            // 新页：下一个可写追加页（跨到位图页本身时先物化并跳过）。
-            let logical = self.segment.prepare_append_page()?;
+            // 新页：下一个可写追加页。若它**就是位图页自身**（窗口首位），
+            // 先**计划物化**（不在此直写——镜像随 plan 返回，写路径经池 + redo，
+            // `fresh` 先格式化 fsync）。
+            let mut logical = self.segment.append_position()?;
+            let mut fresh_bitmap: Option<Page> = None;
+            if self.segment.is_bitmap_page(logical) {
+                let (i, _, _) = self.segment.bitmap_slot(logical);
+                let adv = self.segment.plan_materialize_bitmap_page(i)?;
+                // 段头**以后像为基**（`append_pos` 已推进、`bitmap_pages` 已 +1）
+                // ——否则本次的链头/槽更新会把这两个字段写回旧值。
+                header_before = Page::from_bytes(Box::new(*adv.header_after.as_bytes()));
+                txn_slot = read_slot(&header_before, slot_index)?;
+                if let Some((_, page)) = adv.fresh.first() {
+                    fresh_bitmap = Some(Page::from_bytes(Box::new(*page.as_bytes())));
+                }
+                advance = Some(adv);
+                logical = logical
+                    .checked_add(1)
+                    .ok_or(SegmentSpaceError::BitmapCoverage)?; // 位图页的下一逻辑页
+            }
             if self.segment.logical_block(logical).is_none() {
+                // 兜底直写（非池路径；池路径由 `ensure_undo_capacity` 先计划扩展）。
                 self.segment.extend()?;
                 header_before = self.segment.read_page(0)?;
                 txn_slot = read_slot(&header_before, slot_index)?;
@@ -1016,9 +1040,14 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             let mut seg_header = read_header(&header_before)?;
             seg_header.append_pos = logical + 1;
             write_header(&mut header_before, &seg_header)?;
-            // 段内位图：新页 → High（按覆盖落到对应位图页）。
+            // 段内位图：新页 → High（按覆盖落到对应位图页）。位图页若是
+            // **本次刚物化的**（尚未落盘），以前像 = fresh 页为基（其初始化
+            // 已把本窗口标 High ⇒ 差异为空、不产生多余写）。
             let (_, bit, bmp_logical) = self.segment.bitmap_slot(logical);
-            let bmp_before = self.segment.read_page(bmp_logical)?;
+            let bmp_before = match &fresh_bitmap {
+                Some(p) if bmp_logical == logical - 1 => Page::from_bytes(Box::new(*p.as_bytes())),
+                _ => self.segment.read_page(bmp_logical)?,
+            };
             let mut bmp_after = Page::from_bytes(Box::new(*bmp_before.as_bytes()));
             crate::bitmap::set_free_level(&mut bmp_after, bit, crate::bitmap::FreeLevel::High)?;
             bitmap = Some((bmp_logical, bmp_before, bmp_after));
@@ -1052,6 +1081,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             bitmap,
             header: (header_before, header_after),
             head,
+            advance,
         })
     }
 
@@ -1079,6 +1109,18 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         payload: UndoPayload,
     ) -> Result<RowId, UndoChainError> {
         let plan = self.plan_append(slot_index, op, flags, rowid, payload)?;
+        // ① 跨位图页的推进（直写形态；池路径在 `txn::write` 里经池 + redo）。
+        if let Some(adv) = &plan.advance {
+            for (rdba, _before, after) in &adv.images {
+                let mut p = Page::from_bytes(Box::new(*after.as_bytes()));
+                self.segment.write_physical_page(rdba.block_id(), &mut p)?;
+            }
+            for (rdba, page) in &adv.fresh {
+                let mut p = Page::from_bytes(Box::new(*page.as_bytes()));
+                self.segment.write_physical_page(rdba.block_id(), &mut p)?;
+            }
+            self.segment.sync()?;
+        }
         if let Some((logical, _, after)) = &plan.bitmap {
             let mut p = Page::from_bytes(Box::new(*after.as_bytes()));
             self.segment.write_page(*logical, &mut p)?;
@@ -1865,6 +1907,72 @@ mod chain_tests {
             .append(0, UndoOp::Insert, 0, rid(3, 1), UndoPayload::None)
             .unwrap_err();
         assert!(matches!(err, UndoChainError::SlotNotActive(0)), "{err}");
+    }
+
+    #[test]
+    fn append_advances_over_the_bitmap_page() {
+        // 审核修复回归（B2）：`append_pos` 走到**段内位图页自身**（窗口首位）
+        // 时必须先物化它再前进——此前走直写/报 BitmapCoverage，撤销段长到
+        // 该点后写路径断裂。小 coverage 把窗口缩到 8 页来走到该路径。
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 512).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4)
+            .unwrap()
+            .with_coverage(8);
+        let mut chain = UndoChain::open(segment);
+        let slot = chain.allocate_slot().unwrap();
+
+        let mut crossed = None;
+        for i in 0..500u32 {
+            let r = match chain.append(
+                slot,
+                UndoOp::Delete,
+                0,
+                rid(3, 1),
+                UndoPayload::FullRow(vec![i as u8; 400]),
+            ) {
+                Ok(r) => r,
+                Err(e) => panic!("append #{i} 失败：{e}（append_pos 见段头）"),
+            };
+            if chain.segment().logical_of_block(r.block_id()).unwrap() > 8 {
+                crossed = Some(r);
+                break;
+            }
+        }
+        let last = crossed.expect("循环应跨过位图页（逻辑页 8）");
+        let logical = chain.segment().logical_of_block(last.block_id()).unwrap();
+        assert!(logical > 8, "跨过位图页后继续追加（落在 {logical}）");
+
+        // 位图页 1（逻辑页 8）已物化：kind/own_index/位值都对。
+        let bmp = chain.segment().read_page(8).unwrap();
+        assert_eq!(
+            crate::bitmap::kind(&bmp).unwrap(),
+            crate::bitmap::BitmapKind::FreeLevel
+        );
+        assert_eq!(crate::bitmap::own_index(&bmp).unwrap(), 1, "位图页 i=1");
+        assert_eq!(
+            crate::bitmap::free_level(&bmp, 0).unwrap(),
+            crate::bitmap::FreeLevel::Full,
+            "窗口首位自指恒满"
+        );
+        assert_eq!(
+            crate::bitmap::free_level(&bmp, 1).unwrap(),
+            crate::bitmap::FreeLevel::High,
+            "本窗口其余页初始为 High"
+        );
+
+        // 段头：append_pos 已越过位图页、bitmap_pages 增加。
+        let h = read_header(&chain.segment().read_page(0).unwrap()).unwrap();
+        assert!(h.append_pos > 8, "append_pos = {}", h.append_pos);
+        assert_eq!(h.bitmap_pages, 2);
+        // 链仍可读（跨页/跨窗口的记录都在）。
+        let head = read_slot(&chain.segment().read_page(0).unwrap(), slot)
+            .unwrap()
+            .undo_current
+            .unwrap();
+        let rec = chain.read(head).unwrap();
+        assert_eq!(rec.op, UndoOp::Delete);
     }
 
     #[test]

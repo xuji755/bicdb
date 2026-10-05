@@ -49,7 +49,7 @@
 //!   （成员镜像位）。
 //!   （续）**区分配的计划形态**——`plan_allocate_extent`/`plan_extend`
 //!   返回受影响页镜像（写路径经池写 redo）；`extend` 保留直写形态。
-//!   （续，v0.26，P3 审核修复）`itl::cleanout`（延迟块清除的落点——已提交条目 → `Committed` + 准确序号、锁清零）；`ITL 覆盖` 载荷加 `txn_id` + **归属守卫**（幽灵/换人记录不得覆盖他人条目）；`Segment::sync`（新页"先落盘后进 redo"次序用）；CR 终止符按 `itl_slot` 匹配。**P4 多写者随后。**
+//!   （续，v0.26，P3 审核修复）`itl::cleanout`（延迟块清除的落点——已提交条目 → `Committed` + 准确序号、锁清零）；`ITL 覆盖` 载荷加 `txn_id` + **归属守卫**（幽灵/换人记录不得覆盖他人条目）；`Segment::sync`（新页"先落盘后进 redo"次序用）；CR 终止符按 `itl_slot` 匹配；（续）`plan_materialize_bitmap_page`（**计划形态的位图页物化**：全新页先格式化 fsync、扩展页经池 + redo、段头以后像为基）、`plan_extend` 支持"窗口首位落在新增区内"、`rollback_chain` 环检测、`ExtentNo` 域校验、页访问器对损坏页降级。**P4 多写者随后。**
 //!
 //! 三条纪律：
 //! 1. **字节序定死小端**（REQ-PRT-003）——磁盘格式不随主机变化；

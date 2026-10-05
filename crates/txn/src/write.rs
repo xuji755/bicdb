@@ -659,6 +659,30 @@ fn append_undo_via_pool(
     // 撤销段容量：下一个追加页未映射 ⇒ **经池扩展**（redo 保护，镜像先写后读）。
     ensure_undo_capacity(pool, log, chain, txn)?;
     let plan = chain.plan_append(txn.slot, op, 0, rowid, payload)?;
+    // ⓪-1 **跨段内位图页的推进**（`append_pos` 落在窗口首位）：全新位图页
+    //      先格式化落盘（fsync）——与"新撤销页"同规；扩展出来的既有页
+    //      （文件位图/段头）**经池写 redo**（系统操作的 redo 保护）。
+    if let Some(adv) = &plan.advance {
+        for (rdba, page) in &adv.fresh {
+            let mut p = Page::from_bytes(Box::new(*page.as_bytes()));
+            chain
+                .segment()
+                .write_physical_page(rdba.block_id(), &mut p)?;
+        }
+        chain.segment().sync()?;
+        for (rdba, before, after) in &adv.images {
+            let key = BufferKey::new(workspace_of(chain), *rdba);
+            write_page_change(
+                pool,
+                log,
+                txn.raw(),
+                key,
+                before.as_bytes(),
+                after.as_bytes(),
+                false,
+            )?;
+        }
+    }
     // ⓪ **新撤销页：先格式化落盘（fsync）、再让它进 redo**（§11.5.4 实现注记）。
     //    物理增量重放**无法重建一个不存在的页**：若只有 redo 耐久而页从未
     //    落盘，掉电后重放会以"页不存在/校验失败"中止恢复。次序反过来则安全：
@@ -1446,6 +1470,112 @@ mod tests {
         );
         // 40 行都在（各事务各插一行）。
         assert_eq!(page.slot_count(), 40);
+    }
+
+    #[test]
+    fn pooled_write_path_advances_over_the_undo_bitmap_page() {
+        // 审核修复回归（B2，池路径）：撤销段 `append_pos` 走到**段内位图页**
+        // （窗口首位）时——全新位图页先格式化 fsync、扩展页经池写 redo——
+        // DML 必须继续成功，位图页落盘可用（此前该点之后写路径断裂）。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4)
+            .unwrap()
+            .with_coverage(8); // 窗口缩到 8 页：约 200 事务内走到位图页
+        let mut chain = UndoChain::open(segment);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(4, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        // 大日志组：本用例不做检查点，组切满会 Blocked（与位图页无关）。
+        let mut log = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(4, 1, 256).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+
+        let key = BufferKey::new(WS, rdba(3, 1));
+        // 用**大行**让撤销页快速填满（每事务 delete+insert ≈ 2KB 撤销记录）。
+        let payload = vec![0x5Au8; 2000];
+        let row = row_bytes(&payload);
+        let mut t0 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t0,
+            key,
+            &row,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+
+        // 每事务做一次"整行都变"的等长更新：Update 补丁 ≈ 2KB ⇒ 撤销页
+        // 快速填满（数据页不长大——等长就地）。
+        for i in 0..40u64 {
+            let mut txn = begin(&pool, &mut log, &mut chain, seq(i + 2)).unwrap();
+            let variant = row_bytes(&vec![i as u8; 2000]);
+            update_row(
+                &pool,
+                &mut log,
+                &mut chain,
+                &mut txn,
+                key,
+                rid.row_id(),
+                &variant,
+            )
+            .unwrap_or_else(|e| panic!("第 {i} 个事务 update 失败：{e}"));
+            commit(&pool, &mut log, &mut chain, &mut txn, seq(i + 2)).unwrap();
+        }
+        // 段头：已跨位图页（可能跨了多个窗口——40 次 ≈2KB 的更新）。
+        let h =
+            bicdb_storage::segment::read_header(&chain.segment().read_page(0).unwrap()).unwrap();
+        assert!(h.bitmap_pages >= 2, "段内位图页已物化到 {}", h.bitmap_pages);
+        assert!(h.append_pos > 8, "append_pos = {}", h.append_pos);
+        // 每个已物化的位图页**都已在磁盘上可用**（先格式化 fsync 的结果）。
+        for w in 1..u32::from(h.bitmap_pages) {
+            let logical = w * 8; // 本用例的 coverage = 8
+            let block = chain.segment().logical_block(logical).unwrap();
+            let bmp = pagefile::read_page_verified(&io, undo_handle, block).unwrap();
+            assert_eq!(
+                bicdb_storage::bitmap::own_index(&bmp).unwrap(),
+                w as u16,
+                "位图页 i = {w}"
+            );
+            assert_eq!(
+                bicdb_storage::bitmap::free_level(&bmp, 0).unwrap(),
+                bicdb_storage::bitmap::FreeLevel::Full,
+                "窗口首位自指恒满"
+            );
+        }
     }
 
     #[test]
