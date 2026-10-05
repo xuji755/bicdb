@@ -1,0 +1,72 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997678
+
+  ── 描述 ──
+  VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1) View: X$KCBWDS [K]ernal [C]ache [B]uffer
+  [W]orking Set management [D]escriptor[s] For 7.3 and 8.0 see this definition, (For 8.1 see further
+  down) 7.3 / 8.0 ~~~~~~~~~ Column Type Description -------- ---- -------- ADDR RAW(4|8) address of
+  this row/entry in the array or SGA INDX NUMBER index number of this row in the fixed table array
+  INST_ID NUMBER 8.x oracle instance number SET_ID NUMBER set id SET_MSIZE NUMBER 7.3-8.0 max # of
+  buffers allowed in set replacement list: REPL_LID NUMBER 7.3-8.0 Replacement List id REPL_RID NUMBER
+  7.3-8.0 replacement policy id REPL_MSIZE NUMBER 7.3-8.0 Max # of buffers allowed in list NXT_REPL
+  RAW(4|8) link for maintaining position in list PRV_REPL RAW(4|8) link for maintaining position in
+  list CNUM_REPL NUMBER current # of buffers in list write list write list: WRITE_LID NUMBER 7.3-8.0
+  Write list id WRITE_RID NUMBER 7.3-8.0 replacement policy id WRITE_MSIZE NUMBER 7.3-8.0 Max # of
+  buffers allowed in list NXT_WRITE RAW(4|8) link for maintaining position in list PRV_WRITE RAW(4|8)
+  link for maintaining position in list CNUM_WRITE NUMBER current # of buffers in list ping list:
+  PING_LID NUMBER 8.0 latch list id PING_RID NUMBER 8.0 replacement policy id PING_MSIZE NUBMER 8.0
+  Max # of buffers allowed in list NXT_PING RAW(4|8) 8.0+ link for maintaining position in list
+  PRV_PING RAW(4|8) 8.0+ link for maintaining position in list CNUM_SET NUMBER current total # of
+  buffers in set BUF_GOT NUMBER sum of # of bufs F/G got from this set SUM_WRT NUMBER dbwr sum of bufs
+  written from this set SUM_SCN NUMBER buf scanned by dbwr from this set FBWAIT NUMBER 8.0+ Free
+  Buffer Waits for this set WCWAIT NUMBER 8.0+ Write Complete Waits for this set BBWAIT NUMBER 8.0+
+  Buffer Busy Waits for this set FBINSP NUMBER 8.0+ Free Buffers Inspected for this set includes clean
+  as well as dirty buffers DBINSP NUMBER 8.0+ Dirty Buffers Inspected for this set DBBCHG NUMBER 8.0+
+  DB Block Changes for this set DBBGET NUMBER 8.0+ DB Block gets for this set CONGET NUMBER 8.0+
+  Consistent gets for this set PREAD NUMBER 8.0+ Physical reads PWRITE NUMBER 8.0+ Physical writes
+  FGSDEPTH NUMBER 8.0+ per set FG scan depth DBLDEPTH NUMBER 8.0 per set DBWR low scan depth DBHDEPTH
+  NUMBER 8.0+ per set DBWR high scan depth DBIDEPTH NUMBER 8.0 per set DBWR scan depth increment
+  DBDDEPTH NUMBER 8.0 per set DBWR scan depth decrement For 8.1 ~~~~~~~ Column Type Description
+  -------- ---- -------- ADDR RAW(4|8) address of this row/entry in the array or SGA INDX NUMBER index
+  number of this row in the fixed table array INST_ID NUMBER 8.x oracle instance number SET_ID NUMBER
+  set id DBWR_NUM NUMBER 8.1+ dbwr process associated with this set PROC_GROUP NUMBER 8.1+ NUMA
+  processor group for buffers in this set START_BUF# NUMBER 8.1+ index of first buffer in this set
+  END_BUF# NUMBER 8.1+ index of last buffer in this set CNUM_SET NUMBER 8.1+ current total # of
+  buffers in set FLAG NUMBER 8.1+ state of working set KCBWDS_MKFREE 0x1 make free mode - dbwr scans
+  lru when set CKPT_LATCH RAW(4|8) 8.1+ checkpoint queue latch address SET_LATCH RAW(4|8) 8.1+ set
+  latch address LRU list (replacement list): NXT_REPL RAW(4|8) address of main list head PRV_REPL
+  RAW(4|8) address of main list tail NXT_REPLAX RAW(4|8) 8.1+ address of aux list head PRV_REPLAX
+  RAW(4|8) 8.1+ address of aux list tail CNUM_REPL NUMBER # of buffers in both main & aux list
+  ANUM_REPL NUMBER 8.1+ # buffers in aux list COLD_HD RAW(4|8) 8.1+ first buffer link in cold portion
+  of lru HBMAX NUMBER 8.1+ maximum bufs in hot portion of lru HBUFS NUMBER 8.1+ number of buffers in
+  hot portion of lru LRU-W list (write list): NXT_WRITE RAW(4|8) address of main list head PRV_WRITE
+  RAW(4|8) address of main list tail NXT_WRITEAX RAW(4|8) 8.1+ address of aux list head PRV_WRITEAX
+  RAW(4|8) 8.1+ address of aux list tail CNUM_WRITE NUMBER # of buffers in both main & aux list
+  ANUM_WRITE NUMBER 8.1+ # buffers in aux list LRU-P list (ping list): NXT_PING RAW(4|8) address of
+  main list head PRV_PING RAW(4|8) address of main list tail NXT_PINGAX RAW(4|8) 8.1+ address of aux
+  list head PRV_PINGAX RAW(4|8) 8.1+ address of aux list tail CNUM_PING NUMBER # of buffers in both
+  main & aux list ANUM_PING NUMBER 8.1+ # buffers in aux list LRU-XO list (reuse object list):
+  NXT_XOBJ RAW(4|8) 8.1+ address of main list head PRV_XOBJ RAW(4|8) 8.1+ address of main list tail
+  NXT_XOBJAX RAW(4|8) 8.1+ address of aux list head PRV_XOBJAX RAW(4|8) 8.1+ address of aux list tail
+  CNUM_XOBJ NUMBER 8.1+ # of buffers in both main & aux list ANUM_XOBJ NUMBER 8.1+ # buffers in aux
+  list LRU-XR list (reuse range list): NXT_XRNG RAW(4|8) 8.1+ address of main list head PRV_XRNG
+  RAW(4|8) 8.1+ address of main list tail NXT_XRNGAX RAW(4|8) 8.1+ address of aux list head PRV_XRNGAX
+  RAW(4|8) 8.1+ address of aux list tail CNUM_XRNG NUMBER 8.1+ # of buffers in both main & aux list
+  ANUM_XRNG NUMBER 8.1+ # buffers in aux list BUF_GOT NUMBER # of bufs F/G gotton from this set
+  updated when reusing buffer dbwriter statistics: SUM_WRT NUMBER dbwr sum of bufs written from this
+  set SUM_SCN NUMBER buf scanned by dbwr from this set NUM_SCN NUMBER 8.1+ scans of cold buffers by
+  dbwr of this set HOT_SCN NUMBER 8.1+ scans of hot buffers by dbwr of this set PIN_SCN NUMBER 8.1+
+  scans of pinned buffers by dbwr this set WRT_MOV NUMBER 8.1+ bufs moved to LRU-W by dbwr in this set
+  AUX_MOV NUMBER 8.1+ bufs moved to LRU-AUX by dbwr in this set FBWAIT NUMBER Free Buffer Waits for
+  this set WCWAIT NUMBER Write Complete Waits for this set BBWAIT NUMBER Buffer Busy Waits for this
+  set FBINSP NUMBER Free Buffers Inspected for this set. This should be called cold buffers inspected.
+  It includes clean as well as dirty and pinned bufs DBINSP NUMBER Dirty Buffers Inspected for this
+  set PNINSP NUMBER 8.1+ Pinned Buffers Inspected for this set HOTMVS NUMBER 8.1+ Hot buffers moved to
+  head for this set DBBCHG NUMBER DB Block Changes for this set DBBGET NUMBER DB Block gets for this
+  set CONGET NUMBER Consistent gets for this
+
+  ── 摘要 ──
+  X$KCBWDS视图描述缓冲缓存工作集描述符，7.3至8.1版本可用，包含SET_ID、DBWR_NUM、PROC_GROUP、LRU列表（替换、写、Ping、重用对象）的链表地址与计数、冷热端缓冲区数量，以及FBWAIT、WCWAIT、BBWAIT等等待统计和扫描深度字段。适合分。

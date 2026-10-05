@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] NUMA 处理器组 进程 绑定 局部内存 性能
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 6，摘要筛选通过 4，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 55，摘要筛选通过 38，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     X$KSMNIM 是 Oracle 内部视图，记录 NUMA 实例映射信息，包含处理器组编号 KSMNIMPROCGRP 和 OS 名称 KSMNIMNAME 等列。该视图用于分析 NUMA 架构下实例与处理器组的绑定关系，辅助诊断跨 NUMA 节点内存访问延迟、buffer cache 亲和性配置错。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:132269.1 VIEW: X$KSMNIM - Numa Instance Mapping - (8.1)  (排序分: 15.0)
+     └ 摘要：X$KSMNIM 是 Oracle 内部视图，记录 NUMA 实例映射信息，包含处理器组编号 KSMNIMPROCGRP 和 OS 名称 KSMNIMNAME 等列。该视图用于分析 NUMA 架构下实例与处理器组的绑定关系，辅助诊断跨 NUMA 节点内存访问延迟、buffer cache 亲和性配置错。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997533
+
+     [KnowledgeEntry] L1：Note:132269.1 VIEW: X$KSMNIM - Numa Instance Mapping - (8.1)  (排序分: 15.0)
+     └ 摘要：X$KSMNIM 用于展示 NUMA 实例映射关系，包含 KSMNIMPROCGRP（处理器组）和 KSMNIMNAME（操作系统相关名称）等列，可诊断 Oracle 实例在 NUMA 架构下的节点分布、处理器绑定及跨节点内存访问性能问题。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996387
+
+     [KnowledgeEntry] L1：Note:132268.1 VIEW: X$KSMNS - Numa Statistics - (8.1)  (排序分: 15.0)
+     └ 摘要：X$KSMNS 展示内核存储内存的 NUMA 统计信息，来源于 ksmh.h 定义。主要列包括 KSMNSNAM（堆对象名称）、KSMNSLEN（已分配对象总长度）和 KSMNSPROCGRP（处理器组）。该视图用于分析 Oracle 实例在 NUMA 架构下的内存分配情况，排查处理器。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997534
+
+     [KnowledgeEntry] L1：Note:132268.1 VIEW: X$KSMNS - Numa Statistics - (8.1)  (排序分: 15.0)
+     └ 摘要：X$KSMNS 是 Oracle 内部固定视图，记录 NUMA 相关内存统计，定义于 ksmh.h，列包括 KSMNSNAM（堆对象名）、KSMNSLEN（已分配对象总长度）及 KSMNSPROCGRP（处理器组），可用于分析 NUMA 架构下的内存分配分布、检查跨 NUMA 节点的内存访问。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996388
+
+     [CaseStudy] Bug 8244734: NUMA POOL UNDERCONFIGURED DUE TO KSS TRUNCATION  (排序分: 10.0)
+     └ 摘要：Bug 8244734: NUMA POOL UNDERCONFIGURED DUE TO KSS TRUNCATION
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:406337
+
+     [FaultModel] NUMA内存节点不均衡引发换页导致业务缓慢  (排序分: 9.3)
+     └ 摘要：客户核心业务系统在15:55出现业务缓慢；AWR未发现明显异常，nmon显示SYS%突然升高、freemem快速下降，换页操作被激活，但swapfree无变化；RDA显示NUMA启用且node0 free 2216MB明显低于node1 5819MB。怀疑NUMA架构下node0内存不足触发换页，导致SYS%高、业务缓慢。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:237405
+

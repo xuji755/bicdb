@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:68926.1 Init.ora Parameter "_DB_BLOCK_NUMA" [Hidden] Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994517
+
+  ── 描述 ──
+  PARAMETER:DB_BLOCK_NUMA Parameter: DB_BLOCK_NUMA ~~~~~~~~~~~~~~~~~~~~~~~~ Oracle8i: HIDDEN
+  Identifier: Description ~~~~~~~~~~~ Number of NUMA nodes Sequent Specific. Articles: Overview of
+  Init.Ora Parameter Reference notes < Note:68462.1 >
+
+  ── 摘要 ──
+  _DB_BLOCK_NUMA 隐藏参数用于指定 NUMA 节点数量，描述为 Sequent 平台特定。该参数影响数据库实例在 NUMA 架构下的内存对象分布与节点间负载平衡，适用于排查 Sequent 系统上的 buffer cache 分配、共享池争用及与 NUMA 拓扑相关的性能。

@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:68587.1 Init.ora Parameter "_NUMA_INSTANCE_MAPPING" [Hidden] Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994588
+
+  ── 描述 ──
+  PARAMETER:NUMA_INSTANCE_MAPPING Reference Note 22-JAN-01, rpowell.uk, Distribution justification:
+  "Hidden parameters must be noncustomer-viewable." - dbither.us Parameter: NUMA_INSTANCE_MAPPING
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Oracle8i: HIDDEN Identifier: ksmins Description ~~~~~~~~~~~ Set of
+  nodes that this instance should run on. Articles: Overview of Init.Ora Parameter Reference Notes. <
+  Note:68462.1 >
+
+  ── 摘要 ──
+  _NUMA_INSTANCE_MAPPING 是 Oracle8i 隐藏参数，标识符为 ksmins，用于指定数据库实例应运行的 NUMA 节点集。它涉及实例与物理 NUMA 节点的绑定关系，可辅助诊断 RAC 节点亲和性配置异常、实例分布不均衡导致的远程内存访问延迟等问题。

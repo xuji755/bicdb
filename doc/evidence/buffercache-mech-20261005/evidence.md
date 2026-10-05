@@ -256,3 +256,27 @@
    **桶数 = ≥ 容量/4 的最小质数**（质数取整是我们的，机制照证据）；
    定位用 **`DBA mod 桶数`**（原文口径）；闩锁按 kcbz.h 形态：一把 latch
    保护一组桶、桶轮转分配（当前单分区 = 一把，P4 再分片）。
+
+---
+
+## 补检索（2026-10-05 晚）：kcbwds 与 NUMA 的绑定
+
+**问题**：kcbwds 是否可以绑定 NUMA、做内存访问性能优化？
+
+| 证据 | 来源 | 要点 |
+| --- | --- | --- |
+| `raw/48-kcbwds-fields.txt`（detail `1997678`） | X$KCBWDS 字段全集 | 8.1 新增 `DBWR_NUM`（**本工作集关联的 DBWR 进程**）、**`PROC_GROUP` = "NUMA processor group for buffers in this set"**（本工作集的缓冲所属的 NUMA 处理器组）、`START_BUF#/END_BUF#`（本集的**连续缓冲区间**）——三者合起来：**工作集 = 一段缓冲 + 一组处理器 + 一个 DBWR** |
+| `raw/49-db-block-numa.txt`（detail `1994517`） | Note 68926.1 `_DB_BLOCK_NUMA` | Oracle8i 隐藏参数：**"Number of NUMA nodes"**（注释 "Sequent Specific"——NUMA 机器的年代渊源） |
+| `raw/52-numa-instance-mapping.txt`（detail `1994588`） | Note 68587.1 `_NUMA_INSTANCE_MAPPING` | 指定**实例允许运行的 NUMA 节点集**（ksmins） |
+| `raw/50-numa-pg.txt` | X$KSMNIM / X$KSMNS | `KSMNIMPROCGRP`（处理器组）记录**实例 ↔ 处理器组**绑定；`X$KSMNS`（`KSMNSNAM/LEN/PROCGRP`）按处理器组统计**内存分配**——用于诊断"**buffer cache 亲和性配置错**"与跨节点访问延迟 |
+| `raw/51-numa-alloc.txt` | Note 780466.1 "How NUMA Allocates Memory" | Linux 默认**本地优先、耗尽才远程**（`numa_memory_allocator`）——用户态"首次触碰 = 本地分配"正是据此成立 |
+
+**结论**：可以，且 Oracle 8.1 就是这么做的——`kcbwds.PROC_GROUP` 把每个
+工作集绑定到一个 NUMA 处理器组，配套"连续缓冲区间 + 每集一个 DBWR"，
+让缓存命中、latch、写回都落在**本地内存**上。本库 §5.10 现把 `PROC_GROUP`
+列为"不要"（理由"单机小规模"）——**若目标部署含多路（双 socket）服务器，
+该理由需要复议**；落法见 §5.10 的 P4 并发路线（第二级绑定：工作区 → 工作集
+→ 处理器组；帧区间按集独立分配 + 首次触碰 + 写线程亲和）。
+
+**未核验**：`PROC_GROUP` 的取值/编码与 `_DB_BLOCK_NUMA` 的默认值未检索；
+Oracle 在非 NUMA 机器上该字段的语义（恒 0？）未见原文。

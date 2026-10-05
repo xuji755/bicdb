@@ -1,0 +1,39 @@
+
+============================================================
+  [问题诊断] NUMA 缓冲池 分区 PROC_GROUP
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 8，摘要筛选通过 0，批次 1；本路已取尽
+  CaseStudy：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 5 条；最终正文补读 0 条
+  文档补充：缺少可操作的诊断证据；候选 0，相关 0
+
+  ⚠️ 精确对象未入图/未命中: PROC_GROUP
+     以下语义检索结果仅供参考；请优先补齐这些对象的 SystemView/Column 数据。
+
+  ✅ 答案要点
+     X$KCBWDS视图记录Oracle缓冲区缓存中每个工作集描述符，7.3/8.0版本包含替换列表（REPL_LID/REPL_RID/CNUM_REPL）、写入列表（WRITE_LID/CNUM_WRITE）及CNUM_SET当前缓冲区总数，8.1版本新增DBWR_NUM、PROC_GROUP、START_BUF#、END_BUF#和冷热段参数HBMAX/HB。
+
+  📍 诊断结果 (5条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 13.3)
+     └ 摘要：X$KCBWDS视图记录Oracle缓冲区缓存中每个工作集描述符，7.3/8.0版本包含替换列表（REPL_LID/REPL_RID/CNUM_REPL）、写入列表（WRITE_LID/CNUM_WRITE）及CNUM_SET当前缓冲区总数，8.1版本新增DBWR_NUM、PROC_GROUP、START_BUF#、END_BUF#和冷热段参数HBMAX/HB。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997367
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 13.3)
+     └ 摘要：X$KCBWDS视图描述缓冲缓存工作集描述符，7.3至8.1版本可用，包含SET_ID、DBWR_NUM、PROC_GROUP、LRU列表（替换、写、Ping、重用对象）的链表地址与计数、冷热端缓冲区数量，以及FBWAIT、WCWAIT、BBWAIT等等待统计和扫描深度字段。适合分。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997678
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 13.2)
+     └ 摘要：X$KCBWDS 是 Oracle 内部视图，描述 buffer cache 中 working set 的描述符，展示了替换列表（REPL）、写列表（WRITE）、ping 列表（PING）的内部结构及 FBWAIT、WCWAIT、BBWAIT 等关键等待统计。8.1 版本新增 LRU 冷热端、NUMA 处理器组、DBWR 进程。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997679
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 13.2)
+     └ 摘要：X$KCBWDS 是内核缓存层描述 buffer cache working set 的内部视图，7.3–8.0 版本展示 replacement、write、ping 列表的链接、计数以及 FBWAIT、WCWAIT 等等待统计与扫描深度；8.1 新增 DBWR 进程号、NUMA 处理器组、LRU 冷热端、辅助列表及 CKPT_LATCH。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997719
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 13.2)
+     └ 摘要：X$KCBWDS 是 Oracle 7.3 至 8.1 版本中的固定表，用于展示 buffer cache 内 working set 的详细描述符。7.3/8.0 版本列出 replacement、write 和 ping 三个 LRU 列表的链接与统计，8.1 版本进一步引入 DBWR 关联（DBWR_NUM）、NUMA 处理器组、冷热端分离。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1993718
+
