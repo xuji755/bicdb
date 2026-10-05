@@ -56,7 +56,29 @@ use crate::rowid::Rdba;
 /// 块定位器：`(工作区标识, rdba) →（页文件句柄、块号）`。
 ///
 /// 带上工作区是因为**池是实例级共享**的：不同工作区各有自己的文件句柄。
-pub type PoolResolver<'io> = dyn FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io;
+pub type PoolResolver<'io> =
+    dyn Fn(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + Sync + 'io;
+
+/// **工作区 → 分区**的稳定哈希（§5.10 的 `H`）：FNV-1a 起步 + splitmix64 收尾。
+///
+/// **收尾是必需的**：工作区标识多是"小的连号整数"（48 位序列的低字节在前），
+/// FNV-1a 对这类短输入的低位区分度不足——实测 `[b; 8]`（b = 1..5）在
+/// `N ≤ 8` 时**全部落同一个分区**（低位没雪崩）；收尾器把高位差扩散到低位，
+/// 分区才是真的"按工作区散开"。
+fn hash_workspace(ws: &[u8; 8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in ws {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // splitmix64 finalizer（雪崩低位）。
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
+    h
+}
 
 /// 缓冲池的键：**工作区标识 + RDBA**（§5.10——池实例级共享，键必须带工作区）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -76,7 +98,7 @@ impl BufferKey {
 }
 
 /// 时钟（touch count 的三秒规则要"距上次递增"——测试用**手动时钟**）。
-pub trait Clock: Send {
+pub trait Clock: Send + Sync {
     /// 单调毫秒。
     fn now_ms(&self) -> u64;
 }
@@ -186,6 +208,11 @@ pub enum BufferError {
     WalFlush(std::io::Error),
     /// 容量为零（非法配置）。
     ZeroCapacity,
+    /// 分区数非法（必须是 1 或 2 的幂）。
+    BadPartitionCount {
+        /// 请求的分区数。
+        partitions: usize,
+    },
 }
 
 impl std::fmt::Display for BufferError {
@@ -220,6 +247,9 @@ impl std::fmt::Display for BufferError {
             }
             BufferError::WalFlush(e) => write!(f, "WAL 规则 2 前置刷盘失败（页未写出）：{e}"),
             BufferError::ZeroCapacity => f.write_str("缓冲池容量为零"),
+            BufferError::BadPartitionCount { partitions } => {
+                write!(f, "缓冲池分区数非法（{partitions}）：必须是 1 或 2 的幂")
+            }
         }
     }
 }
@@ -273,6 +303,26 @@ pub struct BufferStats {
     pub run_pages: u64,
     /// 写完成后放入 AUX 的次数（AUX_MOV）。
     pub aux_moved: u64,
+}
+
+impl BufferStats {
+    /// 并入另一份计数（多分区的**聚合读取**；`V$KCBWDS` 也是逐工作集计数）。
+    pub fn merge(&mut self, other: &BufferStats) {
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.evictions += other.evictions;
+        self.writes += other.writes;
+        self.wal_syncs += other.wal_syncs;
+        self.fb_wait += other.fb_wait;
+        self.free_inspected += other.free_inspected;
+        self.dirty_inspected += other.dirty_inspected;
+        self.pinned_inspected += other.pinned_inspected;
+        self.hot_moved += other.hot_moved;
+        self.aging_steps += other.aging_steps;
+        self.run_reads += other.run_reads;
+        self.run_pages += other.run_pages;
+        self.aux_moved += other.aux_moved;
+    }
 }
 
 /// 一次 `flush_workspace` 的报告。
@@ -353,7 +403,7 @@ struct WriteJob {
 }
 
 /// 池内状态（单闩锁 `db_cache`；分区/桶分片 latch 随 P4——§5.10"闩锁形态与纪律"）。
-struct Inner<'io> {
+struct Inner {
     frames: Vec<Frame>,
     /// 从未用过的帧（首次装入后帧就长期挂在链上）。
     virgin: Vec<usize>,
@@ -367,8 +417,6 @@ struct Inner<'io> {
     aux: VecDeque<usize>,
     /// 写列表：**每工作区一条**（= 检查点队列），按（首次变脏 LSN, rdba）升序。
     write_list: BTreeMap<[u8; 8], BTreeSet<(Lsn, Rdba)>>,
-    resolve: Box<PoolResolver<'io>>,
-    clock: Box<dyn Clock + 'io>,
     cfg: CacheConfig,
     stats: BufferStats,
 }
@@ -376,11 +424,16 @@ struct Inner<'io> {
 /// **DB Cache**（§5.10；本切片 N = 1 分区）。
 pub struct BufferPool<'io> {
     io: &'io dyn FileIo,
+    /// **每分区容量**（帧数）。
     capacity: usize,
-    /// **具名闩锁**（"db_cache"；先自旋后睡眠、V$LATCH 口径统计——
-    /// 证据包 `latch-mech-20261005/`）。**闩锁内不做 I/O**：读盘与写回都在
-    /// 闩外完成（两阶段，见 `pin`/`make_free`）。
-    inner: Latch<Inner<'io>>,
+    /// **工作集分区**（§5.10）：每份自带替换链/桶/写列表与**具名闩锁**
+    /// （"db_cache"；先自旋后睡眠、V$LATCH 口径——证据包 `latch-mech-20261005/`）。
+    /// **闩锁内不做 I/O**：读盘与写回都在闩外完成（两阶段，见 `pin`/`make_free`）。
+    partitions: Vec<Latch<Inner>>,
+    /// 共享的块定位器（跨分区同一份；`Fn + Send + Sync`）。
+    resolve: Box<PoolResolver<'io>>,
+    /// 共享时钟（touch-count 三秒规则）。
+    clock: Box<dyn Clock + 'io>,
     /// **redo 写闩锁**：串行化 WAL 刷盘——`ensure_durable` 的 fsync 在闩内
     /// （"一次 fsync"的串行点；Oracle `redo writing latch` 的对应物），
     /// 它是全库唯一允许在闩锁内做 I/O 的地方（且只做这一件）。
@@ -400,7 +453,7 @@ impl<'io> BufferPool<'io> {
     pub fn new(
         io: &'io dyn FileIo,
         capacity: usize,
-        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io,
+        resolve: impl Fn(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + Sync + 'io,
         wal: impl WalGuard + 'io,
     ) -> Result<Self, BufferError> {
         Self::with_clock(io, capacity, resolve, wal, SystemClock)
@@ -410,7 +463,7 @@ impl<'io> BufferPool<'io> {
     pub fn with_clock(
         io: &'io dyn FileIo,
         capacity: usize,
-        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io,
+        resolve: impl Fn(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + Sync + 'io,
         wal: impl WalGuard + 'io,
         clock: impl Clock + 'io,
     ) -> Result<Self, BufferError> {
@@ -428,7 +481,29 @@ impl<'io> BufferPool<'io> {
     pub fn with_config(
         io: &'io dyn FileIo,
         capacity: usize,
-        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io,
+        resolve: impl Fn(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + Sync + 'io,
+        wal: impl WalGuard + 'io,
+        clock: impl Clock + 'io,
+        cfg: CacheConfig,
+    ) -> Result<Self, BufferError> {
+        Self::with_partitions(io, 1, capacity, resolve, wal, clock, cfg)
+    }
+
+    /// **多工作集分区**（§5.10 的 P4 形态）：`partitions` 个**工作集**，
+    /// 每个自带一条替换链（含 AUX）、一套桶、写列表与**自己的闩锁**；
+    /// `capacity` 是**每个分区**的帧数。
+    ///
+    /// - **映射**：`H(工作区标识) mod partitions`（稳定哈希；2 的幂 ⇒ 按位与）
+    ///   ——同一个工作区每次都落同一个工作集（否则写列表会在写线程之间搬家）；
+    /// - **一个工作区不被拆分**：它的全部缓冲、写列表都在一个分区里
+    ///   ⇒ 检查点推进只碰一个闩锁，零跨分区协调；
+    /// - `partitions` 必须是 1 或 2 的幂（取模退化为按位与）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_partitions(
+        io: &'io dyn FileIo,
+        partitions: usize,
+        capacity: usize,
+        resolve: impl Fn(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + Sync + 'io,
         wal: impl WalGuard + 'io,
         clock: impl Clock + 'io,
         cfg: CacheConfig,
@@ -436,10 +511,11 @@ impl<'io> BufferPool<'io> {
         if capacity == 0 {
             return Err(BufferError::ZeroCapacity);
         }
-        Ok(Self {
-            io,
-            capacity,
-            inner: Latch::new(
+        if partitions == 0 || !partitions.is_power_of_two() {
+            return Err(BufferError::BadPartitionCount { partitions });
+        }
+        let mk = |_| {
+            Latch::new(
                 "db_cache",
                 Inner {
                     frames: (0..capacity).map(|_| Frame::empty()).collect(),
@@ -449,14 +525,38 @@ impl<'io> BufferPool<'io> {
                     cold: VecDeque::new(),
                     aux: VecDeque::new(),
                     write_list: BTreeMap::new(),
-                    resolve: Box::new(resolve),
-                    clock: Box::new(clock),
                     cfg,
                     stats: BufferStats::default(),
                 },
-            ),
+            )
+        };
+        Ok(Self {
+            io,
+            capacity,
+            partitions: (0..partitions).map(mk).collect(),
+            resolve: Box::new(resolve),
+            clock: Box::new(clock),
             wal: Latch::new("redo_write", Box::new(wal)),
         })
+    }
+
+    /// **工作区 → 分区**（§5.10：`H(工作区标识) mod N`，稳定哈希；2 的幂
+    /// ⇒ 按位与）。同一个工作区每次都落同一个工作集——写列表不在写线程间搬家。
+    #[must_use]
+    pub fn partition_of(&self, workspace: &[u8; 8]) -> usize {
+        (hash_workspace(workspace) as usize) & (self.partitions.len() - 1)
+    }
+
+    /// 分区数（诊断）。
+    #[must_use]
+    pub fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
+    /// 某分区的闩锁统计（诊断：逐工作集的 `V$LATCH` 口径）。
+    #[must_use]
+    pub fn partition_latch_stats(&self) -> Vec<LatchStats> {
+        self.partitions.iter().map(Latch::stats).collect()
     }
 
     /// 容量（帧数）。
@@ -465,34 +565,45 @@ impl<'io> BufferPool<'io> {
         self.capacity
     }
 
-    /// 当前驻留帧数。
+    /// 当前驻留帧数（全部分区之和）。
     #[must_use]
     pub fn resident(&self) -> usize {
-        self.lock().capacity_used()
+        self.partitions
+            .iter()
+            .map(|p| p.lock().capacity_used())
+            .sum()
     }
 
-    /// 哈希桶数。
+    /// 哈希桶数（每分区同值）。
     #[must_use]
     pub fn bucket_count(&self) -> usize {
-        self.lock().buckets.len()
+        self.partitions[0].lock().buckets.len()
     }
 
-    /// 某桶的链长（诊断）。
+    /// 某桶的链长（诊断；**全部分区之和**——单分区时即该桶链长）。
     #[must_use]
     pub fn bucket_len(&self, bucket: usize) -> usize {
-        self.lock().buckets.get(bucket).map_or(0, Vec::len)
+        self.partitions
+            .iter()
+            .map(|p| p.lock().buckets.get(bucket).map_or(0, Vec::len))
+            .sum()
     }
 
-    /// 统计快照。
+    /// 统计快照（**全部分区之和**；口径与 X$KCBWDS 对齐——Oracle 也是逐工作集
+    /// 计数、汇总读取）。
     #[must_use]
     pub fn stats(&self) -> BufferStats {
-        self.lock().stats
+        let mut out = BufferStats::default();
+        for p in &self.partitions {
+            out.merge(&p.lock().stats);
+        }
+        out
     }
 
     /// 某工作区写列表长度（= 脏块数）。
     #[must_use]
     pub fn dirty_len(&self, workspace: [u8; 8]) -> usize {
-        self.lock()
+        self.lock_of(&workspace)
             .write_list
             .get(&workspace)
             .map_or(0, BTreeSet::len)
@@ -501,13 +612,17 @@ impl<'io> BufferPool<'io> {
     /// **有脏页的工作区**（DBWR 后台线程的入口：按此逐个 `flush_workspace`）。
     #[must_use]
     pub fn dirty_workspaces(&self) -> Vec<[u8; 8]> {
-        self.lock().write_list.keys().copied().collect()
+        let mut out = Vec::new();
+        for p in &self.partitions {
+            out.extend(p.lock().write_list.keys().copied());
+        }
+        out
     }
 
     /// **低水位**：该工作区最老脏块的（首次变脏 LSN）；`None` = 无脏页。
     #[must_use]
     pub fn low_water(&self, workspace: [u8; 8]) -> Option<Lsn> {
-        self.lock()
+        self.lock_of(&workspace)
             .write_list
             .get(&workspace)
             .and_then(|s| s.iter().next().map(|(lsn, _)| *lsn))
@@ -517,14 +632,14 @@ impl<'io> BufferPool<'io> {
     /// Oracle 侧即"TCH 越高，块被访问越频繁"）。
     #[must_use]
     pub fn touch_count(&self, key: BufferKey) -> Option<u32> {
-        let inner = self.lock();
+        let inner = self.lock_of(&key.workspace);
         inner.find_frame(key).map(|idx| inner.frames[idx].touches)
     }
 
     /// 某帧在哪条链上（`hot` / `cold` / `aux`；诊断与测试）。
     #[must_use]
     pub fn chain_of(&self, key: BufferKey) -> Option<&'static str> {
-        let inner = self.lock();
+        let inner = self.lock_of(&key.workspace);
         let idx = inner.find_frame(key)?;
         Some(if inner.hot.contains(&idx) {
             "hot"
@@ -543,17 +658,18 @@ impl<'io> BufferPool<'io> {
     /// ① 闩锁内定位与钉住；未命中则**释放闩锁后**读盘并做身份核对（串页
     /// 防线）；② 重新持闩：期间可能已被他人装入（**先到者为准**，丢弃本次
     /// 读到的副本），否则腾帧（Make Free 的 I/O 同样在闩外）后装入。
-    pub fn pin(&self, key: BufferKey) -> Result<PageGuard<'_, 'io>, BufferError> {
-        let mut inner = self.lock();
+    pub fn pin(&self, key: BufferKey) -> Result<PageGuard<'_>, BufferError> {
+        let partition = self.partition_of(&key.workspace);
+        let mut inner = self.lock(partition);
         if let Some(idx) = inner.find_frame(key) {
             // 命中：钉住、touch count（三秒规则）、可能的冷→热提升。
             inner.stats.hits += 1;
             inner.frames[idx].pins += 1;
-            inner.touch(idx);
+            inner.touch(idx, &*self.clock);
             return Ok(PageGuard { inner, idx });
         }
         inner.stats.misses += 1;
-        let (handle, block) = (inner.resolve)(&key.workspace, key.rdba)
+        let (handle, block) = (self.resolve)(&key.workspace, key.rdba)
             .ok_or(BufferError::Unresolved { rdba: key.rdba })?;
         drop(inner);
 
@@ -565,30 +681,30 @@ impl<'io> BufferPool<'io> {
         self.verify_identity(&page, key)?;
 
         // 重新持闩：期间已被他人装入 ⇒ 以先到者为准；能腾出帧 ⇒ 装入。
-        let mut inner = self.lock();
+        let mut inner = self.lock(partition);
         if let Some(idx) = inner.find_frame(key) {
             inner.stats.hits += 1;
             inner.frames[idx].pins += 1;
-            inner.touch(idx);
+            inner.touch(idx, &*self.clock);
             return Ok(PageGuard { inner, idx });
         }
         if let Some(victim) = inner.find_reusable() {
-            inner.attach(victim, key, page);
+            inner.attach(victim, key, page, &*self.clock);
             return Ok(PageGuard { inner, idx: victim });
         }
         // 无可用帧：闩外 Make Free（I/O 在闩外）后重试一次。
         drop(inner);
-        self.make_free()?;
-        let mut inner = self.lock();
+        self.make_free(partition)?;
+        let mut inner = self.lock(partition);
         if let Some(idx) = inner.find_frame(key) {
             inner.stats.hits += 1;
             inner.frames[idx].pins += 1;
-            inner.touch(idx);
+            inner.touch(idx, &*self.clock);
             return Ok(PageGuard { inner, idx });
         }
         match inner.find_reusable() {
             Some(victim) => {
-                inner.attach(victim, key, page);
+                inner.attach(victim, key, page, &*self.clock);
                 Ok(PageGuard { inner, idx: victim })
             }
             None => {
@@ -621,30 +737,27 @@ impl<'io> BufferPool<'io> {
     ///
     /// 调用方随后应自行生成 redo（新页的"前像" = 全零页）并 `mark_dirty`。
     /// 返回的卫兵已钉住该帧。
-    pub fn insert_new(
-        &self,
-        key: BufferKey,
-        page: Page,
-    ) -> Result<PageGuard<'_, 'io>, BufferError> {
-        let mut inner = self.lock();
+    pub fn insert_new(&self, key: BufferKey, page: Page) -> Result<PageGuard<'_>, BufferError> {
+        let partition = self.partition_of(&key.workspace);
+        let mut inner = self.lock(partition);
         // **该键仍在池中 ⇒ 原位替换**：页被重置/复用（段回卷、重置复用的撤销页）
         // 时调用方给的镜像就是权威内容——若走 `find_reusable`/`attach`，
         // 桶里会留下**两个同键帧**，`find_frame` 命中的仍是旧的干净帧 ⇒
         // 写回被静默跳过（新内容永远到不了盘上；实测的撤销页丢失即此）。
         if let Some(idx) = inner.find_frame(key) {
-            inner.replace_in_place(idx, key, page);
+            inner.replace_in_place(idx, key, page, &*self.clock);
             return Ok(PageGuard { inner, idx });
         }
         if let Some(victim) = inner.find_reusable() {
-            inner.attach(victim, key, page);
+            inner.attach(victim, key, page, &*self.clock);
             return Ok(PageGuard { inner, idx: victim });
         }
         drop(inner);
-        self.make_free()?; // I/O 在闩外
-        let mut inner = self.lock();
+        self.make_free(partition)?; // I/O 在闩外
+        let mut inner = self.lock(partition);
         match inner.find_reusable() {
             Some(victim) => {
-                inner.attach(victim, key, page);
+                inner.attach(victim, key, page, &*self.clock);
                 Ok(PageGuard { inner, idx: victim })
             }
             None => {
@@ -659,7 +772,7 @@ impl<'io> BufferPool<'io> {
     /// 不该污染热段"由此在 API 上显式化）。
     #[must_use]
     pub fn copy_if_resident(&self, key: BufferKey) -> Option<Page> {
-        let inner = self.lock();
+        let inner = self.lock_of(&key.workspace);
         let idx = inner.find_frame(key)?;
         Some(inner.frames[idx].page.clone())
     }
@@ -677,24 +790,25 @@ impl<'io> BufferPool<'io> {
     /// **装入净页（两阶段）**：闩锁内 attach；需腾帧则在闩外 Make Free 后重试。
     /// 已驻留 ⇒ 保留先到者（传入副本丢弃）。
     fn insert_clean(&self, key: BufferKey, page: Page) -> Result<(), BufferError> {
-        let mut inner = self.lock();
+        let partition = self.partition_of(&key.workspace);
+        let mut inner = self.lock(partition);
         if inner.find_frame(key).is_some() {
             return Ok(());
         }
         if let Some(v) = inner.find_reusable() {
-            inner.attach(v, key, page);
+            inner.attach(v, key, page, &*self.clock);
             inner.frames[v].pins = 0; // 净页装入立即放掉
             return Ok(());
         }
         drop(inner);
-        self.make_free()?; // I/O 在闩外
-        let mut inner = self.lock();
+        self.make_free(partition)?; // I/O 在闩外
+        let mut inner = self.lock(partition);
         if inner.find_frame(key).is_some() {
             return Ok(());
         }
         match inner.find_reusable() {
             Some(v) => {
-                inner.attach(v, key, page);
+                inner.attach(v, key, page, &*self.clock);
                 inner.frames[v].pins = 0;
                 Ok(())
             }
@@ -721,6 +835,7 @@ impl<'io> BufferPool<'io> {
         if count == 0 {
             return Ok(Vec::new());
         }
+        let partition = self.partition_of(&workspace);
         let key_at = |i: u32| -> Option<BufferKey> {
             let block = first.block_id().checked_add(i)?;
             let rdba = Rdba::from_parts(first.file_id(), block)?;
@@ -730,7 +845,7 @@ impl<'io> BufferPool<'io> {
         let mut out: Vec<Option<Page>> = Vec::with_capacity(count as usize);
         let mut any_missing = false;
         let (handle, base) = {
-            let mut inner = self.lock();
+            let inner = self.lock(partition);
             for i in 0..count {
                 let key = key_at(i).ok_or(BufferError::Unresolved { rdba: first })?;
                 match inner.find_frame(key) {
@@ -744,7 +859,7 @@ impl<'io> BufferPool<'io> {
             if !any_missing {
                 return Ok(out.into_iter().flatten().collect());
             }
-            (inner.resolve)(&workspace, first).ok_or(BufferError::Unresolved { rdba: first })?
+            (self.resolve)(&workspace, first).ok_or(BufferError::Unresolved { rdba: first })?
         };
         // ② 闩锁外：一次区读。
         let pages = pagefile::read_run(self.io, handle, base, count).map_err(|e| match e {
@@ -752,7 +867,7 @@ impl<'io> BufferPool<'io> {
             PageFileError::Io(e) => BufferError::Io(e),
         })?;
         {
-            let mut inner = self.lock();
+            let mut inner = self.lock(partition);
             inner.stats.run_reads += 1;
             inner.stats.run_pages += u64::from(count);
         }
@@ -778,17 +893,19 @@ impl<'io> BufferPool<'io> {
 
     /// 写回某一页（若脏）。返回是否真的写了。
     pub fn flush(&self, key: BufferKey) -> Result<bool, BufferError> {
+        let partition = self.partition_of(&key.workspace);
         Ok(matches!(
-            self.write_back_step(WriteTarget::Key(key))?,
+            self.write_back_step(partition, WriteTarget::Key(key))?,
             Some(true)
         ))
     }
 
     /// **按序写回一个工作区的全部脏页**（写列表头 → 尾）。
     pub fn flush_workspace(&self, workspace: [u8; 8]) -> Result<FlushReport, BufferError> {
+        let partition = self.partition_of(&workspace);
         let mut report = FlushReport::default();
         loop {
-            match self.write_back_step(WriteTarget::WorkspaceHead(workspace))? {
+            match self.write_back_step(partition, WriteTarget::WorkspaceHead(workspace))? {
                 None => break,
                 Some(wrote) => {
                     if wrote {
@@ -802,15 +919,15 @@ impl<'io> BufferPool<'io> {
 
     /// **Make Free**（§5.10 的 MKFREE 流程内联版）：写列表头按序写回一批；
     /// **闩锁内只选页与收尾，I/O 在闩外**。返回是否实际写过页。
-    fn make_free(&self) -> Result<bool, BufferError> {
+    fn make_free(&self, partition: usize) -> Result<bool, BufferError> {
         let batch = {
-            let inner = self.lock();
+            let inner = self.lock(partition);
             (inner.frames.len() / 64).max(1)
         };
         let mut steps = 0usize;
         let mut wrote_any = false;
         while steps < batch {
-            match self.write_back_step(WriteTarget::OldestHead)? {
+            match self.write_back_step(partition, WriteTarget::OldestHead)? {
                 None => break,
                 Some(wrote) => {
                     wrote_any |= wrote;
@@ -827,10 +944,14 @@ impl<'io> BufferPool<'io> {
     ///
     /// 返回：`None` = 无候选；`Some(false)` = 清理了失步条目（有进展、没写页）；
     /// `Some(true)` = 写了一页。
-    fn write_back_step(&self, target: WriteTarget) -> Result<Option<bool>, BufferError> {
+    fn write_back_step(
+        &self,
+        partition: usize,
+        target: WriteTarget,
+    ) -> Result<Option<bool>, BufferError> {
         let job = {
-            let mut inner = self.lock();
-            match inner.pick_for_write(target)? {
+            let mut inner = self.lock(partition);
+            match inner.pick_for_write(target, &*self.resolve)? {
                 Pick::None => return Ok(None),
                 Pick::Stale => return Ok(Some(false)),
                 Pick::Ready {
@@ -842,7 +963,7 @@ impl<'io> BufferPool<'io> {
             }
         };
         let wal_synced = self.perform_write(&job)?;
-        let mut inner = self.lock();
+        let mut inner = self.lock(partition);
         inner.finish_write(&job, wal_synced);
         Ok(Some(true))
     }
@@ -865,19 +986,43 @@ impl<'io> BufferPool<'io> {
         Ok(wal_synced)
     }
 
-    fn lock(&self) -> LatchGuard<'_, Inner<'io>> {
-        self.inner.lock()
+    /// 取某分区的闩锁（`partition` 由 [`BufferPool::partition_of`] 给出）。
+    fn lock(&self, partition: usize) -> LatchGuard<'_, Inner> {
+        self.partitions[partition].lock()
+    }
+
+    /// 按工作区取它所在分区的闩锁（一个工作区不被拆分 ⇒ 一次定位）。
+    fn lock_of(&self, workspace: &[u8; 8]) -> LatchGuard<'_, Inner> {
+        self.lock(self.partition_of(workspace))
     }
 
     /// **闩锁统计**（诊断：gets/immediate/spin/sleeps/wait_ns——
     /// `V$LATCH` 口径；证据包 `latch-mech-20261005/`）。
+    /// 多分区时是**全部工作集之和**（逐分区的细目见
+    /// [`BufferPool::partition_latch_stats`]）。
     #[must_use]
     pub fn latch_stats(&self) -> LatchStats {
-        self.inner.stats()
+        let mut out = LatchStats {
+            name: "db_cache",
+            gets: 0,
+            immediate: 0,
+            spin_gets: 0,
+            sleeps: 0,
+            wait_ns: 0,
+        };
+        for p in &self.partitions {
+            let s = p.stats();
+            out.gets += s.gets;
+            out.immediate += s.immediate;
+            out.spin_gets += s.spin_gets;
+            out.sleeps += s.sleeps;
+            out.wait_ns += s.wait_ns;
+        }
+        out
     }
 }
 
-impl Inner<'_> {
+impl Inner {
     fn capacity_used(&self) -> usize {
         self.frames.len() - self.virgin.len()
     }
@@ -900,8 +1045,8 @@ impl Inner<'_> {
     }
 
     /// 命中时的 touch count（三秒规则）与冷→热提升。
-    fn touch(&mut self, idx: usize) {
-        let now = self.clock.now_ms();
+    fn touch(&mut self, idx: usize, clock: &dyn Clock) {
+        let now = clock.now_ms();
         {
             let f = &mut self.frames[idx];
             if now.saturating_sub(f.last_touch_ms) >= self.cfg.touch_interval_ms {
@@ -986,7 +1131,11 @@ impl Inner<'_> {
     ///
     /// 失步条目（帧已不在池中/已干净）就地清理并返回 [`Pick::Stale`]——按
     /// **条目自己的 LSN** 删除（用 `Lsn(0)` 当键删不掉 ⇒ 死循环，前台挂起）。
-    fn pick_for_write(&mut self, target: WriteTarget) -> Result<Pick, BufferError> {
+    fn pick_for_write(
+        &mut self,
+        target: WriteTarget,
+        resolve: &PoolResolver<'_>,
+    ) -> Result<Pick, BufferError> {
         let candidate: Option<(Lsn, [u8; 8], Rdba)> = match target {
             WriteTarget::Key(key) => {
                 let Some(idx) = self.find_frame(key) else {
@@ -1031,7 +1180,7 @@ impl Inner<'_> {
         let Some(fkey) = self.frames[idx].key else {
             return Ok(Pick::None);
         };
-        let (handle, block) = (self.resolve)(&fkey.workspace, fkey.rdba)
+        let (handle, block) = resolve(&fkey.workspace, fkey.rdba)
             .ok_or(BufferError::Unresolved { rdba: fkey.rdba })?;
         Ok(Pick::Ready {
             idx,
@@ -1107,7 +1256,7 @@ impl Inner<'_> {
     }
 
     /// 把一个帧装上新键与内容：出旧链、入桶、落**冷段头**。
-    fn attach(&mut self, idx: usize, key: BufferKey, page: Page) {
+    fn attach(&mut self, idx: usize, key: BufferKey, page: Page, clock: &dyn Clock) {
         Self::detach_from_chains(&mut self.hot, &mut self.cold, &mut self.aux, idx);
         if let Some(old) = self.frames[idx].key.take() {
             let ob = self.bucket_of(old);
@@ -1122,7 +1271,7 @@ impl Inner<'_> {
             first_dirty: None,
             pins: 1,
             touches: self.cfg.cool_count,
-            last_touch_ms: self.clock.now_ms(),
+            last_touch_ms: clock.now_ms(),
         };
         let b = self.bucket_of(key);
         self.buckets[b].push(idx);
@@ -1132,7 +1281,7 @@ impl Inner<'_> {
     /// **原位替换一个已驻留帧的内容**（同键重新装入）：帧在桶/链上的位置不变
     /// （键未变），只换内容与记账——写列表里的旧条目按旧 `first_dirty` 摘除
     /// （旧内容被权威镜像取代，不再需要写回）。
-    fn replace_in_place(&mut self, idx: usize, key: BufferKey, page: Page) {
+    fn replace_in_place(&mut self, idx: usize, key: BufferKey, page: Page, clock: &dyn Clock) {
         debug_assert_eq!(
             self.frames[idx].pins, 0,
             "同键重装时不应有在途卫兵（单写者纪律）"
@@ -1147,7 +1296,7 @@ impl Inner<'_> {
             first_dirty: None,
             pins: 1,
             touches: self.cfg.cool_count,
-            last_touch_ms: self.clock.now_ms(),
+            last_touch_ms: clock.now_ms(),
         };
     }
 
@@ -1167,18 +1316,18 @@ impl Inner<'_> {
 }
 
 /// **页卫兵**（`PageGuard`）：钉住一帧，`Drop` = unpin。
-pub struct PageGuard<'a, 'io> {
-    inner: LatchGuard<'a, Inner<'io>>,
+pub struct PageGuard<'a> {
+    inner: LatchGuard<'a, Inner>,
     idx: usize,
 }
 
-impl std::fmt::Debug for PageGuard<'_, '_> {
+impl std::fmt::Debug for PageGuard<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PageGuard").field("idx", &self.idx).finish()
     }
 }
 
-impl PageGuard<'_, '_> {
+impl PageGuard<'_> {
     /// 本帧的键。
     #[must_use]
     pub fn key(&self) -> BufferKey {
@@ -1209,20 +1358,20 @@ impl PageGuard<'_, '_> {
     }
 }
 
-impl std::ops::Deref for PageGuard<'_, '_> {
+impl std::ops::Deref for PageGuard<'_> {
     type Target = Page;
     fn deref(&self) -> &Page {
         &self.inner.frames[self.idx].page
     }
 }
 
-impl std::ops::DerefMut for PageGuard<'_, '_> {
+impl std::ops::DerefMut for PageGuard<'_> {
     fn deref_mut(&mut self) -> &mut Page {
         &mut self.inner.frames[self.idx].page
     }
 }
 
-impl Drop for PageGuard<'_, '_> {
+impl Drop for PageGuard<'_> {
     fn drop(&mut self) {
         let idx = self.idx;
         self.inner.frames[idx].pins = self.inner.frames[idx].pins.saturating_sub(1);
@@ -2015,20 +2164,208 @@ mod tests {
         let h = harness();
         let pool = h.pool(2, h.fake_wal());
         {
-            let mut inner = pool.lock();
+            let mut inner = pool.lock(0);
             inner
                 .write_list
                 .entry(WS_A)
                 .or_default()
                 .insert((lsn(7), rdba(7, 1)));
         }
-        pool.make_free().unwrap();
+        pool.make_free(0).unwrap();
         assert!(
-            !pool.lock().write_list.contains_key(&WS_A),
+            !pool.lock(0).write_list.contains_key(&WS_A),
             "失步条目按自身 LSN 清除"
         );
         // 再跑一次也不挂（幂等）。
-        pool.make_free().unwrap();
+        pool.make_free(0).unwrap();
+    }
+
+    /// 分区池（多工作集；§5.10 的 P4 形态）。
+    impl Harness {
+        fn pool_partitioned<'io>(
+            &'io self,
+            partitions: usize,
+            capacity: usize,
+            wal: impl WalGuard + 'io,
+        ) -> BufferPool<'io> {
+            let (a, b) = (self.a, self.b);
+            BufferPool::with_partitions(
+                &self.io,
+                partitions,
+                capacity,
+                move |ws, r| {
+                    if *ws == WS_A && r.file_id() == 7 {
+                        Some((a, r.block_id()))
+                    } else if *ws == WS_B && r.file_id() == 8 {
+                        Some((b, r.block_id()))
+                    } else {
+                        None
+                    }
+                },
+                wal,
+                SystemClock,
+                CacheConfig::for_capacity(capacity),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn partitions_map_workspaces_by_stable_hash() {
+        // §5.10：`H(工作区标识) mod N`——稳定、确定、2 的幂按位与。
+        let h = harness();
+        let pool = h.pool_partitioned(4, 2, h.fake_wal());
+        assert_eq!(pool.partition_count(), 4);
+        // 同一个工作区永远落同一个分区（写列表不在写线程间搬家）。
+        for _ in 0..3 {
+            assert_eq!(pool.partition_of(&WS_A), pool.partition_of(&WS_A));
+        }
+        // 结构可见：容量是**每分区**的（总帧数 = N × 容量）。
+        assert_eq!(pool.capacity(), 2);
+        // 非 2 的幂被拒绝。
+        let err = BufferPool::with_partitions(
+            &h.io,
+            3,
+            2,
+            |_, _| None,
+            h.fake_wal(),
+            SystemClock,
+            CacheConfig::for_capacity(2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BufferError::BadPartitionCount { .. }));
+    }
+
+    #[test]
+    fn partitions_have_independent_capacity() {
+        // 每分区容量 1、两个**不同分区**的工作区 ⇒ 各驻留一帧、互不驱逐——
+        // "分区把跨工作区争用降为零"的最小可观测形态（N=1 时必驱逐）。
+        // 夹具就地搭（两个文件、两个工作区；哈希决定分区，选已验证的一对）。
+        let mem = MemFileIo::new();
+        mem.add_dir("/mem");
+        let io = mem;
+        const WS_C: [u8; 8] = [3u8; 8]; // [3;8] 与 [1;8] 在 N=4 下不同分区（实测）
+        let a = io
+            .open(
+                Path::new("/mem/pa.dat"),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        let c = io
+            .open(
+                Path::new("/mem/pc.dat"),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        for (h, ws, fid) in [(a, WS_A, 7u16), (c, WS_C, 9)] {
+            io.set_len(h, 2 * crate::page::PAGE_SIZE as u64).unwrap();
+            for block in 0..2u32 {
+                let mut page = Page::new(PageType::HeapTable, ws, fid, block);
+                page.as_bytes_mut()[4096] = 0x5A;
+                pagefile::write_page(&io, h, block, &mut page).unwrap();
+            }
+        }
+        let pool = BufferPool::with_partitions(
+            &io,
+            4,
+            1,
+            move |ws, r| {
+                if *ws == WS_A && r.file_id() == 7 {
+                    Some((a, r.block_id()))
+                } else if *ws == WS_C && r.file_id() == 9 {
+                    Some((c, r.block_id()))
+                } else {
+                    None
+                }
+            },
+            FakeWal {
+                durable: std::sync::atomic::AtomicU64::new(0),
+                fail: false,
+                log: Arc::new(Mutex::new(Vec::new())),
+            },
+            SystemClock,
+            CacheConfig::for_capacity(1),
+        )
+        .unwrap();
+        let pa = pool.partition_of(&WS_A);
+        let pc = pool.partition_of(&WS_C);
+        assert_ne!(pa, pc, "夹具的两个工作区必须落不同分区");
+        let ka = BufferKey::new(WS_A, rdba(7, 0));
+        let kc = BufferKey::new(WS_C, rdba(9, 0));
+        {
+            let _ga = pool.pin(ka).unwrap();
+            let _gc = pool.pin(kc).unwrap(); // 另一分区：不驱逐 ka
+        }
+        assert_eq!(pool.resident(), 2, "两分区各驻留一帧");
+        // 两个键都还是**命中**（容量 1 的 N=1 池此时必然驱逐过一次）。
+        let stats = pool.stats();
+        assert_eq!(stats.misses, 2, "各未命中一次");
+        {
+            let _ga = pool.pin(ka).unwrap();
+            let _gc = pool.pin(kc).unwrap();
+        }
+        assert_eq!(pool.stats().hits, 2, "复访仍命中：分区互不驱逐");
+    }
+
+    #[test]
+    fn a_workspace_is_never_split_across_partitions() {
+        // §5.10：**一个工作区不被拆分**——它的全部缓冲与写列表都在同一个
+        // 工作集里（检查点推进只碰一个闩锁，零跨分区协调）。
+        let h = harness();
+        let pool = h.pool_partitioned(8, 2, h.fake_wal());
+        let p = pool.partition_of(&WS_A);
+        for block in 0..2u32 {
+            let mut g = pool.pin(BufferKey::new(WS_A, rdba(7, block))).unwrap();
+            g.as_bytes_mut()[4096] = 0x11;
+            g.mark_dirty(lsn(1 + u64::from(block)));
+        }
+        assert_eq!(pool.dirty_len(WS_A), 2);
+        // 该工作区的两个帧都在同一个分区里（其它分区没有任何属于它的帧）。
+        assert_eq!(
+            pool.partitions[p]
+                .lock()
+                .write_list
+                .get(&WS_A)
+                .map(BTreeSet::len),
+            Some(2),
+            "写列表整体落在一个分区"
+        );
+        for (i, part) in pool.partitions.iter().enumerate() {
+            if i != p {
+                assert!(
+                    !part.lock().write_list.contains_key(&WS_A),
+                    "分区 {i} 不该有该工作区的写列表"
+                );
+            }
+        }
+        // 按分区刷该工作区：一次 flush_workspace 只碰一个分区、按序写两页。
+        let report = pool.flush_workspace(WS_A).unwrap();
+        assert_eq!(report.pages_written, 2);
+    }
+
+    #[test]
+    fn partition_counters_aggregate_and_split_by_latch() {
+        let h = harness();
+        let pool = h.pool_partitioned(4, 2, h.fake_wal());
+        let ka = BufferKey::new(WS_A, rdba(7, 0));
+        {
+            let _g = pool.pin(ka).unwrap();
+        }
+        {
+            // **一次一个卫兵**（§5.10 纪律）：统计读取前先放开卫兵。
+            let _g = pool.pin(ka).unwrap(); // 命中
+        }
+        let stats = pool.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        // 闩锁统计：和 ≥ 逐分区之和（聚合读取）；逐分区条数与分区数一致。
+        let per = pool.partition_latch_stats();
+        assert_eq!(per.len(), 4);
+        let sum: u64 = per.iter().map(|s| s.gets).sum();
+        let agg = pool.latch_stats();
+        assert_eq!(agg.gets, sum, "聚合 = 逐分区之和");
+        assert_eq!(agg.name, "db_cache");
+        assert!(sum >= 2, "至少两次取闩锁（命中 + 未命中）");
     }
 
     #[test]
