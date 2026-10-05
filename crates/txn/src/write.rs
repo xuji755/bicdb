@@ -580,8 +580,8 @@ fn append_undo_via_pool(
         plan.opened,
     )?;
     // ② 段内位图页（仅新开页时有改动）。
-    if let Some((before, after)) = &plan.bitmap {
-        let key = undo_page_key(chain, 1)?;
+    if let Some((logical, before, after)) = &plan.bitmap {
+        let key = undo_page_key(chain, *logical)?;
         write_undo_page_change(
             pool,
             log,

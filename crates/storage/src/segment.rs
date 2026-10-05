@@ -520,6 +520,11 @@ pub struct Segment<'io, 'f> {
     header: SegmentHeader,
     page0: u32,
     map: Vec<ExtentEntry>,
+    /// 段内位图页的覆盖（位图页 i 管 `[i×coverage, (i+1)×coverage)`；
+    /// 生产恒 [`BITMAP_PAGE_COVERAGE`]——**多位图页的落点**：页 i（i≥1）固定
+    /// 落在逻辑页 `i×coverage`，i=0 特例在逻辑页 1（窗口首位自指、恒标满）；
+    /// 测试可缩小以走到该路径）。
+    coverage: u32,
 }
 
 impl std::fmt::Debug for Segment<'_, '_> {
@@ -599,6 +604,7 @@ impl<'io, 'f> Segment<'io, 'f> {
             header,
             page0,
             map,
+            coverage: BITMAP_PAGE_COVERAGE,
         })
     }
 
@@ -615,16 +621,21 @@ impl<'io, 'f> Segment<'io, 'f> {
             header,
             page0,
             map,
+            coverage: BITMAP_PAGE_COVERAGE,
         })
+    }
+
+    /// 缩小位图覆盖（**仅测试**：走到跨位图页的路径）。
+    #[cfg(test)]
+    pub fn with_coverage_for_test(mut self, coverage: u32) -> Self {
+        self.coverage = coverage;
+        self
     }
 
     /// **扩展**：分配一个新区（就近合并进区映射）、持久化段头页，
     /// 并把新区的数据页在段内位图里标 `High`。
     pub fn extend(&mut self) -> Result<crate::bitmap::ExtentNo, SegmentSpaceError> {
         let first_logical = self.header.extent_count as u32 * EXTENT_BLOCKS;
-        if first_logical + EXTENT_BLOCKS > BITMAP_PAGE_COVERAGE {
-            return Err(SegmentSpaceError::BitmapCoverage);
-        }
         let extent = self.file.allocate_extent()?;
         let rdba =
             Rdba::from_parts(self.file.file_id(), extent.first_block()).expect("块号在 28 位内");
@@ -634,14 +645,104 @@ impl<'io, 'f> Segment<'io, 'f> {
         self.header = read_header(&page)?;
         self.map = map;
 
-        // 新区数据页 → High（仍在首个位图页覆盖内）。
-        let bmp_block = self.logical_block(1).expect("首区位图页");
-        let mut bmp = self.file.read_page(bmp_block)?;
+        // 新区数据页 → High（按覆盖自动落到对应位图页；跨窗时先物化位图页 i）。
+        // **位图页自身跳过**：它的级别由物化时写（窗口首位自指、恒满）。
         for k in first_logical..first_logical + EXTENT_BLOCKS {
-            crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::High)?;
+            if self.is_bitmap_page(k) {
+                continue;
+            }
+            self.write_free_level(k, crate::bitmap::FreeLevel::High)?;
         }
-        self.file.write_page(bmp_block, &mut bmp)?;
         Ok(extent)
+    }
+
+    /// **段内位图页的落点**：逻辑页 `logical` 的级别位在
+    /// （第 `i` 个位图页，页内位号 `bit`）——位图页 i 位于逻辑页
+    /// `i×coverage`（i=0 特例在逻辑页 1）。
+    #[must_use]
+    pub fn bitmap_slot(&self, logical: u32) -> (u32, u32, u32) {
+        let i = logical / self.coverage;
+        let bitmap_logical = if i == 0 { 1 } else { i * self.coverage };
+        (i, logical - i * self.coverage, bitmap_logical)
+    }
+
+    /// 该逻辑页**是不是位图页本身**（i≥1 的窗口首位；i=0 的位图页在逻辑页 1）。
+    #[must_use]
+    pub fn is_bitmap_page(&self, logical: u32) -> bool {
+        logical == 1 || (logical != 0 && logical % self.coverage == 0)
+    }
+
+    /// **写一个逻辑页的空闲级别**（自动落到对应位图页；跨窗先物化位图页）。
+    pub fn write_free_level(
+        &mut self,
+        logical: u32,
+        level: crate::bitmap::FreeLevel,
+    ) -> Result<(), SegmentSpaceError> {
+        let (i, bit, bitmap_logical) = self.bitmap_slot(logical);
+        self.ensure_bitmap_page(i, bitmap_logical)?;
+        let block = self
+            .logical_block(bitmap_logical)
+            .ok_or(SegmentSpaceError::BitmapCoverage)?;
+        let mut bmp = self.file.read_page(block)?;
+        crate::bitmap::set_free_level(&mut bmp, bit, level)?;
+        self.file.write_page(block, &mut bmp)?;
+        Ok(())
+    }
+
+    /// **物化第 i 个位图页**（必要时扩展段到该逻辑页所在区；幂等）。
+    pub fn ensure_bitmap_page(
+        &mut self,
+        i: u32,
+        bitmap_logical: u32,
+    ) -> Result<(), SegmentSpaceError> {
+        if u32::from(self.header.bitmap_pages) > i {
+            return Ok(()); // 已物化（位图页按序物化）
+        }
+        // 扩到覆盖该逻辑页（每扩一区 +8 逻辑页）。
+        while self.logical_block(bitmap_logical).is_none() {
+            self.extend()?;
+        }
+        // 页体：FreeLevel、own_index = i；**窗口首位自指**——自己的位标满。
+        let block = self
+            .logical_block(bitmap_logical)
+            .ok_or(SegmentSpaceError::BitmapCoverage)?;
+        let mut bmp = Page::new(
+            PageType::Bitmap,
+            self.file.workspace_ref(),
+            self.file.file_id(),
+            block,
+        );
+        crate::bitmap::init(&mut bmp, crate::bitmap::BitmapKind::FreeLevel, i as u16)?;
+        crate::bitmap::set_free_level(&mut bmp, 0, crate::bitmap::FreeLevel::Full)?;
+        self.file.write_page(block, &mut bmp)?;
+        // 段头：位图页数 +1（读当前页，避免覆盖 extend 的写入）。
+        let mut page = self.file.read_page(self.page0)?;
+        let mut h = read_header(&page)?;
+        h.bitmap_pages = h.bitmap_pages.saturating_add(1);
+        write_header(&mut page, &h)?;
+        self.file.write_page(self.page0, &mut page)?;
+        self.header = h;
+        Ok(())
+    }
+
+    /// **准备下一个可写的追加逻辑页**：跳过（并物化）跨到的位图页本身。
+    pub fn prepare_append_page(&mut self) -> Result<u32, SegmentSpaceError> {
+        loop {
+            let mut h = read_header(&self.file.read_page(self.page0)?)?;
+            let logical = h.append_pos;
+            if self.is_bitmap_page(logical) {
+                let (i, _, bmp_logical) = self.bitmap_slot(logical);
+                self.ensure_bitmap_page(i, bmp_logical)?;
+                h = read_header(&self.file.read_page(self.page0)?)?;
+                h.append_pos = logical + 1;
+                let mut page = self.file.read_page(self.page0)?;
+                write_header(&mut page, &h)?;
+                self.file.write_page(self.page0, &mut page)?;
+                self.header = h;
+                continue;
+            }
+            return Ok(logical);
+        }
     }
 
     /// 段头（内存镜像）。
@@ -1038,5 +1139,56 @@ mod space_tests {
             block,
             "逻辑页 2 ↔ 该区第 3 块（预留区之后）"
         );
+    }
+
+    #[test]
+    fn multi_page_bitmaps_materialize_on_window_boundary() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
+        // coverage = 8（= 一个区）：位图页 0 管 [0,8)（在逻辑页 1）；
+        // 位图页 1 管 [8,16)，落在逻辑页 8（窗口首位、自指）。
+        let mut seg = Segment::create(&mut file, SegType::Heap, 1, 2, 4, 10, 0)
+            .unwrap()
+            .with_coverage_for_test(8);
+        seg.extend().unwrap(); // 第二区：逻辑页 8..16 就位
+        assert!(seg.is_bitmap_page(1) && seg.is_bitmap_page(8));
+        assert!(!seg.is_bitmap_page(0), "逻辑页 0 是段头页（不是位图页）");
+        assert!(!seg.is_bitmap_page(9));
+        assert_eq!(seg.bitmap_slot(0), (0, 0, 1));
+        assert_eq!(seg.bitmap_slot(7), (0, 7, 1));
+        assert_eq!(seg.bitmap_slot(8), (1, 0, 8), "跨窗：落第 1 个位图页");
+        assert_eq!(seg.bitmap_slot(9), (1, 1, 8));
+
+        // 扩到窗口 1 时其位图页随标记**自动物化**（窗口首位自指、恒满）。
+        assert_eq!(seg.header().bitmap_pages, 2, "位图页 1 随第二次扩展物化");
+        // 写逻辑页 9 的级别 → 落到位图页 1 的位 1。
+        seg.write_free_level(9, crate::bitmap::FreeLevel::Medium)
+            .unwrap();
+        let b1 = seg.read_page(8).unwrap();
+        assert_eq!(crate::bitmap::kind(&b1).unwrap(), BitmapKind::FreeLevel);
+        assert_eq!(crate::bitmap::own_index(&b1).unwrap(), 1);
+        assert_eq!(
+            crate::bitmap::free_level(&b1, 0).unwrap(),
+            FreeLevel::Full,
+            "窗口首位自指：位图页自身标满"
+        );
+        assert_eq!(
+            crate::bitmap::free_level(&b1, 1).unwrap(),
+            FreeLevel::Medium,
+            "逻辑页 9 的级别落在位图页 1 的位 1"
+        );
+        // 位图页 0 的位 7（逻辑页 7）不受影响。
+        let b0 = seg.read_page(1).unwrap();
+        assert_eq!(crate::bitmap::free_level(&b0, 7).unwrap(), FreeLevel::High);
+
+        // 追加位置跨到时：物化并跳过位图页本身。
+        seg.write_free_level(8, FreeLevel::Full).unwrap(); // 幂等（已物化）
+        let mut page = seg.read_page(0).unwrap();
+        let mut h = read_header(&page).unwrap();
+        h.append_pos = 8;
+        write_header(&mut page, &h).unwrap();
+        seg.write_page(0, &mut page).unwrap();
+        assert_eq!(seg.prepare_append_page().unwrap(), 9, "跳过位图页后落到 9");
+        assert_eq!(seg.header().append_pos, 9);
     }
 }

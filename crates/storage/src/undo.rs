@@ -23,8 +23,7 @@ use bicdb_workspace::io::{FileHandle, FileIo};
 use crate::page::{Page, PageType, ITL_ENTRY_LEN};
 use crate::rowid::{Rdba, RowId};
 use crate::segment::{
-    read_header, write_header, SegType, Segment, SegmentSpaceError, BITMAP_PAGE_COVERAGE,
-    SEG_EXTENSION_OFFSET,
+    read_header, write_header, SegType, Segment, SegmentSpaceError, SEG_EXTENSION_OFFSET,
 };
 
 /// 事务表槽数（§14 第 28 项：V1.0 单段、N = 256）。
@@ -876,8 +875,8 @@ pub struct UndoAppend {
     pub txn_id: TxnId,
     /// 撤销页的（追加前、追加后）镜像。
     pub undo_page: (Page, Page),
-    /// 段内位图页的（前、后）镜像（仅新开页时存在）。
-    pub bitmap: Option<(Page, Page)>,
+    /// 段内位图页：（逻辑页号，前像，后像）（仅新开页时存在）。
+    pub bitmap: Option<(u32, Page, Page)>,
     /// 段头页的（前、后）镜像（槽的 `undo_current`/`rec_count` 已更新）。
     pub header: (Page, Page),
     /// **新链头**（本记录的地址）。
@@ -969,12 +968,8 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             let page = self.segment.read_page(logical)?;
             (logical, page, false)
         } else {
-            // 新页：逻辑页号 = 段头 `追加位置`；必要时（直写）扩展段。
-            let mut seg_header = read_header(&header_before)?;
-            let logical = seg_header.append_pos;
-            if logical >= BITMAP_PAGE_COVERAGE {
-                return Err(UndoChainError::BitmapCoverage);
-            }
+            // 新页：下一个可写追加页（跨到位图页本身时先物化并跳过）。
+            let logical = self.segment.prepare_append_page()?;
             if self.segment.logical_block(logical).is_none() {
                 self.segment.extend()?;
                 header_before = self.segment.read_page(0)?;
@@ -1001,14 +996,15 @@ impl<'io, 'f> UndoChain<'io, 'f> {
                     state: crate::itl::ItlState::Active,
                 },
             )?;
-            seg_header = read_header(&header_before)?;
+            let mut seg_header = read_header(&header_before)?;
             seg_header.append_pos = logical + 1;
             write_header(&mut header_before, &seg_header)?;
-            // 段内位图：新页 → High（仍在首个位图页覆盖内）。
-            let bmp_before = self.segment.read_page(1)?;
+            // 段内位图：新页 → High（按覆盖落到对应位图页）。
+            let (_, bit, bmp_logical) = self.segment.bitmap_slot(logical);
+            let bmp_before = self.segment.read_page(bmp_logical)?;
             let mut bmp_after = Page::from_bytes(Box::new(*bmp_before.as_bytes()));
-            crate::bitmap::set_free_level(&mut bmp_after, logical, crate::bitmap::FreeLevel::High)?;
-            bitmap = Some((bmp_before, bmp_after));
+            crate::bitmap::set_free_level(&mut bmp_after, bit, crate::bitmap::FreeLevel::High)?;
+            bitmap = Some((bmp_logical, bmp_before, bmp_after));
             (logical, page, true)
         };
 
@@ -1061,9 +1057,9 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         payload: UndoPayload,
     ) -> Result<RowId, UndoChainError> {
         let plan = self.plan_append(slot_index, op, flags, rowid, payload)?;
-        if let Some((_, after)) = &plan.bitmap {
+        if let Some((logical, _, after)) = &plan.bitmap {
             let mut p = Page::from_bytes(Box::new(*after.as_bytes()));
-            self.segment.write_page(1, &mut p)?;
+            self.segment.write_page(*logical, &mut p)?;
         }
         if plan.opened {
             let mut p = Page::from_bytes(Box::new(*plan.undo_page.1.as_bytes()));
