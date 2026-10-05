@@ -18,11 +18,17 @@
 //! | **腾块** | 前台先扫 **AUX**、再扫**冷段尾**（跳过钉住；脏块已在写列表 ⇒ 跳过）；扫不到 ⇒ **Make Free**（内联 DBWR 批处理：写列表头按序写） |
 //! | **写回** | 写列表**头**（= 最老首次变脏）逐块写；**WAL 规则 2**（redo 未持久化则推迟/催刷）；写完 → 清脏 → **入 AUX** |
 //!
-//! # touch count（三秒规则）
+//! # touch count：三秒规则 + 老化减半（Note 104937.1）
 //!
-//! 命中且**距上次递增 ≥ 3 秒**才 `+1`（防突发访问虚高）；冷段中的帧计数达
-//! **热判据** ⇒ 提升到**热段头**；热段超上限（`HBMAX`）⇒ 热段尾**退回冷段头**。
-//! 新读入/重用的帧落在**冷段头**（不是热段）。
+//! 命中且**距上次递增 ≥ 3 秒**（`dbagingtouchtime`）才 `+1`；计数达
+//! **热判据** ⇒ 提升到**热段头**、计数置**驻留值**（`_STAY_COUNT` 语义）；
+//! 热段超上限（`HBMAX`）⇒ 热段尾**退回冷段头**、计数置**冷却值**
+//! （`_COOL_COUNT` 语义）。
+//!
+//! **淘汰不立即发生**：前台扫冷段尾遇到**计数 > 冷却值**的候选时，把它
+//! **减半（aging）后继续扫**——"计数够高的块即使位于列表尾也不被重用"，
+//! 减半让它再循环一轮；命中会把计数顶回去，真热块因此永不到达淘汰线。
+//! 新读入/重用的帧落在**冷段头**（不是热段），计数 = 冷却值。
 //!
 //! # 单线程形态（v2 起）
 //!
@@ -97,8 +103,11 @@ pub struct CacheConfig {
     pub hot_fraction: usize,
     /// 触摸计数的最小递增间隔（毫秒）——**三秒规则**（有证据）。
     pub touch_interval_ms: u64,
-    /// 冷却计数（新帧/退回冷段的计数；自定）。
+    /// 冷却值（`_COOL_COUNT`/`kcbpacc` 语义：新装入与退回冷段时置的计数；
+    /// 数值自定——取 0 ⇒"冷却块立即可复用"，被碰过的块获得一轮减半豁免）。
     pub cool_count: u32,
+    /// 驻留值（`_STAY_COUNT`/`kcbpasc` 语义：提升到热段头时置的计数；数值自定）。
+    pub stay_count: u32,
     /// 热判据（冷段计数达此值 ⇒ 升热段；自定）。
     pub hot_criteria: u32,
     /// 前台扫空闲缓冲的上限 = 容量 / 该值（Oracle `db_block_max_scan_cnt` 默认 缓冲数/4）。
@@ -113,7 +122,8 @@ impl CacheConfig {
             buckets: prime_at_least(2 * capacity.max(1)),
             hot_fraction: 4,
             touch_interval_ms: 3_000,
-            cool_count: 1,
+            cool_count: 0,
+            stay_count: 2,
             hot_criteria: 2,
             max_scan_fraction: 4,
         }
@@ -218,7 +228,7 @@ impl From<std::io::Error> for BufferError {
 }
 
 /// 缓冲池统计（口径对齐 X$KCBWDS：FBWAIT、FBINSP/DBINSP/PNINSP、HOTMVS/AUX_MOV、
-/// SUM_WRT）。
+/// SUM_WRT；`aging_steps` 为 touch-count 老化算法的自有计数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BufferStats {
     /// 命中次数（缓存层）。
@@ -241,6 +251,8 @@ pub struct BufferStats {
     pub pinned_inspected: u64,
     /// 冷段高计数帧提升到热段的次数（HOTMVS）。
     pub hot_moved: u64,
+    /// **老化减半**（aging）的次数——扫描遇到高计数候选、减半后继续（不走淘汰）。
+    pub aging_steps: u64,
     /// 写完成后放入 AUX 的次数（AUX_MOV）。
     pub aux_moved: u64,
 }
@@ -582,11 +594,13 @@ impl Inner<'_> {
                 f.last_touch_ms = now;
             }
         }
-        // 冷段中计数达热判据 ⇒ 提升到热段头（热段超限则热段尾退回冷段头）。
+        // 冷段中计数达热判据 ⇒ 提升到热段头（计数置驻留值——`_STAY_COUNT` 语义）；
+        // 热段超限 ⇒ 热段尾退回冷段头（计数置冷却值——`_COOL_COUNT` 语义）。
         if self.frames[idx].touches >= self.cfg.hot_criteria {
             if let Some(p) = self.cold.iter().position(|&i| i == idx) {
                 self.cold.remove(p);
                 self.hot.push_front(idx);
+                self.frames[idx].touches = self.cfg.stay_count;
                 self.stats.hot_moved += 1;
                 let hot_max = (self.frames.len() / self.cfg.hot_fraction).max(1);
                 while self.hot.len() > hot_max {
@@ -624,6 +638,13 @@ impl Inner<'_> {
             if self.frames[idx].dirty {
                 self.stats.dirty_inspected += 1;
                 continue; // 脏帧不直接写回——交 Make Free 按序写
+            }
+            // **老化减半**（Note 104937.1）：计数高于冷却值 ⇒ 不立即淘汰，
+            // 减半后继续扫——"计数够高的块即使位于列表尾也不被重用"。
+            if self.frames[idx].touches > self.cfg.cool_count {
+                self.frames[idx].touches /= 2;
+                self.stats.aging_steps += 1;
+                continue;
             }
             let p = self.cold.len() - 1 - k;
             let idx = self.cold.remove(p).expect("位置在界内");
@@ -1266,12 +1287,18 @@ mod tests {
         }
         assert_eq!(pool.chain_of(k0), Some("cold"));
         assert_eq!(pool.stats().hot_moved, 0);
-        // 5 秒后再命中：≥3 秒 ⇒ +1 达热判据 ⇒ 提升到热段。
+        // 5 秒后再命中：≥3 秒 ⇒ +1（=1），未达热判据（2）⇒ 仍在冷段。
         *clock.lock().unwrap() = 5_000;
         {
             let _g = pool.pin(k0).unwrap();
         }
-        assert_eq!(pool.chain_of(k0), Some("hot"), "冷段高计数升热段");
+        assert_eq!(pool.chain_of(k0), Some("cold"), "一次命中还不够热");
+        // 10 秒后再命中：+1 达热判据 ⇒ 提升到热段。
+        *clock.lock().unwrap() = 10_000;
+        {
+            let _g = pool.pin(k0).unwrap();
+        }
+        assert_eq!(pool.chain_of(k0), Some("hot"), "冷段计数达热判据升热段");
         assert_eq!(pool.stats().hot_moved, 1);
     }
 
@@ -1288,13 +1315,19 @@ mod tests {
         for k in keys {
             let _g = pool.pin(k).unwrap();
         }
-        // 三块先后提升到热段（热段上限 = 8/4 = 2）⇒ 最早的那块被退回冷段头。
+        // 每块两次跨 3 秒命中才会提升（冷却值 0、热判据 2）。
         *clock.lock().unwrap() = 10_000;
         for k in keys {
             let _g = pool.pin(k).unwrap();
         }
-        assert_eq!(pool.chain_of(keys[2]), Some("hot"), "最后命中的在热段头");
+        *clock.lock().unwrap() = 20_000;
+        for k in keys {
+            let _g = pool.pin(k).unwrap();
+        }
+        // 三块先后提升到热段（热段上限 = 8/4 = 2）⇒ 最早的那块被退回冷段头。
+        assert_eq!(pool.chain_of(keys[2]), Some("hot"), "最后提升的在热段头");
         assert_eq!(pool.chain_of(keys[0]), Some("cold"), "最早的被退回冷段头");
+        assert_eq!(pool.stats().hot_moved, 3);
     }
 
     #[test]
@@ -1352,5 +1385,29 @@ mod tests {
         assert!(pool.stats().dirty_inspected >= 1, "扫描先见到脏帧");
         assert_eq!(pool.stats().writes, 1);
         assert_eq!(pool.stats().evictions, 1);
+    }
+
+    #[test]
+    fn aging_halves_touch_count_instead_of_evicting() {
+        // Note 104937.1：扫描遇到计数高于冷却值的候选 ⇒ **减半后继续**，
+        // 不立即淘汰；下一次扫描（计数已 ≤ 冷却值）才可复用。
+        let h = harness();
+        let clock = Arc::new(Mutex::new(0u64));
+        let pool = h.pool_with(1, Arc::clone(&clock), CacheConfig::for_capacity(1));
+        let ka = BufferKey::new(WS_A, rdba(7, 0));
+        {
+            let _g = pool.pin(ka).unwrap();
+        }
+        *clock.lock().unwrap() = 5_000;
+        {
+            let _g = pool.pin(ka).unwrap(); // 计数 = 1（高于冷却值 0）
+        }
+        // 读入新块：冷段尾的 A 计数 1 > 0 ⇒ 减半为 0、跳过；重试后才复用。
+        {
+            let _g = pool.pin(BufferKey::new(WS_A, rdba(7, 1))).unwrap();
+        }
+        assert_eq!(pool.stats().aging_steps, 1, "发生过一次老化减半");
+        assert_eq!(pool.stats().evictions, 1);
+        assert_eq!(pool.stats().writes, 0, "干净块不需写回");
     }
 }

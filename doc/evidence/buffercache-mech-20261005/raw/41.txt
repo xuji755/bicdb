@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] hash buckets 默认值 质数 2倍 缓冲区数 推导 每链长度
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 9，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 25，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     文档提供了LOG_BUFFER默认值的具体计算方式：取512KB和128KB乘以CPU数量这两个值中的较大者。例如，在一个4 CPU的系统上，默认值为max(512K, 128K*4) = max(512K, 512K) = 512K。在一个32 CPU的系统上，默认值为max(512K, 128K*32) = max(512K, 4M) = 4M。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] Redo日志缓冲区默认值计算：512K或128K*CPU  (排序分: 9.4)
+     └ 详情：文档提供了LOG_BUFFER默认值的具体计算方式：取512KB和128KB乘以CPU数量这两个值中的较大者。例如，在一个4 CPU的系统上，默认值为max(512K, 128K*4) = max(512K, 512K) = 512K。在一个32 CPU的系统上，默认值为max(512K, 128K*32) = max(512K, 4M) = 4M。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1541149
+
+     [KnowledgeEntry] 日志缓冲区大小计算：LOG_BUFFER默认值  (排序分: 9.4)
+     └ 摘要：LOG_BUFFER参数用于定义重做日志缓冲区的总大小，其默认值为512KB与128KB乘以CPU数量两者中的较大值，且必须为物理块大小的整数倍。此外，系统强制设置一个最小限制，即最大数据库块大小的四倍加上两个用于保护重做缓冲区的内存页。内存页大小在Sun/Solaris系统上为8192字节，在Windows NT上为4096字节。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1544689
+
+     [KnowledgeEntry] 重做日志缓冲区大小与默认值  (排序分: 9.4)
+     └ 摘要：重做日志缓冲区用于临时存储重做记录，其总大小由 LOG_BUFFER 参数决定，默认值为 512K 与 128K 乘以 CPU 数量中的较大值。该参数值必须是物理块大小的倍数，并受强制最小限制约束，即最大数据库块大小的四倍加上两个保护页所需的内存页。不同操作系统下内存页大小不同，例如 Sun/Solaris 为 8192，Windows NT 为 4096。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557421
+
+     [KnowledgeEntry] 脏缓冲区数量与恢复 I/O 估计  (排序分: 9.4)
+     └ 详情：恢复过程中需要将脏缓冲区写回数据文件，脏缓冲区数量越多，恢复 I/O 越大。企业版可借此评估恢复的 I/O 影响，而标准版不提供此统计。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:330235
+
+     [CaseStudy] cache buffers chains latch争用诊断案例  (排序分: 8.8)
+     └ 摘要：场景：查询V$LATCH WHERE SLEEPS!=0，发现LATCH#11 (cache buffers chains) SLEEPS=4326最高。诊断：查询V$LATCH_CHILDREN找到子Latch统计，关联x$bh和v$latch_children.addr定位热点块所在的文件（file15=358, file19=151, file18=31），通过dba_extents和x$bh定位对象（表LOG、TEAMAVAIL、索引LOG_ANALYST_和SYS_C001177）。处理：建议应用重设计减少并发访问，或增大DB_BLOCK_SIZE减少缓冲区数量，或使用隐藏参数_DB_BLOCK_HASH_BUCKETS增加哈希桶数量分散热点链。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325469
+
+     [FaultModel] 缓冲区数据块校验失败  (排序分: 8.6)
+     └ 摘要：诊断摘要：根因是缓冲区缓存中的块头校验失败，通常由物理磁盘损坏或内存错误导致。典型影响为抛出ORA-00600[2032]错误，可能引发查询异常、进程终止甚至实例崩溃。关键现象包括Alert日志中频繁出现该错误，且伴随数据块访问失败或缓冲区校验错误警告。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325155
+

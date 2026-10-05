@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: Touch Count
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:203534
+
+  ── 描述 ──
+  每个缓冲区维护一个touch count，每次访问时增加。当touch count达到_HOT_CRITERIA值时，该缓冲区被移至LRU热端。当缓冲区被冷却时，其touch
+  count被重置为_COOL_COUNT。_STAY_COUNT用于当缓冲区被显式保留时设置。Touch Count机制使得频繁访问的块保持在缓存中，减少物理读。关键参数：_HOT_CRITERIA（
+  热端阈值）、_COOL_COUNT（冷却重置值）、_STAY_COUNT（保留值）。应用场景：缓冲区缓存管理，提高热块保留概率。概念 kernel Touch Count 热块 冷块 LRU
+
+  ── 摘要 ──
+  每个缓冲区维护一个touch count计数器，每次被访问时递增。当计数值达到_HOT_CRITERIA时，该缓冲区被移至LRU链表的冷热端，使高频访问的块优先保留在缓存中。若缓冲区被冷却，其touch count将重置为_COOL_COUNT。此外，_STAY_COUNT用于在显式保留缓冲区时设置固定计数值。这一机制通过动态调整缓冲区的热度和淘汰优先级，有效减少物理读操作。

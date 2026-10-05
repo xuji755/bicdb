@@ -1,0 +1,2 @@
+  ✅ [knowledge] _db_aging_hot_criteria
+     描述: 概念：_db_aging_hot_criteria是Oracle隐藏参数，定义判断缓冲区是否为“热”的阈值。机制：在替换算法中，若缓冲区触摸计数（touch count）大于此值，则给予另一次机会。默认值为2。影响所有缓冲池。应用场景：用于调优缓冲区缓存替换策略，控制热块的保留程度。配置 kernel config Touch Count Hot Criteria

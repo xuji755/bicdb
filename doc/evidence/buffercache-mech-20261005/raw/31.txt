@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: Touch Count与缓冲区重用
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1541572
+
+  ── 描述 ──
+  文档解释了Buffer Cache的LRU算法并非严格的LRU。缓冲区从列表尾部被重用，但每个缓冲区都有一个`Touch Count`。如果一个缓冲区的Touch
+  Count足够高，它就不会被重用，即使它在列表的尾部。
+
+  ── 摘要 ──
+  Buffer Cache的LRU算法并非严格的最近最少使用策略。缓冲区通常从列表尾部被重用，但每个缓冲区都关联一个Touch Count值。如果某个缓冲区的Touch Count足够高，即使它位于列表尾部，也不会被重用。这一机制通过Touch Count来影响缓冲区的重用决策。

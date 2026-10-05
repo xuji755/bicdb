@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] hash bucket 数量 buffers 比例 每个哈希链 长度 搜索 成本
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 26，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 30，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     PARAMETER:DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES [Hidden] Reference Note Parameter: DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Defined In: kcb.h Versions: See <IVERS.DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES> Values: TRUE/FALSE D
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:33954.1 Init.ora Parameter "_DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES" [Hidden] Reference Note  (排序分: 14.4)
+     └ 摘要：_DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES 是隐藏参数，控制 buffer cache 哈希链闩锁分配。默认 TRUE 时每个哈希链分配独立闩锁，FALSE 则所有更改共用单一闩锁。该参数定义在 kcb.h，与 DB_BLOCK_HASH_BUCKETS 相关，修改值可能导致性能异常，不建。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994391
+
+     [KnowledgeEntry] L1：Note:33393.1 Init.ora Parameter "_DB_BLOCK_HASH_BUCKETS" [Hidden] Reference Note  (排序分: 14.4)
+     └ 摘要：隐藏参数 _DB_BLOCK_HASH_BUCKETS 定义缓冲区缓存中哈希桶或哈希链的数量。SGA 中的缓冲区通过将所需数据块地址（DBA）除以该数量进行哈希，以定位到哈希链，随后扫描该链以查找对应缓冲区。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2048560
+
+     [KnowledgeEntry] L1：Note:33393.1 Init.ora Parameter "_DB_BLOCK_HASH_BUCKETS" [Hidden] Reference Note  (排序分: 14.4)
+     └ 摘要：_DB_BLOCK_HASH_BUCKETS 是隐藏参数，控制 buffer cache 内哈希桶的数量，决定通过哈希 DBA 定位缓冲区所在哈希链的方式。当调整该参数时，会影响链的长度和扫描开销，可用于诊断 buffer cache 哈希冲突、搜索性能瓶颈及缓存命中率问。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043012
+
+     [KnowledgeEntry] L1：Note:33439.1 QREF: The Buffer Cache (Diagram)  (排序分: 14.0)
+     └ 摘要：在Oracle 8i中，缓冲区缓存参考图说明参数DB_BLOCK_BUFFERS和DB_BLOCK_HASH_BUCKETS关联。注释指出“每个哈希链由LATCH保护”不适用，并引用源码kcbz.h的设计：每个latch/bucket结构包含一个指向bucket数组的指针和一个latch，该latch保护这些bu。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996837
+
+     [CaseStudy] 19c RAC ORA-600 [kkshhcdel:wrong-bucket] 案例  (排序分: 9.1)
+     └ 摘要：Oracle 19c (19.9) RAC on Linux执行update SQL时报ORA-600 [kkshhcdel:wrong-bucket]，定位为SQL解析阶段多session并发访问相同游标导致shared pool哈希链查找错误，flush shared pool恢复，与Bug 31213034相似。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2228401
+
+     [FaultModel] cache buffers chains latch竞争  (排序分: 8.6)
+     └ 摘要：cache_buffers_chains_latch_contention：多个进程并发访问同一哈希链的缓冲头导致latch竞争。根因：热点块（如高频数据块、索引根块）使大量进程同时访问同一哈希链。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:322115
+

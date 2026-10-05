@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:33439.1 QREF: The Buffer Cache (Diagram)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996837
+
+  ── 描述 ──
+  Parameter:DB_BLOCK_BUFFERS> <Parameter:DB_BLOCK_HASH_BUCKETS> In 8.i A LATCH protects each hash
+  chain doesn't apply ( see /export/home/ssupport/815/rdbms/src/server/cache/if/kcbz.h ) ** Each
+  latch/bucket structure contains a pointer to an array of ** buckets and a latch. The buckets in this
+  array are protected by ** the latch. Buckets are round-robined across the latches. .
+
+  ── 摘要 ──
+  在Oracle 8i中，缓冲区缓存参考图说明参数DB_BLOCK_BUFFERS和DB_BLOCK_HASH_BUCKETS关联。注释指出“每个哈希链由LATCH保护”不适用，并引用源码kcbz.h的设计：每个latch/bucket结构包含一个指向bucket数组的指针和一个latch，该latch保护这些bu。

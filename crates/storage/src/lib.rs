@@ -37,12 +37,13 @@
 //!   5 MiB，块 1 起连续、永不搬移）、`DATA_AREA_FIRST_BLOCK` = 321、
 //!   `DataFile::extend` = `set_len` + 更新文件头（零复制）、`coverage_limit`
 //!   ≈ 5 TB 覆盖 4 TiB 上限。
-//!   （续）**DB Cache v2**（§5.10 完整设计落地）——哈希桶（质数）+ 热/冷段
-//!   + LRU-AUX + **touch count 三秒规则**、前台找空闲缓冲（AUX 优先 → 冷段尾，
-//!   脏帧交写列表）、**Make Free 内联批处理**（写列表头按序 + WAL 规则 2 +
-//!   写完入 AUX）、统计口径对齐 X$KCBWDS（FBWAIT/FBINSP/DBINSP/PNINSP/
-//!   HOTMVS/AUX_MOV）。
-//!   **DML 写路径随后。**
+//!   （续）**DB Cache v2**（§5.10 完整设计落地）——哈希桶（键对桶数取模、
+//!   桶数取质数）+ 热/冷段 + LRU-AUX + **touch count 三秒规则与老化减半**
+//!   （命中合并窗口 / 减半不立即淘汰）、前台找空闲缓冲（AUX 优先 → 冷段尾）、
+//!   **Make Free 内联批处理**（写列表头按序 + WAL 规则 2 + 写完入 AUX）、
+//!   统计口径对齐 X$KCBWDS。
+//!
+//! **DML 写路径随后。**
 //!
 //! 三条纪律：
 //! 1. **字节序定死小端**（REQ-PRT-003）——磁盘格式不随主机变化；

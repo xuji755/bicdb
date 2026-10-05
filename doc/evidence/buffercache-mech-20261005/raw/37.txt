@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:33393.1 Init.ora Parameter "_DB_BLOCK_HASH_BUCKETS" [Hidden] Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2048560
+
+  ── 描述 ──
+  Init.ora Parameter "_DB_BLOCK_HASH_BUCKETS" [Hidden] Reference Note Description: ~~~~~~~~~~~~ The
+  number of 'hash buckets' or chains in the buffer cache. The buffers in the SGA are located by
+  hashing the required DBA by this number to get to a hash chain. The chain is then scanned for
+  buffers of the required DBA. Articles: ~~~~~~~~~ Overview of Init.Ora Parameter Reference notes Note
+  68462.1 . Copyright © 2006, Oracle. All rights reserved.
+
+  ── 摘要 ──
+  隐藏参数 _DB_BLOCK_HASH_BUCKETS 定义缓冲区缓存中哈希桶或哈希链的数量。SGA 中的缓冲区通过将所需数据块地址（DBA）除以该数量进行哈希，以定位到哈希链，随后扫描该链以查找对应缓冲区。

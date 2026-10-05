@@ -1,0 +1,112 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] DB_BLOCK_HASH_BUCKETS默认值计算
+      文档明确指出，哈希桶的默认数量为 `(DB_BLOCK_BUFFERS x 2)`。这是一个重要的默认值，用于计算内存中哈希桶的数量，影响缓冲区查找效率。可以通过隐藏参数 `_DB_BLOCK_HASH_BUCKETS` 覆盖此默认值。
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] db_block_hash_buckets 内存占用
+      4031 heapdump 显示 db_block_hash_buckets 在三个子池中占比均为 0% 到 2%，属于 buffer cache 哈希桶内存。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:33954.1 Init.ora Parameter "_DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES" [Hidden] Reference Note
+      PARAMETER:DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES
+[Hidden] Reference Note
+Parameter: DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Defined In: kcb.h
+Versions: See <IVERS.DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES>
+Values: TRUE/FALSE Default is TRUE. Change not recommnended
+Related: <Parameter:DB_BLOCK_HASH_BUCKETS>
+Description:
+~~~~~~~~~~~~
+If TRUE use one latch per hash chain
+(vs. one latch for all changes).
+Articles:
+~~~~~~~~~
+Overview of Init.Ora Parameter Reference notes < Note:68462.1 >
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996973
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] shared 池 db_block_hash_buckets 保持 356.00 MB
+      db_block_hash_buckets 是共享池中用于 buffer cache 哈希查找的桶结构。本次 Begin MB 与 End MB 均为 356.00 MB，无变化。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:33954.1 Init.ora Parameter "_DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES" [Hidden] Reference Note
+      PARAMETER:DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES
+[Hidden] Reference Note
+Parameter: DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Defined In: kcb.h
+Versions: See <IVERS.DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES>
+Values: TRUE/FALSE Default is TRUE. Change not recommnended
+Related: <Parameter:DB_BLOCK_HASH_BUCKETS>
+Description:
+~~~~~~~~~~~~
+If TRUE use one latch per hash chain
+(vs. one latch for all changes).
+Articles:
+~~~~~~~~~
+Overview of Init.Ora Parameter Reference notes < Note:68462.1 >
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994391
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed] DB_BLOCK_HASH_BUCKETS
+      DB_BLOCK_HASH_BUCKETS是隐藏参数_DB_BLOCK_HASH_BUCKETS，用于设置数据库块哈希桶数量，默认值为db_block_buffers/4。调整此参数可影响哈希链长度和cache buffers chains latch的争用情况，通常不需要修改。应用场景：仅在诊断或调优latch竞争时考虑，不建议随意调整。配置 config _DB_BLOCK_HASH_BUCKETS Hash buckets cache buffers chains latch
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:153944
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] dpdump 默认 directory 与 expdp/impdp 默认路径
+      文档指出 dpdump 是 Oracle 默认的 directory，可通过 DBA_DIRECTORIES 查看，并作为 expdp、impdp 的默认导出/导入路径。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:33393.1 Init.ora Parameter "_DB_BLOCK_HASH_BUCKETS" [Hidden] Reference Note
+      PARAMETER:DB_BLOCK_HASH_BUCKETS
+Reference Note
+Parameter: DB_BLOCK_HASH_BUCKETS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Oracle8i: HIDDEN
+Identifier: kcbphb
+Versions: See <IVERS.DB_BLOCK_HASH_BUCKETS>
+Values: (Not recommended to be changed without careful benchmarking
+of the effects)
+In Oracle7/8.0 the Default is the next PRIME number above
+'DB_BLOCK_BUFFERS/4'.
+8.1 is different at "db_block_buffers*2" (See <Function:kcbshh> )
+Related:
+<Parameter:DB_BLOCK_BUFFERS>
+<Parameter:DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES>
+Description:
+~~~~~~~~~~~~
+The number of 'hash buckets' or chains in the buffer cache.
+The buffers in the SGA are located by hashing the required DBA
+by this number to get to a hash chain. The chain is then scanned
+for buffers of the required DBA.
+Articles:
+~~~~~~~~~
+Overview of Init.Ora Parameter Reference notes < Note:68462.1 >
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994388
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 默认Schema WKSYS
+      12c之前系统默认Schema，属于安全敏感默认账户。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:33393.1 Init.ora Parameter "_DB_BLOCK_HASH_BUCKETS" [Hidden] Reference Note
+      PARAMETER:DB_BLOCK_HASH_BUCKETS
+Reference Note
+Parameter: DB_BLOCK_HASH_BUCKETS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Oracle8i: HIDDEN
+Identifier: kcbphb
+Versions: See <IVERS.DB_BLOCK_HASH_BUCKETS>
+Values: (Not recommended to be changed without careful benchmarking
+of the effects)
+In Oracle7/8.0 the Default is the next PRIME number above
+'DB_BLOCK_BUFFERS/4'.
+8.1 is different at "db_block_buffers*2" (See <Function:kcbshh> )
+Related:
+<Parameter:DB_BLOCK_BUFFERS>
+<Parameter:DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES>
+Description:
+~~~~~~~~~~~~
+The number of 'hash buckets' or chains in the buffer cache.
+The buffers in the SGA are located by hashing the required DBA
+by this number to get to a hash chain. The chain is then scanned
+for buffers of the required DBA.
+Articles:
+~~~~~~~~~
+Overview of Init.Ora Parameter Reference notes < Note:68462.1 >
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996970
+  🔍 [bic_agent_KnowledgeEntry,SyncEntity] 默认Schema WKPROXY
+      12c之前系统默认Schema，属于安全敏感默认账户。
+  🔍 [bic_agent_KnowledgeEntry,KGV2Managed] L1：Note:33439.1 QREF: The Buffer Cache (Diagram)
+      Parameter:DB_BLOCK_BUFFERS>
+<Parameter:DB_BLOCK_HASH_BUCKETS>
+In 8.i A LATCH protects each hash chain doesn't apply
+( see /export/home/ssupport/815/rdbms/src/server/cache/if/kcbz.h )
+** Each latch/bucket structure contains a pointer to an array of
+** buckets and a latch. The buckets in this array are protected by
+** the latch. Buckets are round-robined across the latches.
+.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997676

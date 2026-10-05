@@ -1,0 +1,17 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KnowledgeEntry,KGV2Managed
+  名称: 1.3 Oracle 8i 新缓冲区替换算法 (Note:104937.1)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:364630
+
+  ── 描述 ──
+  Oracle 8i（8.1.3及以上版本）的Buffer Cache替换算法从传统的LRU改为基于Touch
+  Count（触摸计数）的方案。每个缓冲区拥有tch字段，命中时递增该值，但在dbagingtouchtime秒内的连续命中只计为一次。当需要空闲缓冲区时，DBWR或前台进程扫描寻找低touch
+  count的缓冲区，但不会立即淘汰，而是将其touch
+  count减半（aging）后继续在缓存中循环。该算法通过“触摸计数”和“老化”机制替代了LRU，旨在更高效地管理缓冲区替换。关键变化：Oracle 8i (8.1.3+) 的Buffer
+  Cache替换算法不再是基于LRU，而是基于"Touch Count"（触摸计数/时钟频率）方案。工作原理： 1. 每个缓冲区有一个 tch（touch count）字段 2.
+  每次命中时增加touch count 3. 过于接近的命中（在 dbagingtouchtime 秒内）只计为1次 4. 当需要空闲缓冲区时，DBWR/前台进程扫描查找低touch count的缓冲区
+  5. 缓冲区不会被立即淘汰，而是touch count被减半（aging），然后继续在cache中循环 与官方文档对比： - 官方Concepts提到的是...
+
+  ── 摘要 ──
+  Oracle 8i（8.1.3及以上版本）的Buffer Cache替换算法从传统的LRU改为基于Touch Count（触摸计数）的方案。每个缓冲区拥有tch字段，命中时递增该值，但在dbagingtouchtime秒内的连续命中只计为一次。当需要空闲缓冲区时，DBWR或前台进程扫描寻找低touch count的缓冲区，但不会立即淘汰，而是将其touch count减半（aging）后继续在缓存中循环。该算法通过“触摸计数”和“老化”机制替代了LRU，旨在更高效地管理缓冲区替换。

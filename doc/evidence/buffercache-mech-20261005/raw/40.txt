@@ -1,0 +1,16 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:33954.1 Init.ora Parameter "_DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES" [Hidden] Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994391
+
+  ── 描述 ──
+  PARAMETER:DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES [Hidden] Reference Note Parameter:
+  DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Defined In: kcb.h
+  Versions: See <IVERS.DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES> Values: TRUE/FALSE Default is TRUE. Change
+  not recommnended Related: <Parameter:DB_BLOCK_HASH_BUCKETS> Description: ~~~~~~~~~~~~ If TRUE use
+  one latch per hash chain (vs. one latch for all changes). Articles: ~~~~~~~~~ Overview of Init.Ora
+  Parameter Reference notes < Note:68462.1 >
+
+  ── 摘要 ──
+  _DB_BLOCK_MULTIPLE_HASHCHAIN_LATCHES 是隐藏参数，控制 buffer cache 哈希链闩锁分配。默认 TRUE 时每个哈希链分配独立闩锁，FALSE 则所有更改共用单一闩锁。该参数定义在 kcb.h，与 DB_BLOCK_HASH_BUCKETS 相关，修改值可能导致性能异常，不建。
