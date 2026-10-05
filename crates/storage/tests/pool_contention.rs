@@ -159,8 +159,14 @@ fn pool_paths_contention() {
             lc.sleep_ratio,
             lc.spin_success
         );
-        println!("| B 同块 `pin`（内容锁独占） | {threads} | {:.1} | — |", b / 1e4);
-        println!("| C 同块 `pin_shared`（内容锁共享） | {threads} | {:.1} | — |", c / 1e4);
+        println!(
+            "| B 同块 `pin`（内容锁独占） | {threads} | {:.1} | — |",
+            b / 1e4
+        );
+        println!(
+            "| C 同块 `pin_shared`（内容锁共享） | {threads} | {:.1} | — |",
+            c / 1e4
+        );
     }
     // D：分区数的影响（不同块 pin，4 分区）。
     for threads in [8usize, 32] {
@@ -179,6 +185,9 @@ fn pool_paths_contention() {
             }
             n
         });
-        println!("| D 不同块 `pin`（4 分区同哈希） | {threads} | {:.1} | — |", d / 1e4);
+        println!(
+            "| D 不同块 `pin`（4 分区同哈希） | {threads} | {:.1} | — |",
+            d / 1e4
+        );
     }
 }
