@@ -207,11 +207,9 @@ pub fn insert_record(
     if row.len() < ROW_HEADER_FIXED_LEN {
         return Err(HeapError::BadRow);
     }
-    let declared = usize::from(
-        RowHeader::read_from(row)
-            .map_err(|_| HeapError::BadRow)?
-            .row_len,
-    );
+    let declared = RowHeader::read_from(row)
+        .map_err(|_| HeapError::BadRow)?
+        .row_len as usize;
     if declared != row.len() {
         return Err(HeapError::BadRow);
     }
@@ -259,7 +257,7 @@ pub fn row(page: &Page, row_no: u16) -> Option<&[u8]> {
     let start = usize::from(slot.offset());
     let bytes = page.as_bytes();
     let header = RowHeader::read_from(bytes.get(start..)?).ok()?;
-    let len = usize::from(header.row_len);
+    let len = header.row_len as usize;
     let end = start.checked_add(len)?;
     if end > PAGE_SIZE {
         return None;
@@ -308,11 +306,11 @@ pub fn defrag(page: &mut Page) -> Result<usize, HeapError> {
         let bytes = page.as_bytes();
         let len = match slot.status() {
             SlotStatus::Forwarding => crate::rowid::ROWID_LEN,
-            _ => usize::from(
+            _ => {
                 RowHeader::read_from(bytes.get(start..).ok_or(HeapError::BadRow)?)
                     .map_err(|_| HeapError::BadRow)?
-                    .row_len,
-            ),
+                    .row_len as usize
+            }
         };
         let end = start.checked_add(len).ok_or(HeapError::BadRow)?;
         if end > PAGE_SIZE {
@@ -606,12 +604,12 @@ mod tests {
         let mut page = Page::new(PageType::HeapTable, [1; 8], 1, 1);
         let free = page.free_space();
         let reserve = InsertPolicy::in_place(10).reserved_bytes();
-        // 行开销 = 行头 10 + 位图 1 + 偏移 2 = 13；槽位另占 2。
+        // 行开销 = 行头 12 + 位图 1 + 偏移 4 = 17；槽位另占 2。
         // 取一行使其"无预留下可容纳、10% 预留下放不下"。
-        let payload_len = free - reserve - SLOT_ENTRY_LEN - 13 + 1;
-        debug_assert!(13 + payload_len + SLOT_ENTRY_LEN + reserve > free);
+        let payload_len = free - reserve - SLOT_ENTRY_LEN - 17 + 1;
+        debug_assert!(17 + payload_len + SLOT_ENTRY_LEN + reserve > free);
         let big = tiny_row(&vec![0u8; payload_len]);
-        assert_eq!(big.len(), 13 + payload_len);
+        assert_eq!(big.len(), 17 + payload_len);
 
         assert!(can_insert(&page, big.len(), &InsertPolicy::in_place(0)));
         assert!(!can_insert(&page, big.len(), &InsertPolicy::in_place(10)));

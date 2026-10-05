@@ -19,7 +19,7 @@
 //!
 //! 从头片段沿 `next` 收集数据段直到链尾，拼接后回填整行长度。
 //! 三条把守：**环检测**（访问过的 ROWID 集合）、**总长有界**
-//! （≤ `u16::MAX`）、**片段自洽**（每片 `row_len` == 自身字节数）。
+//! （≤ `MAX_ROW_LEN`，且 ≤ 64 片）、**片段自洽**（每片 `row_len` == 自身字节数）。
 //! 更新路径（就地转链 / 收缩回收）属 P3 事务域。
 
 use std::collections::HashSet;
@@ -93,7 +93,7 @@ pub fn insert_row(
     // 在这里就被拒绝；只核 `row_len` 会在下面的 `[header_len..]` 越界 panic）。
     RowView::new(encoded_row)?;
     let header = RowHeader::read_from(encoded_row)?;
-    if usize::from(header.row_len) != encoded_row.len() {
+    if header.row_len as usize != encoded_row.len() {
         return Err(FragmentError::Row(RowError::LengthMismatch));
     }
     if heap.fits_one_page(encoded_row.len(), policy) {
@@ -139,7 +139,7 @@ pub fn insert_row(
         let mut frag = Vec::with_capacity(FRAGMENT_HEADER_LEN + take);
         frag.push(row::row_flags::FRAGMENT);
         frag.push(row::ITL_SLOT_NONE);
-        let len = (FRAGMENT_HEADER_LEN + take) as u16;
+        let len = (FRAGMENT_HEADER_LEN + take) as u32;
         frag.extend_from_slice(&len.to_le_bytes());
         frag.extend_from_slice(&[0u8; ROWID_LEN]); // 下一片段占位
         frag.extend_from_slice(&data[..take]);
@@ -178,13 +178,13 @@ pub fn read_row(heap: &Heap, head: RowId) -> Result<Vec<u8>, FragmentError> {
         let bytes = heap.get(id).ok_or(FragmentError::BrokenChain)?;
         let view = FragmentView::new(bytes)?;
         out.extend_from_slice(view.data());
-        if out.len() > usize::from(u16::MAX) {
+        if out.len() > row::MAX_ROW_LEN {
             return Err(FragmentError::BrokenChain);
         }
         next = view.next();
     }
-    let total = out.len() as u16;
-    out[2..4].copy_from_slice(&total.to_le_bytes());
+    let total = out.len() as u32;
+    out[2..6].copy_from_slice(&total.to_le_bytes());
     out[0] &= !(row::row_flags::FRAGMENT | row::row_flags::FRAGMENT_HEAD); // 逻辑行不是片段
     Ok(out)
 }
@@ -220,8 +220,8 @@ fn pick_page(
 
 /// 把片段记录的 `row_len` 改为它自身长度（头片段写完后调用）。
 fn set_own_row_len(fragment: &mut [u8]) {
-    let len = fragment.len() as u16;
-    fragment[2..4].copy_from_slice(&len.to_le_bytes());
+    let len = fragment.len() as u32;
+    fragment[2..6].copy_from_slice(&len.to_le_bytes());
 }
 
 #[cfg(test)]
@@ -241,6 +241,44 @@ mod tests {
         let id = insert_row(&mut heap, &row, &InsertPolicy::append_only()).unwrap();
         assert_eq!(heap.get(id), Some(&row[..]), "直接以普通行存放");
         assert_eq!(heap.page_count(), 1);
+    }
+
+    #[test]
+    fn nearly_one_mib_row_roundtrips_across_the_chain() {
+        // **#38 定案（扩格式到 1 MiB）**：整行长度与变长偏移升为 4B。
+        // 600 KiB 的行（远超旧 64 KiB 上限）经 64 片以内的片段链写入/重组，
+        // 逐字节往返一致；行头的 `row_len` 在链上是"片段自身长度"、
+        // 重组后回填为整行长度。
+        let policy = InsertPolicy::append_only();
+        let mut heap = Heap::new([8; 8], policy);
+        let payload = big_row(600 * 1024);
+        assert!(payload.len() > usize::from(u16::MAX), "超过旧 2B 上限");
+        let id = insert_row(&mut heap, &payload, &policy).unwrap();
+        let back = read_row(&heap, id).unwrap();
+        assert_eq!(back.len(), payload.len());
+        assert_eq!(back, payload, "600 KiB 行逐字节往返");
+        let view = crate::row::RowView::new(&back).unwrap();
+        assert_eq!(view.header().row_len as usize, payload.len());
+        assert_eq!(view.var_column(0, 0).unwrap().len(), 600 * 1024);
+    }
+
+    #[test]
+    fn row_over_the_hard_cap_is_rejected() {
+        // 硬上限 `MAX_ROW_LEN` = 1 MiB（行层）——再大即 `TooLong`；
+        // 而 1 MiB 以内的行即使超 64 片也只会得到 `TooManyFragments`
+        // （两种错误都"写入时报"，不读到一半才发现）。
+        assert!(matches!(
+            assemble_row(0, 0, &[false], &[], &[&vec![0u8; row::MAX_ROW_LEN][..]]),
+            Err(crate::row::RowError::TooLong { .. })
+        ));
+        let policy = InsertPolicy::append_only();
+        let mut heap = Heap::new([9; 8], policy);
+        // 约 1 MiB 的载荷：行层允许，但片数超 64 ⇒ 片段层拒绝。
+        let payload = big_row(row::MAX_ROW_LEN - row::ROW_HEADER_FIXED_LEN - 8);
+        assert!(matches!(
+            insert_row(&mut heap, &payload, &policy),
+            Err(FragmentError::TooManyFragments { .. })
+        ));
     }
 
     #[test]

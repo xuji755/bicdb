@@ -5,16 +5,16 @@
 //! 完整行（普通行；碎片行重组后同形）：
 //!   偏移 0  1B  row_flags      位 0 已删除 / 位 1 已迁移 / 位 2 片段 / 3–7 保留
 //!   偏移 1  1B  itl_slot       指向本页 ITL 槽索引；0xFF = 无
-//!   偏移 2  2B  row_len        含行头（**每条片段记录 = 片段自身长度**）
-//!   偏移 4  2B  col_count
-//!   偏移 6  2B  null_bitmap_len
-//!   偏移 8  2B  var_col_count
-//!   偏移 10 nB  null_bitmap    位 i = 第 i 列是 NULL（LSB 在前）
-//!         2mB  var_offsets     各变长列起始偏移（相对**变长数据区**起点），单调不减
+//!   偏移 2  4B  row_len        含行头（**每条片段记录 = 片段自身长度**）
+//!   偏移 6  2B  col_count
+//!   偏移 8  2B  null_bitmap_len
+//!   偏移 10 2B  var_col_count
+//!   偏移 12 nB  null_bitmap    位 i = 第 i 列是 NULL（LSB 在前）
+//!         4mB  var_offsets     各变长列起始偏移（相对**变长数据区**起点），单调不减
 //!            列数据            定长列在前、变长列在后
 //!
 //! 头片段：完整行头 + 下一片段 ROWID 6B + 数据第 1 段
-//! 中/尾片段：短行头 10B（row_flags │ itl_slot │ row_len │ 下一片段 ROWID）+ 数据段
+//! 中/尾片段：短行头 12B（row_flags │ itl_slot │ row_len │ 下一片段 ROWID）+ 数据段
 //! 转发指针：槽位状态 = 2，行体**只有 6 字节**新 ROWID（无行头）
 //! ```
 //!
@@ -39,10 +39,21 @@
 use crate::rowid::{RowId, ROWID_LEN};
 
 /// 行头固定部分长度。
-pub const ROW_HEADER_FIXED_LEN: usize = 10;
+pub const ROW_HEADER_FIXED_LEN: usize = 12;
 
 /// 片段短行头长度（含下一片段 ROWID）。
-pub const FRAGMENT_HEADER_LEN: usize = 10;
+pub const FRAGMENT_HEADER_LEN: usize = 12;
+
+/// **整行长度硬上限**（`row_len` 为 4B，这里取 1 MiB 作为格式自身上界；
+/// 有效上限更小——受 `MAX_FRAGMENTS = 64` 的片段链约束，实测 ≈ 1.04 MB×……见
+/// `fragment::MAX_FRAGMENTS` 与 §6.8；超长值的设计出口是 `ASSET_REF`，§6.6）。
+pub const MAX_ROW_LEN: usize = 1 << 20;
+
+/// `row_len` 字段宽度（字节）。
+pub const ROW_LEN_LEN: usize = 4;
+
+/// 变长列偏移项的宽度（字节；4B——行可达 1 MB 级）。
+pub const VAR_OFFSET_LEN: usize = 4;
 
 /// 转发指针长度（行体只有新 ROWID）。
 pub const FORWARDING_LEN: usize = ROWID_LEN;
@@ -80,7 +91,7 @@ pub enum RowError {
     BadVarOffsets,
     /// 片段链指针不允许出现在该形态上（或缺失）。
     BadFragmentChain,
-    /// **行超过行长上限**（`row_len` 为 2B、变长偏移亦为 2B——格式上限 65535B）。
+    /// **行超过行长上限**（[`MAX_ROW_LEN`] = 1 MiB）。
     /// 超长值的设计出口是 `ASSET_REF`（§6.6），不是更长的行。
     TooLong {
         /// 实际长度（字节）。
@@ -96,7 +107,7 @@ impl std::fmt::Display for RowError {
             RowError::BadNullBitmapLen => "NULL 位图长度非规范",
             RowError::BadVarOffsets => "变长列偏移数组非规范",
             RowError::BadFragmentChain => "片段链指针缺失或非法",
-            RowError::TooLong { .. } => "行超过 64 KiB 上限（row_len 为 2B）",
+            RowError::TooLong { .. } => "行超过行长上限（1 MiB）",
         })
     }
 }
@@ -110,8 +121,8 @@ pub struct RowHeader {
     pub flags: u8,
     /// `itl_slot`（[`ITL_SLOT_NONE`] = 无）。
     pub itl_slot: u8,
-    /// 行长（含行头；碎片行 = 整行长度）。
-    pub row_len: u16,
+    /// 行长（含行头；每条片段记录 = **片段自身长度**，重组后 = 整行长度）。
+    pub row_len: u32,
     /// 列数。
     pub col_count: u16,
     /// NULL 位图字节数。
@@ -136,20 +147,20 @@ impl RowHeader {
     /// 列数据区起点（定长列在前）。
     #[must_use]
     pub fn data_start(&self) -> usize {
-        self.var_offsets_start() + 2 * self.var_col_count as usize
+        self.var_offsets_start() + VAR_OFFSET_LEN * self.var_col_count as usize
     }
 
-    /// 写入行头（前 10 字节）。
+    /// 写入行头固定部分。
     pub fn write_into(&self, out: &mut [u8]) {
         out[0] = self.flags;
         out[1] = self.itl_slot;
-        out[2..4].copy_from_slice(&self.row_len.to_le_bytes());
-        out[4..6].copy_from_slice(&self.col_count.to_le_bytes());
-        out[6..8].copy_from_slice(&self.null_bitmap_len.to_le_bytes());
-        out[8..10].copy_from_slice(&self.var_col_count.to_le_bytes());
+        out[2..6].copy_from_slice(&self.row_len.to_le_bytes());
+        out[6..8].copy_from_slice(&self.col_count.to_le_bytes());
+        out[8..10].copy_from_slice(&self.null_bitmap_len.to_le_bytes());
+        out[10..12].copy_from_slice(&self.var_col_count.to_le_bytes());
     }
 
-    /// 读出前 10 字节。
+    /// 读出固定部分。
     pub fn read_from(bytes: &[u8]) -> Result<Self, RowError> {
         if bytes.len() < ROW_HEADER_FIXED_LEN {
             return Err(RowError::Truncated);
@@ -157,10 +168,10 @@ impl RowHeader {
         Ok(Self {
             flags: bytes[0],
             itl_slot: bytes[1],
-            row_len: u16::from_le_bytes(bytes[2..4].try_into().expect("2 字节")),
-            col_count: u16::from_le_bytes(bytes[4..6].try_into().expect("2 字节")),
-            null_bitmap_len: u16::from_le_bytes(bytes[6..8].try_into().expect("2 字节")),
-            var_col_count: u16::from_le_bytes(bytes[8..10].try_into().expect("2 字节")),
+            row_len: u32::from_le_bytes(bytes[2..6].try_into().expect("4 字节")),
+            col_count: u16::from_le_bytes(bytes[6..8].try_into().expect("2 字节")),
+            null_bitmap_len: u16::from_le_bytes(bytes[8..10].try_into().expect("2 字节")),
+            var_col_count: u16::from_le_bytes(bytes[10..12].try_into().expect("2 字节")),
         })
     }
 }
@@ -179,7 +190,7 @@ impl<'a> RowView<'a> {
     /// 见 [`RowView::validate_var_offsets`]。
     pub fn new(bytes: &'a [u8]) -> Result<Self, RowError> {
         let header = RowHeader::read_from(bytes)?;
-        if usize::from(header.row_len) != bytes.len() {
+        if header.row_len as usize != bytes.len() {
             return Err(RowError::LengthMismatch);
         }
         if header.null_bitmap_len != 0
@@ -258,9 +269,9 @@ impl<'a> RowView<'a> {
             return None;
         }
         let area = self.var_area(fixed_len)?;
-        let start = usize::from(self.var_offset(i)?);
+        let start = self.var_offset(i)? as usize;
         let end = if i + 1 < self.header.var_col_count as usize {
-            usize::from(self.var_offset(i + 1)?)
+            self.var_offset(i + 1)? as usize
         } else {
             area.len()
         };
@@ -274,13 +285,13 @@ impl<'a> RowView<'a> {
             return Ok(());
         }
         let area = self.var_area(fixed_len).ok_or(RowError::Truncated)?;
-        let mut prev = 0u16;
+        let mut prev = 0u32;
         for i in 0..m {
             let off = self.var_offset(i).ok_or(RowError::Truncated)?;
             if i == 0 && off != 0 {
                 return Err(RowError::BadVarOffsets);
             }
-            if off < prev || usize::from(off) > area.len() {
+            if off < prev || off as usize > area.len() {
                 return Err(RowError::BadVarOffsets);
             }
             prev = off;
@@ -288,10 +299,10 @@ impl<'a> RowView<'a> {
         Ok(())
     }
 
-    fn var_offset(&self, i: usize) -> Option<u16> {
-        let at = self.header.var_offsets_start() + 2 * i;
-        let raw = self.bytes.get(at..at + 2)?;
-        Some(u16::from_le_bytes(raw.try_into().expect("2 字节")))
+    fn var_offset(&self, i: usize) -> Option<u32> {
+        let at = self.header.var_offsets_start() + VAR_OFFSET_LEN * i;
+        let raw = self.bytes.get(at..at + VAR_OFFSET_LEN)?;
+        Some(u32::from_le_bytes(raw.try_into().expect("4 字节")))
     }
 }
 
@@ -313,7 +324,7 @@ impl<'a> HeadFragment<'a> {
         if header.flags & row_flags::FRAGMENT == 0 {
             return Err(RowError::BadFragmentChain);
         }
-        if usize::from(header.row_len) != bytes.len() {
+        if header.row_len as usize != bytes.len() {
             return Err(RowError::LengthMismatch);
         }
         if header.data_start() + ROWID_LEN > bytes.len() {
@@ -365,8 +376,8 @@ impl<'a> FragmentView<'a> {
         if bytes.len() < FRAGMENT_HEADER_LEN {
             return Err(RowError::Truncated);
         }
-        let row_len = u16::from_le_bytes(bytes[2..4].try_into().expect("2 字节"));
-        if usize::from(row_len) != bytes.len() {
+        let row_len = u32::from_le_bytes(bytes[2..6].try_into().expect("4 字节"));
+        if row_len as usize != bytes.len() {
             return Err(RowError::LengthMismatch);
         }
         if bytes[0] & row_flags::FRAGMENT == 0 {
@@ -421,9 +432,9 @@ pub fn forwarding_pointer(bytes: &[u8]) -> Result<RowId, RowError> {
 /// `nulls` 按列序给出（`true` = 该列 NULL，其数据不得出现在
 /// `fixed_data` / `var_columns` 中）。
 ///
-/// **长度受格式上限约束**（§6.1）：`row_len` 与变长列偏移都是 2B ⇒ 整行
-/// 与变长区都必须 ≤ 65535B；超限返回 [`RowError::TooLong`]（**不截断、
-/// 不回绕**——超长值的设计出口是 `ASSET_REF`，§6.6）。
+/// **长度受格式上限约束**（§6.1）：整行 ≤ [`MAX_ROW_LEN`]（1 MiB；有效上限
+/// 还受 64 片片段链约束，§6.3/§6.8）；超限返回 [`RowError::TooLong`]
+/// （**不截断、不回绕**——超长值的设计出口是 `ASSET_REF`，§6.6）。
 pub fn assemble_row(
     flags: u8,
     itl_slot: u8,
@@ -437,17 +448,17 @@ pub fn assemble_row(
     let var_area_len: usize = var_columns.iter().map(|c| c.len()).sum();
     let row_len = ROW_HEADER_FIXED_LEN
         + bitmap_len as usize
-        + 2 * var_columns.len()
+        + VAR_OFFSET_LEN * var_columns.len()
         + fixed_data.len()
         + var_area_len;
-    if row_len > usize::from(u16::MAX) {
+    if row_len > MAX_ROW_LEN {
         return Err(RowError::TooLong { len: row_len });
     }
 
     let header = RowHeader {
         flags,
         itl_slot,
-        row_len: row_len as u16,
+        row_len: row_len as u32,
         col_count,
         null_bitmap_len: bitmap_len,
         var_col_count,
@@ -461,14 +472,14 @@ pub fn assemble_row(
     }
     let mut acc: usize = 0;
     for (i, col) in var_columns.iter().enumerate() {
-        let at = header.var_offsets_start() + 2 * i;
-        // 变长列偏移也是 2B：任一项超限即整体拒绝（上界检查已保证累计不越）。
-        if acc > usize::from(u16::MAX) {
+        let at = header.var_offsets_start() + VAR_OFFSET_LEN * i;
+        // 偏移项 4B；上界检查已保证累计不越（仍在 MAX_ROW_LEN 内）。
+        if acc > MAX_ROW_LEN {
             return Err(RowError::TooLong {
                 len: acc + col.len(),
             });
         }
-        out[at..at + 2].copy_from_slice(&(acc as u16).to_le_bytes());
+        out[at..at + VAR_OFFSET_LEN].copy_from_slice(&(acc as u32).to_le_bytes());
         acc += col.len();
     }
     let mut at = header.data_start();
@@ -496,13 +507,13 @@ pub fn reassemble_row(head: &[u8], rest: &[&[u8]]) -> Result<Vec<u8>, RowError> 
         let view = FragmentView::new(frag)?;
         out.extend_from_slice(view.data());
     }
-    if out.len() > usize::from(u16::MAX) {
+    if out.len() > MAX_ROW_LEN {
         return Err(RowError::TooLong { len: out.len() });
     }
     // 回填整行长度（头片段的 row_len 是片段自身的），
     // 并清除 `FRAGMENT` 位——该位描述"页内记录是片段"，重组后的逻辑行不是。
-    let total = out.len() as u16;
-    out[2..4].copy_from_slice(&total.to_le_bytes());
+    let total = out.len() as u32;
+    out[2..6].copy_from_slice(&total.to_le_bytes());
     out[0] &= !(row_flags::FRAGMENT | row_flags::FRAGMENT_HEAD);
     Ok(out)
 }
@@ -579,12 +590,12 @@ mod tests {
         );
         // 位图长度非规范。
         let mut bad = row.clone();
-        bad[6..8].copy_from_slice(&5u16.to_le_bytes());
+        bad[8..10].copy_from_slice(&5u16.to_le_bytes());
         assert!(RowView::new(&bad).is_err());
         // 偏移数组首项非 0。
         let mut bad = row.clone();
         let at = ROW_HEADER_FIXED_LEN + 1;
-        bad[at..at + 2].copy_from_slice(&3u16.to_le_bytes());
+        bad[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
         assert_eq!(
             RowView::new(&bad)
                 .unwrap()
@@ -595,8 +606,8 @@ mod tests {
         // 偏移越过数据区。
         let row2 = assemble_row(0, 0, &[false], &[], &[b"a", b"bc"]).unwrap();
         let mut bad2 = row2.clone();
-        let o1 = ROW_HEADER_FIXED_LEN + 1 + 2;
-        bad2[o1..o1 + 2].copy_from_slice(&999u16.to_le_bytes());
+        let o1 = ROW_HEADER_FIXED_LEN + 1 + 4;
+        bad2[o1..o1 + 4].copy_from_slice(&999u32.to_le_bytes());
         assert_eq!(
             RowView::new(&bad2).unwrap().validate_var_offsets(0).err(),
             Some(RowError::BadVarOffsets)
@@ -623,21 +634,21 @@ mod tests {
         head.extend_from_slice(&next.to_bytes());
         head.extend_from_slice(chunk1);
         // 头片段的 row_len = 本片段长度。
-        let head_len = head.len() as u16;
-        head[2..4].copy_from_slice(&head_len.to_le_bytes());
+        let head_len = head.len() as u32;
+        head[2..6].copy_from_slice(&head_len.to_le_bytes());
 
         let mut mid = Vec::new();
         mid.push(row_flags::FRAGMENT);
         mid.push(3u8);
-        mid.extend_from_slice(&0u16.to_le_bytes()); // 占位，稍后修正
+        mid.extend_from_slice(&0u32.to_le_bytes()); // 占位，稍后修正
         mid.extend_from_slice(&[0u8; ROWID_LEN]); // 链尾
         mid.extend_from_slice(chunk2);
-        let mid_len = mid.len() as u16;
-        mid[2..4].copy_from_slice(&mid_len.to_le_bytes());
+        let mid_len = mid.len() as u32;
+        mid[2..6].copy_from_slice(&mid_len.to_le_bytes());
 
         // 头片段：row_len = 自身长度；`RowView` 同样可解析（与普通行同规）。
         let hf = HeadFragment::new(&head).expect("头片段可解析");
-        assert_eq!(usize::from(hf.header().row_len), head.len());
+        assert_eq!(hf.header().row_len as usize, head.len());
         assert_eq!(
             RowView::new(&head).unwrap().header().row_len as usize,
             head.len()
@@ -648,7 +659,7 @@ mod tests {
         // ——位图与偏移数组描述的是**整行**（列元数据只在头片段）。
         let hb = hf.header_bytes();
         assert_eq!(hb.len(), data_start);
-        assert_eq!(&hb[4..], &full[4..data_start], "列/位图/偏移元数据一致");
+        assert_eq!(&hb[6..], &full[6..data_start], "列/位图/偏移元数据一致");
         assert_eq!(hb[0], full[0] | row_flags::FRAGMENT, "仅置片段位");
         assert_eq!(hb[1], full[1]);
 
@@ -692,20 +703,25 @@ mod tests {
     }
 
     #[test]
-    fn assemble_row_rejects_rows_over_64k() {
-        // 审核修复回归（F3）：`row_len` 与变长偏移都是 2B ⇒ 超限**明确报错**
-        // （旧行为：row_len 静默截断、偏移累加 debug panic / release 回绕）。
-        let big = vec![0u8; 70000];
+    fn assemble_row_rejects_rows_over_one_mib() {
+        // **#38 定案（扩格式到 1 MiB）**：`row_len` 与变长偏移都是 4B，
+        // 硬上限 `MAX_ROW_LEN` = 1 MiB；超限**明确报错**（不截断、不回绕）。
+        let big = vec![0u8; MAX_ROW_LEN + 1];
         assert!(matches!(
             assemble_row(0, 1, &[false], &[], &[big.as_slice()]),
             Err(RowError::TooLong { .. })
         ));
         // 两列各自不大、合计越界：同样拒绝（不是只查单列）。
-        let a = vec![0u8; 40000];
-        let b = vec![0u8; 40000];
+        let a = vec![0u8; MAX_ROW_LEN / 2 + 1];
+        let b = vec![0u8; MAX_ROW_LEN / 2 + 1];
         assert!(matches!(
             assemble_row(0, 1, &[], &[], &[a.as_slice(), b.as_slice()]),
             Err(RowError::TooLong { .. })
         ));
+        // **1 MiB 减一行头**可以组装（2B 时代不可能）——偏移项 4B 生效。
+        let ok = assemble_row(0, 1, &[false], &[], &[&vec![7u8; MAX_ROW_LEN / 2][..]]).unwrap();
+        assert_eq!(ok.len(), MAX_ROW_LEN / 2 + ROW_HEADER_FIXED_LEN + 1 + 4);
+        let v = RowView::new(&ok).unwrap();
+        assert!(v.var_column(0, 0).unwrap().iter().all(|&b| b == 7));
     }
 }

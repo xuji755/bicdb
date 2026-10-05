@@ -546,7 +546,7 @@ pub enum UndoPayload {
         /// 行头里原来的 `itl_slot` 字节。
         old_itl_slot: u8,
         /// 变更段的前像列表：（行内偏移, 旧值）。
-        patches: Vec<(u16, Vec<u8>)>,
+        patches: Vec<(u32, Vec<u8>)>,
     },
     /// 转发指针更新：旧的转发目标。
     Forward(RowId),
@@ -600,7 +600,7 @@ impl UndoRecord {
                 out.push(*old_itl_slot);
                 for (off, old) in patches {
                     out.extend_from_slice(&off.to_le_bytes());
-                    out.extend_from_slice(&(old.len() as u16).to_le_bytes());
+                    out.extend_from_slice(&(old.len() as u32).to_le_bytes());
                     out.extend_from_slice(old);
                 }
             }
@@ -657,12 +657,18 @@ impl UndoRecord {
                 let mut patches = Vec::new();
                 let mut at = 1usize;
                 while at < body.len() {
-                    if at + 4 > body.len() {
+                    if at + 8 > body.len() {
                         return Err(UndoError::MalformedRecord);
                     }
-                    let off = u16::from_le_bytes([body[at], body[at + 1]]);
-                    let len = usize::from(u16::from_le_bytes([body[at + 2], body[at + 3]]));
-                    at += 4;
+                    let off =
+                        u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+                    let len = u32::from_le_bytes([
+                        body[at + 4],
+                        body[at + 5],
+                        body[at + 6],
+                        body[at + 7],
+                    ]) as usize;
+                    at += 8;
                     if at + len > body.len() {
                         return Err(UndoError::MalformedRecord);
                     }
@@ -1427,7 +1433,7 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
             }
             let base = usize::from(entry.offset());
             for (off, old) in patches {
-                let at = base + usize::from(*off);
+                let at = base + *off as usize;
                 if at + old.len() > crate::page::PAGE_SIZE || at < base {
                     return Err(RollbackError::Undo(UndoError::MalformedRecord));
                 }

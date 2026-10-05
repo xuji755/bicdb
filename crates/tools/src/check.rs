@@ -666,7 +666,7 @@ mod tests {
         let mid = head.next().expect("碎片行有中片段");
         // 链首的 next 清空 → 后续片段不可达；中片段自指成环。
         heap.patch_record(id, head_len, &[0u8; 6]).unwrap();
-        heap.patch_record(mid, 4, &mid.to_bytes()).unwrap(); // 中片段 next 在偏移 4
+        heap.patch_record(mid, 6, &mid.to_bytes()).unwrap(); // 中片段 next 在偏移 6（短行头 12B：flags│itl│row_len 4B│next 6B）
 
         let report = check_heap(&heap);
         assert!(

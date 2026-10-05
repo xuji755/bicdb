@@ -301,7 +301,7 @@ pub fn update_row(
     // 新行必须是**结构合法**的完整行（等长之外还要行头自洽）——否则写进读不回。
     let header = bicdb_storage::row::RowHeader::read_from(new_row)
         .map_err(|_| TxnError::Heap(HeapError::BadRow))?;
-    if usize::from(header.row_len) != new_row.len() {
+    if header.row_len as usize != new_row.len() {
         return Err(TxnError::Heap(HeapError::BadRow));
     }
     // 占用 ITL 条目（同 delete：此前空槽上什么都不写，是可见性缺陷的落点）。
@@ -344,7 +344,7 @@ pub fn update_row(
 }
 
 /// 行内连续差异段（（行内偏移, 旧值）列表）。
-fn row_patches(old: &[u8], new: &[u8]) -> Vec<(u16, Vec<u8>)> {
+fn row_patches(old: &[u8], new: &[u8]) -> Vec<(u32, Vec<u8>)> {
     let mut patches = Vec::new();
     let mut start: Option<usize> = None;
     for i in 0..old.len().min(new.len()) {
@@ -353,11 +353,11 @@ fn row_patches(old: &[u8], new: &[u8]) -> Vec<(u16, Vec<u8>)> {
                 start = Some(i);
             }
         } else if let Some(s) = start.take() {
-            patches.push((s as u16, old[s..i].to_vec()));
+            patches.push((s as u32, old[s..i].to_vec()));
         }
     }
     if let Some(s) = start {
-        patches.push((s as u16, old[s..old.len()].to_vec()));
+        patches.push((s as u32, old[s..old.len()].to_vec()));
     }
     patches
 }
