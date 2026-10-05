@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: Working Set（kcbwbl）与LRU/LRU-W/LRU-AUX链
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257632
+
+  ── 描述 ──
+  Working Set是DB Cache的内部工作组，目的是提高DB Cache刷新性能。每个WS拥有独立的LRU、LRU-W、LRU-
+  AUX链和闩锁；不同WS由DBWR进程维护，一个DBWR可管理一个或多个WS。kcbwbl中的统计信息包括前台读取Buffer/空Buffer申请/DBWR写扫描计数、free buffer
+  waits、write complete waits、buffer busy waits、Free/Dirty/Pinned Buffers Inspected、DB Block
+  Changes/gets、Consistent gets、物理读写、前台扫描深度、脏数据最大比例等，这些统计信息可在AWR报告中看到。
+
+  ── 摘要 ──
+  Oracle将DB Cache划分为多个Working Set（WS），每个WS管理一部分DB Cache并由独立LRU链和闩锁维护；kcbwbl保存WS的LRU/LRU-AUX链信息、冷端BH、热块占比、对象HASH表指针及各类buffer访问/等待统计。

@@ -1,0 +1,16 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:33441.1 QREF: Buffer Handle State Object
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995610
+
+  ── 描述 ──
+  03fbec FLG: 1 ==> (CR) Shown if this was a Consistent Get (recovery) KCBBFFRCV this is begin/end
+  recovery s.o. (Exclusive Wait) We are waiting exclusive. (IO failure) Recovery failure ==> PR:
+  kcbbfph FLG: These flags are used only if this is a recovery s.o. KCBBFRRB 0x01 repair media corrupt
+  blocks KCBBFRIR 0x02 instance recovery kcbbfbh Buffer that may need lock releas kcbbfbp BH=pointer
+  to buffer we are hung off LINK=chain to hang this so off BUFFER HEADER See < Note:33436.1 > If the
+  header is trashed this may just be a memory dump.
+
+  ── 摘要 ──
+  Buffer Handle State Object 描述缓冲区句柄的内部状态，包含 FLG 标志位（如 CR 表示一致读，恢复相关标志 KCBBFFRCV）、KCBBFRRB (0x01 修复介质损坏块) 及 KCBBFRIR (0x02 实例恢复) 和 kcbbfbp 指向的缓冲区指针。当缓冲区头部损坏时可能仅是。

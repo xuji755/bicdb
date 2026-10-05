@@ -1,0 +1,40 @@
+
+============================================================
+  [问题诊断] buffer cache LRU 链 LRU-W LRU-AUX 辅助列表 touch count 冷热端
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 6，摘要筛选通过 6，批次 1；本路已取尽
+  CaseStudy：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+  文档补充：缺少可操作的诊断证据；候选 0，相关 0
+
+  ✅ 答案要点
+     缓冲区管理8.1中，LRU列表的结构发生变化：不再是严格的LRU算法，而是通过维护每个缓冲区的touch count，高touch count的缓冲区不会被重用。替换列表中间设有一个指针，首次被重用的缓冲区被放在冷部分头部而非热部分头部。辅助列表头（LRU-AUX）包含可重用候选缓冲区以及DBWR从LRU尾部扫描并确认为干净的缓冲区；冷指针始终指向替换列表内部，不指向AUX列表。写列表（LRU-W）保存已老化但需写入磁盘后才能重用的缓冲区，新缓冲区添加到尾部，DBWR从头部写入。此外，辅助列表还用于存储正在被DBW
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 缓冲区管理8.1的LRU列表结构变化  (排序分: 10.0)
+     └ 摘要：缓冲区管理8.1中，LRU列表的结构发生变化：不再是严格的LRU算法，而是通过维护每个缓冲区的touch count，高touch count的缓冲区不会被重用。替换列表中间设有一个指针，首次被重用的缓冲区被放在冷部分头部而非热部分头部。辅助列表头（LRU-AUX）包含可重用候选缓冲区以及DBWR从LRU尾部扫描并确认为干净的缓冲区；冷指针始终指向替换列表内部，不指向AUX列表。写列表（LRU-W）保存已老化但需写入磁盘后才能重用的缓冲区，新缓冲区添加到尾部，DBWR从头部写入。此外，辅助列表还用于存储正在被DBWR写入的缓冲区。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:270353
+
+     [KnowledgeEntry] 缓冲区管理 LRU 列表结构  (排序分: 10.0)
+     └ 摘要：缓冲区管理采用LRU列表结构，包含三个关键部分：LRU-AUX辅助列表、LRU-MAIN主列表和LRU-W写列表。初始时，缓冲区哈希到LRU-AUX，该列表存放可重用候选缓冲区以及DBWR扫描尾部确认干净的缓冲区。前台进程从LRU-AUX开始扫描以获取缓冲区。当缓冲区被重用即分配为自由缓冲区时，会移动到LRU-MAIN列表的中间位置（冷指针指向的位置）。DBWR进程负责扫描LRU-MAIN尾部，并将脏缓冲区移动到LRU-W写列表。冷指针始终指向LRU-MAIN中的某个位置，不会指向AUX列表。这种结构高效管理缓冲区的重用与写入，通过冷热分离提升缓存命中率。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:270351
+
+     [KnowledgeEntry] LRU-AUX LIST：空闲Buffer优先查找子链  (排序分: 10.0)
+     └ 摘要：LRU-AUX LIST是LRU LIST中的一条子链，用于提高LRU算法性能。当LRU-W上的脏Buffer被写盘后，这些Buffer可以重用但不会马上放入LRU链，而是被放入LRU-AUX链。前台进程查找空闲Buffer时，首先从AUX链查找，只有在AUX链找不到时才会搜索LRU链。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3256603
+
+     [KnowledgeEntry] Working Set（kcbwbl）与LRU/LRU-W/LRU-AUX链  (排序分: 10.0)
+     └ 摘要：Oracle将DB Cache划分为多个Working Set（WS），每个WS管理一部分DB Cache并由独立LRU链和闩锁维护；kcbwbl保存WS的LRU/LRU-AUX链信息、冷端BH、热块占比、对象HASH表指针及各类buffer访问/等待统计。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257632
+
+     [KnowledgeEntry] LRU链多链结构与LRU替换原则  (排序分: 10.0)
+     └ 详情：LRU-W主要由DBWR负责将脏数据写入文件后释放缓冲；LRU-AUX是辅助LRU链。虽然DBA通常不需要深入理解LRU内部每条链的细节，但其替换原则仍是近似的LRU算法：冷端缓冲优先被重用。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3256615
+
+     [KnowledgeEntry] DBWR Make Free Message后的批处理写流程  (排序分: 9.7)
+     └ 摘要：空闲Buffer不足时设置Make Free Message唤醒DBWR；DBWR获取LRU闩锁并清标志，若LRU-W空且known free buffers充足则继续睡；否则从LRU尾部搬脏块到LRU-W直到达到dbwr batch数量或dbwr scan depth，随后释放闩锁写文件并把已写Buffer放入LRU-AUX。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3256209
+

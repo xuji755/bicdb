@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] kcbwds 工作集 描述符 buffer cache working set 结构
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 25，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 45，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1) View: X$KCBWDS [K]ernal [C]ache [B]uffer [W]orking Set management [D]escriptor[s] For 7.3 and 8.0 see this definition, (For 8.1 see further down) 7.3 / 8.0 ~~~~~~~~~ Column Type Description -------- ---- ---
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 14.4)
+     └ 摘要：X$KCBWDS 视图展示 Buffer Cache 中 Working Set 描述符，包含 SET_ID、CNUM_SET、替换列表（REPL_）、写列表（WRITE_）和 Ping 列表等内存结构，以及 FBWAIT、WCWAIT、BBWAIT 等等待统计与 DBWR 扫描深度，可用于分析 buffer cache 工作集划分、DBWR 写。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996842
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 14.4)
+     └ 摘要：X$KCBWDS 是 Oracle 内核视图，用于展示 buffer cache 中 Working Set 描述符，包含 LRU 替换列表、写列表和 ping 列表等内部链表信息。该视图提供每个工作集的缓冲区数量、扫描深度、缓冲忙等待、空闲缓冲等待等统计，适用于诊断 buff。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047740
+
+     [KnowledgeEntry] L1：Note:121623.1 VIEW: X$KCBWBPD - Working set Buffer Pool Descriptor (8.0 - 8.1)  (排序分: 14.4)
+     └ 摘要：视图 X$KCBWBPD 描述 buffer pool 的工作集描述符，记录缓冲池名称（BP_NAME）、ID（BP_ID）、关联工作集 ID 范围（BP_LO_SID 和 BP_HI_SID）、缓冲池大小（BP_SIZE）等信息，比实际缓冲池数多分配一行。每个缓冲池对应一个连续工作集范围。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997366
+
+     [KnowledgeEntry] L1：Note:43632.1 VIEW: X$KCBWDS - Working set Descriptors (7.3 - 8.1)  (排序分: 14.4)
+     └ 摘要：X$KCBWDS 是 Oracle 内部视图，描述 buffer cache 中 working set 的描述符，展示了替换列表（REPL）、写列表（WRITE）、ping 列表（PING）的内部结构及 FBWAIT、WCWAIT、BBWAIT 等关键等待统计。8.1 版本新增 LRU 冷热端、NUMA 处理器组、DBWR 进程。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997679
+
+     [CaseStudy] buffer_cache_latch_contention_case  (排序分: 9.1)
+     └ 摘要：案例场景：系统在高峰时段响应缓慢，AWR报告显示'cache buffer lru chains'等待事件占总等待时间的40%以上。诊断：系统有64个CPU，但工作集数量只有16个，导致每个工作集上的闩锁竞争激烈。处理：通过设置隐含参数_db_block_lru_latches=64（需要重启实例），将工作集数量增加到64个，使闩锁竞争分散。重启后，'cache buffer lru chains'等待事件显著下降，系统性能恢复正常。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1558921
+
+     [FaultModel] CSS文件描述符不足  (排序分: 8.6)
+     └ 摘要：CSS文件描述符不足，根因是进程文件描述符限制过低。出现CSS错误信息。需调整ulimit。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1579594
+

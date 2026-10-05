@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: LRU-AUX LIST：空闲Buffer优先查找子链
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3256603
+
+  ── 描述 ──
+  在Oracle Buffer Cache中，DBWR将LRU-
+  W链上的脏数据写盘后，相关Buffer已经处于可重用状态。为了减少前台进程寻找空闲Buffer的开销，Oracle将这些Buffer放入LRU-
+  AUX子链，使前台进程优先从AUX链获取空闲Buffer，从而避免每次都要遍历LRU主链。
+
+  ── 摘要 ──
+  LRU-AUX LIST是LRU LIST中的一条子链，用于提高LRU算法性能。当LRU-W上的脏Buffer被写盘后，这些Buffer可以重用但不会马上放入LRU链，而是被放入LRU-AUX链。前台进程查找空闲Buffer时，首先从AUX链查找，只有在AUX链找不到时才会搜索LRU链。

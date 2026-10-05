@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:33612.1 DRAFT: User process wants a FREE buffer
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1993935
+
+  ── 描述 ──
+  Statistic:free_buffer_inspected> loop } if DIRTY Bump <Statistic:free_buffer_inspected> Bump
+  <Statistic:dirty_buffers_inspected> remember to message DBWR if we dont get a free buffer if 2*
+  db_block_write_batch on DBWR queue already QUIT out and post DBWR free space is needed Wait and
+  retry? else Move buffer the LRUW ON EXIT: If we didnt find a free buffer in:
+  <Parameter:db_block_max_scan_cnt> (default buffers/4) or LRUW full post DBWR
+
+  ── 摘要 ──
+  该流程描述用户进程获取空闲缓冲区的内部机制：进程扫描缓冲池时统计free_buffer_inspected，遇到脏块增加dirty_buffers_inspected并可能触发DBWR；当DBWR队列达到2*db_block_write_batch时退出并通知DBWR需要空闲空间；扫描上限由db_block_max_sc。

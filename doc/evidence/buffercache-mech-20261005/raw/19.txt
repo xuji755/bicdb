@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] free buffer waits 前台进程 找不到空闲缓冲区 唤醒 DBWR 扫描
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 61，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 59，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 49，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     DBWR MAKE FREE REQUESTS 统计 DBWR 收到释放 LRU 空闲缓冲区的请求消息次数，包括 DBWR 自身发出的请求。该指标可用于诊断 buffer cache 空闲缓冲区压力、DBWR 写活动频率以及与 DBWR_timeouts 和 DBWR_free_buffers_found 关联分析，排查LRU链空闲。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:33629.1 STATISTIC: V7 CACHE "dbwr_make_free_requests"  (排序分: 15.0)
+     └ 摘要：DBWR MAKE FREE REQUESTS 统计 DBWR 收到释放 LRU 空闲缓冲区的请求消息次数，包括 DBWR 自身发出的请求。该指标可用于诊断 buffer cache 空闲缓冲区压力、DBWR 写活动频率以及与 DBWR_timeouts 和 DBWR_free_buffers_found 关联分析，排查LRU链空闲。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995652
+
+     [KnowledgeEntry] L1：Note:33612.1 DRAFT: User process wants a FREE buffer  (排序分: 15.0)
+     └ 摘要：该流程描述用户进程获取空闲缓冲区的内部机制：进程扫描缓冲池时统计free_buffer_inspected，遇到脏块增加dirty_buffers_inspected并可能触发DBWR；当DBWR队列达到2*db_block_write_batch时退出并通知DBWR需要空闲空间；扫描上限由db_block_max_sc。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1993935
+
+     [KnowledgeEntry] L1：Note:76091.1 EVENT:10084 "free list becomes empty"  (排序分: 15.0)
+     └ 摘要：EVENT:10084 是一个 Oracle 内部事件，其触发文本为“free list becomes empty”，表示进程在需要空闲缓冲区时发现相关自由列表已空。该事件可用于诊断 buffer cache 中空闲缓冲区耗尽导致的等待，常见于 DBWR 写入滞后或缓冲池配置不足。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995282
+
+     [KnowledgeEntry] L1：Bug 2079526 FREE BUFFER WAITS DURING CHECKPOINT  (排序分: 15.0)
+     └ 摘要：检查点期间触发Bug 2079526，出现空闲缓冲区等待(free buffer waits)，根因是LRU链表处理不公导致写操作在各工作集(working sets)分布不均，部分工作集堆积大量脏缓冲区，引发搜索空闲缓冲时DBWR写等待脏块。修复方案：(i)DBWR扫描下。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2044687
+
+     [CaseStudy] Re: DBWR and 3 seconds...  (排序分: 10.0)
+     └ 摘要：DBWR与3秒间隔的写入问题，伴随包含TABLE_CHECK、TABLE_RECORD、TB_IW_CHECKLIST的多表连接SQL查询，根因可能为该SQL导致的I/O或latch竞争，典型场景为数据库写入延迟和性能下降。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:414229
+
+     [FaultModel] DBWR 恐慌状态  (排序分: 9.5)
+     └ 摘要：该条目为故障模型，未提供具体描述，可能涉及数据库运行中的异常场景。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1557719
+

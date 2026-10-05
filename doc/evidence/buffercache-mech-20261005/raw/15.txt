@@ -1,0 +1,38 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:33439.1 QREF: The Buffer Cache (Diagram)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1993852
+
+  ── 描述 ──
+  QREF: The Buffer Cache (Diagram) Buffer Cache Overview: Example Dump see Note 33437.1
+  ~~~~~~~~~~~~~~~~~~~~~~ X$BH view of cache see Note 33568.1 This example applies to Oracle7 and
+  Oracle8, although in reality there may be multiple LRU chains. In Oracle8i the LRU concept is
+  replaced by a touch-count algorithm but the idea is the same. LRU Chain: Most Recent Doubly linked
+  list Least Recent +------+------+------+ - - - - +------+------+------+------+------+ | | | | | |
+  PTR | | | | +------+------+------+ - - - - +------+------+------+------+------+ Newly used buffers |
+  We search for are placed at this end. | LRU just FREE buffers | points from this end LRUW Chain
+  (Dirty List): | to of the LRU. +------+------+ - - +------+ | buffer Dirty buffers | | | | | |
+  headers. are moved to +------+------+ - - +------+ | LRUW if there (Cleared by DBWR) | is room. | |
+  Hashing is | based on DBA | modulo the | number of buckets. | A LATCH protects | each hash chain | |
+  ,-------. --------------------------------/----------------------+ Double | Hash |
+  <------------------------------/---------------------+ | linked | Bucket| ,--------.
+  ,---------V----. ,--------. | | hash | 1 | ----->| Buffer |--->| Buffer |---->| Buffer |--+ | chain.
+  `-------' <-----| Header |<---| Header |<----| Header |<---+ | 40 | | 2 | | 999 | | | | | | |
+  |--------| | See | | | |Usr|Wait| | Note 33438.1 | | | `--------' `--------------' `--------'
+  ,-------. | | | : |SO. |--------------' | | | | | | `-------' | | Buffer Handle | | state object | |
+  Note 33441.1 | | (actual DB blocks) | | ,-------------------. ,-------. | | | 1 | | Hash | | | | | |
+  Bucket| | | +-------------------+ | 2 | -->... | `---------->| 2 | `-------' <--... | | | |
+  +-------------------+ | : : | +-------------------+ : `-------------------------->| 40 Data Block |
+  : | Eg Note 33242.1 | +-------------------+ : : +-------------------+ ,-------. | 999 | | Hash | | |
+  | Bucket| +-------------------+ | N | | 1000 | `-------' | | There are a PRIME +-------------------+
+  number of Hash buckets. <Parameter:DB_BLOCK_BUFFERS> <Parameter:DB_BLOCK_HASH_BUCKETS> In 8.i A
+  LATCH protects each hash chain doesn't apply ( see
+  /export/home/ssupport/815/rdbms/src/server/cache/if/kcbz.h ) ** Each latch/bucket structure contains
+  a pointer to an array of ** buckets and a latch. The buckets in this array are protected by ** the
+  latch. Buckets are round-robined across the latches. . --> Bookmarks Admin Profile Feedback Sign Out
+  Help User: BWANG_AU Language: en-us Copyright © 2005, Oracle. All rights reserved. --> Copyright ©
+  2005, Oracle. All rights reserved. Legal Notices and Terms of Use | Privacy Statement
+
+  ── 摘要 ──
+  该条目以示意图解释 Oracle 7/8/8i 的 buffer cache 内部结构，包括 LRU 链（最近使用端放置新缓冲区，最近最少端查找空闲缓冲区）、LRUW 脏链（DBWR 清理脏块，脏缓冲区移至 LRUW）、基于 DBA 和质数哈希桶的哈希机制，每个哈希链由。

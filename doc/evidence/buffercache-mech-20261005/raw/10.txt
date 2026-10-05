@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: DBWR Make Free Message后的批处理写流程
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3256209
+
+  ── 描述 ──
+  DBWR收到Make Free Message后：先获取LRU闩锁，清除DBWR Make Free Message标志；若LRU-W为空且known free buffers计数大于dbwr
+  scan depth的一半，则直接释放闩锁继续睡觉。若LRU-W上的Buffer数量不够一次DBWR BATCH，则从LRU尾部搜索脏数据块并将其移到LRU-
+  W尾部；若扫描的数据块未被移入LRU-W，clean buffers scanned计数增加。搜索结束条件为LRU-W数量达到dbwr batch数量或扫描深度达到dbwr scan
+  depth。扫描后known clean buffer被重置为clean buffers scanned与本次写入缓冲区数之和；释放LRU闩锁后写脏块，写完后放入LRU-
+  AUX链。该算法以8i为基准，真实算法细节更复杂。
+
+  ── 摘要 ──
+  空闲Buffer不足时设置Make Free Message唤醒DBWR；DBWR获取LRU闩锁并清标志，若LRU-W空且known free buffers充足则继续睡；否则从LRU尾部搬脏块到LRU-W直到达到dbwr batch数量或dbwr scan depth，随后释放闩锁写文件并把已写Buffer放入LRU-AUX。

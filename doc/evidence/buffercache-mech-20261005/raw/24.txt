@@ -1,0 +1,39 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:113818.1 VIEW: X$KCBBES (8.1+) DBWR Buffer Event Statistics (write reasons)
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040682
+
+  ── 描述 ──
+  VIEW: X$KCBBES (8.1+) DBWR Buffer Event Statistics (write reasons) Description ~~~~~~~~~~~ Column
+  Type Comments ------------------ ---- -------- ADDR RAW(4) Address INDX NUMBER Reason / Priority /
+  Savecode number INST_ID NUMBER Instance id REASON NUMBER Count of buffers written for this REASON
+  PRIORITY NUMBER Count of buffers written at this PRIORITY SAVECODE NUMBER Count of occurrences of
+  return to write buffers This is an unusual view in that the REASON / PRIORITY and SAVECODE columns
+  are counts for the given INDX. Reason Codes (8.1.5/8.1.6) ~~~~~~~~~~~~ Different reasons for writing
+  buffers: KCBB_INVALID 0 invalid reason KCBB_PING 1 Ping write KCBB_HIPR_CKPT 2 High priority thread
+  checkpoint KCBB_IRCV_CKPT 3 Instance recovery checkpoint KCBB_MDPR_CKPT 4 Medium priority thread
+  checkpoint (typically due to incremental checkpoint) KCBB_AGING 5 Aging writes KCBB_MRCV_CKPT 6
+  Media recovery checkpoint KCBB_LOPR_CKPT 7 Low priority thread checkpoint KCBB_TBSP_CKPT 8
+  Tablespace checkpoint KCBB_REUSE_OBJ 9 Reuse object KCBB_REUSE_RNG 10 Reuse block range
+  KCBB_DBUF_LMT 11 Limit dirty buffers Priority Codes (8.1.5) ~~~~~~~~~~~~~~~~~~~~~~ Priorities for
+  writing buffers: KCBB_INVALID_PRI 0 invalid priority KCBB_HI_PRI 1 high priority KCBB_MED_PRI 2
+  medium priority KCBB_LOW_PRI 3 low priority Save Codes (8.1.5) (comment from the code)
+  ~~~~~~~~~~~~~~~~~~ Not all buffers can be written. Buffers may be linked onto the write queues by
+  foregrounds but may no longer be writeable by the time dbwriter gets to them. DBWR may decide not to
+  write a buffer for other reasons as well. The following return codes are used to specify the outcome
+  of an attempt to save a buffer for writing. NOTE: A return code of OK or REDO means that the
+  buffer's being written has been set and that DBWR is committed to writing the buffer */ KCBB_OK 0
+  buffer write successfully queued KCBB_REDO 1 write deferred till log sync KCBB_BEING_WRITTEN 2
+  buffer was already being written KCBB_NOT_DIRTY 3 buffer was not dirty KCBB_BEING_MODIFIED 4 buffer
+  is being modified KCBB_QUIT 5 I/O subsystem maxed out KCBB_FLUSHED 6 buffer is logically flushed
+  KCBB_FULL 7 No free slots remaining Example ~~~~~~~ SELECT * FROM X$KCBBES; ADDR INDX INST_ID REASON
+  PRIORITY SAVECODE -------- ---------- ---------- ---------- ---------- ---------- 2DB80FDC 0 1 0 0
+  233061478 2DB80FE8 1 1 3809 3809 107643363 2DB80FF4 2 1 0 388630970 46719257 2DB81000 3 1 0 240221
+  77 2DB8100C 4 1 348554330 0 1767344 2DB81018 5 1 40244476 0 0 2DB81024 6 1 0 0 0 2DB81030 7 1 0 0 0
+  2DB8103C 8 1 236603 0 0 2DB81048 9 1 2955 0 0 2DB81054 10 1 645 0 0 2DB81060 11 1 0 0 0 So this
+  shows, for example, that 348554330 buffers were written for REASON 4 (KCBB_MDPR_CKPT Medium priority
+  thread checkpoint). . Copyright © 2006, Oracle. All rights reserved.
+
+  ── 摘要 ──
+  X$KCBBES 记录 DBWR 写缓冲区的原因、优先级和保存码计数，可区分如高优先级检查点(KCBB_HIPR_CKPT)、增量检查点(KCBB_MDPR_CKPT)、老化写(KCBB_AGING)等 11 种原因，用于诊断检查点推进、脏块冲刷热点、写队列拥塞及 DBWR 写活动分布与效。

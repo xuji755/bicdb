@@ -1,0 +1,15 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:68477.1 Init.ora Parameter "_DB_AGING_COOL_COUNT" [Hidden] Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1994508
+
+  ── 描述 ──
+  PARAMETER:DB_AGING_COOL_COUNT Reference Note 19-JAN-01, rpowell.uk, Distribution justification:
+  "Hidden parameters must be noncustomer-viewable." - dbither.us Parameter: DB_AGING_COOL_COUNT
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Oracle8i: HIDDEN Identifier: kcbpacc Description ~~~~~~~~~~~ Touch
+  count set when buffer cooled. Articles: Overview of Init.Ora Parameter Reference Notes. <
+  Note:68462.1 >
+
+  ── 摘要 ──
+  _DB_AGING_COOL_COUNT 是 Oracle8i 隐藏参数，由 kcbpacc 模块控制，用于设置缓冲区冷却时的 touch count 值。该参数影响 buffer cache 中 buffer 的老化冷却行为，可用于调优缓存驻留策略、排查冷热缓冲区管理相关问题，但作为隐藏参数存在。

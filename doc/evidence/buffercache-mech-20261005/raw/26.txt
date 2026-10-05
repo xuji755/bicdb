@@ -1,0 +1,42 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] free buffer waits write complete waits buffer busy waits 三个等
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 50，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Buffer Cache 层共有17个定义的事件。重要的事件包括：free buffer waits, buffer busy waits, write complete waits。其他如local write wait, checkpoint completed, buffer deadlock, buffer latch等较少见。RAC相关事件如buffer read retry等。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] Buffer Cache 层的等待事件列表  (排序分: 9.4)
+     └ 详情：Buffer Cache 层共有17个定义的事件。重要的事件包括：free buffer waits, buffer busy waits, write complete waits。其他如local write wait, checkpoint completed, buffer deadlock, buffer latch等较少见。RAC相关事件如buffer read retry等。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:151931
+
+     [KnowledgeEntry] 来自X$KCBWDS的Working Set统计： 列名 说明 关联等待事件 FBWAIT Free Buffer Waits free buffer waits WCWAIT Write Complete Waits write complete waits BBWAIT Buffer Busy Waits buffer busy waits FBINSP Free Buffers Ins...  (排序分: 9.4)
+     └ 摘要：来自X$KCBWDS的Working Set统计提供了缓冲区工作集的性能指标，其中列名FBWAIT对应等待事件Free Buffer Waits，WCWAIT对应Write Complete Waits，用于分析缓冲区管理中的等待问题。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:227240
+
+     [KnowledgeEntry] 等待事件 buffer busy waits  (排序分: 9.4)
+     └ 详情：该等待事件出现在优化文档的数据库资源等待分析章节，通常与缓冲区竞争相关，需优化 SQL 或调整 BUFFER CACHE 大小。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:508900
+
+     [KnowledgeEntry] 常见Buffer Cache等待事件和Latch  (排序分: 9.4)
+     └ 详情：Buffer Cache相关等待：free buffer waits（无空闲缓冲区），buffer busy waits（块级争用），write complete waits（等待DBWR写完）。Latch：cache buffers lru chain（LRU链表），cache buffer chain（哈希链）。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1565357
+
+     [CaseStudy] 1.9.2  LATCH FREE  (排序分: 9.1)
+     └ 摘要：1.9.2  LATCH FREE
+WAIT EVENT	注释
+latch free	闩锁等待，一般情况下这个等待事件的平均每次等待时间为几个毫秒，如果这个等待事件出现在TOP EVENTS里，说明闩
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1519497
+
+     [FaultModel] Free Buffer等待事件  (排序分: 8.6)
+     └ 摘要：oracle_free_buffer_contention 是一种 Buffer Cache 资源竞争故障模型，含义是 Free Buffer 等待事件表示 Buffer Cache 中没有可用内存空间。根因是 Buffer Cache 过小或数据块被过度使用，导致无法分配新缓冲区。影响是会话等待空闲缓冲区，导致数据库性能下降，严重时可能引发系统挂起，需通过增大 Buffer Cache 或优化 SQL 减少物理 I/O 来缓解。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545360
+

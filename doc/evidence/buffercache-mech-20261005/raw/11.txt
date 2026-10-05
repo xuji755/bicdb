@@ -1,0 +1,11 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: LRU链多链结构与LRU替换原则
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3256615
+
+  ── 描述 ──
+  LRU-W主要由DBWR负责将脏数据写入文件后释放缓冲；LRU-AUX是辅助LRU链。虽然DBA通常不需要深入理解LRU内部每条链的细节，但其替换原则仍是近似的LRU算法：冷端缓冲优先被重用。
+
+  ── 摘要 ──
+  DB Cache中的LRU链是多条链的总称，包含LRU、LRU-W和LRU-AUX等链。会话分配缓冲区时从LRU链查找；LRU按类似LRU算法组织，最近不被使用的缓冲区最先被重用。
