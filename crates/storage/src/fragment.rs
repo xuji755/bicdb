@@ -25,7 +25,9 @@
 use std::collections::HashSet;
 
 use crate::heap::{self, Heap, HeapError, InsertPolicy};
-use crate::row::{self, FragmentView, HeadFragment, RowError, RowHeader, FRAGMENT_HEADER_LEN};
+use crate::row::{
+    self, FragmentView, HeadFragment, RowError, RowHeader, RowView, FRAGMENT_HEADER_LEN,
+};
 use crate::rowid::{RowId, ROWID_LEN};
 
 /// 片段链操作错误。
@@ -39,6 +41,13 @@ pub enum FragmentError {
     LoopDetected,
     /// 链不完整或越界（指针指向不存在的片段 / 总长越界）。
     BrokenChain,
+    /// **片段数超过链长上限**（§6.3：64 片）——在写入时报，不是读到一半才发现。
+    /// 注意：本 API 无回滚，报错时**已写入的片段成为孤儿**（当前仅测试/工具
+    /// 使用该入口；事务层的行迁移切片接入时须与页级 undo 一并处理）。
+    TooManyFragments {
+        /// 上限（片）。
+        limit: usize,
+    },
 }
 
 impl From<RowError> for FragmentError {
@@ -60,11 +69,17 @@ impl std::fmt::Display for FragmentError {
             FragmentError::Heap(e) => write!(f, "片段页操作错误：{e}"),
             FragmentError::LoopDetected => f.write_str("片段链存在环"),
             FragmentError::BrokenChain => f.write_str("片段链不完整"),
+            FragmentError::TooManyFragments { limit } => {
+                write!(f, "片段链超过上限（{limit} 片，§6.3）")
+            }
         }
     }
 }
 
 impl std::error::Error for FragmentError {}
+
+/// **链长上限**（§6.3：64 个片段 ⇒ 整行上限约 1MB）。超限在写入时报错。
+pub const MAX_FRAGMENTS: usize = 64;
 
 /// 插入一条行字节流：**装得下一页就不成链**，否则拆为片段链。
 ///
@@ -74,6 +89,9 @@ pub fn insert_row(
     encoded_row: &[u8],
     policy: &InsertPolicy,
 ) -> Result<RowId, FragmentError> {
+    // **整行结构校验**（位图规范、头部区在行内——`data_start` 越过行尾
+    // 在这里就被拒绝；只核 `row_len` 会在下面的 `[header_len..]` 越界 panic）。
+    RowView::new(encoded_row)?;
     let header = RowHeader::read_from(encoded_row)?;
     if usize::from(header.row_len) != encoded_row.len() {
         return Err(FragmentError::Row(RowError::LengthMismatch));
@@ -107,7 +125,15 @@ pub fn insert_row(
     // ---- 后续片段：中/尾（短行头），逐片写入并回填前一片的 next ----
     let mut prev = head_id;
     let mut prev_next_at = header_len; // 头片段的 next 在完整行头之后
+    let mut fragments = 1usize; // 头片段计入链长
     while !data.is_empty() {
+        // 链长上限（§6.3：64 片）——**写入时报**，不读到一半才发现。
+        if fragments >= MAX_FRAGMENTS {
+            return Err(FragmentError::TooManyFragments {
+                limit: MAX_FRAGMENTS,
+            });
+        }
+        fragments += 1;
         let (page, cap) = pick_page(heap, FRAGMENT_HEADER_LEN, policy)?;
         let take = cap.min(data.len());
         let mut frag = Vec::with_capacity(FRAGMENT_HEADER_LEN + take);
@@ -205,7 +231,7 @@ mod tests {
     use crate::row::{assemble_row, row_flags};
 
     fn big_row(payload_len: usize) -> Vec<u8> {
-        assemble_row(0, 0, &[false], &[], &[&vec![0x5A; payload_len]])
+        assemble_row(0, 0, &[false], &[], &[&vec![0x5A; payload_len]]).unwrap()
     }
 
     #[test]
@@ -304,5 +330,31 @@ mod tests {
             .data_start();
         heap.patch_record(id, head_len, &bogus.to_bytes()).unwrap();
         assert_eq!(read_row(&heap, id).err(), Some(FragmentError::BrokenChain));
+    }
+
+    #[test]
+    fn malformed_row_is_rejected_before_slicing() {
+        // 审核修复回归（E1）：`data_start` 越过行尾的行——旧代码在
+        // `&encoded_row[header_len..]` 直接 panic；现按行格式错误拒绝。
+        let mut heap = Heap::new([1; 8], InsertPolicy::in_place(0));
+        let mut bad = crate::row::assemble_row(0, 1, &[false], &[], &[b"x".as_slice()]).unwrap();
+        bad[8..10].copy_from_slice(&10u16.to_le_bytes()); // var_col_count=10 → data_start > 行尾
+        let err = insert_row(&mut heap, &bad, &InsertPolicy::in_place(0)).unwrap_err();
+        assert!(matches!(err, FragmentError::Row(_)), "{err}");
+    }
+
+    #[test]
+    fn fragment_chain_length_is_capped_at_64() {
+        // 审核修复回归（E3）：§6.3 的链长上限 64 片——**写入时报错**。
+        // 用小页容量把大行拆出 64 片以上。
+        let mut heap = Heap::new([2; 8], InsertPolicy::in_place(99));
+        // pctfree 99 ⇒ 每页只容 ~80B 数据 ⇒ 60000B 的行需要数百片（> 64）。
+        let payload = vec![0x5Au8; 60000];
+        let big = crate::row::assemble_row(0, 1, &[false], &[], &[payload.as_slice()]).unwrap();
+        let err = insert_row(&mut heap, &big, &InsertPolicy::in_place(99)).unwrap_err();
+        assert!(
+            matches!(err, FragmentError::TooManyFragments { limit: 64 }),
+            "{err}"
+        );
     }
 }

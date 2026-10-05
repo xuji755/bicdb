@@ -1907,7 +1907,7 @@ mod rollback_tests {
     }
 
     fn row_bytes(itl_slot: u8, payload: &[u8]) -> Vec<u8> {
-        assemble_row(0, itl_slot, &[false], &[], &[payload])
+        assemble_row(0, itl_slot, &[false], &[], &[payload]).unwrap()
     }
 
     /// 建数据页文件（堆表页，file 3 block 0），返回句柄。

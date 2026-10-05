@@ -183,6 +183,10 @@ fn find_free_slot(page: &Page) -> Option<usize> {
 /// 返回行号（1 起；= 槽位下标 + 1）。页内字段已改（含 `free_end` 与槽位），
 /// **调用方负责 `seal()`**（写回路径统一收尾）。
 pub fn insert_row(page: &mut Page, row: &[u8], policy: &InsertPolicy) -> Result<u16, HeapError> {
+    // **整行结构校验**（位图规范、头部区在行内）——只核 `row_len` 会放进
+    // "写得进、读不回"的行（`RowView` 拒绝、`heap::row` 返回 None）。
+    // 片段（`insert_record` 的其他状态）不走这里：它们不是完整逻辑行。
+    crate::row::RowView::new(row).map_err(|_| HeapError::BadRow)?;
     insert_record(page, row, policy, SlotStatus::Normal)
 }
 
@@ -283,7 +287,9 @@ pub fn delete_row(page: &mut Page, row_no: u16) -> Result<(), HeapError> {
 /// 页内整理：把活动记录按槽位下标升序重排到页底，合并空闲区。
 ///
 /// 返回回收的字节数。转发指针与片段头等其他槽位状态**一并搬运**
-/// （它们也是页里的记录）。
+/// （它们也是页里的记录）——但**按各自的长度形态**：普通行/片段头是
+/// "行头 + 行体"（长度由 `row_len` 给出），**转发指针是裸的 6B 目标**
+/// （没有行头——把它当带行头的记录读，会按垃圾 `row_len` 搬运或越界）。
 pub fn defrag(page: &mut Page) -> Result<usize, HeapError> {
     require_data_page(page)?;
     let slots = page.slot_count() as usize;
@@ -296,18 +302,26 @@ pub fn defrag(page: &mut Page) -> Result<usize, HeapError> {
         }
         let start = usize::from(slot.offset());
         let bytes = page.as_bytes();
-        let len = usize::from(
-            RowHeader::read_from(&bytes[start..])
-                .map_err(|_| HeapError::BadRow)?
-                .row_len,
-        );
-        live.push((i, bytes[start..start + len].to_vec()));
+        let len = match slot.status() {
+            SlotStatus::Forwarding => crate::rowid::ROWID_LEN,
+            _ => usize::from(
+                RowHeader::read_from(bytes.get(start..).ok_or(HeapError::BadRow)?)
+                    .map_err(|_| HeapError::BadRow)?
+                    .row_len,
+            ),
+        };
+        let end = start.checked_add(len).ok_or(HeapError::BadRow)?;
+        if end > PAGE_SIZE {
+            return Err(HeapError::BadRow);
+        }
+        live.push((i, bytes[start..end].to_vec()));
     }
     let before = page.free_space();
     let floor = page.row_area_floor();
     let mut cursor = floor;
     for (i, bytes) in &live {
-        cursor -= bytes.len();
+        // 记录总量超出可用区（槽位重叠的损坏页）：拒绝，不越界写。
+        cursor = cursor.checked_sub(bytes.len()).ok_or(HeapError::BadRow)?;
         page.as_bytes_mut()[cursor..cursor + bytes.len()].copy_from_slice(bytes);
         let entry = SlotEntry::new(cursor as u16, page.slot(*i).expect("槽位在界内").status())
             .ok_or(HeapError::BadRow)?;
@@ -522,7 +536,7 @@ mod tests {
 
     fn tiny_row(payload: &[u8]) -> Vec<u8> {
         // 1 列（变长）：行头 10B + 位图 1B + 偏移 2B + 数据。
-        assemble_row(0, 0, &[false], &[], &[payload])
+        assemble_row(0, 0, &[false], &[], &[payload]).unwrap()
     }
 
     #[test]
@@ -610,7 +624,7 @@ mod tests {
     fn slot_limit_is_enforced() {
         let mut page = Page::new(PageType::HeapTable, [1; 8], 1, 1);
         let policy = InsertPolicy::append_only();
-        let row = assemble_row(0, 0, &[], &[], &[]); // 10B 最小行
+        let row = assemble_row(0, 0, &[], &[], &[]).unwrap(); // 10B 最小行
         for _ in 0..MAX_SLOTS {
             insert_row(&mut page, &row, &policy).expect("1023 槽内应可插入");
         }
@@ -684,7 +698,7 @@ mod tests {
     #[test]
     fn non_data_page_is_rejected() {
         let mut page = Page::new(PageType::Bitmap, [1; 8], 1, 1);
-        let row = assemble_row(0, 0, &[], &[], &[]);
+        let row = assemble_row(0, 0, &[], &[], &[]).unwrap();
         assert_eq!(
             insert_row(&mut page, &row, &InsertPolicy::append_only()).unwrap_err(),
             HeapError::NotADataPage
@@ -700,12 +714,47 @@ mod tests {
             HeapError::BadRow,
             "不足行头"
         );
-        let mut row = assemble_row(0, 0, &[], &[], &[]);
+        let mut row = assemble_row(0, 0, &[], &[], &[]).unwrap();
         row[2..4].copy_from_slice(&99u16.to_le_bytes());
         assert_eq!(
             insert_row(&mut page, &row, &InsertPolicy::append_only()).unwrap_err(),
             HeapError::BadRow,
             "row_len 与字节数不符"
+        );
+    }
+
+    #[test]
+    fn defrag_moves_forwarding_pointers_as_six_bytes() {
+        // 审核修复回归（E2）：转发指针是**裸 6B 目标**（没有行头）——defrag
+        // 按状态区分长度搬运，不得把它当带行头的记录（会丢指针/越界 panic）。
+        let mut page = Page::new(crate::page::PageType::HeapTable, [0u8; 8], 3, 1);
+        // 两行 + 一个转发指针。
+        let bytes = crate::row::assemble_row(0, 1, &[false], &[], &[b"keep".as_slice()]).unwrap();
+        let n1 = insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+        let n2 = insert_row(&mut page, &bytes, &InsertPolicy::in_place(0)).unwrap();
+        let target = crate::rowid::RowId::from_parts(3, 9, 5).unwrap();
+        // 槽 3 = 转发指针（手工置入：6B 目标、状态 Forwarding）。
+        let offset = page.free_end() - crate::rowid::ROWID_LEN;
+        page.as_bytes_mut()[offset..offset + crate::rowid::ROWID_LEN]
+            .copy_from_slice(&target.to_bytes());
+        page.set_free_end(offset);
+        page.set_slot_count(3).unwrap();
+        page.set_slot(
+            2,
+            SlotEntry::new(offset as u16, SlotStatus::Forwarding).unwrap(),
+        );
+
+        defrag(&mut page).unwrap();
+
+        // 三者的槽偏移都被重排，但**内容与状态不变**：行可读、指针目标原样。
+        assert_eq!(row(&page, n1), Some(&bytes[..]));
+        assert_eq!(row(&page, n2), Some(&bytes[..]));
+        let slot = page.slot(2).unwrap();
+        assert_eq!(slot.status(), SlotStatus::Forwarding);
+        let at = usize::from(slot.offset());
+        assert_eq!(
+            &page.as_bytes()[at..at + crate::rowid::ROWID_LEN],
+            &target.to_bytes()
         );
     }
 }

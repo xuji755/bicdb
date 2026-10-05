@@ -284,7 +284,7 @@ mod tests {
     }
 
     fn row_bytes(itl_slot: u8, payload: &[u8]) -> Vec<u8> {
-        assemble_row(0, itl_slot, &[false], &[], &[payload])
+        assemble_row(0, itl_slot, &[false], &[], &[payload]).unwrap()
     }
 
     fn seq(v: u64) -> CommitSeq {

@@ -183,12 +183,17 @@ mod tests {
         let policy = InsertPolicy::append_only();
         heap::insert_row(
             &mut page,
-            &assemble_row(0, 2, &[false], &[], &[b"hello"]),
+            &assemble_row(0, 2, &[false], &[], &[b"hello"]).unwrap(),
             &policy,
         )
         .unwrap();
         heap::delete_row(&mut page, 1).unwrap();
-        heap::insert_row(&mut page, &assemble_row(0, 0, &[], &[], &[]), &policy).unwrap();
+        heap::insert_row(
+            &mut page,
+            &assemble_row(0, 0, &[], &[], &[]).unwrap(),
+            &policy,
+        )
+        .unwrap();
         page.seal();
 
         let text = page_dump(&page);

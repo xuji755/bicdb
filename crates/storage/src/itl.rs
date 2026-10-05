@@ -482,7 +482,7 @@ mod tests {
             3,
             0,
         );
-        let row = crate::row::assemble_row(0, 1, &[false], &[], &[b"alpha".as_slice()]);
+        let row = crate::row::assemble_row(0, 1, &[false], &[], &[b"alpha".as_slice()]).unwrap();
         let n1 = heap::insert_row(&mut p, &row, &InsertPolicy::in_place(0)).unwrap();
         let n2 = heap::insert_row(&mut p, &row, &InsertPolicy::in_place(0)).unwrap();
         assert_eq!((n1, n2), (1, 2));

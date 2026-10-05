@@ -32,7 +32,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 fn data_page(block_id: u32, payload: &[u8]) -> Page {
     let mut page = Page::new(PageType::HeapTable, [0x42; 8], 1, block_id);
-    let row = assemble_row(0, 0, &[false], &[], &[payload]);
+    let row = assemble_row(0, 0, &[false], &[], &[payload]).unwrap();
     heap::insert_row(&mut page, &row, &InsertPolicy::append_only()).unwrap();
     page
 }

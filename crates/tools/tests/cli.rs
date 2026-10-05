@@ -37,13 +37,13 @@ fn clean_page() -> Page {
     let policy = InsertPolicy::append_only();
     heap::insert_row(
         &mut page,
-        &assemble_row(0, 0, &[false], &[], &[b"hello"]),
+        &assemble_row(0, 0, &[false], &[], &[b"hello"]).unwrap(),
         &policy,
     )
     .unwrap();
     heap::insert_row(
         &mut page,
-        &assemble_row(0, 0, &[false], &[], &[b"world"]),
+        &assemble_row(0, 0, &[false], &[], &[b"world"]).unwrap(),
         &policy,
     )
     .unwrap();

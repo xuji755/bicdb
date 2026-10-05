@@ -633,7 +633,7 @@ mod recover_tests {
         pagefile::write_page(&io, data, 0, &mut before.clone()).unwrap();
 
         // 输家：插入一行（ITL[0] = 活动，链上 = 占用 + 插入）。
-        let loser_bytes = assemble_row(0, 1, &[false], &[], &[b"loser".as_slice()]);
+        let loser_bytes = assemble_row(0, 1, &[false], &[], &[b"loser".as_slice()]).unwrap();
         let mut after1 = before.clone();
         let loser_row =
             heap::insert_row(&mut after1, &loser_bytes, &InsertPolicy::in_place(0)).unwrap();
@@ -668,7 +668,7 @@ mod recover_tests {
         .unwrap();
 
         // 胜者：插入一行并提交（ITL[1] 留"活动"外观——延迟块清除）。
-        let winner_bytes = assemble_row(0, 2, &[false], &[], &[b"winner".as_slice()]);
+        let winner_bytes = assemble_row(0, 2, &[false], &[], &[b"winner".as_slice()]).unwrap();
         let mut after2 = after1.clone();
         let winner_row =
             heap::insert_row(&mut after2, &winner_bytes, &InsertPolicy::in_place(0)).unwrap();
@@ -905,7 +905,7 @@ mod pitr_tests {
 
         // W：插入 row1，ITL[0]；提交在目标点之内（seq 3）。
         let mut after1 = before.clone();
-        let bytes_w = assemble_row(0, 1, &[false], &[], &[b"w".as_slice()]);
+        let bytes_w = assemble_row(0, 1, &[false], &[], &[b"w".as_slice()]).unwrap();
         let row_w = heap::insert_row(&mut after1, &bytes_w, &InsertPolicy::in_place(0)).unwrap();
         chain
             .append(
@@ -945,7 +945,7 @@ mod pitr_tests {
 
         // L：插入 row2，ITL[1]；从不提交。
         let mut after2 = after1.clone();
-        let bytes_l = assemble_row(0, 2, &[false], &[], &[b"l".as_slice()]);
+        let bytes_l = assemble_row(0, 2, &[false], &[], &[b"l".as_slice()]).unwrap();
         let row_l = heap::insert_row(&mut after2, &bytes_l, &InsertPolicy::in_place(0)).unwrap();
         chain
             .append(
@@ -984,7 +984,7 @@ mod pitr_tests {
 
         // W2：插入 row3，ITL[2]；**目标点之后**才提交（seq 9）。
         let mut after3 = after2.clone();
-        let bytes_w2 = assemble_row(0, 3, &[false], &[], &[b"w2".as_slice()]);
+        let bytes_w2 = assemble_row(0, 3, &[false], &[], &[b"w2".as_slice()]).unwrap();
         let row_w2 = heap::insert_row(&mut after3, &bytes_w2, &InsertPolicy::in_place(0)).unwrap();
         itl::grow(&mut after3, 8).unwrap(); // ITL[2] 就位
         chain

@@ -322,7 +322,7 @@ mod tests {
     }
 
     fn row_bytes(payload: &[u8]) -> Vec<u8> {
-        assemble_row(0, 1, &[false], &[], &[payload])
+        assemble_row(0, 1, &[false], &[], &[payload]).unwrap()
     }
 
     fn rdba(file_id: u16, block: u32) -> Rdba {

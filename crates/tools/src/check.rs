@@ -521,7 +521,7 @@ mod tests {
     use bicdb_storage::row::assemble_row;
 
     fn row_of(payload: &[u8]) -> Vec<u8> {
-        assemble_row(0, 0, &[false], &[], &[payload])
+        assemble_row(0, 0, &[false], &[], &[payload]).unwrap()
     }
 
     #[test]

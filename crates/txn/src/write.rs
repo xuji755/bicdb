@@ -808,7 +808,7 @@ mod tests {
         }
     }
     fn row_bytes(payload: &[u8]) -> Vec<u8> {
-        assemble_row(0, 1, &[false], &[], &[payload])
+        assemble_row(0, 1, &[false], &[], &[payload]).unwrap()
     }
 
     /// 期望的"落盘行"：行头 `itl_slot` 由写路径回填为**实际占用的 ITL 槽号**

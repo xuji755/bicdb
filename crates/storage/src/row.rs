@@ -80,6 +80,12 @@ pub enum RowError {
     BadVarOffsets,
     /// 片段链指针不允许出现在该形态上（或缺失）。
     BadFragmentChain,
+    /// **行超过行长上限**（`row_len` 为 2B、变长偏移亦为 2B——格式上限 65535B）。
+    /// 超长值的设计出口是 `ASSET_REF`（§6.6），不是更长的行。
+    TooLong {
+        /// 实际长度（字节）。
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for RowError {
@@ -90,6 +96,7 @@ impl std::fmt::Display for RowError {
             RowError::BadNullBitmapLen => "NULL 位图长度非规范",
             RowError::BadVarOffsets => "变长列偏移数组非规范",
             RowError::BadFragmentChain => "片段链指针缺失或非法",
+            RowError::TooLong { .. } => "行超过 64 KiB 上限（row_len 为 2B）",
         })
     }
 }
@@ -413,14 +420,17 @@ pub fn forwarding_pointer(bytes: &[u8]) -> Result<RowId, RowError> {
 ///
 /// `nulls` 按列序给出（`true` = 该列 NULL，其数据不得出现在
 /// `fixed_data` / `var_columns` 中）。
-#[must_use]
+///
+/// **长度受格式上限约束**（§6.1）：`row_len` 与变长列偏移都是 2B ⇒ 整行
+/// 与变长区都必须 ≤ 65535B；超限返回 [`RowError::TooLong`]（**不截断、
+/// 不回绕**——超长值的设计出口是 `ASSET_REF`，§6.6）。
 pub fn assemble_row(
     flags: u8,
     itl_slot: u8,
     nulls: &[bool],
     fixed_data: &[u8],
     var_columns: &[&[u8]],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, RowError> {
     let col_count = nulls.len() as u16;
     let var_col_count = var_columns.len() as u16;
     let bitmap_len = RowHeader::null_bitmap_len_for(col_count);
@@ -430,6 +440,9 @@ pub fn assemble_row(
         + 2 * var_columns.len()
         + fixed_data.len()
         + var_area_len;
+    if row_len > usize::from(u16::MAX) {
+        return Err(RowError::TooLong { len: row_len });
+    }
 
     let header = RowHeader {
         flags,
@@ -446,11 +459,17 @@ pub fn assemble_row(
             out[ROW_HEADER_FIXED_LEN + i / 8] |= 1 << (i % 8);
         }
     }
-    let mut acc = 0u16;
+    let mut acc: usize = 0;
     for (i, col) in var_columns.iter().enumerate() {
         let at = header.var_offsets_start() + 2 * i;
-        out[at..at + 2].copy_from_slice(&acc.to_le_bytes());
-        acc += col.len() as u16;
+        // 变长列偏移也是 2B：任一项超限即整体拒绝（上界检查已保证累计不越）。
+        if acc > usize::from(u16::MAX) {
+            return Err(RowError::TooLong {
+                len: acc + col.len(),
+            });
+        }
+        out[at..at + 2].copy_from_slice(&(acc as u16).to_le_bytes());
+        acc += col.len();
     }
     let mut at = header.data_start();
     out[at..at + fixed_data.len()].copy_from_slice(fixed_data);
@@ -459,7 +478,7 @@ pub fn assemble_row(
         out[at..at + col.len()].copy_from_slice(col);
         at += col.len();
     }
-    out
+    Ok(out)
 }
 
 /// 由头片段与后续片段（中/尾，按链序）重组整行字节流。
@@ -478,7 +497,7 @@ pub fn reassemble_row(head: &[u8], rest: &[&[u8]]) -> Result<Vec<u8>, RowError> 
         out.extend_from_slice(view.data());
     }
     if out.len() > usize::from(u16::MAX) {
-        return Err(RowError::LengthMismatch);
+        return Err(RowError::TooLong { len: out.len() });
     }
     // 回填整行长度（头片段的 row_len 是片段自身的），
     // 并清除 `FRAGMENT` 位——该位描述"页内记录是片段"，重组后的逻辑行不是。
@@ -503,7 +522,8 @@ mod tests {
             &nulls,
             &[0xAA, 0xBB, 0xCC, 0xDD],
             &[b"hello", b"world!"],
-        );
+        )
+        .unwrap();
         let view = RowView::new(&row).expect("可解析");
         assert_eq!(view.header().col_count, 4);
         assert_eq!(view.header().var_col_count, 2);
@@ -523,7 +543,7 @@ mod tests {
     #[test]
     fn empty_var_column_is_legal() {
         // 零长度变长列：相邻偏移相等（合法的规范形式）。
-        let row = assemble_row(0, ITL_SLOT_NONE, &[false, false], &[], &[b"", b"x"]);
+        let row = assemble_row(0, ITL_SLOT_NONE, &[false, false], &[], &[b"", b"x"]).unwrap();
         let view = RowView::new(&row).unwrap();
         view.validate_var_offsets(0).unwrap();
         assert_eq!(view.var_column(0, 0), Some(&b""[..]));
@@ -532,7 +552,7 @@ mod tests {
 
     #[test]
     fn no_null_bitmap_when_no_columns() {
-        let row = assemble_row(0, ITL_SLOT_NONE, &[], &[], &[]);
+        let row = assemble_row(0, ITL_SLOT_NONE, &[], &[], &[]).unwrap();
         let view = RowView::new(&row).unwrap();
         assert_eq!(view.header().null_bitmap_len, 0);
         assert!(!view.is_null(0));
@@ -543,7 +563,7 @@ mod tests {
     fn more_than_eight_columns_use_multi_byte_bitmap() {
         let mut nulls = [false; 11];
         nulls[8] = true;
-        let row = assemble_row(0, ITL_SLOT_NONE, &nulls, &[], &[b"x"]);
+        let row = assemble_row(0, ITL_SLOT_NONE, &nulls, &[], &[b"x"]).unwrap();
         let view = RowView::new(&row).unwrap();
         assert_eq!(view.header().null_bitmap_len, 2);
         assert!(view.is_null(8) && !view.is_null(7) && !view.is_null(9));
@@ -551,7 +571,7 @@ mod tests {
 
     #[test]
     fn strict_validation_rejects_non_canonical_rows() {
-        let row = assemble_row(0, ITL_SLOT_NONE, &[false, false], &[1, 2], &[b"ab"]);
+        let row = assemble_row(0, ITL_SLOT_NONE, &[false, false], &[1, 2], &[b"ab"]).unwrap();
         // 长度不符。
         assert_eq!(
             RowView::new(&row[..row.len() - 1]).err(),
@@ -573,7 +593,7 @@ mod tests {
             Some(RowError::BadVarOffsets)
         );
         // 偏移越过数据区。
-        let row2 = assemble_row(0, 0, &[false], &[], &[b"a", b"bc"]);
+        let row2 = assemble_row(0, 0, &[false], &[], &[b"a", b"bc"]).unwrap();
         let mut bad2 = row2.clone();
         let o1 = ROW_HEADER_FIXED_LEN + 1 + 2;
         bad2[o1..o1 + 2].copy_from_slice(&999u16.to_le_bytes());
@@ -590,7 +610,8 @@ mod tests {
         // 整行 = 行头 + 定长 4B + 变长 "0123456789"；拆成头片段（前 4 字节数据）
         // + 中片段（后 6 字节数据，链尾）。每条片段记录 = 自身长度（§6.3）。
         // 原始（未拆分的）行：flags = 0；FRAGMENT 位由拆分方在头片段上置。
-        let full = assemble_row(0, 3, &[false], &[0xDE, 0xAD, 0xBE, 0xEF], &[b"0123456789"]);
+        let full =
+            assemble_row(0, 3, &[false], &[0xDE, 0xAD, 0xBE, 0xEF], &[b"0123456789"]).unwrap();
         let view = RowView::new(&full).unwrap();
         let data_start = view.header().data_start();
         let (chunk1, chunk2) = full[data_start..].split_at(4);
@@ -657,7 +678,7 @@ mod tests {
 
     #[test]
     fn head_fragment_requires_flag_and_fits() {
-        let plain = assemble_row(0, ITL_SLOT_NONE, &[], &[], &[]);
+        let plain = assemble_row(0, ITL_SLOT_NONE, &[], &[], &[]).unwrap();
         assert_eq!(
             HeadFragment::new(&plain).err(),
             Some(RowError::BadFragmentChain),
@@ -668,5 +689,23 @@ mod tests {
             HeadFragment::new(&too_short).err(),
             Some(RowError::Truncated)
         );
+    }
+
+    #[test]
+    fn assemble_row_rejects_rows_over_64k() {
+        // 审核修复回归（F3）：`row_len` 与变长偏移都是 2B ⇒ 超限**明确报错**
+        // （旧行为：row_len 静默截断、偏移累加 debug panic / release 回绕）。
+        let big = vec![0u8; 70000];
+        assert!(matches!(
+            assemble_row(0, 1, &[false], &[], &[big.as_slice()]),
+            Err(RowError::TooLong { .. })
+        ));
+        // 两列各自不大、合计越界：同样拒绝（不是只查单列）。
+        let a = vec![0u8; 40000];
+        let b = vec![0u8; 40000];
+        assert!(matches!(
+            assemble_row(0, 1, &[], &[], &[a.as_slice(), b.as_slice()]),
+            Err(RowError::TooLong { .. })
+        ));
     }
 }
