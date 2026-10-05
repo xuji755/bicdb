@@ -1038,6 +1038,11 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         })
     }
 
+    /// 段的可变视图（写路径经池扩展段时用）。
+    pub fn segment_mut(&mut self) -> &mut Segment<'io, 'f> {
+        &mut self.segment
+    }
+
     /// 链写作器状态更新（`plan_append` 之后必须调用）。
     pub fn note_append(&mut self, plan: &UndoAppend) {
         if plan.opened {

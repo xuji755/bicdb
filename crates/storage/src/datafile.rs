@@ -43,6 +43,20 @@ pub const MAX_BITMAP_RUNS: usize = 40;
 /// 建文件的最小块数：块 0 文件头 + **全量预留的位图区**（320 页）+ 至少一个数据区。
 pub const MIN_FILE_BLOCKS: u64 = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64 + 8;
 
+/// 计划中的区分配（[`DataFile::plan_allocate_extent`]）。
+pub struct PlannedExtent {
+    /// 分配的区号。
+    pub extent: ExtentNo,
+    /// 位图区在文件内的起始块。
+    pub run_start: u32,
+    /// 受影响页：（区内页号, 前像, 后像）。
+    pub images: Vec<(u8, Page, Page)>,
+}
+
+fn clone_page(p: &Page) -> Page {
+    Page::from_bytes(Box::new(*p.as_bytes()))
+}
+
 /// 数据文件错误（**明确判定**）。
 #[derive(Debug)]
 pub enum DataFileError {
@@ -427,6 +441,38 @@ impl<'a> DataFile<'a> {
         write_file_head(&mut header, &self.head)?;
         self.write_page(0, &mut header)?;
         Ok(())
+    }
+
+    /// **计划分配一个区**（**不写盘**）：返回区号 + 位图区的起始块 +
+    /// 受影响页的（页内序号, 前像, 后像）——写路径经缓冲池落盘（生成 redo，
+    /// §11.5.3"页/区分配是系统操作"）。**决策已定**（位已置在后像里），
+    /// 调用方写盘后即完成。
+    pub fn plan_allocate_extent(&mut self) -> Result<PlannedExtent, DataFileError> {
+        for idx in 0..self.runs.len() {
+            let mut map = self.load_run(idx)?;
+            // **前像先拍**（allocate 会就地把位翻过去）。
+            let before: Vec<Page> = map.pages().iter().map(clone_page).collect();
+            if let Some(extent) = map.allocate() {
+                if u64::from(extent.first_block()) + u64::from(extent.blocks())
+                    > u64::from(self.data_limit())
+                {
+                    map.free(extent)?; // 越出上限：不落盘、不改位图
+                    return Err(DataFileError::FileFull);
+                }
+                let mut images = Vec::new();
+                for (i, (b, a)) in before.iter().zip(map.pages()).enumerate() {
+                    if b.as_bytes() != a.as_bytes() {
+                        images.push((i as u8, clone_page(b), clone_page(a)));
+                    }
+                }
+                return Ok(PlannedExtent {
+                    extent,
+                    run_start: self.runs[idx],
+                    images,
+                });
+            }
+        }
+        Err(DataFileError::FileFull)
     }
 
     /// **分配一个区**：按位图区顺序取最低空闲区；候选越出

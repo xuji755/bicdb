@@ -414,6 +414,38 @@ fn row_patches(old: &[u8], new: &[u8]) -> Vec<(u16, Vec<u8>)> {
     patches
 }
 
+/// **确保撤销段可容纳下一次追加**：下一逻辑页未映射 ⇒ 计划扩展
+/// （`plan_extend` 的镜像）→ 每页经池写 redo + 立即 flush。
+fn ensure_undo_capacity(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    txn: &Txn,
+) -> Result<(), TxnError> {
+    // 以**磁盘上的段头页**为准（plan_append 也直读它）。
+    let next = bicdb_storage::segment::read_header(&chain.segment().read_page(0)?)
+        .map_err(|e| TxnError::Segment(bicdb_storage::segment::SegmentSpaceError::Format(e)))?
+        .append_pos;
+    if chain.segment().logical_block(next).is_some() {
+        return Ok(());
+    }
+    let ws = workspace_of(chain);
+    let planned = chain.segment_mut().plan_extend()?;
+    for (rdba, before, after) in planned.images {
+        let key = BufferKey::new(ws, rdba);
+        write_undo_page_change(
+            pool,
+            log,
+            txn.raw(),
+            key,
+            before.as_bytes(),
+            after.as_bytes(),
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 /// 保证本事务在该块有一个 ITL 条目：
 /// - 已有本事务的活动条目 ⇒ `(slot, None)`（不必记"ITL 覆盖"）；
 /// - 占用空槽/可复用槽 ⇒ `(slot, Some(前像))`（调用方先记 "ITL 覆盖"）。
@@ -567,6 +599,8 @@ fn append_undo_via_pool(
     rowid: RowId,
     payload: UndoPayload,
 ) -> Result<RowId, TxnError> {
+    // 撤销段容量：下一个追加页未映射 ⇒ **经池扩展**（redo 保护，镜像先写后读）。
+    ensure_undo_capacity(pool, log, chain, txn)?;
     let plan = chain.plan_append(txn.slot, op, 0, rowid, payload)?;
     // ① 撤销页（可能新开）。
     let key = undo_page_key(chain, plan.logical)?;
@@ -1086,5 +1120,96 @@ mod tests {
         // 行头 itl_slot 指向 t2 的槽（更新时改写）；其余字节 = 新行。
         assert_eq!(stored[1], t2.slot as u8, "itl_slot 归本事务");
         assert_eq!(&stored[2..], &row_v2[2..], "行体 = 更新后的内容");
+    }
+
+    #[test]
+    fn undo_segment_extension_is_redo_protected() {
+        // 把撤销段的追加位置推到首区之外 ⇒ 第一次写入触发**经池扩展**：
+        // 段头页/段内位图页/文件位图页的改动都要**进日志**（崩溃可重放）。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        // 推 append_pos 到首区之外（1 区 = 8 逻辑页）。
+        {
+            let mut page = chain.segment().read_page(0).unwrap();
+            let mut h = bicdb_storage::segment::read_header(&page).unwrap();
+            h.append_pos = 8;
+            bicdb_storage::segment::write_header(&mut page, &h).unwrap();
+            chain.segment().write_page(0, &mut page).unwrap();
+        }
+        assert_eq!(chain.segment().header().extent_count, 1);
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let row = row_bytes(b"ext");
+        let mut txn = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut txn,
+            key,
+            &row,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut txn, seq(1)).unwrap();
+        pool.flush_workspace(WS).unwrap();
+
+        // 扩展发生了（第二个区）。
+        assert_eq!(chain.segment().header().extent_count, 2, "段已扩展");
+        // 日志里有指向**文件级位图页**（file 1 的 runs[0] = 块 1）与
+        // **段头页**的页修改记录——扩展的全部改动都受 redo 保护。
+        log.flush(log.appended_lsn()).unwrap();
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let groups = online_groups(&io, &cf_ro, Path::new(WAL), spec()).unwrap();
+        let scan = bicdb_wal::file::scan_log(
+            &io,
+            groups[0].handle,
+            groups[0].start_lsn,
+            u64::from(groups[0].file_pages),
+        )
+        .unwrap();
+        let touches = |file: u16, block: u32| {
+            scan.records.iter().any(|r| {
+                r.blocks
+                    .iter()
+                    .any(|b| b.rdba.file_id() == file && b.rdba.block_id() == block)
+            })
+        };
+        assert!(touches(1, 1), "文件级位图页（块 1）有 redo");
+        let page0_block = chain.segment().logical_block(0).unwrap();
+        assert!(touches(1, page0_block), "段头页有 redo");
+        // 数据页照常。
+        assert!(touches(3, 1), "数据页有 redo");
+        let _ = rid;
     }
 }

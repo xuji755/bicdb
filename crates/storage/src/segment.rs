@@ -437,6 +437,14 @@ pub fn logical_to_rdba(extents: &[ExtentEntry], logical: u32) -> Option<Rdba> {
     None
 }
 
+/// 计划中的段扩展（[`Segment::plan_extend`]）：要写的页镜像 + 新区号。
+pub struct PlannedExtend {
+    /// 分配的区号。
+    pub extent: crate::bitmap::ExtentNo,
+    /// 要写的页：（rdba, 前像, 后像）。
+    pub images: Vec<(Rdba, Page, Page)>,
+}
+
 /// 第 `i` 个段内位图页覆盖的逻辑页范围 `[i×65216, (i+1)×65216)`。
 #[must_use]
 pub const fn bitmap_page_range(index: u32) -> (u32, u32) {
@@ -723,6 +731,82 @@ impl<'io, 'f> Segment<'io, 'f> {
         self.file.write_page(self.page0, &mut page)?;
         self.header = h;
         Ok(())
+    }
+
+    /// **计划扩展**（**不写盘**）：分配新区 + 段头页（区映射/计数）+ 段内
+    /// 位图页的（前像、后像）——写路径经缓冲池落盘（redo 保护，
+    /// §11.5.3"页/区分配是系统操作"）。决策已在返回镜像里定下。
+    pub fn plan_extend(&mut self) -> Result<PlannedExtend, SegmentSpaceError> {
+        let planned = self.file.plan_allocate_extent()?;
+        let rdba = Rdba::from_parts(self.file.file_id(), planned.extent.first_block())
+            .expect("块号在 28 位内");
+
+        // 段头页（前/后）：区映射 + 计数。
+        let header_before = self.file.read_page(self.page0)?;
+        let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
+        let map = append_extent(&mut header_after, ExtentEntry::new(rdba, 1))?;
+        let header_after_state = read_header(&header_after)?;
+
+        // 段内位图页（前/后）：新区数据页 → High（位图页自身跳过）。
+        let first_logical = self.header.extent_count as u32 * EXTENT_BLOCKS;
+        let mut bmp_images: Vec<(u32, Page, Page)> = Vec::new();
+        for k in first_logical..first_logical + EXTENT_BLOCKS {
+            if self.is_bitmap_page(k) {
+                continue;
+            }
+            let (_, bit, bmp_logical) = self.bitmap_slot(k);
+            if self.logical_block(bmp_logical).is_none() {
+                // 跨到尚未物化的位图页：本切片不在此路径物化（生产 coverage
+                // 下不可达；多页位图已有独立物化口）。
+                return Err(SegmentSpaceError::BitmapCoverage);
+            }
+            let idx = bmp_images.iter().position(|(l, _, _)| *l == bmp_logical);
+            let (entry_idx, _) = match idx {
+                Some(i) => (i, ()),
+                None => {
+                    let before = self.file.read_page(
+                        self.logical_block(bmp_logical)
+                            .ok_or(SegmentSpaceError::BitmapCoverage)?,
+                    )?;
+                    let after = Page::from_bytes(Box::new(*before.as_bytes()));
+                    bmp_images.push((bmp_logical, before, after));
+                    (bmp_images.len() - 1, ())
+                }
+            };
+            let (_, _, after) = &mut bmp_images[entry_idx];
+            crate::bitmap::set_free_level(after, bit, crate::bitmap::FreeLevel::High)?;
+        }
+
+        // 文件级位图页的镜像 → rdba。
+        let mut images: Vec<(crate::rowid::Rdba, Page, Page)> = Vec::new();
+        for (page_in_run, before, after) in planned.images {
+            let block = planned.run_start + u32::from(page_in_run);
+            let rdba = Rdba::from_parts(self.file.file_id(), block).expect("块号在 28 位内");
+            images.push((rdba, before, after));
+        }
+        images.push((
+            Rdba::from_parts(self.file.file_id(), self.page0).expect("块号在 28 位内"),
+            header_before,
+            header_after,
+        ));
+        for (logical, before, after) in bmp_images {
+            let block = self
+                .logical_block(logical)
+                .ok_or(SegmentSpaceError::BitmapCoverage)?;
+            images.push((
+                Rdba::from_parts(self.file.file_id(), block).expect("块号在 28 位内"),
+                before,
+                after,
+            ));
+        }
+
+        // 内存状态推进（镜像已定，写盘由调用方完成）。
+        self.header = header_after_state;
+        self.map = map;
+        Ok(PlannedExtend {
+            extent: planned.extent,
+            images,
+        })
     }
 
     /// **准备下一个可写的追加逻辑页**：跳过（并物化）跨到的位图页本身。
