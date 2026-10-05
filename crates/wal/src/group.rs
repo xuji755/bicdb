@@ -528,7 +528,11 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// **检查点发布**（CKPT 角色）：把"**组结尾 LSN ≤ 检查点低水位**"的
     /// `ACTIVE` 组降为 `INACTIVE`，与低水位**同一次控制文件更新**发布
     /// （§11.9 的发布纪律）。
-    pub fn publish_checkpoint(&mut self, progress: &CheckpointProgress) -> Result<(), GroupError> {
+    pub fn publish_checkpoint(
+        &mut self,
+        progress: &CheckpointProgress,
+    ) -> Result<usize, GroupError> {
+        let mut demoted = 0usize;
         for g in 0..self.spec.group_count as usize {
             if self.entries.groups[g].run != LogRunState::Active {
                 continue;
@@ -536,12 +540,24 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             if let Some(end) = self.group_ends[g] {
                 if end <= progress.checkpoint_lsn {
                     self.entries.groups[g].run = LogRunState::Inactive;
+                    demoted += 1;
                 }
             }
         }
         self.cf
             .write_checkpoint_and_groups(progress, &self.entries)?;
-        Ok(())
+        Ok(demoted)
+    }
+
+    /// 控制文件里当前的检查点进度（检查点的单调性守卫用）。
+    pub fn checkpoint_progress(&self) -> Result<CheckpointProgress, GroupError> {
+        Ok(self.cf.checkpoint_progress()?)
+    }
+
+    /// 某组的结尾 LSN（已写前缀的下一页边界；未用过的组为 `None`）。
+    #[must_use]
+    pub fn group_end_lsn(&self, group: u8) -> Option<Lsn> {
+        self.group_ends[usize::from(group)]
     }
 
     /// **归档完成发布**（ARCn 角色的替身，归档切片接管）：
