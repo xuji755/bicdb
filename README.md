@@ -26,9 +26,13 @@ It unifies five kinds of data under one transactional store:
 
 ### Status
 
-> **Design frozen (2026-10). Skeleton only — nothing is implemented yet.**
-> The V1.0 design documents are frozen; all crates remain placeholders and no
-> callable API exists yet.
+> **Design frozen (2026-10). Phases P1–P4 implemented.**
+> Storage, WAL/recovery, transactions, the buffer pool (with per-workspace
+> working sets and per-frame state objects), and the B+Tree index (wired into
+> `SegType::BTree` segments) are implemented and covered by tests
+> (`cargo test --workspace`). Next: P5 (SQL/JSON/SDK) and the
+> executor/session layer. The remaining P4 items are tracked with explicit
+> triggers or dependencies (see `doc/待讨论清单.md`).
 
 ### Documentation
 
@@ -169,8 +173,12 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 
 ### 当前状态
 
-> **设计已冻结（2026-10）；仅有目录骨架，尚未实现任何功能。**
-> V1.0 设计文档已冻结；所有 crate 仍为占位，尚无可调用接口。
+> **设计已冻结（2026-10）；P1–P4 已实现。**
+> 存储、WAL/恢复、事务、缓冲池（按工作集的**多分区** + **per-frame 状态
+> 对象**）与 B+Tree 索引（已接入 `SegType::BTree` 段：树头落段头页扩展区、
+> 池存取口）均已实现并有测试覆盖（`cargo test --workspace`）；下一步 =
+> P5（SQL/JSON/SDK）与执行器/会话层。P4 的少数余项挂明确触发条件或依赖
+> （见 `doc/待讨论清单.md`）。
 
 ### 文档
 
