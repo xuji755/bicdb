@@ -244,12 +244,16 @@ pub fn insert_record(
     u16::try_from(index + 1).map_err(|_| HeapError::SlotLimit)
 }
 
-/// 读取行字节；槽位空闲 / 越界 / 指针非法一律 `None`。
+/// 读取行字节；槽位空闲 / **转发指针** / 越界 / 指针非法一律 `None`。
+///
+/// **转发指针不是行**（§6.2）：它是一个裸的 6 字节目标、没有行头——把它当
+/// 行头解析会按指针字节算出"假行"（审核修复：此前 `iter_rows` 会产出空行/
+/// 垃圾行）。跟随指针取真实行属行迁移切片；此处如实返回 `None`。
 #[must_use]
 pub fn row(page: &Page, row_no: u16) -> Option<&[u8]> {
     let index = slot_index(row_no)?;
     let slot = page.slot(index)?;
-    if slot.status() == SlotStatus::Free {
+    if matches!(slot.status(), SlotStatus::Free | SlotStatus::Forwarding) {
         return None;
     }
     let start = usize::from(slot.offset());
@@ -727,6 +731,25 @@ mod tests {
             HeapError::BadRow,
             "row_len 与字节数不符"
         );
+    }
+
+    #[test]
+    fn forwarding_slot_is_not_a_row() {
+        // 审核修复回归（F4）：转发指针没有行头——`row()` 必须返回 None，
+        // 而不是把 6B 目标当行头解析出"假行"。
+        let mut page = Page::new(crate::page::PageType::HeapTable, [0u8; 8], 3, 1);
+        let target = crate::rowid::RowId::from_parts(3, 9, 5).unwrap();
+        let offset = page.free_end() - crate::rowid::ROWID_LEN;
+        page.as_bytes_mut()[offset..offset + crate::rowid::ROWID_LEN]
+            .copy_from_slice(&target.to_bytes());
+        page.set_free_end(offset);
+        page.set_slot_count(1).unwrap();
+        page.set_slot(
+            0,
+            SlotEntry::new(offset as u16, SlotStatus::Forwarding).unwrap(),
+        );
+        assert_eq!(row(&page, 1), None, "转发指针不是行");
+        assert_eq!(slot_status(&page, 1), Some(SlotStatus::Forwarding));
     }
 
     #[test]
