@@ -63,6 +63,12 @@ dependencies = [
 [[package]]
 name = "bicdb-txn"
 version = "0.0.0"
+dependencies = [
+ "bicdb-common",
+ "bicdb-storage",
+ "bicdb-wal",
+ "bicdb-workspace",
+]
 
 [[package]]
 name = "bicdb-types"

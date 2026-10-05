@@ -534,12 +534,16 @@ pub enum UndoPayload {
     None,
     /// 删除：整行旧值（**含行头**）。
     FullRow(Vec<u8>),
-    /// 更新：旧 `itl_slot` 1B + 每个变更列的（列号 2B │ 旧值长度 2B │ 旧值）。
+    /// 更新：旧 `itl_slot` 1B + 每个变更段的（**行内偏移** 2B │ 旧值长度 2B │ 旧值）。
+    ///
+    /// **"列号"改为"行内偏移"**（编码期细化，2026-10-05）：补偿落点要能
+    /// **不依赖列元数据**地写回（`apply_undo_to_page` 手上只有页），而行内
+    /// 偏移在"等长就地更新"下是稳定的——2B 换来自包含的补偿。
     Update {
         /// 行头里原来的 `itl_slot` 字节。
         old_itl_slot: u8,
-        /// 变更列的前像列表。
-        columns: Vec<(u16, Vec<u8>)>,
+        /// 变更段的前像列表：（行内偏移, 旧值）。
+        patches: Vec<(u16, Vec<u8>)>,
     },
     /// 转发指针更新：旧的转发目标。
     Forward(RowId),
@@ -584,11 +588,11 @@ impl UndoRecord {
             UndoPayload::FullRow(bytes) => out.extend_from_slice(bytes),
             UndoPayload::Update {
                 old_itl_slot,
-                columns,
+                patches,
             } => {
                 out.push(*old_itl_slot);
-                for (col, old) in columns {
-                    out.extend_from_slice(&col.to_le_bytes());
+                for (off, old) in patches {
+                    out.extend_from_slice(&off.to_le_bytes());
                     out.extend_from_slice(&(old.len() as u16).to_le_bytes());
                     out.extend_from_slice(old);
                 }
@@ -638,24 +642,24 @@ impl UndoRecord {
                     return Err(UndoError::MalformedRecord);
                 }
                 let old_itl_slot = body[0];
-                let mut columns = Vec::new();
+                let mut patches = Vec::new();
                 let mut at = 1usize;
                 while at < body.len() {
                     if at + 4 > body.len() {
                         return Err(UndoError::MalformedRecord);
                     }
-                    let col = u16::from_le_bytes([body[at], body[at + 1]]);
+                    let off = u16::from_le_bytes([body[at], body[at + 1]]);
                     let len = usize::from(u16::from_le_bytes([body[at + 2], body[at + 3]]));
                     at += 4;
                     if at + len > body.len() {
                         return Err(UndoError::MalformedRecord);
                     }
-                    columns.push((col, body[at..at + len].to_vec()));
+                    patches.push((off, body[at..at + len].to_vec()));
                     at += len;
                 }
                 UndoPayload::Update {
                     old_itl_slot,
-                    columns,
+                    patches,
                 }
             }
             UndoOp::Forward => {
@@ -862,6 +866,25 @@ impl From<crate::segment::SegmentError> for UndoChainError {
 /// **Undo 页写入器与链**：绑定 undo 段，把撤销记录追加进 undo 页并维护
 /// 事务表槽的链头。**一个 undo 页同一时刻只服务一个事务**（§4.6.1）——
 /// 换事务即换新页（旧事务的记录仍在该页上，沿链可达）。
+/// 一次链追加的**页级计划**（[`UndoChain::plan_append`] 的产物）。
+pub struct UndoAppend {
+    /// 撤销页的逻辑页号。
+    pub logical: u32,
+    /// 是否新开了撤销页。
+    pub opened: bool,
+    /// 本页归属的事务（状态更新用）。
+    pub txn_id: TxnId,
+    /// 撤销页的（追加前、追加后）镜像。
+    pub undo_page: (Page, Page),
+    /// 段内位图页的（前、后）镜像（仅新开页时存在）。
+    pub bitmap: Option<(Page, Page)>,
+    /// 段头页的（前、后）镜像（槽的 `undo_current`/`rec_count` 已更新）。
+    pub header: (Page, Page),
+    /// **新链头**（本记录的地址）。
+    pub head: RowId,
+}
+
+/// undo 段上的链写入器（当前页与归属事务的写作状态）。
 pub struct UndoChain<'io, 'f> {
     segment: Segment<'io, 'f>,
     current_logical: Option<u32>,
@@ -903,16 +926,22 @@ impl<'io, 'f> UndoChain<'io, 'f> {
 
     /// **追加一条撤销记录**：链头来自事务表槽的 `undo_current`；
     /// 页归属不符或放不下则新开 undo 页；最后更新槽的链头与计数。
-    pub fn append(
+    /// **计划一次链追加**（**不写盘**）：返回要写的页镜像与前后像——
+    /// 写路径经缓冲池落盘（为每页生成 redo 并标脏，§11.1.2"undo 自身受
+    /// redo 保护"的落点）；恢复/测试走 [`UndoChain::append`] 的直写形态。
+    ///
+    /// 若需要新开撤销页且段内无空闲逻辑页，会**直写**扩展段（段头页与位图
+    /// 页——`Segment::extend` 的既有行为）；其余页一律只返回镜像。
+    pub fn plan_append(
         &mut self,
         slot_index: u16,
         op: UndoOp,
         flags: u8,
         rowid: RowId,
         payload: UndoPayload,
-    ) -> Result<RowId, UndoChainError> {
-        let mut header = self.segment.read_page(0)?;
-        let mut txn_slot = read_slot(&header, slot_index)?;
+    ) -> Result<UndoAppend, UndoChainError> {
+        let mut header_before = self.segment.read_page(0)?;
+        let mut txn_slot = read_slot(&header_before, slot_index)?;
         if txn_slot.state == TxnState::Free {
             return Err(UndoChainError::SlotNotActive(slot_index));
         }
@@ -934,19 +963,22 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             }
             _ => false,
         };
-        let (logical, mut page) = if reuse {
+        let mut bitmap = None;
+        let (logical, undo_before, opened) = if reuse {
             let logical = self.current_logical.expect("已判定存在");
             let page = self.segment.read_page(logical)?;
-            (logical, page)
+            (logical, page, false)
         } else {
-            // 新页：逻辑页号 = 段头 `追加位置`；必要时扩展段。
-            let mut seg_header = read_header(&header)?;
+            // 新页：逻辑页号 = 段头 `追加位置`；必要时（直写）扩展段。
+            let mut seg_header = read_header(&header_before)?;
             let logical = seg_header.append_pos;
             if logical >= BITMAP_PAGE_COVERAGE {
                 return Err(UndoChainError::BitmapCoverage);
             }
             if self.segment.logical_block(logical).is_none() {
                 self.segment.extend()?;
+                header_before = self.segment.read_page(0)?;
+                txn_slot = read_slot(&header_before, slot_index)?;
             }
             let block = self
                 .segment
@@ -969,31 +1001,80 @@ impl<'io, 'f> UndoChain<'io, 'f> {
                     state: crate::itl::ItlState::Active,
                 },
             )?;
+            seg_header = read_header(&header_before)?;
             seg_header.append_pos = logical + 1;
-            write_header(&mut header, &seg_header)?;
+            write_header(&mut header_before, &seg_header)?;
             // 段内位图：新页 → High（仍在首个位图页覆盖内）。
-            let mut bmp = self.segment.read_page(1)?;
-            crate::bitmap::set_free_level(&mut bmp, logical, crate::bitmap::FreeLevel::High)?;
-            self.segment.write_page(1, &mut bmp)?;
-            self.current_logical = Some(logical);
-            self.current_txn = Some(txn_id);
-            (logical, page)
+            let bmp_before = self.segment.read_page(1)?;
+            let mut bmp_after = Page::from_bytes(Box::new(*bmp_before.as_bytes()));
+            crate::bitmap::set_free_level(&mut bmp_after, logical, crate::bitmap::FreeLevel::High)?;
+            bitmap = Some((bmp_before, bmp_after));
+            (logical, page, true)
         };
 
-        let slot_no = put_record(&mut page, &record)?;
+        let mut undo_after = Page::from_bytes(Box::new(*undo_before.as_bytes()));
+        let slot_no = if opened {
+            // 新页由上面就地构造——直接在其上追加。
+            put_record(&mut undo_after, &record)?
+        } else {
+            put_record(&mut undo_after, &record)?
+        };
         let block = self
             .segment
             .logical_block(logical)
             .ok_or(SegmentSpaceError::BitmapCoverage)?;
-        self.segment.write_page(logical, &mut page)?;
-
-        let rid = RowId::from_parts(self.segment.file_id(), block, slot_no)
+        let head = RowId::from_parts(self.segment.file_id(), block, slot_no)
             .map_err(|_| UndoError::MalformedRecord)?;
-        txn_slot.undo_current = Some(rid);
+
+        let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
+        txn_slot.undo_current = Some(head);
         txn_slot.rec_count = txn_slot.rec_count.saturating_add(1);
-        write_slot(&mut header, slot_index, &txn_slot)?;
-        self.segment.write_page(0, &mut header)?;
-        Ok(rid)
+        write_slot(&mut header_after, slot_index, &txn_slot)?;
+
+        Ok(UndoAppend {
+            logical,
+            opened,
+            txn_id,
+            undo_page: (undo_before, undo_after),
+            bitmap,
+            header: (header_before, header_after),
+            head,
+        })
+    }
+
+    /// 链写作器状态更新（`plan_append` 之后必须调用）。
+    pub fn note_append(&mut self, plan: &UndoAppend) {
+        if plan.opened {
+            self.current_logical = Some(plan.logical);
+            self.current_txn = Some(plan.txn_id);
+        }
+    }
+
+    /// **追加一条撤销记录并直写落盘**（恢复/测试路径；写路径用
+    /// [`UndoChain::plan_append`] 经缓冲池）。
+    pub fn append(
+        &mut self,
+        slot_index: u16,
+        op: UndoOp,
+        flags: u8,
+        rowid: RowId,
+        payload: UndoPayload,
+    ) -> Result<RowId, UndoChainError> {
+        let plan = self.plan_append(slot_index, op, flags, rowid, payload)?;
+        if let Some((_, after)) = &plan.bitmap {
+            let mut p = Page::from_bytes(Box::new(*after.as_bytes()));
+            self.segment.write_page(1, &mut p)?;
+        }
+        if plan.opened {
+            let mut p = Page::from_bytes(Box::new(*plan.undo_page.1.as_bytes()));
+            self.segment.write_page(plan.logical, &mut p)?;
+        }
+        let mut p = Page::from_bytes(Box::new(*plan.undo_page.1.as_bytes()));
+        self.segment.write_page(plan.logical, &mut p)?;
+        let mut h = Page::from_bytes(Box::new(*plan.header.1.as_bytes()));
+        self.segment.write_page(0, &mut h)?;
+        self.note_append(&plan);
+        Ok(plan.head)
     }
 
     /// **按 `txn_id` 查事务表槽**（一致性读的可见性判定用）：`None` =
@@ -1238,7 +1319,35 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
                 }
             }
         }
-        UndoOp::Update => return Err(RollbackError::UpdateNeedsLayout),
+        UndoOp::Update => {
+            let (old_itl_slot, patches) = match &record.payload {
+                UndoPayload::Update {
+                    old_itl_slot,
+                    patches,
+                } => (*old_itl_slot, patches),
+                _ => return Err(RollbackError::Undo(UndoError::MalformedRecord)),
+            };
+            let Some(entry) = page.slot(index) else {
+                return Ok(()); // 页状态早于本记录（PITR 有界重放）：空操作
+            };
+            if entry.status() == crate::page::SlotStatus::Free {
+                // 行不在（已删/未重放）——前像即"没有这一行"，空操作。
+                return Ok(());
+            }
+            let base = usize::from(entry.offset());
+            for (off, old) in patches {
+                let at = base + usize::from(*off);
+                if at + old.len() > crate::page::PAGE_SIZE || at < base {
+                    return Err(RollbackError::Undo(UndoError::MalformedRecord));
+                }
+                page.as_bytes_mut()[at..at + old.len()].copy_from_slice(old);
+            }
+            // 行头 `itl_slot`（偏移 1）也要还原（§4.6.2："行头字节也进 undo"）。
+            if base + 1 >= crate::page::PAGE_SIZE {
+                return Err(RollbackError::Undo(UndoError::MalformedRecord));
+            }
+            page.as_bytes_mut()[base + 1] = old_itl_slot;
+        }
     }
     Ok(())
 }
@@ -1437,7 +1546,7 @@ mod tests {
             rowid: rid(9, 3),
             payload: UndoPayload::Update {
                 old_itl_slot: 2,
-                columns: vec![(1, b"old-a".to_vec()), (7, vec![])],
+                patches: vec![(1, b"old-a".to_vec()), (7, vec![])],
             },
         };
         assert_eq!(UndoRecord::decode(&update.encode()).unwrap(), update);
@@ -1500,7 +1609,7 @@ mod tests {
             rowid: rid(9, 1),
             payload: UndoPayload::Update {
                 old_itl_slot: 0,
-                columns: vec![(1, vec![9, 9, 9])],
+                patches: vec![(1, vec![9, 9, 9])],
             },
         }
         .encode();
@@ -2034,22 +2143,48 @@ mod rollback_tests {
     }
 
     #[test]
-    fn update_rollback_is_explicitly_deferred() {
+    fn update_rollback_restores_patches_and_itl_slot() {
+        // 等长就地更新：补偿 = 按**行内偏移**写回旧值 + 行头 `itl_slot` 还原。
         let io = mem();
         let h = data_file(&io);
+        let original = row_bytes(1, b"v1");
+        {
+            let mut page = load(&io, h);
+            heap::insert_row(&mut page, &original, &InsertPolicy::in_place(0)).unwrap();
+            store(&io, h, &mut page);
+        }
+        // "更新"：改 itl_slot 字节（1 → 7）+ 改一个数据字节（行内偏移 11）。
+        let mut updated = original.clone();
+        updated[1] = 7;
+        updated[11] ^= 0xFF;
+        {
+            let mut page = load(&io, h);
+            let offset = page.slot(0).unwrap().offset() as usize;
+            page.as_bytes_mut()[offset..offset + updated.len()].copy_from_slice(&updated);
+            store(&io, h, &mut page);
+        }
         let mut resolve = |r: Rdba| (r.file_id() == 3).then_some((h, 0));
         let r = rec(
             UndoOp::Update,
             UndoPayload::Update {
-                old_itl_slot: 0,
-                columns: vec![(1, b"old".to_vec())],
+                old_itl_slot: 1,
+                patches: vec![(11, vec![original[11]])],
             },
             1,
         );
-        assert!(matches!(
-            rollback_record(&io, &r, &mut resolve),
-            Err(RollbackError::UpdateNeedsLayout)
-        ));
+        rollback_record(&io, &r, &mut resolve).unwrap();
+        let page = load(&io, h);
+        assert_eq!(heap::row(&page, 1), Some(&original[..]), "行逐字节还原");
+
+        // 行不在（槽空闲）⇒ 空操作（PITR/幂等家族）。
+        {
+            let mut page = load(&io, h);
+            heap::delete_row(&mut page, 1).unwrap();
+            store(&io, h, &mut page);
+        }
+        rollback_record(&io, &r, &mut resolve).unwrap();
+        let page = load(&io, h);
+        assert_eq!(page.slot(0).unwrap().status(), SlotStatus::Free);
     }
 
     #[test]

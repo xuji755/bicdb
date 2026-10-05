@@ -520,6 +520,33 @@ impl<'io> BufferPool<'io> {
         Ok(PageGuard { inner, idx: victim })
     }
 
+    /// **装入一张新页**（尚未落盘的分配页——不经 read，不做身份核对）。
+    ///
+    /// 调用方随后应自行生成 redo（新页的"前像" = 全零页）并 `mark_dirty`。
+    /// 返回的卫兵已钉住该帧。
+    pub fn insert_new(
+        &self,
+        key: BufferKey,
+        page: Page,
+    ) -> Result<PageGuard<'_, 'io>, BufferError> {
+        let mut inner = self.lock();
+        let victim = match inner.find_reusable() {
+            Some(v) => v,
+            None => {
+                inner.make_free(self.io)?;
+                match inner.find_reusable() {
+                    Some(v) => v,
+                    None => {
+                        inner.stats.fb_wait += 1;
+                        return Err(BufferError::FreeBufferWait);
+                    }
+                }
+            }
+        };
+        inner.attach(victim, key, page);
+        Ok(PageGuard { inner, idx: victim })
+    }
+
     /// 写回某一页（若脏）。返回是否真的写了。
     pub fn flush(&self, key: BufferKey) -> Result<bool, BufferError> {
         let mut inner = self.lock();
