@@ -375,41 +375,35 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
 
         let mut written_pages = vec![0u64; spec.group_count as usize];
         let mut group_ends: [Option<Lsn>; MAX_REDO_GROUPS] = [None; MAX_REDO_GROUPS];
+        let mut current_start_opt: Option<Lsn> = None;
         for g in 0..spec.group_count as usize {
             let used =
                 entries.groups[g].run != LogRunState::Unused || entries.groups[g].sequence != 0;
             if !used {
                 continue; // 从未用过：文件保持全零
             }
-            // 成员挑选（同 `online_groups`）：健康成员里取已写前缀最长者。
-            let rusty = entries.groups[g].member_stale;
-            let mut order: Vec<u8> = (0..spec.member_count)
-                .filter(|m| rusty & (1 << m) == 0)
-                .collect();
-            if order.is_empty() {
-                order = (0..spec.member_count).collect();
-            }
-            let mut best: Option<(u64, Lsn)> = None;
-            for m in order {
-                let (pages, start) =
-                    scan_used_group(io, files[g][usize::from(m)], g as u8, spec.group_pages)?;
-                if best.as_ref().map_or(true, |(p, _)| pages > *p) {
-                    best = Some((pages, start));
+            // 成员挑选（同 `online_groups`）：健康成员里取已写前缀最长者；
+            // 单成员损坏/为空由其余镜像顶替（§11.9）；全部为空 = 复用前的
+            // 截断态（该组内容不参与恢复），视为"无内容"。
+            if let Some((pages, start, _)) = best_member_scan(
+                io,
+                &files[g],
+                g as u8,
+                entries.groups[g].member_stale,
+                &spec,
+            )? {
+                written_pages[g] = pages;
+                group_ends[g] = Some(lsn_add(start, pages * LOG_PAGE_SIZE as u64)?);
+                if g == usize::from(current) {
+                    current_start_opt = Some(start);
                 }
             }
-            let (pages, start) = best.ok_or(GroupError::Damaged {
-                group: g as u8,
-                reason: "无可用成员",
-            })?;
-            written_pages[g] = pages;
-            group_ends[g] = Some(lsn_add(start, pages * LOG_PAGE_SIZE as u64)?);
         }
 
-        let current_start =
-            read_group_start(io, files[current as usize][0])?.ok_or(GroupError::Damaged {
-                group: current,
-                reason: "当前组无内容（切换记录缺失）",
-            })?;
+        let current_start = current_start_opt.ok_or(GroupError::Damaged {
+            group: current,
+            reason: "当前组无内容（切换记录缺失）",
+        })?;
         let resume = group_ends[current as usize].ok_or(GroupError::Damaged {
             group: current,
             reason: "当前组无内容（切换记录缺失）",
@@ -490,34 +484,55 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     pub fn flush(&mut self, target: Lsn) -> Result<Lsn, GroupError> {
         let g = self.current as usize;
         let pages = self.written_pages[g];
-        let handles: Vec<_> = self.files[g].clone();
+        // **只写健康成员**：已置 `STALE` 的成员在重建前不再接收写入——否则
+        // 落后成员会写出空洞、被位置校验拒绝，进而把健康成员也拖垮。
+        let stale = self.entries.groups[g].member_stale;
+        let active: Vec<usize> = (0..usize::from(self.spec.member_count))
+            .filter(|m| stale & (1 << m) == 0)
+            .collect();
+        if active.is_empty() {
+            return Err(GroupError::Damaged {
+                group: self.current,
+                reason: "全部成员已置 STALE——先重建成员镜像",
+            });
+        }
         let mut tee = TeeSink {
-            sinks: handles
+            sinks: active
                 .iter()
-                .map(|h| {
+                .map(|&m| {
                     FileLogSink::resume(
                         self.io,
-                        *h,
+                        self.files[g][m],
                         self.current_start,
                         self.spec.group_pages as u64,
                         pages,
                     )
                 })
                 .collect(),
-            failed: vec![false; handles.len()],
+            failed: vec![false; active.len()],
         };
         let synced = self.buffer.flush_to(target, &mut tee)?;
-        self.written_pages[g] = tee.sinks[0].written_pages();
+        // 组已写页数 = **未失败成员**的最大值。取成员 0 的计数会让"成员 0
+        // 一次瞬时写失败"把所有人的续写基准拖回落后值（下一次 flush 位置
+        // 不符 ⇒ WAL 永久写不出去——实测复现）。
+        self.written_pages[g] = tee
+            .sinks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !tee.failed[*i])
+            .map(|(_, s)| s.written_pages())
+            .max()
+            .unwrap_or(pages);
         self.group_ends[g] = Some(lsn_add(
             self.current_start,
             self.written_pages[g] * LOG_PAGE_SIZE as u64,
         )?);
 
-        // **成员失败 ⇒ 标 STALE**（降级为单成员继续；发布进控制文件）。
+        // **成员失败 ⇒ 标 STALE**（降级为其余成员继续；发布进控制文件）。
         let mut changed = false;
-        for (m, bad) in tee.failed.iter().enumerate() {
+        for (i, bad) in tee.failed.iter().enumerate() {
             if *bad {
-                self.entries.groups[g].member_stale |= 1 << m;
+                self.entries.groups[g].member_stale |= 1 << active[i];
                 changed = true;
             }
         }
@@ -551,6 +566,9 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             self.io.write_at(self.files[g][m], &buf[..n], copied)?;
             copied += n as u64;
         }
+        // 目标尾部可能残留上一周期的旧页——截到已复制前缀，避免"重建好的
+        // 成员"再被扫描判成"中部坏页"。
+        self.io.set_len(self.files[g][m], bytes)?;
         self.io.sync_data(self.files[g][m])?;
         self.entries.groups[g].member_stale &= !(1 << m);
         self.cf.write_redo_entries(&self.entries)?;
@@ -623,6 +641,14 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         };
 
         // 2) 切换记录写进新组并落盘（**先于** CURRENT 发布——见模块文档）。
+        //    **复用组先清空**：上一周期的旧页会以"中部坏页"形态被判损坏
+        //    （新周期写得比上一轮少时必然踩中）。截断到零，让组内容 = 本周期；
+        //    截断后的空文件对 `open/online_groups` 是合法的"无内容"态
+        //    （`Inactive` 组的旧内容不参与恢复）——崩溃在切换记录落盘前，
+        //    也只是留下一个空组，不产生"损坏"。
+        for h in &self.files[next as usize] {
+            self.io.set_len(*h, 0)?;
+        }
         self.current = next;
         self.current_start = new_start;
         self.written_pages[next as usize] = 0;
@@ -824,28 +850,37 @@ pub fn online_groups(
             continue;
         }
         // **成员挑选**（§11.9）：健康成员里取"已写前缀最长"者——
-        // `STALE` 成员不参与；全 `STALE` 时（防御）退回全部候选。
-        let mut order: Vec<u8> = (0..spec.member_count)
-            .filter(|m| entry.member_stale & (1 << m) == 0)
-            .collect();
-        if order.is_empty() {
-            order = (0..spec.member_count).collect();
-        }
-        let mut best: Option<(u64, Lsn, FileHandle)> = None;
-        for m in order {
+        // `STALE` 成员不参与；全 `STALE` 时（防御）退回全部候选；
+        // 单成员损坏/为空由其余镜像顶替（健康镜像必须救得回来）。
+        let mut handles: Vec<FileHandle> = Vec::with_capacity(spec.member_count as usize);
+        for m in 0..spec.member_count {
             let path = dir.join(member_file_name(g as u8, m));
-            let handle = io.open(&path, OpenOptions::new().read(true))?;
-            let (pages, start) = scan_used_group(io, handle, g as u8, spec.group_pages)?;
-            if best.as_ref().map_or(true, |(p, _, _)| pages > *p) {
-                best = Some((pages, start, handle));
+            handles.push(io.open(&path, OpenOptions::new().read(true))?);
+        }
+        let picked = best_member_scan(io, &handles, g as u8, entry.member_stale, &spec);
+        let best = match picked {
+            Ok(b) => b,
+            Err(e) => {
+                for h in handles {
+                    let _ = io.close(h);
+                }
+                return Err(e);
+            }
+        };
+        let Some((pages, start, m)) = best else {
+            // 全部为空（复用前截断的 `Inactive` 组）：不参与恢复，跳过。
+            for h in handles {
+                let _ = io.close(h);
+            }
+            continue;
+        };
+        // 未选中的句柄关掉（不泄漏 fd）。
+        for (i, h) in handles.iter().enumerate() {
+            if i != m {
+                let _ = io.close(*h);
             }
         }
-        let Some((pages, start, handle)) = best else {
-            return Err(GroupError::Damaged {
-                group: g as u8,
-                reason: "无可用成员",
-            });
-        };
+        let handle = handles[m];
         out.push(OnlineGroup {
             group: g as u8,
             sequence: entry.sequence,
@@ -867,16 +902,19 @@ pub fn online_groups(
 /// 扫描一个已用组：返回（已写页数，组起点 LSN）。
 ///
 /// 组的尾部残缺（坏页/空页）与之区分：其后仍有非零页 ⇒ **中部坏页**，按损坏拒绝。
+/// 扫描一个已用组：`Ok(None)` = **文件为空**（从未写过，或复用前已截断）；
+/// `Ok(Some(..))` = （已写页数，组起点 LSN）；`Err` = 损坏。
+///
+/// 组的尾部残缺（坏页/空页）与之区分：其后仍有非零页 ⇒ **中部坏页**，按损坏拒绝。
 fn scan_used_group(
     io: &dyn FileIo,
     handle: FileHandle,
     group: u8,
     group_pages: u32,
-) -> Result<(u64, Lsn), GroupError> {
-    let start = read_group_start(io, handle)?.ok_or(GroupError::Damaged {
-        group,
-        reason: "组状态非 UNUSED 但文件为空",
-    })?;
+) -> Result<Option<(u64, Lsn)>, GroupError> {
+    let Some(start) = read_group_start(io, handle, group)? else {
+        return Ok(None); // 空文件：不是损坏（复用前的截断态）
+    };
     let scan = scan_log(io, handle, start, group_pages as u64)?;
     if let Some(bad) = scan.first_bad_page {
         if any_nonzero_page_after(io, handle, bad + 1, group_pages as u64)? {
@@ -886,11 +924,15 @@ fn scan_used_group(
             });
         }
     }
-    Ok((scan.pages_scanned, start))
+    Ok(Some((scan.pages_scanned, start)))
 }
 
 /// 读组的首张页并将其起始 LSN 作为组起点；整页全零 = 从未写过（`None`）。
-fn read_group_start(io: &dyn FileIo, handle: FileHandle) -> Result<Option<Lsn>, GroupError> {
+fn read_group_start(
+    io: &dyn FileIo,
+    handle: FileHandle,
+    group: u8,
+) -> Result<Option<Lsn>, GroupError> {
     let mut buf = Box::new([0u8; LOG_PAGE_SIZE]);
     io.read_exact_at(handle, buf.as_mut_slice(), 0)?;
     if buf.iter().all(|&b| b == 0) {
@@ -898,10 +940,53 @@ fn read_group_start(io: &dyn FileIo, handle: FileHandle) -> Result<Option<Lsn>, 
     }
     let page = LogPage::from_bytes(buf);
     page.verify().map_err(|_| GroupError::Damaged {
-        group: 0,
+        group,
         reason: "组首张页校验和不符",
     })?;
     Ok(Some(page.start_lsn()))
+}
+
+/// **跨成员扫描一个"已用过"的组**（`open` 与 `online_groups` 共用）：
+/// 健康成员里取**已写前缀最长**者；单个成员损坏或为空 ⇒ **跳过**
+/// （其余镜像顶替——§11.9 的降级语义，健康镜像必须救得回来）。
+///
+/// - `Ok(Some((页数, 起点, 成员号)))`：选中者；
+/// - `Ok(None)`：**所有候选都为空文件**（复用前的截断态——`Inactive` 组的旧
+///   内容不参与恢复，合法）；
+/// - `Err`：没有可用候选，且至少一个候选是**损坏**（不是"为空"）——响亮报错。
+fn best_member_scan(
+    io: &dyn FileIo,
+    files: &[FileHandle],
+    group: u8,
+    member_stale: u8,
+    spec: &GroupSpec,
+) -> Result<Option<(u64, Lsn, usize)>, GroupError> {
+    let mut order: Vec<usize> = (0..usize::from(spec.member_count))
+        .filter(|m| member_stale & (1 << m) == 0)
+        .collect();
+    if order.is_empty() {
+        order = (0..usize::from(spec.member_count)).collect();
+    }
+    let mut best: Option<(u64, Lsn, usize)> = None;
+    let mut damaged = false;
+    for m in order {
+        match scan_used_group(io, files[m], group, spec.group_pages) {
+            Ok(None) => {} // 空文件：跳过
+            Ok(Some((pages, start))) => {
+                if best.as_ref().map_or(true, |(p, _, _)| pages > *p) {
+                    best = Some((pages, start, m));
+                }
+            }
+            Err(_) => damaged = true, // 坏成员：跳过，健康镜像顶替
+        }
+    }
+    if best.is_none() && damaged {
+        return Err(GroupError::Damaged {
+            group,
+            reason: "无可用成员（候选全部损坏）",
+        });
+    }
+    Ok(best)
 }
 
 /// 从页号 `from` 起，是否存在非零页（用于区分"组尾截断"与"中部坏页"）。
@@ -961,7 +1046,7 @@ mod tests {
         let h = io
             .open(Path::new(&path), OpenOptions::new().read(true))
             .unwrap();
-        let start = read_group_start(io, h).unwrap().expect("已写过");
+        let start = read_group_start(io, h, group).unwrap().expect("已写过");
         let result = scan_log(io, h, start, pages as u64).unwrap();
         (result.records, result.pages_scanned)
     }
@@ -1600,5 +1685,152 @@ mod tests {
         .unwrap();
         assert_eq!(w.group_end_lsn(0), Some(end_before), "以更长成员为准续写");
         assert_eq!(w.current_group(), 0);
+    }
+
+    #[test]
+    fn member0_failure_does_not_wedge_subsequent_flushes() {
+        // 审核修复回归（D2）：**成员 0** 一次瞬时写失败后，组已写页数必须取
+        // 未失败成员的最大值——取成员 0 的落后计数会让下一次 flush 位置不符
+        // （"页自带 1024，按序应为 512"），WAL 永久写不出去。
+        let io = FlakyIo::new();
+        io.inner.add_dir("/mem");
+        io.inner.add_dir(WAL);
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 2).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 2, 8).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+
+        // 成员 1（`_m1`）的写从此失败：本次降级、成员 2 继续。
+        io.arm("_m1");
+        w.append(|l| RedoRecord::commit(l, 9, 3)).unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+        assert_eq!(w.member_stale(0), 0b01, "成员 1（bit0）被标 STALE");
+
+        // **后续 flush 必须还能工作**（旧代码从此永久"位置不符"）。
+        io.disarm();
+        w.append(|l| RedoRecord::commit(l, 10, 4)).unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+
+        // 重建成员 1：复制健康前缀 → 两成员一致、位清除、继续可写。
+        w.rebuild_member(0, 0).unwrap();
+        assert_eq!(w.member_stale(0), 0);
+        w.append(|l| RedoRecord::commit(l, 11, 5)).unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+        let m1 = io
+            .contents(&format!("{WAL}/{}", member_file_name(0, 0)))
+            .unwrap();
+        let m2 = io
+            .contents(&format!("{WAL}/{}", member_file_name(0, 1)))
+            .unwrap();
+        assert_eq!(m1, m2, "重建后两成员逐字节一致");
+    }
+
+    #[test]
+    fn reused_group_is_cleared_so_shorter_cycle_reopens() {
+        // 审核修复回归（D1）：复用组必须先清空——新周期写得比上一轮少时，
+        // 旧周期的页会以"中部坏页"形态让重开判损坏（崩溃恢复不可用）。
+        let io = mem();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let spec = GroupSpec::new(2, 1, 4).unwrap();
+        let mut w = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec, lsn(0)).unwrap();
+        // 组 0 写满（4 页）后自动切到组 1；组 1 再写 1 页。
+        let mut seq = 0u64;
+        while w.current_group() == 0 {
+            advance_commit(&mut w, seq);
+            seq += 1;
+        }
+        advance_commit(&mut w, seq);
+        seq += 1;
+        w.flush(w.appended_lsn()).unwrap();
+        let g0_pages = scan_group(&io, 0, 4).1;
+        assert_eq!(g0_pages, 4, "上一周期组 0 写满了 4 页");
+
+        // 组 0 越过检查点 → INACTIVE；归档完成 → 可复用。
+        let progress = CheckpointProgress {
+            checkpoint_lsn: lsn(g0_pages * LOG_PAGE_SIZE as u64),
+            ..CheckpointProgress::default()
+        };
+        w.publish_checkpoint(&progress).unwrap();
+        w.archive_done(0).unwrap();
+        assert_eq!(w.switch_group().unwrap(), 0);
+
+        // 组 0 本轮只写 1 页（远少于上一周期的 4 页）。
+        advance_commit(&mut w, seq);
+        w.flush(w.appended_lsn()).unwrap();
+        assert_eq!(scan_group(&io, 0, 4).1, 2, "本轮 = 切换记录 + 1 条");
+        w.close().unwrap();
+
+        // **重开**：不得因上一周期残页判损坏（旧代码在此报"中部有坏页"）。
+        let mut cf2 = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        GroupWriter::open(&io, &mut cf2, Path::new(WAL), spec).expect("复用组重开不得判损坏");
+        let groups = online_groups(&io, &cf2, Path::new(WAL), spec).unwrap();
+        assert!(groups.iter().any(|g| g.group == 0), "组 0 仍在线");
+    }
+
+    #[test]
+    fn open_falls_back_to_healthy_member_when_one_is_damaged() {
+        // 审核修复回归（D3）：单成员**中部损坏**不得让整组判损坏——健康
+        // 镜像必须救得回来（§11.9 的降级语义）。
+        let io = mem();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 2).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let spec = GroupSpec::new(2, 2, 8).unwrap();
+        let mut w = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec, lsn(0)).unwrap();
+        // 写 ≥3 页，让成员 1 的第 2 页成为"中部"页。
+        for i in 0..40u64 {
+            w.append(|l| RedoRecord::commit(l, i + 1, i + 1)).unwrap();
+        }
+        w.flush(w.appended_lsn()).unwrap();
+        assert!(scan_group(&io, 0, 8).1 >= 3, "至少 3 页");
+        let end_before = w.group_end_lsn(0).unwrap();
+        w.close().unwrap();
+
+        // 打坏成员 1 的第 2 页（其后仍有数据 ⇒ 中部坏页，不是尾部截断）。
+        let h = io
+            .open(
+                Path::new(&format!("{WAL}/{}", member_file_name(0, 0))),
+                bicdb_workspace::io::OpenOptions::new()
+                    .read(true)
+                    .write(true),
+            )
+            .unwrap();
+        io.write_at(h, &[0xAB; LOG_PAGE_SIZE], LOG_PAGE_SIZE as u64)
+            .unwrap();
+        io.close(h).unwrap();
+
+        // 重开：健康成员 2 顶替（旧代码在此报"中部有坏页而其后仍有数据"）。
+        let w = GroupWriter::open(&io, &mut cf, Path::new(WAL), spec).expect("健康镜像顶替");
+        assert_eq!(w.group_end_lsn(0), Some(end_before), "以健康成员为准");
+        let groups = online_groups(&io, &cf, Path::new(WAL), spec).unwrap();
+        assert!(groups.iter().any(|g| g.group == 0));
     }
 }
