@@ -41,6 +41,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
+/// `wait_ns` 的**采样间隔**（每 N 次睡眠实测一次、×N 折算成估计值）：把
+/// "两次时钟读取 + 一次 RMW"从每次争用降为 1/N 次（实测隔离数据见
+/// `doc/evidence/latch-ab-20261005/`）。
+pub const WAIT_NS_SAMPLE: u32 = 64;
+
 /// 默认真自旋预算（见模块文档的权衡说明）。
 ///
 /// **实测定的 8**（128 核 Neoverse-N1 单 socket，`tests/lock_contention.rs`
@@ -72,7 +77,8 @@ pub struct LatchStats {
     pub spin_gets: u64,
     /// **睡眠次数**（"latch free" 的睡眠尝试次数）。
     pub sleeps: u64,
-    /// 睡眠等待累计纳秒。
+    /// 睡眠等待累计纳秒（**采样估计**：每 64 次睡眠实测一次 ×64 折算——
+    /// 诊断用途，"睡眠是否昂贵"看它与 `sleeps` 的比值即可）。
     pub wait_ns: u64,
 }
 
@@ -117,17 +123,66 @@ pub struct LatchContention {
     pub spin_success: f64,
 }
 
+/// **计数器分片数**（2 的幂；线程按首次使用顺序轮转选片，读取时求和）。
+///
+/// 为什么分片（实测驱动，证据包 `doc/evidence/latch-ab-20261005/`）：一次 `lock`
+/// 原先要写**两个全局共享计数器**（gets/immediate）——高核数上每次 RMW 都是一次
+/// cache line 转移，合成基准里"统计"一项单独吃掉 **~38%** 吞吐，真实路径基准里
+/// 又与"负扩展"直接相关。分片后每个线程只写**自己那片**的行（同片争用者降
+/// ~N×），读取时求和——**仍然精确**（不是采样）。
+pub const COUNTER_SHARDS: usize = 8;
+
+/// 一片计数器（对齐 cache line：片之间不互相踢行）。
+#[repr(align(64))]
+#[derive(Debug)]
+struct CounterShard {
+    /// 无竞争直接成功（快路径，**每操作一次 RMW**）。
+    immediate: AtomicU64,
+    /// 自旋后成功。
+    spin_gets: AtomicU64,
+    /// 睡眠次数。
+    sleeps: AtomicU64,
+    /// 睡眠等待累计纳秒。
+    wait_ns: AtomicU64,
+}
+
+impl CounterShard {
+    fn new() -> Self {
+        Self {
+            immediate: AtomicU64::new(0),
+            spin_gets: AtomicU64::new(0),
+            sleeps: AtomicU64::new(0),
+            wait_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+/// **线程标识 = 本函数栈帧地址**：每个线程的栈地址不同、且线程存续期内恒定。
+///
+/// 为什么不走 `thread_local!`：动态 TLS 访问要走 `__tls_get_addr`（每操作
+/// 十几纳秒、直逼锁本体），实测分片收益被它吃掉；取一个**局部变量地址**是
+/// 零成本、零 unsafe（只取地址、从不解引用），分布由各线程栈地址（不同页、
+/// ASLR）保证。
+#[inline]
+fn thread_tag() -> usize {
+    let x = 0u8;
+    std::ptr::addr_of!(x) as usize
+}
+
+/// 线程 → 分片（栈地址右移混入高位——栈 16 字节对齐，低位不够散）。
+#[inline]
+fn shard_of(n: usize) -> usize {
+    (thread_tag() >> 6) % n
+}
+
 /// 具名闩锁（先自旋、后睡眠）。
 #[derive(Debug)]
 pub struct Latch<T> {
     name: &'static str,
     inner: Mutex<T>,
     spin: u32,
-    gets: AtomicU64,
-    immediate: AtomicU64,
-    spin_gets: AtomicU64,
-    sleeps: AtomicU64,
-    wait_ns: AtomicU64,
+    /// 分片计数器（**精确**：读取时求和；写只碰本线程那片）。
+    shards: [CounterShard; COUNTER_SHARDS],
 }
 
 impl<T> Latch<T> {
@@ -138,11 +193,7 @@ impl<T> Latch<T> {
             name,
             inner: Mutex::new(value),
             spin: DEFAULT_SPIN,
-            gets: AtomicU64::new(0),
-            immediate: AtomicU64::new(0),
-            spin_gets: AtomicU64::new(0),
-            sleeps: AtomicU64::new(0),
-            wait_ns: AtomicU64::new(0),
+            shards: std::array::from_fn(|_| CounterShard::new()),
         }
     }
 
@@ -161,9 +212,9 @@ impl<T> Latch<T> {
 
     /// **获取**：immediate → 自旋 → 睡眠（三段式，统计各自计数）。
     pub fn lock(&self) -> LatchGuard<'_, T> {
-        self.gets.fetch_add(1, Ordering::Relaxed);
+        let shard = shard_of(COUNTER_SHARDS);
         if let Ok(guard) = self.inner.try_lock() {
-            self.immediate.fetch_add(1, Ordering::Relaxed);
+            self.shards[shard].immediate.fetch_add(1, Ordering::Relaxed);
             return LatchGuard { guard };
         }
         // **分段退避**（PG `perform_spin_delay` 形态）：段长 1,2,4,…,16 封顶，
@@ -177,7 +228,7 @@ impl<T> Latch<T> {
             while n > 0 {
                 std::hint::spin_loop();
                 if let Ok(guard) = self.inner.try_lock() {
-                    self.spin_gets.fetch_add(1, Ordering::Relaxed);
+                    self.shards[shard].spin_gets.fetch_add(1, Ordering::Relaxed);
                     return LatchGuard { guard };
                 }
                 n -= 1;
@@ -188,12 +239,26 @@ impl<T> Latch<T> {
                 std::thread::yield_now();
             }
         }
-        self.sleeps.fetch_add(1, Ordering::Relaxed);
-        let t0 = Instant::now();
+        // **睡眠路径的记账要便宜**（实测隔离，证据包 `latch-ab-20261005/`：
+        // 两次 `Instant::now` + 一个 RMW 曾是每次争用的主要额外成本——
+        // aarch64 上一次时钟读取 ~20-30ns，逼近锁本体）。`sleeps` 精确
+        // （一次 RMW；其返回值顺带给出采样位）；`wait_ns` 改为**采样估计**：
+        // 每 `WAIT_NS_SAMPLE` 次睡眠测一次、×N 折算（诊断足够，口径见其文档）。
+        let prev = self.shards[shard].sleeps.fetch_add(1, Ordering::Relaxed);
+        let t0 = if prev % u64::from(WAIT_NS_SAMPLE) == 0 {
+            Some(Instant::now())
+        } else {
+            None
+        };
         // 闩锁语义不采用中毒级联：把数据取回继续用（"下一次使用者发现"）。
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        self.wait_ns
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(t0) = t0 {
+            let ns = t0.elapsed().as_nanos() as u64;
+            self.shards[shard].wait_ns.fetch_add(
+                ns.saturating_mul(u64::from(WAIT_NS_SAMPLE)),
+                Ordering::Relaxed,
+            );
+        }
         LatchGuard { guard }
     }
 
@@ -203,16 +268,23 @@ impl<T> Latch<T> {
         self.inner.try_lock().ok().map(|guard| LatchGuard { guard })
     }
 
-    /// 统计快照。
+    /// 统计快照（**逐片求和——精确**；`gets` 是三个结局之和，不再单设计数器）。
     #[must_use]
     pub fn stats(&self) -> LatchStats {
+        let (mut immediate, mut spin_gets, mut sleeps, mut wait_ns) = (0, 0, 0, 0);
+        for s in &self.shards {
+            immediate += s.immediate.load(Ordering::Relaxed);
+            spin_gets += s.spin_gets.load(Ordering::Relaxed);
+            sleeps += s.sleeps.load(Ordering::Relaxed);
+            wait_ns += s.wait_ns.load(Ordering::Relaxed);
+        }
         LatchStats {
             name: self.name,
-            gets: self.gets.load(Ordering::Relaxed),
-            immediate: self.immediate.load(Ordering::Relaxed),
-            spin_gets: self.spin_gets.load(Ordering::Relaxed),
-            sleeps: self.sleeps.load(Ordering::Relaxed),
-            wait_ns: self.wait_ns.load(Ordering::Relaxed),
+            gets: immediate + spin_gets + sleeps,
+            immediate,
+            spin_gets,
+            sleeps,
+            wait_ns,
         }
     }
 

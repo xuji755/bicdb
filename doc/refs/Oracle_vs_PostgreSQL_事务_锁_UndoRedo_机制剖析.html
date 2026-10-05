@@ -1,0 +1,1742 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oracle / PostgreSQL 事务、锁、Undo-Redo 机制剖析（伪代码级）</title>
+<style>
+:root{
+  --bg:#FFFFFF; --bg-alt:#FAFAF8; --bg-code:#F6F5F1; --bg-note:#F2F6FB;
+  --text:#1A1A18; --text-2:#5F5E5A; --text-3:#888780;
+  --border:#E5E3DC; --border-2:#D3D1C7;
+  --ora:#A3401C; --ora-bg:#FAECE7; --ora-line:#D85A30;
+  --pg:#1B5FA5;  --pg-bg:#E6F1FB;  --pg-line:#378ADD;
+  --warn:#8A5A0B; --warn-bg:#FAEEDA;
+  --ok:#2E6B14; --ok-bg:#EAF3DE;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:"PingFang SC","Microsoft YaHei","Hiragino Sans GB",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-size:15px; line-height:1.75; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:960px;margin:0 auto;padding:48px 32px 120px}
+h1{font-size:26px;font-weight:600;letter-spacing:-.3px;margin:0 0 8px;line-height:1.35}
+h2{font-size:20px;font-weight:600;margin:56px 0 16px;padding-bottom:10px;border-bottom:2px solid var(--border);letter-spacing:-.2px}
+h3{font-size:16px;font-weight:600;margin:32px 0 10px}
+h4{font-size:14px;font-weight:600;margin:22px 0 8px;color:var(--text-2)}
+p{margin:10px 0}
+ul,ol{margin:10px 0;padding-left:24px}
+li{margin:5px 0}
+code{font-family:ui-monospace,"SF Mono",Consolas,"Cascadia Mono",monospace;font-size:13px;
+  background:var(--bg-code);padding:1.5px 5px;border-radius:4px;border:1px solid var(--border)}
+pre{background:var(--bg-code);border:1px solid var(--border);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;margin:14px 0;line-height:1.55}
+pre code{background:none;border:none;padding:0;font-size:12.5px;white-space:pre}
+.sub{color:var(--text-2);font-size:14px;margin:0 0 4px}
+.meta{color:var(--text-3);font-size:13px;margin:0 0 36px}
+
+.toc{background:var(--bg-alt);border:1px solid var(--border);border-radius:12px;padding:20px 24px;margin:28px 0 12px}
+.toc h4{margin:0 0 10px;font-size:13px;letter-spacing:.5px;text-transform:uppercase;color:var(--text-3)}
+.toc ol{margin:0;padding-left:20px;columns:2;column-gap:32px}
+.toc li{margin:3px 0;font-size:13.5px}
+.toc a{color:var(--text-2);text-decoration:none}
+.toc a:hover{color:var(--text);text-decoration:underline}
+
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13.5px}
+th,td{border:1px solid var(--border);padding:8px 11px;text-align:left;vertical-align:top}
+th{background:var(--bg-alt);font-weight:600;font-size:13px}
+tbody tr:nth-child(even){background:#FCFCFB}
+td.ora{background:var(--ora-bg);color:var(--ora)}
+td.pg{background:var(--pg-bg);color:var(--pg)}
+
+.note{border-left:3px solid var(--pg-line);background:var(--bg-note);padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0;font-size:14px}
+.warn{border-left:3px solid var(--ora-line);background:var(--warn-bg);padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0;font-size:14px}
+.key{border-left:3px solid var(--ok);background:var(--ok-bg);padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0;font-size:14px}
+.note b,.warn b,.key b{font-weight:600}
+
+.tag{display:inline-block;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:20px;margin-right:8px;vertical-align:1px;letter-spacing:.3px}
+.tag.ora{background:var(--ora-bg);color:var(--ora);border:1px solid var(--ora-line)}
+.tag.pg{background:var(--pg-bg);color:var(--pg);border:1px solid var(--pg-line)}
+
+h3 .tag{font-size:11px}
+.cap{font-size:12.5px;color:var(--text-3);margin:-6px 0 18px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:16px 0}
+@media(max-width:760px){.grid{grid-template-columns:1fr}.toc ol{columns:1}.wrap{padding:32px 20px 80px}}
+.pane{border:1px solid var(--border);border-radius:12px;padding:16px 18px}
+.pane.ora{border-color:var(--ora-line);background:linear-gradient(0deg,var(--ora-bg),var(--ora-bg))}
+.pane.pg{border-color:var(--pg-line);background:var(--pg-bg)}
+.pane h4{margin-top:0}
+.pane pre{background:#fff;border-color:var(--border)}
+ol.steps{list-style:none;padding-left:0;counter-reset:s}
+ol.steps>li{counter-increment:s;position:relative;padding-left:38px;margin:14px 0}
+ol.steps>li::before{content:counter(s);position:absolute;left:0;top:1px;width:24px;height:24px;border-radius:50%;
+  background:var(--bg-alt);border:1px solid var(--border-2);font-size:12px;font-weight:600;
+  display:flex;align-items:center;justify-content:center;color:var(--text-2)}
+hr{border:none;border-top:1px solid var(--border);margin:44px 0}
+footer{margin-top:64px;padding-top:20px;border-top:1px solid var(--border);font-size:12.5px;color:var(--text-3)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Oracle / PostgreSQL 事务、锁与 Undo-Redo 机制剖析</h1>
+<p class="sub">从数据结构、状态机到伪代码的完整对照，含崩溃恢复与死锁检测路径</p>
+<p class="meta">深度技术剖析 · 全部伪代码为「结构忠实、细节简化」的等价描述，用于理解机制而非可直接编译的实现</p>
+
+<div class="toc">
+<h4>目录</h4>
+<ol>
+<li><a href="#s1">零、总纲：两种哲学</a></li>
+<li><a href="#s2">一、事务标识与状态存储</a></li>
+<li><a href="#s3">二、事务生命周期（开始 / 提交 / 回滚 / 2PC）</a></li>
+<li><a href="#s4">三、MVCC 与读一致性</a></li>
+<li><a href="#s5">四、Undo 机制 vs VACUUM</a></li>
+<li><a href="#s6">五、Redo / WAL 底层机制</a></li>
+<li><a href="#s7">六、锁机制全貌</a></li>
+<li><a href="#s8">七、死锁检测</a></li>
+<li><a href="#s9">八、崩溃恢复</a></li>
+<li><a href="#s10">九、隔离级别与写冲突语义</a></li>
+<li><a href="#s11">十、典型并发场景逐条推演</a></li>
+<li><a href="#s12">十一、工程启示与选型建议</a></li>
+</ol>
+</div>
+
+<h2 id="s1">零、总纲：两种哲学</h2>
+
+<p>理解这两个系统的一切差异，都可以归结为一句话：<b>旧版本数据放在哪里</b>。</p>
+
+<div class="grid">
+<div class="pane ora">
+<h4>Oracle：旧版本放在 undo 里</h4>
+<p style="font-size:13.5px;margin:0">数据块永远只保存「当前版本」。要读旧数据，就用 undo 里的前像，在内存中把当前块「倒带」出一个一致性读块（CR block）。<br><br>undo 本身也是数据块，因此<b>undo 也必须被 redo 保护</b>——这是 redo 日志里为什么既有数据块 change vector 又有 undo 块 change vector 的原因。</p>
+</div>
+<div class="pane pg">
+<h4>PostgreSQL：旧版本留在堆里</h4>
+<p style="font-size:13.5px;margin:0">UPDATE 不覆盖旧元组，而是插入一个新元组，把旧元组的 <code>xmax</code> 指向自己。旧元组的字节原封不动留在页里。<br><br>因此<b>没有 undo</b>。回滚不需要撤销任何数据页，只需要让版本可见性反转；代价是死元组要靠 VACUUM 回收。</p>
+</div>
+</div>
+
+<h3>核心差异一览</h3>
+<table>
+<thead><tr><th style="width:110px">维度</th><th style="width:44%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>多版本位置</td><td class="ora">Undo 段（前像），数据块只有当前版本</td><td class="pg">堆页内（新旧元组共存）</td></tr>
+<tr><td>无 undo 的代价</td><td class="ora">回滚慢、undo 空间/保留期需管理、可能 ORA-01555</td><td class="pg">表膨胀、需 VACUUM、XID 回卷风险</td></tr>
+<tr><td>读一致性时点</td><td class="ora">SCN（System Change Number）</td><td class="pg">Snapshot（xmin / xmax / xip[]）</td></tr>
+<tr><td>事务状态存储</td><td class="ora">undo 段头的事务表（Transaction Table）</td><td class="pg">pg_xact（CLOG），每 xid 2 bit</td></tr>
+<tr><td>行锁存放</td><td class="ora">数据块头 ITL 槽 + 行头 <code>lb</code> 字段</td><td class="pg">元组头 <code>xmax</code> + infomask 位</td></tr>
+<tr><td>事务级等待对象</td><td class="ora">TX enqueue（id1=undo段号, id2=槽号）</td><td class="pg">LOCKTAG_TRANSACTION(xid) 上的共享锁</td></tr>
+<tr><td>回滚成本</td><td class="ora">O(已产生的 undo 量)，且回滚自身产生 redo</td><td class="pg">近似 O(1)，改 2 个 bit</td></tr>
+<tr><td>恢复阶段</td><td class="ora">前滚 + 回滚（两阶段）</td><td class="pg">只有 redo 重放（单阶段）</td></tr>
+<tr><td>最高隔离级别</td><td class="ora">SERIALIZABLE = 快照隔离（允许写偏斜）</td><td class="pg">SERIALIZABLE = SSI 真串行化</td></tr>
+<tr><td>锁表膨胀风险</td><td class="ora">无（锁在块里），但受 ITL 槽数量限制</td><td class="pg">有（共享内存锁表），受 <code>max_locks_per_transaction</code> 限制</td></tr>
+</tbody>
+</table>
+
+<h3>术语映射表（阅读下文时随时对照）</h3>
+<table>
+<thead><tr><th style="width:30%">概念</th><th style="width:35%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>日志序号</td><td class="ora">SCN / RBA（Redo Byte Address）</td><td class="pg">LSN（Log Sequence Number）</td></tr>
+<tr><td>日志写进程</td><td class="ora">LGWR（单一进程）</td><td class="pg">WAL writer + 各 backend 自行插入</td></tr>
+<tr><td>数据写进程</td><td class="ora">DBWR</td><td class="pg">background writer + checkpointer</td></tr>
+<tr><td>检查点</td><td class="ora">CKPT，增量检查点，记录 RBA</td><td class="pg">checkpointer，记录 <code>checkPoint.redo</code></td></tr>
+<tr><td>事务状态</td><td class="ora">undo 段头事务表 + ITL 标志位</td><td class="pg">pg_xact（CLOG）</td></tr>
+<tr><td>提交时间戳</td><td class="ora">commit SCN</td><td class="pg">commit LSN（无全局时间戳语义）</td></tr>
+<tr><td>回滚段引用</td><td class="ora">UBA（Undo Block Address）</td><td class="pg">无</td></tr>
+<tr><td>清理进程</td><td class="ora">SMON（回滚死事务）</td><td class="pg">autovacuum / VACUUM（回收死元组）</td></tr>
+</tbody>
+</table>
+
+<h2 id="s2">一、事务标识与状态存储</h2>
+
+<h3>1.1 事务 ID 的构成</h3>
+
+<p><span class="tag ora">Oracle</span>XID 是一个三元组 <code>USN.SLOT.SEQ</code>，通常显示成十六进制如 <code>0x0006.00c.000042</code>：</p>
+
+<pre><code>Oracle XID = (undo_segment_number, slot_number, sequence)
+
+  undo_segment_number : 2 字节，undo 段号
+  slot_number         : 2 字节，该 undo 段「事务表」中的槽位号
+  sequence            : 4 字节，槽位复用计数器（每次槽位被重用 +1）
+
+关键点：XID 直接编码了「事务状态存在哪里」。
+       拿到 XID 就能定位到 undo 段头的那一个槽，从而读到始起 SCN、
+       提交 SCN、状态标志、以及该事务的 undo 记录链起点。</code></pre>
+
+<p><span class="tag pg">PostgreSQL</span>XID 是 32 位无符号整数，加上 epoch 组成 64 位的 FullTransactionId：</p>
+
+<pre><code>PostgreSQL TransactionId  = uint32  (nextXid 单调递增分配)
+PostgreSQL FullTransactionId = (epoch &lt;&lt; 32) | xid
+
+状态存放在 pg_xact 文件中，每个 xid 占 2 bit：
+    00 = IN_PROGRESS
+    01 = COMMITTED
+    10 = ABORTED
+    11 = SUB_COMMITTED   （子事务已提交，父事务未定）
+
+换句话说：PG 的事务状态是「外置」的，存在一个独立的位图文件里，
+而 Oracle 的事务状态是「内嵌」在 undo 段头那一块里的。</code></pre>
+
+<div class="note">
+<b>为什么 PG 需要 SUB_COMMITTED 这个状态？</b>因为子事务（savepoint）可以单独提交，但最终是否生效取决于顶层事务。可见性判定走到子事务时，需要知道「这个子事务自己提交了，但爸爸还没定」，于是要顺着 <code>pg_subtrans</code> 一路往上找到顶层 xid 才能定论。<code>pg_subtrans</code> 只在内存里缓存最近的部分，回溯很深时会带来明显的性能悬崖——这就是 PG 上「savepoint 用多了会变慢」的根本原因。Oracle 的 SAVEPOINT 没有这个问题，因为它的 undo 链天然就是一条可以从后往前走的路径。
+</div>
+
+<h3>1.2 事务状态的物理结构对照</h3>
+
+<div class="grid">
+<div class="pane ora">
+<h4>Oracle：undo 段头的事务表</h4>
+<pre><code>Undo Segment Header Block
+  USN            : 段号
+  Transaction Table[] (定长槽数组)
+    SLOT    槽号
+    SEQ     序号（复用计数）
+    XID     当前占用者
+    STATUS  FREE / ACTIVE / COMMITTED / ...
+    START_SCN / START_TIME
+    COMMIT_SCN          ← 提交时写入（可延迟）
+    FSC     Free Space Credit
+    START_UBA           ← 该事务 undo 链的头
+    LAST_UBA            ← 该事务 undo 链的尾
+    USED_UBLK / USED_UREC
+    FLAG / DBA / ...    （回滚相关字段）</code></pre>
+<p style="font-size:13px;margin:0">注意「定长槽数组」这个事实：一个 undo 段的并发事务容量有限。槽用完了就要去别的 undo 段抢，或者等待 <code>enq: US - contention</code>。</p>
+</div>
+<div class="pane pg">
+<h4>PostgreSQL：pg_xact 位图</h4>
+<pre><code>pg_xact/0000, 0001, ...  (每个文件 32 个 8KB 页)
+  每个事务占 2 bit
+  每字节 4 个事务
+  每页 8192 * 4 = 32768 个事务
+
+相关的辅助文件：
+  pg_subtrans/   子事务 → 顶层事务 的映射
+  pg_multixact/  多个加锁者的元组锁（键共享锁场景）
+  pg_commit_ts/  提交时间戳（track_commit_timestamp=on）
+  pg_twophase/   已 prepared 的事务状态</code></pre>
+<p style="font-size:13px;margin:0">位图结构意味着状态查询是一次极轻量的数组索引，不需要任何锁竞争——代价是它不参与 WAL，正确性要靠 commit WAL 记录的重放来重建（见第五节）。</p>
+</div>
+</div>
+
+<h2 id="s3">二、事务生命周期</h2>
+
+<h3>2.1 事务开启与会话注册</h3>
+
+<pre><code>// ================= Oracle =================
+function oracle_begin_transaction(conn):
+    // Oracle 的"事务"是隐式的：第一条 DML 语句触发
+    seg = select_undo_segment(conn)          // 轮询所有 ONLINE 的 undo 段
+    acquire_latch(seg.header)
+
+    slot = find_slot(seg.tt, status in {FREE, EXPIRED, COMMITTED})
+    if slot == null:
+        // 所有 undo 段都满了
+        raise ORA-30036 "unable to extend segment in undo tablespace"
+        // 或等待 enq: US - contention
+
+    seg.tt[slot].status     = ACTIVE
+    seg.tt[slot].start_scn  = get_current_scn()
+    seg.tt[slot].start_time = now()
+    seg.tt[slot].seq       += 1                      // 槽位复用 → XID 改变
+    seg.tt[slot].start_uba  = invalid
+    seg.tt[slot].last_uba   = invalid
+    conn.xid = (seg.usn, slot, seg.tt[slot].seq)
+
+    release_latch(seg.header)
+    // 注意：这一段更新本身也要生成 redo，否则崩溃后事务表就丢了
+    generate_redo(seg.header)
+    return conn.xid</code></pre>
+
+<pre><code>// ================= PostgreSQL =================
+function pg_assign_transaction_id(proc):
+    if proc.xid != InvalidTransactionId:
+        return proc.xid                      // 已经有 xid 了
+
+    // 分配是全局的，但通过分段 CAS 大幅降低竞争
+    xid = shmem_variable_cache.nextXid.fetch_add(1)
+
+    proc.xid = xid
+    proc.xmin = ...                          // 更新自己的 xmin 视界
+
+    // pg_xact 里这个 xid 的状态默认就是 IN_PROGRESS（无需显式写）
+    ProcArrayAdd 已在事务开始时完成
+
+    // 注意：只在"真正要写"时才分配 xid
+    //   SELECT 不分配，这正是 PG 读不产生 xid 的原因
+    return xid</code></pre>
+
+<div class="key">
+<b>一个容易忽略的差异：</b>PostgreSQL 是<b>写时才分配 XID</b>（lazy allocation）。纯读事务没有 xid，因此既不占用 pg_xact 空间，也不会推进全局的 <code>nextXid</code> 消耗速度。Oracle 同样是写时才建事务，但它必须抢占一个 undo 段槽位，开销明显更重。
+</div>
+
+<h3>2.2 提交路径（最关键的差异点）</h3>
+
+<h4><span class="tag ora">Oracle</span>Fast Commit 与延迟块清除</h4>
+
+<p>Oracle 的提交有一个非常重要但常被误解的设计：<b>提交时不清理数据块</b>。</p>
+
+<pre><code>function oracle_commit(txn):
+
+    // ① 生成提交 SCN —— SCN 就是 Oracle 的"提交时刻"
+    commit_scn = get_scn()                         // 单调递增，全局唯一
+
+    // ② 把"提交"这件事本身写进 redo buffer
+    redo_buf.append(COMMIT_MARK(txn.xid, commit_scn))
+
+    // ③ 关键一步：把 undo 段头那块"事务表变更为已提交"也写进 redo
+    //    但注意 —— 只写 redo，并不去修改那个数据块！
+    redo_buf.append(REDO_CHANGE_VECTOR(
+        block = txn.undo_segment.header_block,
+        op    = UPDATE_TRANSACTION_SLOT,
+        data  = { slot.status = COMMITTED,
+                  slot.commit_scn = commit_scn }))
+
+    // ④ 日志强制：把 redo buffer 一直刷到当前 RBA
+    current_rba = redo_buf.tail_rba()
+    LGWR_wakeup()
+    wait_for_event("log file sync", until LGWR.flushed_rba >= current_rba)
+
+    // ⑤ 到这里事务已经持久提交，可以返回客户端了
+    //    ★ 但数据块上的 ITL 标志位仍然是 '-'（看起来未提交）
+    //    ★ undo 段头块本身也可能还躺在 buffer cache 里没落盘
+    return COMMIT_OK</code></pre>
+
+<p>这就是著名的 <b>「延迟块清除」（Delayed Block Cleanout）</b>。为什么可以这样？因为 redo 记录已经落盘了——崩溃恢复时会重放这条 redo，把 segment header 改成已提交。所以<b>持久化的正确性由 redo 保证，而数据块上那些陈旧的 ITL 标志位是可推导的冗余信息</b>。</p>
+
+<p>清除动作被推迟到「下一个访问这个块的人」来做：</p>
+
+<pre><code>function oracle_read_block(blk, snapshot_scn):
+    for each itl in blk.itl_array:
+        if itl.flag == '-':
+            // 该 ITL 槽看起来还有未提交事务，但可能其实早就提交了
+            tx = lookup_transaction_table(itl.xid)     // 读 undo 段头
+            if tx.status == COMMITTED:
+                // ★ 执行块清除：修改块，并且这次修改本身产生 redo
+                itl.flag = COMMITTED
+                itl.scn  = tx.commit_scn
+                itl.lck  = 0
+                generate_redo(blk)                      // "cleanout redo"
+                mark_block_dirty(blk)
+            else if tx.status == ACTIVE or tx.status == FREE:
+                // 事务还活着，或者槽位已被复用（→ 需要走 undo 构造 CR）
+                need_cr_construction = true
+    ...</code></pre>
+
+<div class="warn">
+<b>延迟块清除的两个副作用，这两个都是真实生产问题：</b><br>
+① <b>ORA-01555 的一种成因</b>：如果这个块很久以后才被访问，而那个 undo 槽已经被新事务复用（SEQ 变了），Oracle 就再也无法确认「当时那笔事务到底提交了没有」，于是报 ORA-01555 snapshot too old。<br>
+② <b>不可预测的响应时间抖动</b>：一个长批量操作之后的表，第一次被扫到时要做大量块清除并写入 redo，导致这次查询莫名其妙地慢。<br>
+缓解手段：<code>DBMS_STATS</code> 之后主动 <code>ALTER TABLE ... SHRINK</code> 或全表扫描预热，让块清除在工作时间之外完成。
+</div>
+
+<h4><span class="tag pg">PostgreSQL</span>提交路径</h4>
+
+<pre><code>function pg_commit_transaction(proc):
+
+    // ① 前置：如果事务有 WAL 记录，先写 commit 记录
+    if (has_wal_records or mark_xid_committed):
+        commit_lsn = XLogInsert(RM_XACT_ID, XLOG_XACT_COMMIT, {
+            xid, subxacts[], rels[],
+            dbId, tsId, ... })
+
+    // ② 日志强制：这是"提交持久化"的唯一定义
+    if synchronous_commit >= on:
+        XLogFlush(commit_lsn)          // 阻塞到 fsync 完成
+
+    // ③ 标记 pg_xact —— 注意顺序：一定在 WAL 刷盘之后
+    //    而且这一步是"异步"的，不强制刷盘
+    if (wrote_xlog and mark_xid_committed):
+        TransactionIdAsyncCommitTree(xid)      // 只改内存中的 CLOG 页，
+                                               // 由 checkpoint 负责落盘
+    else:
+        // 事务没有写 WAL（例如只读事务，或纯 hint-bit 场景）
+        // 此时 WAL 里没有 commit 记录可以依赖，clog 必须同步刷
+        TransactionIdCommitTree(xid)
+        XLogFlush(commit_lsn)                  // 保证 clog 也持久了
+
+    // ④ 从 ProcArray 摘除：这一步"推进 xmin 地平线"
+    ProcArrayEndTransaction(proc, xid)
+    //    ↑ 这一步决定了 VACUUM 能不能回收元组
+    //    ↑ 长事务/放弃的复制槽之所以导致膨胀，就是因为地平线推不动
+
+    // ⑤ 释放所有 heavyweight lock，并释放事务锁
+    LockReleaseAll(DEFAULT_LOCKMETHOD, proc)
+    XactLockTableCleanup()        // 释放 LOCKTAG_TRANSACTION(MyXid) 上的排他锁
+
+    // ⑥ 执行 on_commit 回调：NOTIFY、延迟约束、deferred trigger
+    ...</code></pre>
+
+<div class="key">
+<b>为什么 clog 不写 WAL 还能正确？</b>因为 <code>xact_redo_commit()</code> 在重放 commit WAL 记录时会<b>重新写一遍 clog</b>。也就是说 WAL 才是事实来源（source of truth），clog 只是一个「缓存 + 加速索引」。这样设计的收益很大：每次提交少一次随机 I/O，只需要顺序追加 WAL。
+<br><br>
+这也解释了为什么 PG 的同步提交性能主要取决于 <code>fsync(WAL)</code> 而不是 <code>fsync(clog)</code>，而 <code>synchronous_commit=off</code> 能带来巨大提升——因为它跳过了第 ② 步的等待，代价是崩溃时可能丢失最近若干毫秒内"已返回成功"的事务。
+</div>
+
+<h3>2.3 回滚路径</h3>
+
+<div class="grid">
+<div class="pane ora">
+<h4>Oracle：反向应用 undo</h4>
+<pre><code>function oracle_rollback(txn):
+    uba = txn.last_uba
+    while uba != invalid:
+        rec = read_undo_block(uba)
+        apply_before_image(rec.target_block, rec)
+        // ★ 关键：撤销操作的本身也要记 redo
+        //    否则"回滚了一半就崩溃"就无法继续
+        generate_redo(rec.target_block)
+        uba = rec.prev_uba
+
+        if redo_buf.is_full():
+            LGWR_flush()      // 回滚会被 redo 写入速度限制
+
+    mark_slot_free(txn.undo_segment, txn.slot)
+    generate_redo(txn.undo_segment.header)
+    txn.undo_segment.header.seq += 1     // 槽位复用</code></pre>
+<p style="font-size:13px;margin:0">回滚一个写了 500 万行的事务，要差不多同样的时间。中途崩溃则由 SMON 从最后一条 undo 记录继续。</p>
+</div>
+<div class="pane pg">
+<h4>PostgreSQL：什么都不用撤销</h4>
+<pre><code>function pg_abort_transaction(proc):
+
+    // ① 事务还没写 WAL 就无所谓；写了就补一条 abort 记录
+    if has_wal_records:
+        XLogInsert(RM_XACT_ID, XLOG_XACT_ABORT, {xid, subxacts[]})
+
+    // ② 状态翻转：就这一步是"数据层面"的全部工作
+    TransactionIdAbortTree(xid)       // pg_xact[xid] = ABORTED
+
+    // ③ 从 ProcArray 摘除
+    ProcArrayEndTransaction(proc, xid)
+
+    // ④ 释放锁
+    LockReleaseAll(DEFAULT_LOCKMETHOD, proc)
+    XactLockTableCleanup()
+
+    // ⑤ ★ 没有任何数据页需要修改！
+    //    事务写入的新元组仍然躺在堆里，xmin 指向一个 ABORTED 的 xid
+    //    → 可见性判定直接判它不可见
+    //    被它标记为已删除的旧元组，xmax 指向 ABORTED 的 xid
+    //    → 可见性判定重新判它可见
+    //    这些"死元组"由后续 VACUUM 物理回收</code></pre>
+<p style="font-size:13px;margin:0">回滚 500 万行的事务几乎是瞬间完成的。代价是磁盘上留下 500 万个死元组，需要 VACUUM。</p>
+</div>
+</div>
+
+<div class="note">
+<b>这是一个真实的架构级权衡，不是实现水平问题。</b>Oracle 把代价付在「回滚时」和「undo 空间管理」上；PG 把代价付在「磁盘空间」和「VACUUM 运维」上。前者的问题是偶发的长回滚和 ORA-01555，后者的问题是表膨胀和 autovacuum 调参。
+</div>
+
+<h3>2.4 两阶段提交（2PC）</h3>
+
+<table>
+<thead><tr><th style="width:22%">环节</th><th style="width:39%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>进入 prepared</td><td class="ora">XA 接口或 <code>COMMIT COMMENT ... FORCE</code>；undo 段头槽位被标记为「in-doubt」，且被<b>钉住不可复用</b></td><td class="pg"><code>PREPARE TRANSACTION 'gid'</code>；状态写入 <code>pg_twophase/&lt;xid&gt;</code>；从 ProcArray 摘除但<b>锁继续持有</b></td></tr>
+<tr><td>查询视图</td><td class="ora"><code>DBA_2PC_PENDING</code>、<code>DBA_2PC_NEIGHBORS</code></td><td class="pg"><code>pg_prepared_xacts</code></td></tr>
+<tr><td>解决不确定事务</td><td class="ora"><code>COMMIT FORCE 'xid'</code> / <code>ROLLBACK FORCE</code>，或 <code>DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY</code></td><td class="pg"><code>COMMIT PREPARED 'gid'</code> / <code>ROLLBACK PREPARED</code>，或 <code>pg_commit_ts</code> 加 <code>pg_resetwal</code></td></tr>
+<tr><td>开关</td><td class="ora">默认开启</td><td class="pg">默认<b>关闭</b>，<code>max_prepared_transactions=0</code>，必须显式打开</td></tr>
+<tr><td>主要风险</td><td class="ora">undo 段无法复用 → 长时间后 undo 表空间爆满，或者被迫覆盖导致 ORA-01555</td><td class="pg">锁不释放 + <code>xmin</code> 地平线被卡住 → 全库膨胀且 VACUUM 失效</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+<b>两者的共同魔鬼：</b>一个卡住的 prepared transaction 都会导致「新事务无法推进清理」。Oracle 表现成 undo 表空间告警，PG 表现成 <code>pg_stat_activity</code> 里永远不动的 <code>xmin</code> 和疯狂增长的 <code>n_dead_tup</code>。线上排障时，两边的第一反应都应该是：<b>先去查有没有悬挂的 prepared transaction</b>。
+</div>
+
+<h2 id="s4">三、MVCC 与读一致性</h2>
+
+<h3>3.1 快照的获取时机</h3>
+
+<table>
+<thead><tr><th style="width:20%">隔离级别</th><th style="width:40%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>READ COMMITTED（默认）</td><td class="ora">每条语句开始时取一次 SCN</td><td class="pg">每条语句开始时取一次 Snapshot</td></tr>
+<tr><td>SERIALIZABLE</td><td class="ora">事务开始时取一次 SCN（<b>等价于快照隔离</b>）</td><td class="pg">事务内第一条语句取一次 Snapshot（SSI）</td></tr>
+<tr><td>REPEATABLE READ</td><td class="ora">不单独提供，用 SERIALIZABLE 近似</td><td class="pg">事务内第一条语句取一次 Snapshot（= 快照隔离）</td></tr>
+<tr><td>只读事务</td><td class="ora"><code>SET TRANSACTION READ ONLY</code>，事务级 SCN</td><td class="pg"><code>BEGIN TRANSACTION READ ONLY</code>，只读优化</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+<b>这里有一个被广泛误解的区别：Oracle 的 SERIALIZABLE 不是真正的可串行化。</b><br>
+Oracle 的 SERIALIZABLE 实现的是<b>快照隔离（Snapshot Isolation）</b>。它写冲突时会报 <code>ORA-08177: can't serialize access for this transaction</code>，但它<b>不能阻止写偏斜（write skew）</b>——因为 SI 只检测「同一行的写写冲突」，不检测跨行的读写依赖环。<br><br>
+PostgreSQL 的 SERIALIZABLE 是<b>真正的可串行化</b>，基于 SSI（Serializable Snapshot Isolation）：它在 SI 之上加了一层「危险结构」检测，用谓词锁（SIReadLock）追踪读依赖，能捕获写偏斜，报 <code>ERROR 40001 could not serialize access due to read/write dependencies</code>。<br><br>
+结论：<b>如果你的业务正确性依赖真正的可串行化（比如某些金融对账逻辑），PG 是唯一在默认配置下就能给出这个保证的开源/商业通用数据库之一；Oracle 需要靠 SELECT FOR UPDATE 手工串行化。</b>
+</div>
+
+<h3>3.2 <span class="tag ora">Oracle</span>一致性读：运行时构造 CR 块</h3>
+
+<p>核心思想：数据块上存的是「最新版本」，需要旧版本时，用 undo 在内存里把块"倒带"。</p>
+
+<pre><code>function oracle_consistent_read(block_addr, snapshot_scn):
+
+    // ---------- 情形 A：块本身就足够旧，直接用 ----------
+    blk = buffer_cache.get(block_addr)
+    if blk.block_scn &lt;= snapshot_scn:
+        return blk
+
+    // ---------- 情形 B：块太新，需要构造 CR 块 ----------
+    cr = clone(blk)                    // 先复制当前块（可能包含未提交数据）
+
+    loop:
+        // 找一个"比快照新"的 ITL 事务，它的修改需要被撤销
+        itl = pick_itl_with_commit_scn_gt(cr, snapshot_scn)
+        if itl == null: break          // 所有修改都早于快照，倒带完成
+
+        uba = itl.uba
+        while true:
+            rec = read_undo(uba)       // 读 undo 块（可能还要递归做一致性读）
+            if rec.change_scn &lt;= snapshot_scn:
+                break                  // 这条 undo 记录对应的修改早于快照，停止
+            apply_before_image(cr, rec)   // ★ 反向应用前像
+            uba = rec.prev_uba
+
+    // ---------- 情形 C：延迟块清除的交互 ----------
+    // 如果 ITL 标志是 '-' 但事务其实已提交且 commit_scn &lt;= snapshot_scn，
+    // 说明这是一个"已提交但未清除"的块：
+    //   → 直接在该 ITL 上做块清除，无需构造 CR
+    //   → 但清除必须写 redo
+
+    return cr   // 这就是一致性读块，可以被缓存复用</code></pre>
+
+<p>CR 块会被缓存在 buffer cache 里复用（一个块的多个 CR 版本可能同时存在），这也是 Oracle buffer cache 里常能观察到「同一 block# 多个版本」的原因。</p>
+
+<h4>ORA-01555 是怎么产生的</h4>
+
+<pre><code>长查询开始，取 SCN = 1000
+    ↓
+查询扫到第 1 万个块时，需要这个块在 SCN=1000 时的版本
+    ↓
+读 ITL 拿到 UBA，去 undo 里找前像
+    ↓
+★ 但是：产生这个前像的 undo 槽位已经被新事务复用了（SEQ 变了）
+    ↓
+ORA-01555: snapshot too old
+   (Query Duration=..., SCN:..., Query Start Time=...)
+
+根因：undo 是环形复用的，无法无限期保存历史版本。</code></pre>
+
+<p>对应的治理手段：<code>undo_retention</code> 调大、<code>RETENTION GUARANTEE</code>（宁可让 DML 失败也不覆盖 undo）、加大 undo 表空间、以及最根本的——<b>缩短长查询、减少批量提交之间的间隙</b>。</p>
+
+<h3>3.3 <span class="tag pg">PostgreSQL</span>可见性判定</h3>
+
+<p>PG 不需要构造任何东西。每个元组自带 <code>xmin</code>（创建者）和 <code>xmax</code>（删除者/加锁者），可见性就是拿这两个值和快照比。</p>
+
+<pre><code>SnapshotData {
+    xmin    : 所有活跃事务中最小的 xid
+    xmax    : 已分配的最大 xid + 1
+    xip[]   : 快照时刻仍然"在运行中"的 xid 列表
+    curcid  : 当前命令 ID（用于同事务内"命令间可见性"）
+}
+
+function xid_in_snapshot(xid, snapshot):
+    if xid &gt;= snapshot.xmax: return false     // 快照之后才开始的，不算在运行中
+    if xid &lt;  snapshot.xmin: return false     // 快照前就结束了，不算在运行中
+    return xid ∈ snapshot.xip                  // 在这两者之间，查列表</code></pre>
+
+<p>核心函数是 <code>HeapTupleSatisfiesMVCC</code>，它是 PG 里被调用最频繁的函数之一：</p>
+
+<pre><code>function heap_tuple_satisfies_mvcc(tuple, snapshot):
+
+    // ================= 第一步：检查 xmin（这个版本是谁创建的）=================
+    if not (tuple.infomask &amp; HEAP_XMIN_COMMITTED):
+
+        if tuple.infomask &amp; HEAP_XMIN_INVALID:
+            return DEAD                              // 已知创建者放弃了
+
+        if TransactionIdIsInProgress(tuple.xmin):
+
+            if xid_in_snapshot(tuple.xmin, snapshot):
+                // ★ 创建者在我这个快照开始时还在跑 → 这个版本不可见
+                //   但要注意：它可能正在更新我这个元组的"前身"，
+                //   不能直接返回 DEAD，要看看它是不是在 LOCK ONLY
+                return (not (tuple.infomask &amp; HEAP_XMAX_FROM_OLD_TUPLE)) ? DEAD : ...
+            else:
+                // 创建者在我快照之前就提交了 → 可见
+                set_hint_bit(tuple, HEAP_XMIN_COMMITTED)
+
+        elif not TransactionIdDidCommit(tuple.xmin):
+            set_hint_bit(tuple, HEAP_XMIN_INVALID)
+            return DEAD
+        else:
+            set_hint_bit(tuple, HEAP_XMIN_COMMITTED)
+
+    // ================= 第二步：检查 xmax（这个版本有没有被删/被锁）=================
+    if tuple.xmax == InvalidTransactionId:
+        return VISIBLE                               // 从未被删，直接可见
+
+    if not (tuple.infomask &amp; HEAP_XMAX_COMMITTED):
+
+        if tuple.infomask &amp; HEAP_XMAX_INVALID:
+            return VISIBLE                           // xmax 无效（如已回滚的删除）
+
+        if tuple.infomask &amp; HEAP_XMAX_IS_MULTI:
+            // 多个加锁者：去 pg_multixact 里查每个成员的状态
+            return multixact_visibility(tuple.xmax, snapshot)
+
+        if TransactionIdIsInProgress(tuple.xmax):
+            if xid_in_snapshot(tuple.xmax, snapshot):
+                return VISIBLE                       // 删除者还没提交对我不算数
+            set_hint_bit(tuple, HEAP_XMAX_COMMITTED)
+
+        elif not TransactionIdDidCommit(tuple.xmax):
+            set_hint_bit(tuple, HEAP_XMAX_INVALID)
+            return VISIBLE                           // 删除者回滚了 → 版本复活
+        else:
+            set_hint_bit(tuple, HEAP_XMAX_COMMITTED)
+
+    // ================= 第三步：xmax 确实提交了，判断是"锁"还是"删"=================
+    if tuple.infomask &amp; HEAP_XMAX_LOCK_ONLY:
+        return VISIBLE          // 只是被别人 FOR UPDATE 锁了，版本还在
+
+    if tuple.infomask &amp; HEAP_XMAX_IS_MULTI:
+        if not MultiXactIdIsRunning(tuple.xmax) and
+           not HEAP_XMAX_IS_LOCKED_ONLY:
+            return DEAD
+
+    return DEAD                 // 被真正删除了</code></pre>
+
+<div class="key">
+<b>hint bit 是 PG 里一个非常聪明的设计，但代价常被忽略。</b><br>
+每次可见性判定如果要查 pg_xact，就是一次额外的共享内存/磁盘访问。<code>set_hint_bit</code> 把这个结论直接写回元组头的 infomask——下次就不用再查了。<br>
+<b>但代价是：一个纯 SELECT 也会「写」数据页</b>（因为改了元组头），于是要产生 WAL、要标记脏页、要触发后续的 checkpoint 写入。这就是 <code>SELECT</code> 有时候也会造成大量 WAL 写入的原因。<br>
+PG 的对策是 <code>VACUUM FREEZE</code>：把足够老的元组标记为「冻结」，彻底摆脱 hint bit 问题。
+</div>
+
+<h3>3.4 HOT 更新：PG 避免索引写放大的机制</h3>
+
+<pre><code>function pg_heap_update(old_tuple, new_values):
+
+    new_tuple = build_tuple(new_values,
+        xmin = my_xid,
+        xmax = Invalid,
+        t_ctid = self)
+
+    same_page = find_space_on_same_page(old_tuple.page, size_of(new_tuple))
+    indexed_cols_changed = any_indexed_column_changed(old_tuple, new_tuple)
+
+    if same_page and not indexed_cols_changed:
+        // ★ HOT 更新（Heap-Only Tuple）
+        insert_into_page(old_tuple.page, new_tuple)
+        old_tuple.t_ctid = new_tuple.location          // 链到新版本
+        old_tuple.infomask |= HEAP_HOT_UPDATED
+        new_tuple.infomask |= HEAP_ONLY_TUPLE
+        old_tuple.xmax = my_xid  (with HEAP_XMAX_EXCL_LOCK)
+        // 不插入任何索引条目！
+        // 旧元组的索引项可以顺着 t_ctid 链找到最新版本
+    else:
+        // 普通更新：新页 + 每个索引都要插一条新条目
+        insert_into_another_page(new_tuple)
+        old_tuple.t_ctid = new_tuple.location
+        old_tuple.xmax = my_xid
+        for each index on table:
+            index_insert(index, new_tuple)
+
+    generate_wal(...)
+    return new_tuple</code></pre>
+
+<p>HOT 是 PG 在高频「非索引列更新」场景下性能可用的关键。反过来说，<b>如果一个表的更新总是触碰索引列，HOT 完全失效</b>——此时每次更新都会给每个索引插一条新条目，索引会迅速膨胀，这是 PG 上一个非常常见的性能陷阱。</p>
+
+<h2 id="s5">四、Undo 机制 vs VACUUM</h2>
+
+<h3>4.1 <span class="tag ora">Oracle</span>Undo 段的结构</h3>
+
+<pre><code>Undo Tablespace
+ └── Undo Segment 0..N（每个活跃事务独占一个）
+      ├── 段头块 (block 0)
+      │     ├── Transaction Table[]   ← 事务状态（前文 2.1）
+      │     ├── Extent Control        ← 区段清单
+      │     ├── 当前区 / 下一个区指针
+      │     └── steal pointer         ← 允许"偷用"其他段的空间
+      └── 多个 Undo Extent
+            └── 多个 Undo Block（环形使用）
+                  └── Undo Records（链式，双向指针）
+
+一条 undo 记录包含：
+    · 目标数据块的 DBA
+    · 被修改行的行号 / 偏移
+    · 前像（before image）字节
+    · 该事务上一条 undo 记录的 UBA（prev_uba）
+    · 修改时的 SCN</code></pre>
+
+<p>undo 内容的三大用途，其实是同一份数据服务的三种消费者：</p>
+<ol class="steps">
+<li><b>回滚</b>：事务 ROLLBACK 或崩溃恢复时，顺着 undo 链从尾往头反向应用。</li>
+<li><b>一致性读</b>：长查询需要旧版本时，按 SCN 判断需要倒带多少条 undo 记录。</li>
+<li><b>事务恢复</b>：SMON 处理「dead transaction」（会话异常断开但事务未提交）时回滚。</li>
+</ol>
+
+<div class="note">
+<b>一个常见误解需要澄清：</b>很多资料说 Oracle 用 undo「回滚段」做多版本，好像 undo 只是为了回滚。实际上 Oracle 9i 之后已经统一了——同一套 undo 机制同时服务于回滚和一致性读。早期的「回滚段（Rollback Segment）」一词逐渐被「Undo Segment」取代，正是因为它的职责已经不只是 rollback。
+</div>
+
+<h3>4.2 <span class="tag pg">PostgreSQL</span>没有 undo，用 VACUUM 替代</h3>
+
+<pre><code>function pg_vacuum(relation):
+
+    // ---------- 阶段一：扫描并清理死元组 ----------
+    for each page in relation:
+        page_vacuum:
+            prune_dead_tuples(page)
+            // 判定死元组：xmin 和 xmax 都已确定且不可见
+            for each tuple in page:
+                if tuple_is_dead(tuple):
+                    mark_line_pointer_unused(tuple.lp)
+                    record_free_space(page)
+            defragment_page(page)              // 整理页内空闲空间
+
+        // 更新可见性映射（Visibility Map）
+        if all_visible(page):
+            vm_set(page, ALL_VISIBLE)
+            // ★ 这是 index-only scan 能工作的前提
+
+        vacuum_delay_point()                   // 限速，避免拖垮 IO
+
+    // ---------- 阶段二：清理索引 ----------
+    // 用第一阶段收集的死元组 TID 列表去各索引里删条目
+    for each index on relation:
+        bulkdelete_index_tuples(index, dead_tids)
+
+    // ---------- 阶段三：冻结处理 ----------
+    // 把足够老的元组"冻结"，使其永远可见，不再需要 xid 比较
+    aggressive_freeze(relation)   // 由 autovacuum 在接近回卷时触发
+
+    // ---------- 收尾 ----------
+    truncate_empty_trailing_pages(relation)
+    update_statistics(relation)</code></pre>
+
+<h3>4.3 两条路线的成本结构对照</h3>
+
+<table>
+<thead><tr><th style="width:24%">操作</th><th style="width:38%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>正常 UPDATE</td><td class="ora">原地修改 + 写 undo 前像 + 写 redo</td><td class="pg">插入新元组 + 更新旧元组头 + 写 WAL + 可能写索引</td></tr>
+<tr><td>回滚大事务</td><td class="ora">O(undo 量)，可能几十分钟</td><td class="pg">O(1)，毫秒级</td></tr>
+<tr><td>读旧数据</td><td class="ora">运行时构造 CR 块，CPU 成本换空间</td><td class="pg">直接在堆里读，但要扫描跳过死元组</td></tr>
+<tr><td>空间回收</td><td class="ora">undo 环形复用，自动</td><td class="pg">必须先 VACUUM，<b>不会自动归还给操作系统</b></td></tr>
+<tr><td>空间回收时延</td><td class="ora">取决于 undo_retention</td><td class="pg">取决于 autovacuum 调度与长事务</td></tr>
+<tr><td>典型故障</td><td class="ora">ORA-01555 snapshot too old</td><td class="pg">表/索引膨胀、XID 回卷停机</td></tr>
+<tr><td>运维要点</td><td class="ora">undo 表空间容量 + retention 设置</td><td class="pg">autovacuum 参数 + 禁止长事务 + 监控 <code>age(relfrozenxid)</code></td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+<b>PG 上最危险的一类操作：忘了提交的长事务。</b>因为 <code>ProcArrayEndTransaction</code> 才会推进 xmin 地平线，一个忘记提交的事务会让 VACUUM 无法回收它开始之后产生的<b>所有</b>死元组——即使那些活是别的会话干的。经常可以看到一个被遗忘了两天的 <code>idle in transaction</code> 把整个库的膨胀拖到几倍。
+<br><br>对应的防护：<code>idle_in_transaction_session_timeout</code>、<code>statement_timeout</code>，以及监控 <code>pg_stat_activity.backend_xmin</code>。
+</div>
+
+<h2 id="s6">五、Redo / WAL 底层机制</h2>
+
+<h3>5.1 两种日志的定位差异</h3>
+
+<p>这是最容易被忽略、但其实是理解整个系统的一把钥匙：</p>
+
+<div class="grid">
+<div class="pane ora">
+<h4>Oracle redo 保护「一切」</h4>
+<pre><code>redo 中包含：
+  · 数据块的 change vector
+  · ★ undo 块的 change vector
+  · 索引块的 change vector
+  · 段头 / 位图块修改
+  · 块清除的修改
+  · 提交/回滚标记
+  · 控制文件更新
+
+因为 undo 也是数据，所以 undo 必须被保护。
+"redo protects undo" 是 Oracle 恢复的基石。</code></pre>
+</div>
+<div class="pane pg">
+<h4>PG WAL 只保护「数据」</h4>
+<pre><code>WAL 中包含：
+  · 堆页 / 索引页的修改
+  · 事务提交/中止/XID 分配
+  · 检查点、FPI（整页镜像）
+  · relcache 失效等辅助记录
+
+不包含：
+  · pg_xact 的状态位  ← 靠重放 commit 记录重建
+  · pg_multixact 的部分内容
+  · hint bits          ← 是"建议"，丢了也不影响正确性</code></pre>
+</div>
+</div>
+
+<h3>5.2 <span class="tag ora">Oracle</span>Redo 生成与 LGWR</h3>
+
+<pre><code>function oracle_generate_redo(changed_block):
+    // 数据块修改前，先构造 change vector
+    cv = {
+        opcode     : 如 "update row",
+        block_ref  : DBA,
+        before_img : 被覆盖的字节片段（用于逻辑撤销）
+        after_img  : 新字节
+    }
+    redo_buf.append(redo_record(current_scn, cv))
+
+function LGWR():
+    loop:
+        wait_for_event_any([
+            commit_request        // 有事务要提交 → 最高优先级，必须立即刷
+            1/3_redo_buf_full     // 缓冲区用了 1/3
+            1MB_accumulated       // 累积 1MB
+            3_second_timeout      // 每 3 秒兜底
+            DBWR_needs_redo       // DBWR 要写脏块，redo 必须先落盘（WAL 规则）
+        ])
+
+        start_rba = redo_buf.flush_start
+        end_rba   = redo_buf.active_tail
+
+        // 并行写所有成员（多路复用组内多个 member）
+        parallel_for member in current_log_group.members:
+            write_at(member, start_rba, redo_buf[start_rba..end_rba])
+
+        // ★ 只要"至少一个成员"写成功，事务就算持久
+        //   这就是"log file parallel write"能容忍单盘慢的原因
+        if at_least_one_member_succeeded:
+            redo_buf.flush_start = end_rba
+            wake_up_sessions_waiting_on("log file sync")
+
+        if current_log_group.is_full():
+            log_switch()               // 切换日志组
+            archive(current_log_group) // ARCHn 进程归档</code></pre>
+
+<div class="key">
+<b>多路复用（Multiplexing）是 Oracle 提交持久性的关键机制。</b>一个 redo log group 可以有多个 member（分放在不同磁盘）。LGWR 并行写所有成员，只要有一个成功就认为提交成功。因此丢单块磁盘不会导致数据丢失，但会降低写入速度（等待最慢的那个成员，实际上 Oracle 在这点上有个隐含的设计伸缩余地）。
+</div>
+
+<h4>Redo 的幂等性：为什么可以安全重放</h4>
+
+<pre><code>每个数据块头都有：
+    block_scn    : 该块最后一次被修改时的 SCN
+    block_seq    : 该块被修改的序列号（防止 SCN 相同时无法区分）
+
+重放时的判定：
+    if redo_record.scn &lt;= block.block_scn:
+        skip          // 这个修改已经反映在块里了（可能上次恢复中途崩溃）
+    else:
+        apply(redo_record)
+
+★ 这个判定使恢复可以"随意重放任意次"，
+  也让实例恢复可以在中断后从任意起点重新开始。</code></pre>
+
+<h3>5.3 <span class="tag pg">PostgreSQL</span>WAL 记录结构与写入</h3>
+
+<pre><code>XLogRecord 结构：
+    total_len   : 4 字节  记录总长
+    xid         : 4 字节  产生该记录的事务
+    prev        : 8 字节  同一后端上一条记录的 LSN（用于可恢复性校验）
+    info        : 1 字节  标志位（是否含 FPI、是否含数据块等）
+    rmid        : 1 字节  资源管理器 ID（heap / btree / xact / ...）
+    pad         : 2 字节
+    crc         : 4 字节
+
+随后是若干 Block References：
+    block_id / fork / 标志位
+    如果 HAS_IMAGE → 附整个 8KB 页（Full Page Image）
+    如果 HAS_DATA  → 附 delta，并用 "hole offset/length"
+                     把页中未修改的部分"挖掉"以压缩体积
+
+重放：
+    RmgrTable[rmid].rm_redo(record)   // 每种资源一个函数
+
+幂等性判定：
+    PageHeader.pd_lsn 与 record.lsn 比较
+    if page.pd_lsn &gt;= record.lsn: skip</code></pre>
+
+<h4>整页写入（Full Page Writes）解决什么问题</h4>
+
+<pre><code>问题场景：
+    8KB 页写到一半机器断电
+    → 磁盘上是一个"半新半旧"的断裂页（torn page）
+    → 仅靠 delta 形式的 WAL 无法修复（因为 delta 是相对某个完整状态算的）
+
+解决方案：
+    检查点之后第一次修改某个页时，把整个 8KB 页原样写进 WAL
+    → 恢复时先用 FPI 把页恢复成完整状态，再应用后续 delta
+
+代价：
+    WAL 体积显著增大（checkpoint 之后的第一次写入都是 8KB）
+    → 这是"检查点太频繁"会导致写放大的根本原因
+    → 也解释了为什么调大 max_wal_size / 放宽 checkpoint 能提升写吞吐</code></pre>
+
+<h4>WAL 写入的并发控制</h4>
+
+<pre><code>function pg_xlog_insert(record):
+    // ① 插入锁：分段，避免全局串行化
+    //    PG 9.5+ 有 8 个 WAL insert lock，按 CPU 数自动配置
+    insert_lock = wal_insert_locks[MyProc.pid % num_insert_locks]
+    spin_lock(insert_lock)
+    reserved = wal_buf.reserve_space(len(record))
+    spin_unlock(insert_lock)
+
+    memcpy(wal_buf[reserved], record)
+
+    // ② 因为分段申请，LSN 顺序与写入顺序可能不一致
+    //    用一个 "insert pos" 原子推进来保证日志顺序正确
+    ...
+
+    // ③ 写盘阶段：write lock 与 flush lock 分离（PG 9.6+）
+    //    多个后端可以并行 write，只对 fsync 做串行化
+    return lsn</code></pre>
+
+<h3>5.4 日志机制对照总结</h3>
+
+<table>
+<thead><tr><th style="width:22%">维度</th><th style="width:39%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>日志单位</td><td class="ora">redo record = SCN + change vectors</td><td class="pg">XLogRecord = LSN + block references</td></tr>
+<tr><td>谁负责写入</td><td class="ora">LGWR 单一进程集中写</td><td class="pg">各 backend 自己插入，WAL writer 辅助刷</td></tr>
+<tr><td>提交同步点</td><td class="ora"><code>log file sync</code> 等待 LGWR</td><td class="pg"><code>XLogFlush</code> 等待 fsync</td></tr>
+<tr><td>块保护方式</td><td class="ora">block_scn + block_seq 双重门控</td><td class="pg">pd_lsn 门控 + 整页镜像修断裂页</td></tr>
+<tr><td>日志复用</td><td class="ora">在线日志组循环 + 归档</td><td class="pg">pg_wal 段文件（16MB）循环 + 归档 / 复制槽保留</td></tr>
+<tr><td>可关日志的操作</td><td class="ora"><code>NOLOGGING</code>（需重建）</td><td class="pg"><code>UNLOGGED TABLE</code>、<code>wal_level=minimal</code> 下的批量建表</td></tr>
+<tr><td>灾备基础</td><td class="ora">Data Guard（redo transport/apply）</td><td class="pg">流复制 / 逻辑复制 / PITR</td></tr>
+</tbody>
+</table>
+
+<h2 id="s7">六、锁机制全貌</h2>
+
+<h3>6.1 Oracle 的行锁：完全存储在数据块里</h3>
+
+<p>这是 Oracle 相对同时代数据库（DB2、SQL Server 早期版本）最大的架构创新——<b>行锁不占用任何集中的锁管理器内存</b>。</p>
+
+<pre><code>数据块物理布局（Oracle）：
+
+┌───────────────────────────────────────────────────┐
+│ Block Header                                      │
+│   · block_scn / block_seq / block_type            │
+│   · ITL 数组（Interested Transaction List）        │
+│       ITL[i] = { XID, UBA, Flag, Lck, SCN/Fsc }   │
+│         Flag:  '-' = 未提交（SCN 字段是上界或 FSC）│
+│                'C' = 已提交（SCN 字段是提交 SCN）  │
+│                'U' = 上界 SCN                      │
+│         Lck :  该 ITL 锁住的该块内行数            │
+├───────────────────────────────────────────────────┤
+│ Row Directory（行号 → 行数据偏移）                 │
+├───────────────────────────────────────────────────┤
+│ Row Data                                          │
+│   行头包含一个 lb 字段（lock byte）                │
+│   lb = 0x00  → 该行未被锁                          │
+│   lb = 0x01  → 该行被 ITL[1] 锁定                 │
+└───────────────────────────────────────────────────┘
+
+实际块转储里的样子（对应上图的某一行）：
+    Itl   Xid                  Uba          Flag  Lck  Scn/Fsc
+    0x01  0x0006.00c.00000042 0x00c0005a.00d1.01 ----  1  fsc 0x0000.00000000
+    ...
+    某行： tl: 5 fb: --H-FL-- lb: 0x1  cc: 2
+                            └──────┘ 锁字节指向 ITL[1]</code></pre>
+
+<div class="key">
+<b>「行锁存在数据块里」带来三个重要后果：</b><br>
+① <b>绝对没有锁升级（lock escalation）</b>。Oracle 从设计上就不存在「锁太多升级成表锁」这种事。你可以放心地在一个事务里更新几百万行。<br>
+② <b>不需要维护集中的锁表内存</b>，也就不会出现「锁表满了」这类错误。<br>
+③ 代价是<b>受块内 ITL 槽数量和剩余空间限制</b>。同一块上有太多并发事务时，会出现 <code>enq: TX - allocate ITL entry</code> 等待——这是 Oracle 特有的等待事件，也是分区/分表要打散热块的经典理由。
+</div>
+
+<h3>6.2 Oracle 的 DML 完整伪代码</h3>
+
+<pre><code>function oracle_update_row(blk, row_offset, new_values):
+
+    // ========== 步骤 1：获取事务级 TX enqueue ==========
+    // 注意：这不是行锁，而是"我这个事务本身"作为一个可等待对象被注册
+    enqueue(resource = TX,
+            id1 = my_undo_segment.usn,
+            id2 = my_slot_number,
+            mode = EXCLUSIVE)
+    // 这个 TX 锁从第一次修改一直持有到 commit/rollback
+
+    // ========== 步骤 2：检查目标行是否已被锁定 ==========
+    lb = blk.row[row_offset].lb
+    if lb != 0:
+        other_itl = blk.itl[lb]
+        if other_itl.flag == '-' and not is_committed(other_itl.xid):
+            // 去向"那个事务"的 TX enqueue 请求共享锁 → 阻塞
+            test_and_set_wait(resource = TX,
+                              id1 = other_itl.xid.usn,
+                              id2 = other_itl.xid.slot,
+                              mode = SHARE)
+            event = "enq: TX - row lock contention"
+            // 等 3 秒仍未获得 → 触发死锁检测（见第七节）
+
+    // ========== 步骤 3：为我的事务取得一个 ITL 槽 ==========
+    slot = find_free_itl(blk)
+    if slot == null:
+        slot = try_steal_itl_from_committed_tx(blk)   // 做块清除腾位置
+    if slot == null:
+        // 块的 ITL 空间用尽，且空闲空间不足以再扩一个 ITL 条目
+        // （或者是我自己的事务在同一块上要占第二个 ITL 槽）
+        event = "enq: TX - allocate ITL entry"
+        wait_for_itl_space(blk)
+
+    // ========== 步骤 4：写 undo 前像（先写 undo，再改数据）==========
+    uba = allocate_undo_record(my_undo_segment)
+    write_before_image(undo_block = uba, row = blk.row[row_offset])
+    redo_buf.append(REDO_FOR_UNDO_BLOCK(uba))       // ★ undo 也受 redo 保护
+
+    // ========== 步骤 5：原地修改数据块 ==========
+    apply_new_values(blk.row[row_offset], new_values)
+    blk.row[row_offset].lb = slot                    // 行锁字节指向我的 ITL 槽
+    blk.itl[slot] = {
+        xid  : my_xid,
+        uba  : uba,
+        flag : '-',                                  // 未提交
+        lck  : blk.itl[slot].lck + 1,
+        scn  : free_space_credit                     // 或上界 SCN
+    }
+    blk.block_scn = current_scn()
+    blk.block_seq += 1
+
+    // ========== 步骤 6：生成 redo ==========
+    redo_buf.append(REDO_FOR_DATA_BLOCK(blk))
+
+    // 整个过程中：TM 锁（表级）在本事务第一次修改该表时已获取，模式 3 (RX)
+    return OK</code></pre>
+
+<h3>6.3 Oracle enqueue 锁的模式与体系</h3>
+
+<pre><code>Oracle 的 enqueue 锁有 6 个级别（不是 2 个！）：
+
+  模式 1: NULL        ── 仅占位，无实际冲突
+  模式 2: SS          ── Sub-Share，子共享
+  模式 3: SX          ── Sub-Exclusive，子排他
+  模式 4: S           ── Share，共享
+  模式 5: SSX         ── Share-Sub-Exclusive，共享子排他
+  模式 6: X           ── Exclusive，排他
+
+常用的主要资源类型：
+
+  TX  事务锁       id1 = undo段号, id2 = 槽号
+                  · DML 时持 X
+                  · 等待其他事务的行锁时持 S
+                  · 唯一键冲突等待时持 S
+                  · ITL 分配、索引分裂也用 TX
+                  → 等待事件：enq: TX - row lock contention
+                             enq: TX - allocate ITL entry
+                             enq: TX - index contention
+                             enq: TX - contention
+
+  TM  表级 DML 锁  id1 = object_id
+                  · 模式 2 (SS/RS)：SELECT ... FOR UPDATE
+                  · 模式 3 (SX/RX)：INSERT/UPDATE/DELETE  ← 最常持的模式
+                  · 模式 4 (S)：LOCK TABLE ... IN SHARE MODE
+                  · 模式 6 (X) ：DDL、LOCK TABLE ... IN EXCLUSIVE MODE
+                  → 等待事件：enq: TM - contention
+                  → ORA-00054 resource busy
+
+  TS  表空间锁     · 用于表空间在线/离线
+  US  Undo 段锁    · 事务要拿 undo 段槽位时
+  HW  高水位锁     · 段扩展
+  CI / CF          · 控制文件、检查点
+  LC / LS          · 库缓存、日志切换</code></pre>
+
+<h3>6.4 PostgreSQL 的锁：五个层次</h3>
+
+<pre><code>第 1 层  元组级锁  ── 存在元组头里，无集中管理
+   · xmax + infomask 标志位（HEAP_XMAX_EXCL_LOCK 等）
+   · 多个加锁者 → MultiXactId，成员存在 pg_multixact
+   · 极端情况（成员数超限）→ 回退到共享内存的 LOCKTAG_TUPLE
+
+第 2 层  heavyweight lock（重锁）
+   · 共享内存哈希锁表，按 tag 分 16 个分区，每分区一把 LWLock
+   · 8 种锁模式 + 冲突矩阵（见下表）
+   · 保证公平性：等待者按序排队，新请求不能插队
+   · 受 max_locks_per_transaction 限制，超了会报
+     "out of shared memory ... increase max_locks_per_transaction"
+
+第 3 层  LWLock（轻量锁）
+   · 保护共享内存数据结构：buffer mapping、WAL insert、ProcArray、
+     lock partition、checkpointer 状态等
+   · 有共享/排他模式，支持超时等待
+   · 典型等待事件：LWLock:BufferContent、LWLock:WALWrite、
+     LWLock:ProcArrayLock
+
+第 4 层  Spinlock（自旋锁）
+   · 保护极短的临界区（几十条指令），内部用 TAS/自旋
+   · 持有期间禁止中断，绝对不允许阻塞
+
+第 5 层  SIReadLock（谓词锁）
+   · 只有 SERIALIZABLE 隔离级别启用
+   · 追踪"读到了哪些范围/哪些元组"，用于 SSI 的危险结构检测
+   · 存在共享内存，也受 max_pred_locks_per_transaction 限制</code></pre>
+
+<h4>PostgreSQL 重锁模式冲突矩阵</h4>
+
+<p>行 = 已持有的模式，列 = 新请求的模式。✗ 表示冲突需要等待。</p>
+
+<table>
+<thead><tr>
+<th style="width:22%">已持有 \ 请求</th><th>AS</th><th>RS</th><th>RE</th><th>SUE</th><th>S</th><th>SRE</th><th>E</th><th>AE</th>
+</tr></thead>
+<tbody>
+<tr><td><b>AS</b> AccessShare</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td style="color:#A32D2D">✗</td></tr>
+<tr><td><b>RS</b> RowShare</td><td></td><td></td><td></td><td></td><td></td><td></td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td></tr>
+<tr><td><b>RE</b> RowExclusive</td><td></td><td></td><td></td><td></td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td></tr>
+<tr><td><b>SUE</b> ShareUpdateExclusive</td><td></td><td></td><td></td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td></tr>
+<tr><td><b>S</b> Share</td><td></td><td></td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td></td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td></tr>
+<tr><td><b>SRE</b> ShareRowExclusive</td><td></td><td></td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td></tr>
+<tr><td><b>E</b> Exclusive</td><td></td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td></tr>
+<tr><td><b>AE</b> AccessExclusive</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td><td style="color:#A32D2D">✗</td></tr>
+</tbody>
+</table>
+
+<p class="cap">注意最下面两行：<b>AccessExclusive 与除自己以外的所有模式都冲突，包括 AccessShare（普通 SELECT）</b>。这一条直接决定了 PG 的 DDL 行为特征。</p>
+
+<div class="warn">
+<b>这张表是 PG 运维中最重要的知识点之一。</b>Oracle 的 SELECT 基本不获取 TM 锁（只获取库缓存锁），所以 <code>ALTER TABLE</code> 通常能在一个长查询运行期间顺利执行。而 PG 的 <code>ALTER TABLE</code> 要拿 AccessExclusive，会<b>阻塞普通 SELECT</b>，而且会排在所有正在运行的查询后面。<br><br>
+线上事故的经典形态：一个跑了 3 小时的报表查询，让你 1 秒钟的 <code>ALTER TABLE ADD COLUMN</code> 阻塞住了；ALTER 之后的排队等待又把这 3 小时内所有新来的 SELECT 全部堵死——<b>整个表被拖垮</b>。<br><br>
+标准防护：<code>SET lock_timeout = '3s'</code> 配合重试循环，绝对不要在无超时保护下发 DDL。
+</div>
+
+<h3>6.5 重锁的获取伪代码</h3>
+
+<pre><code>function LockAcquire(locktag, lockmode, sessionLock, dontWait):
+
+    partition = hash_partition_of(locktag, NUM_LOCK_PARTITIONS)  // 16 个分区
+    LWLockAcquire(partition->lock, LW_EXCLUSIVE)
+
+    // ---------- 会话级重入计数 ----------
+    locallock = hash_search(LockMethodLocalHash, locktag)
+    if locallock.holds_lock(lockmode):
+        locallock.nLocks++
+        LWLockRelease(partition->lock)
+        return LOCKACQUIRE_ALREADY_HELD        // 可重入，同会话再来一次不阻塞
+
+    // ---------- 找到或创建共享的 LOCK 对象 ----------
+    lock = hash_search(LockMethodLockHash, locktag, HASH_ENTER)
+    myproc = MyProc
+
+    // ---------- 冲突检查 ----------
+    if lock.grantMask &amp; conflict_mask(lockmode):
+        // 有冲突，必须等待
+        wait = LockWaitState {
+            lock          : lock,
+            proc          : myproc,
+            requestedMode : lockmode,
+            holdMask      : 0,
+            requestMask   : mode_mask(lockmode),
+            waitLink      : lock.waitProcs,     // 挂到等待链
+            waitLock      : lock
+        }
+        lock.waitProcs = wait
+        myproc.waitLock = lock
+        myproc.waitMask = wait.requestMask
+
+        // ---------- 公平性检查：不允许插队 ----------
+        // 如果队列里已有等待者，即使我此刻能拿到锁也不能抢
+        if not can_jump_queue(lock, wait):
+            LWLockRelease(partition->lock)
+            ProcSleep(lock, wait)              // ← 睡在这里
+            // 醒来后重新走一遍整个流程（可能是被授予，也可能是出错）
+            ...
+            return result
+    else:
+        // 直接授予
+        lock.grantMask |= mode_mask(lockmode)
+        myproc.heldLocks[lockMethodId] |= mode_mask(lockmode)
+
+    LWLockRelease(partition->lock)
+    return LOCKACQUIRE_OK</code></pre>
+
+<h4>ProcSleep：等待与死锁检测的结合点</h4>
+
+<pre><code>function ProcSleep(lock, wait):
+
+    // 把自己加入锁的等待队列（保持顺序），然后开始睡
+    insert_into_wait_queue(lock, wait)
+
+    for (;;):
+        // ---------- 请求死锁检测器介入 ----------
+        deadlock_state = DeadLockCheck(MyProc)
+
+        if deadlock_state == DS_DEADLOCK:
+            return STATUS_ERROR                 // → 调用方抛 ERROR 40P01
+
+        if deadlock_state == DS_BLOCKED:
+            // 只有"第一次"阻塞时启动超时器，避免反复重置
+            enable_timeout_after(DEADLOCK_TIMEOUT, deadlock_timeout)
+
+        // ---------- 睡在信号量上 ----------
+        PGSemaphoreLock(&MyProc.sem)
+
+        // ---------- 被唤醒，检查结果 ----------
+        if MyProc.waitStatus == STATUS_OK:
+            return STATUS_OK                    // 锁已授予
+        if MyProc.waitStatus == STATUS_ERROR:
+            return STATUS_ERROR                 // 死锁被选中
+        // 否则是被"虚假唤醒"，继续循环</code></pre>
+
+<div class="note">
+<b>公平性（queue jumping 禁止）是一个容易被忽视的正确性保障。</b>如果没有公平性，一个高频请求的小锁可能永远插队成功，导致等待者<b>饿死</b>。PG 在 <code>LockAcquire</code> 里专门做了队列检查，保证不会有请求无限期地排在队尾。<br>
+相比之下 Oracle 的 enqueue 也维护有序等待队列，并用"锁转换（convert）"机制处理同会话的模式升级——注意 Oracle 的转换队列是一个更复杂的结构，因为一个会话可能同时持有 S 并请求 X。
+</div>
+
+<h2 id="s8">七、死锁检测</h2>
+
+<h3>7.1 <span class="tag ora">Oracle</span>基于 enqueue 等待图的遍历</h3>
+
+<pre><code>function oracle_deadlock_detection(waiting_session):
+
+    // ---------- 触发条件 ----------
+    // 会话在等待 enqueue 约 3 秒后仍未获得 → 主动发起检测
+    // （RAC 中 DIA0 后台进程也会周期性扫描"疑似挂住"的会话）
+
+    // ---------- 构造等待图 ----------
+    // 节点 = 会话；边 = "我在等 S，而 S 被某个持有者占用"
+    graph = {}
+    for each session s in all_sessions:
+        if s.is_waiting_on_enqueue():
+            resource = s.waiting_resource
+            for each holder h in resource.convert_queue, resource.owner_queue:
+                if h holds a conflicting mode:
+                    graph.add_edge(s → h)
+
+    // ---------- 找环 ----------
+    cycle = find_cycle(graph)          // 标准 DFS 回溯找环
+    if cycle == null:
+        return NO_DEADLOCK             // 只是慢，继续等
+
+    // ---------- 选择牺牲者 ----------
+    // Oracle 的启发式：选择"已经做了最少工作"的事务回滚，
+    // 通常等价于"最近开始的"或"等待链上最后一个"的那个
+    victim = choose_lowest_cost_transaction(cycle)
+
+    // ---------- 执行 ----------
+    for each session in cycle:
+        session.dump_deadlock_graph_to_trace()      // 所有涉及者都转储
+    rollback(victim)
+    raise ORA-00060 on victim.session
+    // 其余会话继续等待，此时环已破，很快能获得锁</code></pre>
+
+<h3>7.2 <span class="tag pg">PostgreSQL</span>基于 PGPROC 等待边的 DFS</h3>
+
+<p>PG 的死锁检测更微妙，因为它能看到的"边"是不完整的——这是它必须引入「硬边 / 软边」概念的原因。</p>
+
+<pre><code>// ---------- 边的类型 ----------
+// 硬边（hard edge）：等待者的请求模式与持有者已授予的模式冲突，
+//                    且持有者没有在等待任何东西 → 持有者只能主动释放
+// 软边（soft edge）：等待者的请求模式与持有者的"等待请求"冲突
+//                    （即持有者自己正在等一个转换）→ 持有者可能先获得、
+//                    然后释放，此时边会自然消失
+
+function DeadLockCheck(proc):
+
+    // ---------- 从每个可能的分叉点尝试 ----------
+    nprocs = 0
+    for i in 0..max:
+        if DeadLockCheckRecurse(proc, nprocs_of_depth[i]):
+            // 在尝试打断第 i 个软边后，如果仍然存在环 → 真死锁
+            ... 记录并继续
+        else:
+            return DS_NOT_BLOCKED      // 打断这条软边后环消失了 → 不是死锁
+
+    // 所有软边都试过仍有硬环 → 确实是死锁
+    // 选牺牲者：通常就是调用检测的 proc 自己（最先到超时的等待者）
+    return DS_DEADLOCK</code></pre>
+
+<pre><code>function DeadLockCheckRecurse(proc, nprocs):
+
+    // ---------- 构造当前等待图 ----------
+    edges = []
+    for each other_proc p in ProcArray:
+        if p.waitLock == null: continue
+
+        // 遍历这个锁的所有持有者和等待者
+        for each h in holders_and_waiters(p.waitLock, p.waitMask):
+            if h == p: continue
+            if is_hard_edge(p, h):
+                edges.add(HARD(p → h))
+            else:
+                edges.add(SOFT(p → h))
+
+    // ---------- 找环 ----------
+    if not find_cycle(edges):
+        return false
+
+    // ---------- 递归尝试打断软边 ----------
+    for each soft_edge e in edges:
+        temporarily_remove(e)                // 假设这条边会先消失
+        if DeadLockCheckRecurse(proc, nprocs + 1):
+            return true                      // 打断它也没用 → 真死锁
+        restore(e)                           // 回溯
+
+    return true</code></pre>
+
+<h3>7.3 死锁检测机制对照</h3>
+
+<table>
+<thead><tr><th style="width:22%">维度</th><th style="width:39%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>触发方式</td><td class="ora">会话等待约 3 秒后主动发起；RAC 中 DIA0 另外周期扫描</td><td class="pg">等待超过 <code>deadlock_timeout</code>（默认 1s）后由该进程发起</td></tr>
+<tr><td>图的信息来源</td><td class="ora">enqueue 资源管理器的持有队列 + 转换队列</td><td class="pg">PGPROC 的 <code>waitLock</code> + 各 LOCK 的持有/等待掩码</td></tr>
+<tr><td>算法核心</td><td class="ora">直接在完整等待图上 DFS 找环</td><td class="pg">DFS + 硬边/软边区分 + 递归回溯尝试打断软边</td></tr>
+<tr><td>牺牲者选择</td><td class="ora">代价函数：做的工作最少的事务</td><td class="pg">通常是发起检测的那个进程自身</td></tr>
+<tr><td>错误码</td><td class="ora">ORA-00060（并在 trace 里输出 deadlock graph）</td><td class="pg">ERROR 40P01 <code>deadlock detected</code></td></tr>
+<tr><td>相关参数</td><td class="ora">隐含参数控制检测间隔</td><td class="pg"><code>deadlock_timeout</code>、<code>log_lock_waits</code>、<code>lock_timeout</code></td></tr>
+</tbody>
+</table>
+
+<div class="key">
+<b>为什么 PG 需要"软边"这么复杂的东西？</b><br>
+因为 Oracle 的等待图是全局锁管理器视角——所有锁和所有持有者都在一个结构里，它是完整的。而 PG 的锁分散在「元组头」、「重锁表」、「事务锁」三处，<code>DeadLockCheck</code> 只能看到 <code>PGPROC.waitLock</code> 能表达的那些边。有些潜在的环在图上看起来只是一条边，所以必须用「假设某条边会先消失再重试」的递归方式逼近真实情况。<br><br>
+代价是这个算法在极端情况下（大量进程、大量锁）会比 Oracle 的简单 DFS 慢不少，并且它以等待者自身作为起点，视野是局部的。
+</div>
+
+<div class="note">
+<b>调优提示：</b>把 <code>deadlock_timeout</code> 调太小会导致每次普通锁等待都触发一次昂贵的检测（检测在持有 LockMgrLock 的情况下运行，会放大竞争）；调太大会让死锁被发现的延迟变长。<code>1s</code> 的默认值是一个相当好的平衡。真正需要消除的是<b>死锁本身</b>，而不是检测速度。
+</div>
+
+<h2 id="s9">八、崩溃恢复</h2>
+
+<h3>8.1 <span class="tag ora">Oracle</span>实例恢复：两个阶段</h3>
+
+<pre><code>function oracle_instance_recovery():
+
+    // ========== 阶段 0：确定恢复起点 ==========
+    control_file = read_control_file()
+    // 取所有线程（RAC 下多实例）中最旧的 checkpoint RBA
+    start_rba = min(thread.checkpoint_rba for thread in control_file.threads)
+    end_rba   = control_file.last_redo_rba      // redo 的末尾
+
+    // ========== 阶段 1：前滚（Roll Forward / Cache Recovery）==========
+    // 重放 redo，把数据文件推进到崩溃前的状态
+    rba = start_rba
+    while rba &lt; end_rba:
+        rec = read_redo_record(rba)
+        for each change_vector cv in rec.change_vectors:
+            blk = buffer_cache.get_for_update(cv.block_ref)
+
+            // ★ 幂等性门控
+            if blk.block_scn &lt; cv.scn:
+                apply_change_vector(blk, cv)
+                blk.block_scn = cv.scn
+                blk.block_seq += 1
+            // 否则跳过（这个修改已经在块里了）
+
+        rba = rec.next_rba
+
+    // ========== 阶段 2：回滚（Roll Back / Transaction Recovery）==========
+    // 扫描 undo 段头的事务表，找出所有"没有提交标记"的事务
+    for each undo_segment us in all_undo_segments:
+        for each slot in us.transaction_table:
+            tx = us.tt[slot]
+            if tx.status == ACTIVE and tx.xid.has_no_commit_record_in_redo():
+                undo_dead_transaction(tx)
+                // 从 tx.last_uba 反向应用 undo 到 tx.start_uba
+                // 回滚操作本身也写 redo
+
+    // ========== 阶段 3：打开数据库 ==========
+    create_checkpoint()
+    open_database()
+    // SMON 继续在后台完成剩余的 dead transaction 回滚（并行回滚）
+
+    // ---------- RAC 的特殊之处 ----------
+    // 多实例共享存储时，前滚需要"两遍"：
+    //   Pass 1：重建 undo 段头的事务表（因为一个实例要回滚别的实例的事务）
+    //   Pass 2：用重建后的事务表信息去做正确的回滚
+    // 这是 RAC 恢复比单实例复杂得多的根本原因</code></pre>
+
+<h3>8.2 <span class="tag pg">PostgreSQL</span>崩溃恢复：只有一个阶段</h3>
+
+<pre><code>function StartupXLOG():
+
+    // ========== 阶段 0：读控制文件判断是否需要恢复 ==========
+    pg_control = read_pg_control()
+    if pg_control.state == DB_SHUTDOWNED:
+        return                          // 干净关闭，不需要恢复
+
+    InRecovery = true
+
+    // ---------- 确定 redo 起点 ----------
+    if archive_recovery or standby:
+        redo_start = read_backup_label().start_lsn
+    else:
+        redo_start = pg_control.checkPoint.redo
+
+    // ========== 阶段 1：重放 WAL ==========
+    EndRecPtr = redo_start
+    while EndRecPtr &lt; wal_end:
+        record = ReadRecord(EndRecPtr, LOG, InRecovery)
+
+        // ---------- 幂等性：低于检查点的记录直接跳过 ----------
+        if record.end &lt;= pg_control.checkPoint.redo:
+            EndRecPtr = record.end
+            continue
+
+        RmgrTable[record.rmid].rm_redo(record)
+        // 例如 heap_redo / btree_redo / xact_redo / xlog_redo
+        // 每个函数内部再用 page.pd_lsn 做二次门控
+
+        EndRecPtr = record.end
+        prefetch_hint_blocks()          // recovery_prefetch（PG 15+）预读加速
+
+    // ========== 阶段 2：结束恢复 ==========
+    InRecovery = false
+
+    // ★★★ 关键：这里没有"回滚阶段" ★★★
+    //
+    // 崩溃时正在进行的事务，其 pg_xact 状态仍然是 IN_PROGRESS。
+    // 之后任何查询遇到这些 xid 时：
+    //   TransactionIdIsInProgress() → 查 ProcArray（此时为空）
+    //                                → 查 clog，得到 IN_PROGRESS
+    //   最终判定"未提交" → 元组不可见
+    //
+    // 也就是说：这些事务的"效果"天然不存在，
+    //          因为它们从未被写入 pg_xact 的 COMMITTED 状态。
+    //          而它们物理留下的死元组，等 VACUUM 来处理即可。
+
+    // ========== 阶段 3：写检查点，允许写入 ==========
+    CreateCheckPoint(CHECKPOINT_END_OF_RECOVERY)
+    pg_control.state = DB_IN_PRODUCTION
+    update_pg_control()
+    allow_connections()</code></pre>
+
+<div class="key">
+<b>「没有回滚阶段」是 PG 架构最优雅的地方，也是最危险的地方。</b><br>
+好处：崩溃恢复时间只取决于 WAL 的量，与「崩溃瞬间有多少未提交的大事务」无关。Oracle 在崩溃时如果恰好有一个写了 5000 万行未提交的事务，恢复阶段的回滚可能要跑几小时（虽然有并行回滚和增量检查点缓解）。<br>
+坏处：那些未提交事务产生的死元组<b>真实地占据了磁盘</b>。如果崩溃前刚好有多个巨大的未提交事务，恢复后表会显著膨胀，而且 autovacuum 需要很长时间才能清理完。
+</div>
+
+<h3>8.3 检查点机制对照</h3>
+
+<table>
+<thead><tr><th style="width:22%">维度</th><th style="width:39%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>触发方式</td><td class="ora">CKPT 主动推进 RBA；DBWR 逐步写脏块（增量检查点）</td><td class="pg">checkpointer 进程按 <code>checkpoint_timeout</code> / <code>max_wal_size</code> 触发</td></tr>
+<tr><td>记录位置</td><td class="ora">控制文件记录 checkpoint RBA（不刷数据文件头）</td><td class="pg">写入 WAL 的 checkpoint 记录 + pg_control</td></tr>
+<tr><td>脏页刷写</td><td class="ora">DBWR 异步、按队列、有 LRUW/检查点队列两套机制</td><td class="pg">checkpointer 本身刷（默认），可配 <code>checkpoint_flush_after</code></td></tr>
+<tr><td>对业务的影响</td><td class="ora">通过 <code>log_checkpoints_to_alert</code> 与 <code>fast_start_mttr_target</code> 平滑</td><td class="pg">checkpoint 期间可能出现 io 尖峰（<code>checkpoint_completion_target</code> 平滑）</td></tr>
+<tr><td>恢复起点</td><td class="ora">最旧的 checkpoint RBA</td><td class="pg"><code>checkPoint.redo</code></td></tr>
+</tbody>
+</table>
+
+<div class="note">
+<b>两者的检查点本质都是「记录一个可安全开始重放的位置」，但权衡点不同。</b>Oracle 用「增量检查点 + 持续异步刷脏」换取实例恢复时间可控（<code>fast_start_mttr_target</code> 可以指定目标恢复秒数，然后反推检查点推进节奏）。PG 的检查点更简单直接，恢复时间取决于 <code>max_wal_size</code>——调大它能减少检查点频率、提升写入性能，代价是崩溃后恢复时间变长。
+</div>
+
+<h2 id="s10">九、隔离级别与写冲突语义</h2>
+
+<h3>9.1 三种隔离级别的实现对照</h3>
+
+<table>
+<thead><tr><th style="width:18%">隔离级别</th><th style="width:41%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr>
+<td><b>READ COMMITTED</b></td>
+<td class="ora">语句级 SCN。写冲突时：<b>等待 → 重新读取最新版本 → 用新值再评估 WHERE</b>（Oracle 内部叫 "restart"）。因此一般不会 lost update，但两次读之间可能看到不同数据（不可重复读）。</td>
+<td class="pg">语句级 Snapshot。<b>写冲突时通过 EvalPlanQual（EPQ）重新读取并重新评估谓词</b>。语义上与 Oracle 高度一致，都是「first updater wins」。</td>
+</tr>
+<tr>
+<td><b>REPEATABLE READ</b></td>
+<td class="ora">不单独提供（用 SERIALIZABLE 近似，但会带写冲突检测）</td>
+<td class="pg">事务级 Snapshot（= 快照隔离 SI）。写冲突时报 <code>ERROR 40001 could not serialize access due to concurrent update</code>，必须重试。</td>
+</tr>
+<tr>
+<td><b>SERIALIZABLE</b></td>
+<td class="ora">事务级 SCN。<b>就是快照隔离</b>，不防写偏斜。写冲突时 ORA-08177。</td>
+<td class="pg">事务级 Snapshot + SSI 危险结构检测。<b>真串行化</b>，能防写偏斜。冲突时 ERROR 40001。</td>
+</tr>
+</tbody>
+</table>
+
+<h3>9.2 一个必须记住的差异：写偏斜</h3>
+
+<p>经典场景：值班表约束「至少一名医生在岗」。两个事务分别做「先查在岗人数，发现是 2，于是各自申请休假」：</p>
+
+<pre><code>-- 两个会话在 SERIALIZABLE 下并发执行，时序如下
+-- T1: SELECT count(*) FROM duty WHERE on_call = true;   → 2
+-- T2: SELECT count(*) FROM duty WHERE on_call = true;   → 2
+-- T1: UPDATE duty SET on_call = false WHERE doctor = 'A';
+-- T2: UPDATE duty SET on_call = false WHERE doctor = 'B';
+-- 两个都 COMMIT
+
+Oracle SERIALIZABLE:
+    ✅ 两个事务都能提交（它们写的是不同的行，没有写写冲突）
+    → 结果：无一人在岗，约束被违反  ❌ 写偏斜发生了
+
+PostgreSQL SERIALIZABLE:
+    ❌ 第二个提交的事务报 ERROR 40001
+       "could not serialize access due to read/write dependencies among transactions"
+    → 应用必须重试整个事务，重试后会看到正确的状态</code></pre>
+
+<div class="warn">
+<b>这个差异直接决定了应用层是否需要重试逻辑。</b><br>
+如果你的业务在 Oracle 上长期跑 SERIALIZABLE 且依赖它来保证正确性，迁移到 PG 时要重新审视：<b>PG 会报错，你的应用必须能处理 40001 并重试</b>。反之，从 PG 迁到 Oracle 时，原本靠 SSI 拦下的异常会静默通过，形成数据不一致——这是最危险的迁移方向。建议在 Oracle 上用 <code>SELECT ... FOR UPDATE</code> 手工把关键读变成写依赖。
+</div>
+
+<h3>9.3 提交顺序与可见性</h3>
+
+<table>
+<thead><tr><th style="width:24%">问题</th><th style="width:38%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr><td>是否有全局提交顺序</td><td class="ora">有。SCN 单调递增即全局提交序，可用于「按提交时间排序」</td><td class="pg">无内置单调提交序号，需靠 commit LSN 或 <code>track_commit_timestamp</code></td></tr>
+<tr><td>能否读到未提交</td><td class="ora">不能（除非 <code>DBMS_...</code> 特殊手段）</td><td class="pg">不能（除非 <code>pg_read_...</code> 或扩展）</td></tr>
+<tr><td>快照与提交的时序保证</td><td class="ora">基于 SCN，读到的所有块必须 ≤ 快照 SCN</td><td class="pg">基于 xip 列表；提交在快照之后的不可见</td></tr>
+</tbody>
+</table>
+
+<h2 id="s11">十、典型并发场景逐条推演</h2>
+
+<h3>场景 1：两个会话更新同一行</h3>
+
+<div class="grid">
+<div class="pane ora">
+<h4>Oracle</h4>
+<pre><code>S1: UPDATE t SET v=1 WHERE id=1;
+    → 取 ITL 槽，行头 lb = 该槽号
+    → 持有 TX enqueue (X)
+
+S2: UPDATE t SET v=2 WHERE id=1;
+    → 读到块，发现 lb 指向活跃 ITL
+    → 请求该事务的 TX enqueue (S) → 阻塞
+    → event: enq: TX - row lock contention
+
+S1: COMMIT;
+    → 写 commit redo 并刷盘
+    → 释放 TX 锁，唤醒 S2
+
+S2: 被唤醒，重新读取该行最新已提交版本
+    → 用新版本重新评估 WHERE
+    → 若仍匹配则更新，否则跳过该行
+    → 不会出现 lost update</code></pre>
+</div>
+<div class="pane pg">
+<h4>PostgreSQL（READ COMMITTED）</h4>
+<pre><code>S1: UPDATE t SET v=1 WHERE id=1;
+    → 旧元组 T1.xmax = S1
+    → 插入新元组 T2(xmin=S1)，T1.t_ctid → T2
+
+S2: UPDATE t SET v=2 WHERE id=1;
+    → 扫到 T1，但 T1.xmax 指向未提交的 S1
+    → XactLockTableWait(S1) 阻塞
+    → event: transactionid / tuple lock
+
+S1: COMMIT;
+    → 释放事务锁，唤醒 S2
+
+S2: 被唤醒 → EvalPlanQual:
+    → 沿 T1.t_ctid 找到 T2
+    → 用 T2 重新评估 WHERE 谓词
+    → 若仍匹配则更新 T2，产生 T3
+    → 不会出现 lost update</code></pre>
+</div>
+</div>
+
+<p><b>结论：两者在默认隔离级别下的语义是一致的，都能避免 lost update。</b>但实现路径不同——Oracle 是「重新读块」，PG 是「顺着 ctid 链重新评估谓词」（EPQ）。</p>
+
+<h3>场景 2：唯一键并发插入</h3>
+
+<div class="grid">
+<div class="pane ora">
+<h4>Oracle</h4>
+<pre><code>S1: INSERT INTO t(k) VALUES (100);
+S2: INSERT INTO t(k) VALUES (100);
+
+S2 在唯一索引上发现冲突条目（由未提交的 S1 创建）
+  → 请求 S1 事务的 TX enqueue，模式 S
+  → 阻塞
+
+S1: COMMIT;
+S2: 被唤醒，重新检查
+  → 索引条目仍然有效
+  → 抛 ORA-00001 unique constraint violated
+
+S1: ROLLBACK;
+S2: 被唤醒
+  → 冲突条目随回滚消失
+  → 插入成功</code></pre>
+</div>
+<div class="pane pg">
+<h4>PostgreSQL</h4>
+<pre><code>S1: INSERT INTO t(k) VALUES (100);
+    → 先插堆元组，再插索引条目
+
+S2: INSERT INTO t(k) VALUES (100);
+    → btree 插入时发现冲突的索引元组
+    → 沿 chain 找到冲突事务的 xid
+    → XactLockTableWait(xid) 阻塞
+
+S1: COMMIT;
+S2: 被唤醒，重新检查冲突索引条目的可见性
+    → 仍然有效 → ERROR 23505 duplicate key value
+
+S1: ROLLBACK;
+S2: 被唤醒
+    → 冲突条目所属事务已中止 → 视为不存在
+    → 重试索引插入，成功
+
+（PG 还有"投机插入" speculative insertion 用于
+  INSERT ... ON CONFLICT DO NOTHING/UPDATE，
+  通过 LOCKTAG_SPECULATIVE_TOKEN 做更细粒度的协调）</code></pre>
+</div>
+</div>
+
+<h3>场景 3：DDL 与 DML 的互斥（最重要的运维差异）</h3>
+
+<table>
+<thead><tr><th style="width:30%">场景</th><th style="width:35%">Oracle</th><th>PostgreSQL</th></tr></thead>
+<tbody>
+<tr>
+<td><b>长 SELECT 期间 ALTER TABLE</b></td>
+<td class="ora">通常能成功。SELECT 不取 TM 锁，DDL 只需要库缓存锁。可能出现 ORA-04021（等待库缓存对象锁超时）但概率低。</td>
+<td class="pg"><b>必然阻塞</b>。ALTER 要 AccessExclusive，与 AccessShare 冲突。而且 ALTER 会排在长查询后面，之后新来的查询又被 ALTER 堵住。</td>
+</tr>
+<tr>
+<td><b>有未提交 DML 时 TRUNCATE/DROP</b></td>
+<td class="ora">ORA-00054 resource busy（拿不到 TM 模式 6）</td>
+<td class="pg">无限期阻塞在 AccessExclusive 上（没有超时的话）</td>
+</tr>
+<tr>
+<td><b>在线加索引</b></td>
+<td class="ora"><code>CREATE INDEX ... ONLINE</code>，几乎不阻塞 DML</td>
+<td class="pg"><code>CREATE INDEX CONCURRENTLY</code>，不阻塞 DML 但耗时更长、失败会留 invalid 索引</td>
+</tr>
+<tr>
+<td><b>加带默认值的列</b></td>
+<td class="ora">ALTER TABLE 有 <code>ONLINE</code> 变体（部分操作）</td>
+<td class="pg">PG 11+ 加非易变默认值不再重写表，很快；但 PG 11 之前会全表重写</td>
+</tr>
+<tr>
+<td><b>最佳实践</b></td>
+<td class="ora">使用 DBMS_REDEFINITION 做在线重定义</td>
+<td class="pg">必须配 <code>lock_timeout</code> + 重试循环，绝不可裸发 DDL</td>
+</tr>
+</tbody>
+</table>
+
+<h3>场景 4：SAVEPOINT 与部分回滚</h3>
+
+<div class="grid">
+<div class="pane ora">
+<h4>Oracle</h4>
+<pre><code>SAVEPOINT sp1;
+INSERT ... 100 万行;
+ROLLBACK TO sp1;
+
+→ 用 undo 反向应用这 100 万行的修改
+→ 有实际的数据修改与 redo 产生
+→ 耗时与工作量成正比
+→ 但事务本身仍活跃，后续操作继续</code></pre>
+</div>
+<div class="pane pg">
+<h4>PostgreSQL</h4>
+<pre><code>SAVEPOINT sp1;         -- 分配一个子事务 xid
+INSERT ... 100 万行;
+ROLLBACK TO sp1;
+
+→ 修改子事务在 pg_subtrans 中的状态为 ABORTED
+→ 100 万个元组原地保留（成为死元组）
+→ 速度很快，但留下 100 万个待 VACUUM 的死元组
+→ 且子事务 xid 会占用 XID 空间，加速回卷
+→ 子事务层数超过 64 层后，快照开销显著上升</code></pre>
+</div>
+</div>
+
+<div class="note">
+<b>PG 的 SAVEPOINT 有一个隐蔽成本：子事务增多会拖慢快照获取。</b>因为每个背板进程的 ProcArray 里要维护子事务列表，快照的 xip 数组需要包含子事务 xid；超过 <code>PGPROC_MAX_CACHED_SUBXIDS</code>（64）后，子事务会溢出到 <code>pg_subtrans</code> 的查找路径上，每次快照都可能要读盘。这是「PL/pgSQL 里到处写 EXCEPTION 块导致性能下降」的技术原因——<b>每个 EXCEPTION 块在 PG 里都是一个隐式 SAVEPOINT</b>。
+</div>
+
+<h2 id="s12">十一、工程启示与选型建议</h2>
+
+<h3>11.1 把机制差异翻译成运维动作</h3>
+
+<table>
+<thead><tr><th style="width:26%">机制差异</th><th style="width:37%">Oracle 侧要做什么</th><th>PostgreSQL 侧要做什么</th></tr></thead>
+<tbody>
+<tr>
+<td>Undo 环形复用 vs 堆内多版本</td>
+<td class="ora">监控 undo 表空间使用率与 maxquerylen；设置合理的 <code>undo_retention</code>；避免批量提交间隙过大</td>
+<td class="pg">监控 <code>n_dead_tup</code>、表大小与 <code>last_autovacuum</code>；调优 autovacuum 阈值</td>
+</tr>
+<tr>
+<td>有无 undo 决定回滚成本</td>
+<td class="ora">避免「大事务中途失败」；用批量分段提交控制单个事务规模</td>
+<td class="pg">避免超长事务占用 xmin 地平线；设置 <code>idle_in_transaction_session_timeout</code></td>
+</tr>
+<tr>
+<td>锁在块内 vs 锁表在内存</td>
+<td class="ora">关注 <code>enq: TX - allocate ITL entry</code>；热块问题用分区打散；适当调大 INITRANS</td>
+<td class="pg">关注 <code>max_locks_per_transaction</code>；分区表减少单事务锁数量；监控 <code>pg_locks</code> 行数</td>
+</tr>
+<tr>
+<td>DDL 的锁粒度不同</td>
+<td class="ora">可用 <code>CREATE INDEX ... ONLINE</code>；重定义用 DBMS_REDEFINITION</td>
+<td class="pg">所有 DDL 必须配 <code>lock_timeout</code> + 重试；大表改造用 CREATE INDEX CONCURRENTLY</td>
+</tr>
+<tr>
+<td>最高隔离级别语义不同</td>
+<td class="ora">靠 <code>SELECT ... FOR UPDATE</code> 手工串行化关键读</td>
+<td class="pg">应用必须能处理 40001 并重试整个事务</td>
+</tr>
+<tr>
+<td>恢复阶段数不同</td>
+<td class="ora">用 <code>fast_start_mttr_target</code> 控制实例恢复时间</td>
+<td class="pg">用 <code>max_wal_size</code> / <code>checkpoint_timeout</code> 权衡写入性能与恢复时间</td>
+</tr>
+<tr>
+<td>2PC 风险形态不同</td>
+<td class="ora">查 <code>DBA_2PC_PENDING</code>，防止 undo 空间被钉住</td>
+<td class="pg">查 <code>pg_prepared_xacts</code>，防止锁与地平线被钉住</td>
+</tr>
+</tbody>
+</table>
+
+<h3>11.2 如果要从 Oracle 迁到 PostgreSQL，最容易踩的五个坑</h3>
+
+<ol class="steps">
+<li><b>把 DDL 当成无害操作。</b>Oracle 上养成的「随手 ALTER」习惯会在 PG 上造成生产事故。必须把所有变更脚本改成「<code>SET lock_timeout</code> + 循环重试」的模式。</li>
+<li><b>依赖 SERIALIZABLE 保证正确性。</b>Oracle 的 SERIALIZABLE 是快照隔离，能跑通的逻辑在 PG 上会因为报 40001 而失败；反过来，PG 上靠 SSI 拦下的写偏斜在 Oracle 上会静默通过。迁移前必须逐条审视业务逻辑依赖哪种语义。</li>
+<li><b>忽略长事务与空闲事务。</b>Oracle 上一个忘提交的事务只是占 undo 和锁；PG 上它会冻结整个实例的清理能力，让膨胀无限增长。</li>
+<li><b>用索引列做高频更新。</b>这会让 HOT 完全失效，索引膨胀速度远超预期。设计上应尽量把频繁变更的列从索引中移除，或改用部分索引。</li>
+<li><b>用大量 EXCEPTION 块做流程控制。</b>每个隐式 SAVEPOINT 都是一个子事务，在 PG 上的成本比 Oracle 高得多。应用状态码而不是异常来驱动正常分支。</li>
+</ol>
+
+<h3>11.3 一句话总结各自的机制内核</h3>
+
+<table>
+<thead><tr><th style="width:28%">方面</th><th style="width:36%">Oracle 的机制内核</th><th>PostgreSQL 的机制内核</th></tr></thead>
+<tbody>
+<tr><td>多版本</td><td class="ora"><b>空间换算力</b>：用 undo 空间换取「数据块永远只有一份」，读旧版本时现场倒带</td><td class="pg"><b>写放大换回滚</b>：用堆内冗余版本换取「回滚零成本」，用 VACUUM 偿还写放大</td></tr>
+<tr><td>锁</td><td class="ora"><b>数据即锁表</b>：锁和被锁的数据放在一起，天然分布式、无集中瓶颈，但受块内空间约束</td><td class="pg"><b>锁在数据里 + 元数据在内存</b>：行锁在元组头，表级语义靠重锁表，两种粒度的组合</td></tr>
+<tr><td>日志</td><td class="ora"><b>redo 保护一切</b>：undo 也是数据，所以 redo 必须覆盖 undo，恢复因此分两阶段</td><td class="pg"><b>WAL 只保护数据</b>：事务状态是缓存，正确性靠 WAL 重放重建，恢复因此只有一阶段</td></tr>
+<tr><td>一致性</td><td class="ora"><b>SCN 是全局时钟</b>：提交顺序、读一致性、恢复起点统一用一个单调数表达</td><td class="pg"><b>快照是一个集合</b>：用「活跃事务列表」表达时点，不需要全局时钟，代价是快照有成本</td></tr>
+</tbody>
+</table>
+
+<hr>
+
+<h3>附：全文伪代码索引</h3>
+<table>
+<thead><tr><th style="width:52%">伪代码</th><th>所在章节</th></tr></thead>
+<tbody>
+<tr><td>oracle_begin_transaction / pg_assign_transaction_id</td><td>2.1 事务开启</td></tr>
+<tr><td>oracle_commit（含 fast commit 与延迟块清除）</td><td>2.2 提交路径</td></tr>
+<tr><td>oracle_read_block（块清除逻辑）</td><td>2.2 提交路径</td></tr>
+<tr><td>pg_commit_transaction</td><td>2.2 提交路径</td></tr>
+<tr><td>oracle_rollback / pg_abort_transaction</td><td>2.3 回滚路径</td></tr>
+<tr><td>xid_in_snapshot / heap_tuple_satisfies_mvcc</td><td>3.3 PG 可见性判定</td></tr>
+<tr><td>oracle_consistent_read（CR 块构造）</td><td>3.2 Oracle 一致性读</td></tr>
+<tr><td>pg_heap_update（HOT 判定）</td><td>3.4 HOT 更新</td></tr>
+<tr><td>pg_vacuum</td><td>4.2 VACUUM</td></tr>
+<tr><td>oracle_generate_redo / LGWR</td><td>5.2 Redo 与 LGWR</td></tr>
+<tr><td>pg_xlog_insert</td><td>5.3 WAL 写入</td></tr>
+<tr><td>oracle_update_row（完整 DML 路径）</td><td>6.2 Oracle DML</td></tr>
+<tr><td>LockAcquire / ProcSleep</td><td>6.5 重锁获取</td></tr>
+<tr><td>oracle_deadlock_detection / DeadLockCheck / DeadLockCheckRecurse</td><td>7.1 / 7.2 死锁检测</td></tr>
+<tr><td>oracle_instance_recovery / StartupXLOG</td><td>8.1 / 8.2 崩溃恢复</td></tr>
+</tbody>
+</table>
+
+<footer>
+本文所有伪代码为「结构忠实、细节简化」的等价描述，用于建立机制层面的直觉。真实实现中还有大量工程优化（如 Oracle 的 latch/mutex 分层、PG 的 WAL insert lock 分段、两者各自的并行与批量优化），未在此逐一展开。
+</footer>
+
+
+
+</div>
+</body>
+</html>

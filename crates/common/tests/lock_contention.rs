@@ -281,3 +281,95 @@ fn ab_oracle_vs_fifo() {
         );
     }
 }
+
+/// **隔离 3：包装形态本身的成本**——裸 `Mutex` vs 同形包装（只多一层函数）
+/// vs 包装 + **1 个私有分片计数器**（模拟分片后的快路径）。
+struct Wrap {
+    inner: std::sync::Mutex<u64>,
+}
+impl Wrap {
+    fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[repr(align(64))]
+struct Shard {
+    c: AtomicU64,
+}
+
+struct Wrap1 {
+    inner: std::sync::Mutex<u64>,
+    shards: [Shard; 8],
+}
+impl Wrap1 {
+    fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        let x = 0u8;
+        let tag = std::ptr::addr_of!(x) as usize;
+        let i = (tag >> 6) % 8;
+        self.shards[i].c.fetch_add(1, Ordering::Relaxed);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn bench_wrap<F>(threads: usize, secs: f64, f: &F) -> f64
+where
+    F: Fn() -> u64 + Sync,
+{
+    let ops = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            let (ops, stop, f) = (&ops, &stop, f);
+            s.spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    n += f();
+                }
+                ops.fetch_add(n, Ordering::Relaxed);
+            });
+        }
+        std::thread::sleep(Duration::from_secs_f64(secs));
+        stop.store(true, Ordering::Relaxed);
+    });
+    ops.load(Ordering::Relaxed) as f64 / secs
+}
+
+#[test]
+#[ignore = "本地基准（跑法见模块文档）；不进 CI"]
+fn isolate_wrapper_cost() {
+    let secs = 1.0;
+    for threads in [2usize, 8, 32, 128] {
+        let m = std::sync::Mutex::new(0u64);
+        let bare = bench_wrap(threads, secs, &|| {
+            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+            *g += 1;
+            1
+        });
+        let w = Wrap {
+            inner: std::sync::Mutex::new(0),
+        };
+        let wrap = bench_wrap(threads, secs, &|| {
+            let mut g = w.lock();
+            *g += 1;
+            1
+        });
+        let w1 = Wrap1 {
+            inner: std::sync::Mutex::new(0),
+            shards: std::array::from_fn(|_| Shard {
+                c: AtomicU64::new(0),
+            }),
+        };
+        let wrap1 = bench_wrap(threads, secs, &|| {
+            let mut g = w1.lock();
+            *g += 1;
+            1
+        });
+        println!("| 裸 Mutex | {threads} | {:.1} |", bare / 1e4);
+        println!("| 同形包装（多一层函数） | {threads} | {:.1} |", wrap / 1e4);
+        println!(
+            "| 包装 + 1 个私有分片计数器 | {threads} | {:.1} |",
+            wrap1 / 1e4
+        );
+    }
+}
