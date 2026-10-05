@@ -55,6 +55,17 @@
 //!   §5.12）、`Segment::{hwm, plan_advance_hwm}`（§4.3.1）、
 //!   `pagefile::read_run`。
 //!   （续，v0.26，P3 审核修复）`itl::cleanout`（延迟块清除的落点——已提交条目 → `Committed` + 准确序号、锁清零）；`ITL 覆盖` 载荷加 `txn_id` + **归属守卫**（幽灵/换人记录不得覆盖他人条目）；`Segment::sync`（新页"先落盘后进 redo"次序用）；CR 终止符按 `itl_slot` 匹配；（续）`plan_materialize_bitmap_page`（**计划形态的位图页物化**：全新页先格式化 fsync、扩展页经池 + redo、段头以后像为基）、`plan_extend` 支持"窗口首位落在新增区内"、`rollback_chain` 环检测、`ExtentNo` 域校验、页访问器对损坏页降级。**P4 多写者随后。**
+//!   （续，v0.28）**多工作集分区**（`BufferPool::with_partitions`：每分区自带
+//!   链/桶/写列表与具名闩锁，`H(工作区) mod N` 稳定哈希——§5.10 的 P4 形态）；
+//!   **NUMA 重绑定原语**——帧的页缓冲**惰性分配**（装页线程 = 首次触碰者，
+//!   "首次触碰落本地"成立；未用帧不占 16 KiB）、`drain_partition`（刷尽 +
+//!   丢净帧）/`drop_clean_frames`/`allocated_frames`（重绑定 Draining，
+//!   详设 `doc/numa绑定设计_v0.1.md` §7）。
+//!   （续，v0.29）**O2：per-frame 状态对象**（§5.10 的 P4 并发路线 ③）——
+//!   帧槽数组稳定地址、每帧 = 原子 `pins` + 内容 `RwLock`；`PageGuard`
+//!   **不持池闩锁**（“一次一个卫兵”纪律退役），新增共享 `PageReadGuard`
+//!   （同一热块并发读）；结构闩锁只护元数据/链/桶/写列表/统计。
+//!   桶分片（O3/②）仍未落。
 //!
 //! 三条纪律：
 //! 1. **字节序定死小端**（REQ-PRT-003）——磁盘格式不随主机变化；
