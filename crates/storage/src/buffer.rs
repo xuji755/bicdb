@@ -43,8 +43,8 @@
 //! 操作时先取副本、放开卫兵再取下一页；分区/工作集与每分区 latch 在 P4 接入。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Mutex, MutexGuard};
 
+use bicdb_common::latch::{Latch, LatchGuard, LatchStats};
 use bicdb_common::seq::Lsn;
 use bicdb_workspace::io::{FileHandle, FileIo};
 
@@ -55,7 +55,7 @@ use crate::rowid::Rdba;
 /// 块定位器：`(工作区标识, rdba) →（页文件句柄、块号）`。
 ///
 /// 带上工作区是因为**池是实例级共享**的：不同工作区各有自己的文件句柄。
-pub type PoolResolver<'io> = dyn FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + 'io;
+pub type PoolResolver<'io> = dyn FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io;
 
 /// 缓冲池的键：**工作区标识 + RDBA**（§5.10——池实例级共享，键必须带工作区）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -300,6 +300,45 @@ impl Frame {
     }
 }
 
+/// 写回目标（`flush` / 写列表头 / 全局最老头）。
+#[derive(Debug, Clone, Copy)]
+enum WriteTarget {
+    /// 指定页（`flush(key)`）。
+    Key(BufferKey),
+    /// 某工作区写列表的头。
+    WorkspaceHead([u8; 8]),
+    /// 所有工作区里"最老首次变脏 LSN"最小的头（Make Free）。
+    OldestHead,
+}
+
+/// 选页结果。
+enum Pick {
+    /// 无候选。
+    None,
+    /// 失步条目已清理（有进展、没写页）。
+    Stale,
+    /// 可写：帧与定位信息。
+    Ready {
+        idx: usize,
+        key: BufferKey,
+        handle: FileHandle,
+        block: u32,
+    },
+}
+
+/// 一次写回的冻结快照（闩锁外的 I/O 阶段用它；期间页可被再修改）。
+struct WriteJob {
+    idx: usize,
+    key: BufferKey,
+    handle: FileHandle,
+    block: u32,
+    /// 冻结的页内容（写盘用副本）。
+    image: Page,
+    /// 快照时的 `mod_seq`（收尾比对：变了 = 期间被再改脏）。
+    mod_seq: u8,
+    page_lsn: Lsn,
+}
+
 /// 池内状态（单闩锁；分区 latch 在 P4 接入）。
 struct Inner<'io> {
     frames: Vec<Frame>,
@@ -316,7 +355,6 @@ struct Inner<'io> {
     /// 写列表：**每工作区一条**（= 检查点队列），按（首次变脏 LSN, rdba）升序。
     write_list: BTreeMap<[u8; 8], BTreeSet<(Lsn, Rdba)>>,
     resolve: Box<PoolResolver<'io>>,
-    wal: Box<dyn WalGuard + 'io>,
     clock: Box<dyn Clock + 'io>,
     cfg: CacheConfig,
     stats: BufferStats,
@@ -326,7 +364,14 @@ struct Inner<'io> {
 pub struct BufferPool<'io> {
     io: &'io dyn FileIo,
     capacity: usize,
-    inner: Mutex<Inner<'io>>,
+    /// **具名闩锁**（"db_cache"；先自旋后睡眠、V$LATCH 口径统计——
+    /// 证据包 `latch-mech-20261005/`）。**闩锁内不做 I/O**：读盘与写回都在
+    /// 闩外完成（两阶段，见 `pin`/`make_free`）。
+    inner: Latch<Inner<'io>>,
+    /// **redo 写闩锁**：串行化 WAL 刷盘——`ensure_durable` 的 fsync 在闩内
+    /// （"一次 fsync"的串行点；Oracle `redo writing latch` 的对应物），
+    /// 它是全库唯一允许在闩锁内做 I/O 的地方（且只做这一件）。
+    wal: Latch<Box<dyn WalGuard + 'io>>,
 }
 
 impl std::fmt::Debug for BufferPool<'_> {
@@ -342,7 +387,7 @@ impl<'io> BufferPool<'io> {
     pub fn new(
         io: &'io dyn FileIo,
         capacity: usize,
-        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + 'io,
+        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io,
         wal: impl WalGuard + 'io,
     ) -> Result<Self, BufferError> {
         Self::with_clock(io, capacity, resolve, wal, SystemClock)
@@ -352,7 +397,7 @@ impl<'io> BufferPool<'io> {
     pub fn with_clock(
         io: &'io dyn FileIo,
         capacity: usize,
-        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + 'io,
+        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io,
         wal: impl WalGuard + 'io,
         clock: impl Clock + 'io,
     ) -> Result<Self, BufferError> {
@@ -370,7 +415,7 @@ impl<'io> BufferPool<'io> {
     pub fn with_config(
         io: &'io dyn FileIo,
         capacity: usize,
-        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + 'io,
+        resolve: impl FnMut(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + 'io,
         wal: impl WalGuard + 'io,
         clock: impl Clock + 'io,
         cfg: CacheConfig,
@@ -381,20 +426,23 @@ impl<'io> BufferPool<'io> {
         Ok(Self {
             io,
             capacity,
-            inner: Mutex::new(Inner {
-                frames: (0..capacity).map(|_| Frame::empty()).collect(),
-                virgin: (0..capacity).rev().collect(),
-                buckets: vec![Vec::new(); cfg.buckets],
-                hot: VecDeque::new(),
-                cold: VecDeque::new(),
-                aux: VecDeque::new(),
-                write_list: BTreeMap::new(),
-                resolve: Box::new(resolve),
-                wal: Box::new(wal),
-                clock: Box::new(clock),
-                cfg,
-                stats: BufferStats::default(),
-            }),
+            inner: Latch::new(
+                "db_cache",
+                Inner {
+                    frames: (0..capacity).map(|_| Frame::empty()).collect(),
+                    virgin: (0..capacity).rev().collect(),
+                    buckets: vec![Vec::new(); cfg.buckets],
+                    hot: VecDeque::new(),
+                    cold: VecDeque::new(),
+                    aux: VecDeque::new(),
+                    write_list: BTreeMap::new(),
+                    resolve: Box::new(resolve),
+                    clock: Box::new(clock),
+                    cfg,
+                    stats: BufferStats::default(),
+                },
+            ),
+            wal: Latch::new("redo_write", Box::new(wal)),
         })
     }
 
@@ -470,7 +518,12 @@ impl<'io> BufferPool<'io> {
         })
     }
 
-    /// **钉住一页**（命中 → touch count；未命中 → 找空闲帧 → 读入 → 冷段头）。
+    /// **钉住一页**（命中 → touch count；未命中 → 读入 → 冷段头）。
+    ///
+    /// **两阶段（闩锁内不做 I/O；证据包 `latch-mech-20261005/` 结论 1）**：
+    /// ① 闩锁内定位与钉住；未命中则**释放闩锁后**读盘并做身份核对（串页
+    /// 防线）；② 重新持闩：期间可能已被他人装入（**先到者为准**，丢弃本次
+    /// 读到的副本），否则腾帧（Make Free 的 I/O 同样在闩外）后装入。
     pub fn pin(&self, key: BufferKey) -> Result<PageGuard<'_, 'io>, BufferError> {
         let mut inner = self.lock();
         if let Some(idx) = inner.find_frame(key) {
@@ -481,30 +534,53 @@ impl<'io> BufferPool<'io> {
             return Ok(PageGuard { inner, idx });
         }
         inner.stats.misses += 1;
-
-        // 未命中：找可复用帧（AUX → 冷段尾；脏帧跳过——它们已在写列表）。
-        let victim = match inner.find_reusable() {
-            Some(v) => v,
-            None => {
-                // Make Free：内联 DBWR 批处理（写列表头按序写）后重试一次。
-                inner.make_free(self.io)?;
-                match inner.find_reusable() {
-                    Some(v) => v,
-                    None => {
-                        inner.stats.fb_wait += 1;
-                        return Err(BufferError::FreeBufferWait);
-                    }
-                }
-            }
-        };
-
-        // 读入 + 身份核对（串页防线）。
         let (handle, block) = (inner.resolve)(&key.workspace, key.rdba)
             .ok_or(BufferError::Unresolved { rdba: key.rdba })?;
+        drop(inner);
+
+        // 闩锁外：读盘 + 身份核对。
         let page = pagefile::read_page_verified(self.io, handle, block).map_err(|e| match e {
             PageFileError::Damaged { .. } => BufferError::Damaged { rdba: key.rdba },
             PageFileError::Io(e) => BufferError::Io(e),
         })?;
+        self.verify_identity(&page, key)?;
+
+        // 重新持闩：期间已被他人装入 ⇒ 以先到者为准；能腾出帧 ⇒ 装入。
+        let mut inner = self.lock();
+        if let Some(idx) = inner.find_frame(key) {
+            inner.stats.hits += 1;
+            inner.frames[idx].pins += 1;
+            inner.touch(idx);
+            return Ok(PageGuard { inner, idx });
+        }
+        if let Some(victim) = inner.find_reusable() {
+            inner.attach(victim, key, page);
+            return Ok(PageGuard { inner, idx: victim });
+        }
+        // 无可用帧：闩外 Make Free（I/O 在闩外）后重试一次。
+        drop(inner);
+        self.make_free()?;
+        let mut inner = self.lock();
+        if let Some(idx) = inner.find_frame(key) {
+            inner.stats.hits += 1;
+            inner.frames[idx].pins += 1;
+            inner.touch(idx);
+            return Ok(PageGuard { inner, idx });
+        }
+        match inner.find_reusable() {
+            Some(victim) => {
+                inner.attach(victim, key, page);
+                Ok(PageGuard { inner, idx: victim })
+            }
+            None => {
+                inner.stats.fb_wait += 1;
+                Err(BufferError::FreeBufferWait)
+            }
+        }
+    }
+
+    /// 身份核对（页头自述与键逐项相符——串页防线）。
+    fn verify_identity(&self, page: &Page, key: BufferKey) -> Result<(), BufferError> {
         let header = page
             .header()
             .ok_or(BufferError::Damaged { rdba: key.rdba })?;
@@ -519,9 +595,7 @@ impl<'io> BufferPool<'io> {
                 found_block: header.block_id,
             });
         }
-
-        inner.attach(victim, key, page);
-        Ok(PageGuard { inner, idx: victim })
+        Ok(())
     }
 
     /// **装入一张新页**（尚未落盘的分配页——不经 read，不做身份核对）。
@@ -534,21 +608,23 @@ impl<'io> BufferPool<'io> {
         page: Page,
     ) -> Result<PageGuard<'_, 'io>, BufferError> {
         let mut inner = self.lock();
-        let victim = match inner.find_reusable() {
-            Some(v) => v,
-            None => {
-                inner.make_free(self.io)?;
-                match inner.find_reusable() {
-                    Some(v) => v,
-                    None => {
-                        inner.stats.fb_wait += 1;
-                        return Err(BufferError::FreeBufferWait);
-                    }
-                }
+        if let Some(victim) = inner.find_reusable() {
+            inner.attach(victim, key, page);
+            return Ok(PageGuard { inner, idx: victim });
+        }
+        drop(inner);
+        self.make_free()?; // I/O 在闩外
+        let mut inner = self.lock();
+        match inner.find_reusable() {
+            Some(victim) => {
+                inner.attach(victim, key, page);
+                Ok(PageGuard { inner, idx: victim })
             }
-        };
-        inner.attach(victim, key, page);
-        Ok(PageGuard { inner, idx: victim })
+            None => {
+                inner.stats.fb_wait += 1;
+                Err(BufferError::FreeBufferWait)
+            }
+        }
     }
 
     /// **命中即拷副本**（**不触发读盘**）：扫描批查池用（§5.12）。
@@ -568,8 +644,38 @@ impl<'io> BufferPool<'io> {
     /// 那边是"尚未落盘的新分配页"（前像为零页、必须"先 fsync 后进 redo"，
     /// §11.5.4）——两种装入语义不得混用。
     pub fn load_clean(&self, key: BufferKey, page: Page) -> Result<(), BufferError> {
+        self.insert_clean(key, page)
+    }
+
+    /// **装入净页（两阶段）**：闩锁内 attach；需腾帧则在闩外 Make Free 后重试。
+    /// 已驻留 ⇒ 保留先到者（传入副本丢弃）。
+    fn insert_clean(&self, key: BufferKey, page: Page) -> Result<(), BufferError> {
         let mut inner = self.lock();
-        load_clean_locked(&mut inner, self.io, key, page)
+        if inner.find_frame(key).is_some() {
+            return Ok(());
+        }
+        if let Some(v) = inner.find_reusable() {
+            inner.attach(v, key, page);
+            inner.frames[v].pins = 0; // 净页装入立即放掉
+            return Ok(());
+        }
+        drop(inner);
+        self.make_free()?; // I/O 在闩外
+        let mut inner = self.lock();
+        if inner.find_frame(key).is_some() {
+            return Ok(());
+        }
+        match inner.find_reusable() {
+            Some(v) => {
+                inner.attach(v, key, page);
+                inner.frames[v].pins = 0;
+                Ok(())
+            }
+            None => {
+                inner.stats.fb_wait += 1;
+                Err(BufferError::FreeBufferWait)
+            }
+        }
     }
 
     /// **扫描区读（多块读）**（§5.12）：对 `[first, first+count)` 的**连续**
@@ -588,40 +694,55 @@ impl<'io> BufferPool<'io> {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let mut inner = self.lock();
-        let mut out: Vec<Option<Page>> = Vec::with_capacity(count as usize);
-        let mut missing = false;
         let key_at = |i: u32| -> Option<BufferKey> {
             let block = first.block_id().checked_add(i)?;
             let rdba = Rdba::from_parts(first.file_id(), block)?;
             Some(BufferKey::new(workspace, rdba))
         };
-        for i in 0..count {
-            let key = key_at(i).ok_or(BufferError::Unresolved { rdba: first })?;
-            match inner.find_frame(key) {
-                Some(idx) => out.push(Some(inner.frames[idx].page.clone())),
-                None => {
-                    out.push(None);
-                    missing = true;
+        // ① 闩锁内查池（命中即拷副本）。
+        let mut out: Vec<Option<Page>> = Vec::with_capacity(count as usize);
+        let mut any_missing = false;
+        let (handle, base) = {
+            let mut inner = self.lock();
+            for i in 0..count {
+                let key = key_at(i).ok_or(BufferError::Unresolved { rdba: first })?;
+                match inner.find_frame(key) {
+                    Some(idx) => out.push(Some(inner.frames[idx].page.clone())),
+                    None => {
+                        out.push(None);
+                        any_missing = true;
+                    }
                 }
             }
-        }
-        if !missing {
-            return Ok(out.into_iter().flatten().collect());
-        }
-        let (handle, base) =
-            (inner.resolve)(&workspace, first).ok_or(BufferError::Unresolved { rdba: first })?;
+            if !any_missing {
+                return Ok(out.into_iter().flatten().collect());
+            }
+            (inner.resolve)(&workspace, first).ok_or(BufferError::Unresolved { rdba: first })?
+        };
+        // ② 闩锁外：一次区读。
         let pages = pagefile::read_run(self.io, handle, base, count).map_err(|e| match e {
             PageFileError::Damaged { .. } => BufferError::Damaged { rdba: first },
             PageFileError::Io(e) => BufferError::Io(e),
         })?;
-        inner.stats.run_reads += 1;
-        inner.stats.run_pages += u64::from(count);
+        {
+            let mut inner = self.lock();
+            inner.stats.run_reads += 1;
+            inner.stats.run_pages += u64::from(count);
+        }
+        // ③ 逐缺失页装入（insert_clean 自带两阶段）；副本**以池内为准**
+        //    （期间可能已有先到者）。
         for (i, page) in pages.into_iter().enumerate() {
             if out[i].is_none() {
                 let key = key_at(i as u32).ok_or(BufferError::Unresolved { rdba: first })?;
-                let copy = page.clone();
-                load_clean_locked(&mut inner, self.io, key, page)?;
+                self.insert_clean(key, page)?;
+                let copy = match self.copy_if_resident(key) {
+                    Some(p) => p,
+                    None => {
+                        // 刚装入就被淘汰（容量压力）：回退到 pin 拷副本。
+                        let guard = self.pin(key)?;
+                        (*guard).clone()
+                    }
+                };
                 out[i] = Some(copy);
             }
         }
@@ -630,48 +751,102 @@ impl<'io> BufferPool<'io> {
 
     /// 写回某一页（若脏）。返回是否真的写了。
     pub fn flush(&self, key: BufferKey) -> Result<bool, BufferError> {
-        let mut inner = self.lock();
-        let Some(idx) = inner.find_frame(key) else {
-            return Ok(false);
-        };
-        if !inner.frames[idx].dirty {
-            return Ok(false);
-        }
-        inner.write_back(self.io, idx)?;
-        Ok(true)
+        Ok(matches!(
+            self.write_back_step(WriteTarget::Key(key))?,
+            Some(true)
+        ))
     }
 
     /// **按序写回一个工作区的全部脏页**（写列表头 → 尾）。
     pub fn flush_workspace(&self, workspace: [u8; 8]) -> Result<FlushReport, BufferError> {
-        let mut inner = self.lock();
         let mut report = FlushReport::default();
         loop {
-            let next = inner
-                .write_list
-                .get(&workspace)
-                .and_then(|s| s.iter().next().copied());
-            let Some((first_dirty, rdba)) = next else {
-                break;
-            };
-            let key = BufferKey::new(workspace, rdba);
-            let Some(idx) = inner.find_frame(key) else {
-                // 写列表与驻留表失步（不应发生）——防呆清理后继续。
-                if let Some(chain) = inner.write_list.get_mut(&workspace) {
-                    chain.remove(&(first_dirty, rdba));
-                    if chain.is_empty() {
-                        inner.write_list.remove(&workspace);
+            match self.write_back_step(WriteTarget::WorkspaceHead(workspace))? {
+                None => break,
+                Some(wrote) => {
+                    if wrote {
+                        report.pages_written += 1;
                     }
                 }
-                continue;
-            };
-            inner.write_back(self.io, idx)?;
-            report.pages_written += 1;
+            }
         }
         Ok(report)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner<'io>> {
-        self.inner.lock().expect("缓冲池闩锁中毒")
+    /// **Make Free**（§5.10 的 MKFREE 流程内联版）：写列表头按序写回一批；
+    /// **闩锁内只选页与收尾，I/O 在闩外**。返回是否实际写过页。
+    fn make_free(&self) -> Result<bool, BufferError> {
+        let batch = {
+            let inner = self.lock();
+            (inner.frames.len() / 64).max(1)
+        };
+        let mut steps = 0usize;
+        let mut wrote_any = false;
+        while steps < batch {
+            match self.write_back_step(WriteTarget::OldestHead)? {
+                None => break,
+                Some(wrote) => {
+                    wrote_any |= wrote;
+                    steps += 1;
+                }
+            }
+        }
+        Ok(wrote_any)
+    }
+
+    /// **一次写回（两阶段）**：① 闩锁内选页 + 冻结快照（含 WAL 所需信息）；
+    /// ② 闩锁外 `ensure_durable` + 写页；③ 闩锁内收尾——**比对 `mod_seq`**：
+    /// 期间被再改脏 ⇒ 保持脏与写列表条目（留给下一轮），否则清脏出列表。
+    ///
+    /// 返回：`None` = 无候选；`Some(false)` = 清理了失步条目（有进展、没写页）；
+    /// `Some(true)` = 写了一页。
+    fn write_back_step(&self, target: WriteTarget) -> Result<Option<bool>, BufferError> {
+        let job = {
+            let mut inner = self.lock();
+            match inner.pick_for_write(target)? {
+                Pick::None => return Ok(None),
+                Pick::Stale => return Ok(Some(false)),
+                Pick::Ready {
+                    idx,
+                    key,
+                    handle,
+                    block,
+                } => inner.begin_write(idx, key, handle, block),
+            }
+        };
+        let wal_synced = self.perform_write(&job)?;
+        let mut inner = self.lock();
+        inner.finish_write(&job, wal_synced);
+        Ok(Some(true))
+    }
+
+    /// 写回作业的闩锁外阶段：**WAL 规则 2 → 页文件写**（§11.1；Oracle
+    /// `KCBB_REDO` 的"推迟到日志同步"）。失败 ⇒ 脏状态保留（调用方不收尾）。
+    fn perform_write(&self, job: &WriteJob) -> Result<bool, BufferError> {
+        let mut wal_synced = false;
+        {
+            let mut wal = self.wal.lock();
+            if job.page_lsn > wal.durable_lsn() {
+                wal.ensure_durable(job.page_lsn)
+                    .map_err(BufferError::WalFlush)?;
+                wal_synced = true;
+            }
+        }
+        let mut image = job.image.clone();
+        pagefile::write_page(self.io, job.handle, job.block, &mut image)
+            .map_err(BufferError::Io)?;
+        Ok(wal_synced)
+    }
+
+    fn lock(&self) -> LatchGuard<'_, Inner<'io>> {
+        self.inner.lock()
+    }
+
+    /// **闩锁统计**（诊断：gets/immediate/spin/sleeps/wait_ns——
+    /// `V$LATCH` 口径；证据包 `latch-mech-20261005/`）。
+    #[must_use]
+    pub fn latch_stats(&self) -> LatchStats {
+        self.inner.stats()
     }
 }
 
@@ -776,41 +951,131 @@ impl Inner<'_> {
         None
     }
 
-    /// **Make Free**：内联 DBWR 批处理——写列表（每工作区）**头**按序写，
-    /// 直到凑够一批或没有可写的。写完的干净未钉住帧进 AUX（可复用）。
-    fn make_free(&mut self, io: &dyn FileIo) -> Result<(), BufferError> {
-        let batch = (self.frames.len() / 64).max(1);
-        let mut written = 0usize;
-        while written < batch {
-            // 取所有工作区里"最老的首次变脏 LSN"最小的那条头。
-            let mut pick: Option<(Lsn, [u8; 8], Rdba)> = None;
-            for (ws, chain) in &self.write_list {
-                if let Some((lsn, rdba)) = chain.iter().next().copied() {
-                    if pick.map_or(true, |(l, _, _)| lsn < l) {
-                        pick = Some((lsn, *ws, rdba));
-                    }
+    /// **选一个写回候选**（闩锁内；不写盘）：
+    /// - `Key`：指定页（`flush` 用；不存在/不脏 ⇒ `None`）；
+    /// - `WorkspaceHead`：该工作区写列表头；
+    /// - `OldestHead`：所有工作区里"最老首次变脏 LSN"最小的头（Make Free）。
+    ///
+    /// 失步条目（帧已不在池中/已干净）就地清理并返回 [`Pick::Stale`]——按
+    /// **条目自己的 LSN** 删除（用 `Lsn(0)` 当键删不掉 ⇒ 死循环，前台挂起）。
+    fn pick_for_write(&mut self, target: WriteTarget) -> Result<Pick, BufferError> {
+        let candidate: Option<(Lsn, [u8; 8], Rdba)> = match target {
+            WriteTarget::Key(key) => {
+                let Some(idx) = self.find_frame(key) else {
+                    return Ok(Pick::None);
+                };
+                if !self.frames[idx].dirty {
+                    return Ok(Pick::None);
                 }
+                self.frames[idx]
+                    .first_dirty
+                    .map(|l| (l, key.workspace, key.rdba))
             }
-            let Some((lsn, ws, rdba)) = pick else {
-                break;
-            };
-            let key = BufferKey::new(ws, rdba);
-            let Some(idx) = self.find_frame(key) else {
-                // 失步条目（帧已不在池中）：按**条目自己的 LSN** 删除。
-                // 用 `Lsn(0)` 当键会删不掉（LSN ≠ 0 的孤儿每轮被重新选中且
-                // 什么都不写 ⇒ 死循环，前台 pin 永久挂起）。
-                if let Some(chain) = self.write_list.get_mut(&ws) {
-                    chain.remove(&(lsn, rdba));
-                    if chain.is_empty() {
-                        self.write_list.remove(&ws);
+            WriteTarget::WorkspaceHead(ws) => self
+                .write_list
+                .get(&ws)
+                .and_then(|c| c.iter().next().copied())
+                .map(|(l, r)| (l, ws, r)),
+            WriteTarget::OldestHead => {
+                let mut best: Option<(Lsn, [u8; 8], Rdba)> = None;
+                for (ws, chain) in &self.write_list {
+                    if let Some((lsn, rdba)) = chain.iter().next().copied() {
+                        if best.map_or(true, |(l, _, _)| lsn < l) {
+                            best = Some((lsn, *ws, rdba));
+                        }
                     }
                 }
-                continue;
-            };
-            self.write_back(io, idx)?;
-            written += 1;
+                best
+            }
+        };
+        let Some((lsn, ws, rdba)) = candidate else {
+            return Ok(Pick::None);
+        };
+        let key = BufferKey::new(ws, rdba);
+        let Some(idx) = self.find_frame(key) else {
+            self.drop_write_entry(ws, lsn, rdba);
+            return Ok(Pick::Stale);
+        };
+        if !self.frames[idx].dirty {
+            self.drop_write_entry(ws, lsn, rdba); // 防呆（不应发生）
+            return Ok(Pick::Stale);
         }
-        Ok(())
+        let Some(fkey) = self.frames[idx].key else {
+            return Ok(Pick::None);
+        };
+        let (handle, block) = (self.resolve)(&fkey.workspace, fkey.rdba)
+            .ok_or(BufferError::Unresolved { rdba: fkey.rdba })?;
+        Ok(Pick::Ready {
+            idx,
+            key: fkey,
+            handle,
+            block,
+        })
+    }
+
+    fn drop_write_entry(&mut self, ws: [u8; 8], lsn: Lsn, rdba: Rdba) {
+        if let Some(chain) = self.write_list.get_mut(&ws) {
+            chain.remove(&(lsn, rdba));
+            if chain.is_empty() {
+                self.write_list.remove(&ws);
+            }
+        }
+    }
+
+    /// **开始写回**（闩锁内）：冻结页内容与 `mod_seq` 快照（I/O 用副本，
+    /// 期间的修改不影响本版写出）。
+    fn begin_write(
+        &mut self,
+        idx: usize,
+        key: BufferKey,
+        handle: FileHandle,
+        block: u32,
+    ) -> WriteJob {
+        let page = &self.frames[idx].page;
+        let page_lsn = page
+            .header()
+            .map_or(Lsn::from_raw(0).expect("0 合法"), |h| h.page_lsn);
+        let mod_seq = page.header().map_or(0, |h| h.mod_seq);
+        WriteJob {
+            idx,
+            key,
+            handle,
+            block,
+            image: page.clone(),
+            mod_seq,
+            page_lsn,
+        }
+    }
+
+    /// **写回收尾**（闩锁内）：`mod_seq` 未变 ⇒ 清脏、出写列表、干净未钉住
+    /// 帧入 AUX；**变过（期间被再改脏）⇒ 保持脏与条目**，留给下一轮——
+    /// 绝不把"更新过的版本"当"已落盘"（PG `BM_JUST_DIRTIED` 的同款判据）。
+    fn finish_write(&mut self, job: &WriteJob, wal_synced: bool) {
+        self.stats.writes += 1;
+        if wal_synced {
+            self.stats.wal_syncs += 1;
+        }
+        let idx = job.idx;
+        if self.frames[idx].key != Some(job.key) {
+            return; // 帧已换人（脏帧不可被淘汰；防御）
+        }
+        if self.frames[idx].page.header().map_or(0, |h| h.mod_seq) != job.mod_seq {
+            return; // 期间被再改脏：保持脏
+        }
+        if let Some(lsn) = self.frames[idx].first_dirty.take() {
+            self.drop_write_entry(job.key.workspace, lsn, job.key.rdba);
+        }
+        self.frames[idx].dirty = false;
+        if self.frames[idx].pins == 0 && !self.aux.contains(&idx) {
+            if let Some(p) = self.hot.iter().position(|&i| i == idx) {
+                self.hot.remove(p);
+            }
+            if let Some(p) = self.cold.iter().position(|&i| i == idx) {
+                self.cold.remove(p);
+            }
+            self.aux.push_front(idx);
+            self.stats.aux_moved += 1;
+        }
     }
 
     /// 把一个帧装上新键与内容：出旧链、入桶、落**冷段头**。
@@ -849,94 +1114,11 @@ impl Inner<'_> {
             }
         }
     }
-
-    /// **写回一帧**：WAL 规则 2 → 页文件写 → 清脏、出写列表；干净未钉住 ⇒ 入 AUX。
-    fn write_back(&mut self, io: &dyn FileIo, idx: usize) -> Result<(), BufferError> {
-        if !self.frames[idx].dirty {
-            return Ok(());
-        }
-        let Some(key) = self.frames[idx].key else {
-            self.frames[idx].dirty = false;
-            self.frames[idx].first_dirty = None;
-            return Ok(());
-        };
-        let page_lsn = self.frames[idx]
-            .page
-            .header()
-            .map_or(Lsn::from_raw(0).expect("0 合法"), |h| h.page_lsn);
-
-        // WAL 规则 2：redo 先持久化到该页的 `page_lsn`（Oracle KCBB_REDO：推迟写）。
-        if page_lsn > self.wal.durable_lsn() {
-            self.wal
-                .ensure_durable(page_lsn)
-                .map_err(BufferError::WalFlush)?;
-            self.stats.wal_syncs += 1;
-        }
-
-        let (handle, block) = (self.resolve)(&key.workspace, key.rdba)
-            .ok_or(BufferError::Unresolved { rdba: key.rdba })?;
-        pagefile::write_page(io, handle, block, &mut self.frames[idx].page)
-            .map_err(BufferError::Io)?;
-
-        self.stats.writes += 1;
-        if let Some(lsn) = self.frames[idx].first_dirty.take() {
-            if let Some(chain) = self.write_list.get_mut(&key.workspace) {
-                chain.remove(&(lsn, key.rdba));
-                if chain.is_empty() {
-                    self.write_list.remove(&key.workspace);
-                }
-            }
-        }
-        self.frames[idx].dirty = false;
-        // 写完的干净未钉住帧 ⇒ AUX（可重用候选；§5.10 的 AUX_MOV）。
-        if self.frames[idx].pins == 0 && !self.aux.contains(&idx) {
-            let p_hot = self.hot.iter().position(|&i| i == idx);
-            let p_cold = self.cold.iter().position(|&i| i == idx);
-            if let Some(p) = p_hot {
-                self.hot.remove(p);
-            }
-            if let Some(p) = p_cold {
-                self.cold.remove(p);
-            }
-            self.aux.push_front(idx);
-            self.stats.aux_moved += 1;
-        }
-        Ok(())
-    }
-}
-
-/// **装入净页**（`load_clean` 与 `read_run` 共用；调用方须已持状态锁）。
-fn load_clean_locked<'io>(
-    inner: &mut Inner<'io>,
-    io: &dyn FileIo,
-    key: BufferKey,
-    page: Page,
-) -> Result<(), BufferError> {
-    if inner.find_frame(key).is_some() {
-        return Ok(()); // 先到者为准
-    }
-    let victim = match inner.find_reusable() {
-        Some(v) => v,
-        None => {
-            inner.make_free(io)?;
-            match inner.find_reusable() {
-                Some(v) => v,
-                None => {
-                    inner.stats.fb_wait += 1;
-                    return Err(BufferError::FreeBufferWait);
-                }
-            }
-        }
-    };
-    inner.attach(victim, key, page);
-    // `attach` 以"钉住"入场（pins = 1）——扫描装入立即放掉（净页、未钉住）。
-    inner.frames[victim].pins = 0;
-    Ok(())
 }
 
 /// **页卫兵**（`PageGuard`）：钉住一帧，`Drop` = unpin。
 pub struct PageGuard<'a, 'io> {
-    inner: MutexGuard<'a, Inner<'io>>,
+    inner: LatchGuard<'a, Inner<'io>>,
     idx: usize,
 }
 
@@ -1059,6 +1241,144 @@ mod tests {
         fn close(&self, h: FileHandle) -> std::io::Result<()> {
             self.inner.close(h)
         }
+    }
+
+    /// **闸门式 I/O**：把指定 `(读/写, 偏移)` 的那次 I/O 调用**阻塞**到测试
+    /// 放行——把"闩锁外的 I/O 窗口"拉成可观测窗口（O1 并发用例）。
+    struct GateIo {
+        inner: MemFileIo,
+        gate: Mutex<GateState>,
+        cv: std::sync::Condvar,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct GateState {
+        /// 拦截点：`(是否写, 字节偏移)`；`None` = 不拦。
+        point: Option<(bool, u64)>,
+        /// 已进入拦截点（测试据此判定"I/O 在途"）。
+        entered: bool,
+        /// 放行（放行后不再拦）。
+        released: bool,
+    }
+
+    impl GateIo {
+        fn new(inner: MemFileIo) -> Self {
+            Self {
+                inner,
+                gate: Mutex::new(GateState {
+                    point: None,
+                    entered: false,
+                    released: false,
+                }),
+                cv: std::sync::Condvar::new(),
+            }
+        }
+
+        /// 设拦截点（`on_write` 区分写路径；`offset` 是页的字节偏移）。
+        fn block(&self, on_write: bool, offset: u64) {
+            let mut g = self.gate.lock().unwrap();
+            g.point = Some((on_write, offset));
+            g.entered = false;
+            g.released = false;
+        }
+
+        /// 等"已有 I/O 进入拦截点"（带超时，防测试自身挂死）。
+        fn wait_entered(&self) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut g = self.gate.lock().unwrap();
+            while !g.entered {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                let (guard, _) = self.cv.wait_timeout(g, left).unwrap();
+                g = guard;
+            }
+            true
+        }
+
+        /// 放行拦截点。
+        fn release(&self) {
+            let mut g = self.gate.lock().unwrap();
+            g.released = true;
+            self.cv.notify_all();
+        }
+
+        /// 命中拦截点 ⇒ 阻塞到放行。
+        fn pass(&self, on_write: bool, offset: u64) {
+            let mut g = self.gate.lock().unwrap();
+            if g.point != Some((on_write, offset)) || g.released {
+                return;
+            }
+            g.entered = true;
+            self.cv.notify_all();
+            while !g.released {
+                g = self.cv.wait(g).unwrap();
+            }
+            g.point = None;
+        }
+    }
+
+    impl FileIo for GateIo {
+        fn open(&self, path: &Path, opts: OpenOptions) -> std::io::Result<FileHandle> {
+            self.inner.open(path, opts)
+        }
+        fn open_dir(&self, path: &Path) -> std::io::Result<FileHandle> {
+            self.inner.open_dir(path)
+        }
+        fn read_at(&self, h: FileHandle, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+            self.pass(false, off);
+            self.inner.read_at(h, buf, off)
+        }
+        fn write_at(&self, h: FileHandle, buf: &[u8], off: u64) -> std::io::Result<()> {
+            self.pass(true, off);
+            self.inner.write_at(h, buf, off)
+        }
+        fn size(&self, h: FileHandle) -> std::io::Result<u64> {
+            self.inner.size(h)
+        }
+        fn set_len(&self, h: FileHandle, len: u64) -> std::io::Result<()> {
+            self.inner.set_len(h, len)
+        }
+        fn sync_data(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_data(h)
+        }
+        fn sync_all(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_all(h)
+        }
+        fn sync_dir(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_dir(h)
+        }
+        fn close(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.close(h)
+        }
+    }
+
+    /// 两个页文件（A：file_id 7 / 块 0-1；B：file_id 8 / 块 0-1），
+    /// 内容字节 = `0xA0+块` / `0xB0+块`——供需要定制 `FileIo` 的用例复用。
+    fn open_files(io: &dyn FileIo) -> (FileHandle, FileHandle) {
+        let a = io
+            .open(
+                Path::new(F_A),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        io.set_len(a, 2 * crate::page::PAGE_SIZE as u64).unwrap();
+        let b = io
+            .open(
+                Path::new(F_B),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        io.set_len(b, 2 * crate::page::PAGE_SIZE as u64).unwrap();
+        for block in 0..2u32 {
+            for (ws, file_id, handle, base) in [(WS_A, 7u16, a, 0xA0u8), (WS_B, 8, b, 0xB0)] {
+                let mut page = Page::new(PageType::HeapTable, ws, file_id, block);
+                page.as_bytes_mut()[4096] = base + block as u8;
+                pagefile::write_page(io, handle, block, &mut page).unwrap();
+            }
+        }
+        (a, b)
     }
 
     /// 假 WAL 协调口。
@@ -1653,16 +1973,146 @@ mod tests {
                 .or_default()
                 .insert((lsn(7), rdba(7, 1)));
         }
-        {
-            let mut inner = pool.lock();
-            inner.make_free(&h.io).unwrap();
-            assert!(
-                !inner.write_list.contains_key(&WS_A),
-                "失步条目按自身 LSN 清除"
-            );
-        }
+        pool.make_free().unwrap();
+        assert!(
+            !pool.lock().write_list.contains_key(&WS_A),
+            "失步条目按自身 LSN 清除"
+        );
         // 再跑一次也不挂（幂等）。
-        let mut inner = pool.lock();
-        inner.make_free(&h.io).unwrap();
+        pool.make_free().unwrap();
+    }
+
+    #[test]
+    fn pin_does_io_outside_the_latch_so_others_proceed() {
+        // O1 回归：**闩锁内不做 I/O**（证据包 latch-mech-20261005 结论 1）。
+        // pin 未命中在闩外读盘——读盘在途时，另一线程必须能立即取得池闩锁；
+        // 旧形态（持闩读盘）下 `pool.stats()` 会一直阻塞到读盘结束。
+        let mem = MemFileIo::new();
+        mem.add_dir("/mem");
+        let io = GateIo::new(mem);
+        let (a, _b) = open_files(&io);
+        io.block(false, crate::page::PAGE_SIZE as u64); // 拦"读块 1"
+        let pool = Arc::new(
+            BufferPool::new(
+                &io,
+                4,
+                move |ws, r| {
+                    if *ws == WS_A && r.file_id() == 7 {
+                        Some((a, r.block_id()))
+                    } else {
+                        None
+                    }
+                },
+                FakeWal {
+                    durable: lsn(0),
+                    fail: false,
+                    log: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .unwrap(),
+        );
+        let key = BufferKey::new(WS_A, rdba(7, 1));
+        std::thread::scope(|scope| {
+            let p1 = Arc::clone(&pool);
+            let reader = scope.spawn(move || p1.pin(key).map(|g| g.as_bytes()[4096]));
+            let entered = io.wait_entered();
+            if !entered {
+                io.release();
+            }
+            assert!(entered, "pin 未命中已进入闩锁外的读盘");
+
+            // 读盘在途：另一线程取闩锁（`stats()` 要持闩锁）必须立即成功。
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p2 = Arc::clone(&pool);
+            let prober = scope.spawn(move || {
+                let _ = p2.stats();
+                tx.send(()).unwrap();
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+            io.release();
+            prober.join().unwrap();
+            assert!(
+                got.is_ok(),
+                "读盘窗口内闩锁可被他人取得（O1：闩锁内不做 I/O）"
+            );
+            assert_eq!(reader.join().unwrap().unwrap(), 0xA1, "并发 pin 结果不变");
+        });
+    }
+
+    #[test]
+    fn re_dirtied_during_write_window_stays_dirty() {
+        // 两阶段写回：写盘窗口内页被**再改脏**（`mod_seq` 推进）⇒ 收尾不得
+        // 清脏——绝不把"更新过的版本"当"已落盘"（PG `BM_JUST_DIRTIED` 同款）。
+        let mem = MemFileIo::new();
+        mem.add_dir("/mem");
+        let io = GateIo::new(mem);
+        let (a, _b) = open_files(&io);
+        let pool = Arc::new(
+            BufferPool::new(
+                &io,
+                2,
+                move |ws, r| {
+                    if *ws == WS_A && r.file_id() == 7 {
+                        Some((a, r.block_id()))
+                    } else {
+                        None
+                    }
+                },
+                FakeWal {
+                    durable: lsn(0),
+                    fail: false,
+                    log: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .unwrap(),
+        );
+        let key = BufferKey::new(WS_A, rdba(7, 0));
+        {
+            let mut g = pool.pin(key).unwrap();
+            g.as_bytes_mut()[4096] = 0x77;
+            g.bump_mod_seq(); // 修改的规范动作（页 API 推进版本号）
+            g.mark_dirty(lsn(5));
+        }
+        io.block(true, 0); // 拦"写块 0"
+        std::thread::scope(|scope| {
+            let p1 = Arc::clone(&pool);
+            let writer = scope.spawn(move || p1.flush(key).unwrap());
+            let entered = io.wait_entered();
+            if !entered {
+                io.release();
+            }
+            assert!(entered, "写回已进入闩锁外的写盘窗口");
+
+            // 窗口内再改脏（闩锁可用 = O1 的又一体现）。
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p2 = Arc::clone(&pool);
+            let modifier = scope.spawn(move || {
+                let mut g = p2.pin(key).unwrap();
+                g.as_bytes_mut()[4096] = 0x88;
+                g.bump_mod_seq();
+                g.mark_dirty(lsn(9));
+                tx.send(()).unwrap();
+            });
+            let modified = rx.recv_timeout(std::time::Duration::from_secs(5));
+            io.release();
+            modifier.join().unwrap();
+            assert!(
+                modified.is_ok(),
+                "写盘窗口内闩锁可被他人取得（O1：闩锁内不做 I/O）"
+            );
+            assert!(writer.join().unwrap(), "第一版已写出（写本身成功）");
+        });
+        assert_eq!(
+            pool.dirty_len(WS_A),
+            1,
+            "期间被再改脏 ⇒ 保持脏（不得标为已落盘）"
+        );
+        assert!(pool.low_water(WS_A).is_some(), "写列表条目保留");
+
+        // 下一轮把新版本写出，读文件确认。
+        pool.flush(key).unwrap();
+        assert_eq!(pool.dirty_len(WS_A), 0, "写回后条目出列");
+        let page = pagefile::read_page(&io, a, 0).unwrap();
+        assert_eq!(page.as_bytes()[4096], 0x88, "新版本落盘");
     }
 }

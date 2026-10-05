@@ -29,8 +29,8 @@
 //! `frag_no`/`frag_cnt` 丢弃（[`crate::logpage::TailState::Truncated`]）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
+use bicdb_common::latch::{Latch, LatchStats};
 use bicdb_common::seq::Lsn;
 
 use crate::logpage::{decode_records, write_record, LogPage, LogPageError};
@@ -163,10 +163,16 @@ fn acquire_page(pages: &mut Vec<LogPage>, pool: &mut Vec<LogPage>, start: Lsn) {
 }
 
 /// 日志缓冲。
+///
+/// 两把**具名闩锁**（先自旋后睡眠、V$LATCH 口径统计——证据包
+/// `latch-mech-20261005/`；Oracle 的 `redo allocation` / `redo writing`
+/// 两把闩锁的对应物）：
+/// - `state`（"redo_buffer"）：追加位置的分配与页槽位操作——**I/O 在闩外**；
+/// - `io`（"redo_io"）：刷盘串行（fsync 在闩内——"一次 fsync"的串行点）。
 pub struct LogBuffer {
-    state: Mutex<BufferState>,
-    /// 刷盘串行（与追加 latch 分离；**写与 sync 在两者之外**）。
-    io: Mutex<()>,
+    state: Latch<BufferState>,
+    /// 刷盘串行（与追加闩锁分离；**写与 sync 在两者之外**——见 `flush_to`）。
+    io: Latch<()>,
 }
 
 impl std::fmt::Debug for LogBuffer {
@@ -193,38 +199,51 @@ impl LogBuffer {
             });
         }
         Ok(Self {
-            state: Mutex::new(BufferState {
-                // 第 0 页立即就位：页体自 start + 16 起（LSN = 字节位置，
-                // 页头也占位）。
-                pages: vec![LogPage::new(start_lsn)],
-                pool: Vec::new(),
-                capacity_pages,
-                next_page_start: start_lsn.as_raw(),
-                appended_lsn: start_lsn.as_raw() + crate::logpage::LOG_PAGE_HEADER_LEN as u64,
-                synced_lsn: AtomicU64::new(start_lsn.as_raw()),
-            }),
-            io: Mutex::new(()),
+            state: Latch::new(
+                "redo_buffer",
+                BufferState {
+                    // 第 0 页立即就位：页体自 start + 16 起（LSN = 字节位置，
+                    // 页头也占位）。
+                    pages: vec![LogPage::new(start_lsn)],
+                    pool: Vec::new(),
+                    capacity_pages,
+                    next_page_start: start_lsn.as_raw(),
+                    appended_lsn: start_lsn.as_raw() + crate::logpage::LOG_PAGE_HEADER_LEN as u64,
+                    synced_lsn: AtomicU64::new(start_lsn.as_raw()),
+                },
+            ),
+            io: Latch::new("redo_io", ()),
         })
+    }
+
+    /// 两把闩锁的统计快照（`(redo_buffer, redo_io)`；V$LATCH 口径）。
+    ///
+    /// 诊断口径：`redo_buffer` 的 ```sleeps``` 高 ⇒ 追加争用（分片/每工作区
+    /// 日志缓冲扩容的信号）；`redo_io` 的 waits 高 ⇒ fsync 串行点是瓶颈
+    /// （组提交窗口调优的信号，§11.5.5）。
+    #[must_use]
+    pub fn latch_stats(&self) -> (LatchStats, LatchStats) {
+        (self.state.stats(), self.io.stats())
     }
 
     /// 容量（页）。
     #[must_use]
     pub fn capacity_pages(&self) -> usize {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock();
         state.capacity_pages
     }
 
     /// 未刷出的字节数（`appended_lsn − synced_lsn`）。
     #[must_use]
     pub fn unflushed_bytes(&self) -> u64 {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock();
         state.appended_lsn - state.synced_lsn.load(Ordering::SeqCst)
     }
 
     /// **1/3 触发**：未刷出占用达到容量的 1/3 ⇒ 建议写方刷盘（§11.5.5）。
     #[must_use]
     pub fn flush_recommended(&self) -> bool {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock();
         let used = state.appended_lsn - state.synced_lsn.load(Ordering::SeqCst);
         used * FLUSH_TRIGGER_DEN as u64
             >= state.capacity_pages as u64
@@ -235,14 +254,14 @@ impl LogBuffer {
     /// 追加位置（下一字节 LSN）。
     #[must_use]
     pub fn appended_lsn(&self) -> Lsn {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock();
         Lsn::from_raw(state.appended_lsn).expect("48 位域内")
     }
 
     /// 已刷盘位置。
     #[must_use]
     pub fn synced_lsn(&self) -> Lsn {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock();
         Lsn::from_raw(state.synced_lsn.load(Ordering::SeqCst)).expect("48 位域内")
     }
 
@@ -253,7 +272,7 @@ impl LogBuffer {
     /// 新组首张页的页头之后。
     #[must_use]
     pub fn current_page_start(&self) -> Lsn {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock();
         let raw = match state.pages.last() {
             Some(last) => last.start_lsn().as_raw(),
             None => state.next_page_start,
@@ -268,7 +287,7 @@ impl LogBuffer {
     /// "记录不得跨组"的提前切换据此**精确**判定，而非保守估计。
     #[must_use]
     pub fn end_lsn_if_appended(&self, encoded_len: usize) -> Lsn {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock();
         let (page_start, used) = match state.pages.last() {
             Some(last) => (last.start_lsn().as_raw(), last.used()),
             None => (state.next_page_start, 0),
@@ -283,7 +302,7 @@ impl LogBuffer {
     ///
     /// `build` 收到的 LSN 必须原样放进记录（构造器自动做）。
     pub fn append(&self, build: impl FnOnce(Lsn) -> RedoRecord) -> Result<Lsn, WalError> {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.state.lock();
         let state = &mut *guard;
         let mut created_fresh_page = false;
         if state.pages.is_empty() {
@@ -345,9 +364,9 @@ impl LogBuffer {
     /// 组提交：`synced_lsn ≥ target` 即直接返回（共享同一次 fsync）。
     /// 失败时 **`synced_lsn` 不前进**（持久性点未达成，调用方不得回应提交）。
     pub fn flush_to(&self, target: Lsn, sink: &mut dyn LogSink) -> Result<Lsn, WalError> {
-        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        let _io = self.io.lock();
         {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.state.lock();
             let synced = state.synced_lsn.load(Ordering::SeqCst);
             if synced >= target.as_raw() {
                 return Ok(Lsn::from_raw(synced).expect("48 位域内"));
@@ -360,7 +379,7 @@ impl LogBuffer {
         //    这类重入触发）。失败路径无需回退：放回的旧页与窗口内新建的页
         //    恰好前后相接（新页起于 `next_page_start` = 旧页之后）。
         let mut pages: Vec<LogPage> = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock();
             let taken = std::mem::take(&mut state.pages);
             if let Some(last) = taken.last() {
                 state.next_page_start =
@@ -383,7 +402,7 @@ impl LogBuffer {
             Ok(())
         })();
         if let Err(e) = outcome {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock();
             let mut restored = pages;
             restored.append(&mut state.pages);
             state.pages = restored;
@@ -392,7 +411,7 @@ impl LogBuffer {
 
         // 3) 持久性点达成：切页 + 前进 synced_lsn + 页**回收进池**
         //    （环形复用的边界 = sync 成功——次序不能反：先取位置，再回收）。
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock();
         let synced_after = pages
             .last()
             .map(|p| {
@@ -738,5 +757,24 @@ mod ring_tests {
             LogBuffer::with_capacity_pages(lsn(0), MIN_CAPACITY_PAGES - 1),
             Err(WalError::InvalidCapacity { .. })
         ));
+    }
+
+    #[test]
+    fn latch_stats_are_named_and_count_the_append_and_flush_paths() {
+        let buf = LogBuffer::new(lsn(0));
+        buf.append(|l| big_rec(l, 1)).unwrap();
+        let mut sink = VecLogSink::default();
+        buf.flush_to(buf.appended_lsn(), &mut sink).unwrap();
+
+        let (state, io) = buf.latch_stats();
+        assert_eq!(
+            state.name, "redo_buffer",
+            "追加闩锁具名（V$LATCHNAME 口径）"
+        );
+        assert_eq!(io.name, "redo_io", "刷盘闩锁具名");
+        assert!(state.gets >= 2, "追加 + 刷盘都要经追加闩锁");
+        assert!(io.gets >= 1, "刷盘经串行闩锁");
+        assert_eq!(state.immediate + state.spin_gets + state.sleeps, state.gets);
+        assert_eq!(io.immediate + io.spin_gets + io.sleeps, io.gets);
     }
 }

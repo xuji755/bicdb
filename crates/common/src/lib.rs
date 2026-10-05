@@ -19,6 +19,7 @@
 
 pub mod checksum;
 pub mod error;
+pub mod latch;
 pub mod seq;
 
 pub use checksum::{
