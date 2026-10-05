@@ -38,8 +38,8 @@ use bicdb_storage::itl::{self, ItlEntry, ItlError, ItlState};
 use bicdb_storage::page::Page;
 use bicdb_storage::rowid::{Rdba, RowId, RowIdRangeError};
 use bicdb_storage::undo::{
-    apply_undo_to_page, free_slot, read_slot, txn_id_of, write_slot, RollbackError, TxnId,
-    TxnState, UndoChain, UndoChainError, UndoError, UndoOp, UndoPayload,
+    apply_undo_to_page, free_slot, read_slot, reclaim_undo, txn_id_of, write_slot, ReclaimReport,
+    RollbackError, TxnId, TxnState, UndoChain, UndoChainError, UndoError, UndoOp, UndoPayload,
 };
 use bicdb_wal::group::{GroupError, GroupWriter};
 use bicdb_wal::record::{page_diff, BlockRef, RedoRecord};
@@ -593,6 +593,46 @@ pub fn rollback(
     Ok(count)
 }
 
+/// **回收撤销空间**（§4.6.5）：把"已提交 且 `commit_seq < 最老快照`"的事务
+/// 出链、推进回收水位；**槽表全空时段回卷**（`append_pos` 复位，空间交还写者）。
+///
+/// - `oldest_snapshot`：最老活跃快照的提交序号
+///   （[`crate::snapshot::SnapshotRegistry::oldest`]）；`None` = 无活跃快照
+///   ⇒ 全部已提交事务可回收（如检查点时的静默窗口）。
+///
+/// 这是**系统操作**：redo 记录的 `txn_id` = **0**（合法身份，非空槽哨兵——
+/// 见待讨论清单第 12 条）；undo 段头页经池写入并**立即落盘**（与其他 undo
+/// 页更新同规：链直读的一致性）。
+///
+/// **幂等**：无可回收对象时不产生任何 I/O 与 redo（字节相同即返回）。
+pub fn reclaim(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    oldest_snapshot: Option<CommitSeq>,
+) -> Result<ReclaimReport, TxnError> {
+    let header_before = chain.segment().read_page(0)?;
+    let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
+    let report = reclaim_undo(&mut header_after, oldest_snapshot, true)?;
+    if header_after.as_bytes() == header_before.as_bytes() {
+        return Ok(report); // 幂等重入：无变化
+    }
+    let key = undo_page_key(chain, 0)?;
+    write_undo_page_change(
+        pool,
+        log,
+        0,
+        key,
+        header_before.as_bytes(),
+        header_after.as_bytes(),
+        false,
+    )?;
+    if report.rewound {
+        chain.note_rewind();
+    }
+    Ok(report)
+}
+
 // -- 内部 -------------------------------------------------------------------
 
 /// **undo 段的页改动**：经池写入后**立即落盘**（见模块文档）。
@@ -689,7 +729,17 @@ fn append_undo_via_pool(
     //    页先于 redo 耐久——崩溃只可能留下"无人引用的已格式化页"（append_pos
     //    未推进，下次原样重写）。
     if plan.opened {
+        // **新撤销页：先格式化落盘（fsync）、再让它进 redo**（见上），且
+        // **`page_lsn` 前置到当前追加位**——该 rdba 可能已有**上一轮生命周期**
+        // 的 redo 记录（段回卷 / 重置复用的页、以及文件层复用的块），重放按
+        // `page_lsn` 跳过更早的记录；不前置（= 0）会把旧记录字节"复活"到新
+        // 内容上（输家回滚读到损坏链）。`before` 与盘上镜像同为这一份字节，
+        // 与后续 diff 的基准保持一致（实测：缺此规则时回收页恢复用例失败）。
         let mut formatted = Page::from_bytes(Box::new(*plan.undo_page.0.as_bytes()));
+        let lsn_now = log.appended_lsn();
+        let mut header = formatted.header().ok_or(TxnError::StaleCache)?;
+        header.page_lsn = lsn_now;
+        formatted.write_header(&header);
         chain.segment().write_page(plan.logical, &mut formatted)?;
         chain.segment().sync()?;
     }
@@ -786,7 +836,9 @@ mod tests {
 
     use bicdb_common::seq::Lsn;
     use bicdb_storage::buffer::WalGuard;
-    use bicdb_storage::controlfile::{ArchiveRecord, ControlFile, RedoEntries, WorkspaceEntry};
+    use bicdb_storage::controlfile::{
+        ArchiveMode, ArchiveRecord, CheckpointProgress, ControlFile, RedoEntries, WorkspaceEntry,
+    };
     use bicdb_storage::datafile::DataFile;
     use bicdb_storage::heap;
     use bicdb_storage::page::PageType;
@@ -950,6 +1002,166 @@ mod tests {
             .any(|r| r.op == RecordOp::Commit.as_u8() && r.txn_id == txn.raw()));
     }
 
+    /// 建一套「undo 段 + 数据页 + 池 + 控制文件」的测试装置（回收用例共用）。
+    /// 日志由用例自己 `GroupWriter::create(&io, &mut cf, ..)`（借用控制文件）。
+    fn harness(
+        io: &MemFileIo,
+        archive: ArchiveMode,
+    ) -> (DataFile<'_>, BufferPool<'_>, ControlFile<'_>) {
+        let undo_file = DataFile::create(io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let data_handle = {
+            let data_file = DataFile::create(io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let cf = ControlFile::format(
+            io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::new(archive),
+        )
+        .unwrap();
+        (undo_file, pool, cf)
+    }
+
+    #[test]
+    fn reclaim_frees_committed_slots_below_the_oldest_snapshot() {
+        // #34：判据 = 已提交 且 commit_seq < 最老快照 ——
+        // 低于水位的槽释放、可再分配；高处的保留；水位单调、幂等。
+        let io = mem();
+        let (mut undo_file, pool, mut cf) = harness(&io, ArchiveMode::ArchiveLog);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t1, seq(10)).unwrap();
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t2, seq(20)).unwrap();
+
+        // 最老快照 15：序号 10 可回收，20 必须保留。
+        let report = reclaim(&pool, &mut log, &mut chain, Some(seq(15))).unwrap();
+        assert_eq!(report.slots_freed, 1);
+        assert_eq!(report.committed_kept, 1);
+        assert_eq!(report.reclaim_seq, seq(10));
+        let header = chain.segment().read_page(0).unwrap();
+        assert_eq!(read_slot(&header, t1.slot).unwrap().state, TxnState::Free);
+        assert_eq!(
+            read_slot(&header, t2.slot).unwrap().state,
+            TxnState::Committed
+        );
+        // 幂等：同一水位再跑不释放更多。
+        let again = reclaim(&pool, &mut log, &mut chain, Some(seq(15))).unwrap();
+        assert_eq!(again.slots_freed, 0);
+        assert_eq!(again.reclaim_seq, seq(10));
+
+        // 快照前进到 21：第二个也回收；槽可再分配（wrap 换代）。
+        let report = reclaim(&pool, &mut log, &mut chain, Some(seq(21))).unwrap();
+        assert_eq!(report.slots_freed, 1);
+        assert_eq!(report.reclaim_seq, seq(20));
+        let mut t3 = begin(&pool, &mut log, &mut chain, seq(21)).unwrap();
+        assert!(t3.slot == t1.slot || t3.slot == t2.slot, "从空闲链取回");
+        let header = chain.segment().read_page(0).unwrap(); // 重读（上面的副本已旧）
+        assert_eq!(read_slot(&header, t3.slot).unwrap().wrap, 1, "wrap 换代");
+        commit(&pool, &mut log, &mut chain, &mut t3, seq(21)).unwrap();
+    }
+
+    #[test]
+    fn steady_state_reclaim_keeps_the_txn_table_from_exhausting() {
+        // 没有回收时，第 257 个事务 begin 必然 `NoFreeSlot`（256 槽）；
+        // 稳态回收（每轮把低于当前序号的全部回收）让事务表**永续**。
+        let io = mem();
+        // 非归档模式：本用例只关心回收与组复用，归档由 group 的专门用例覆盖。
+        let (mut undo_file, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let mut last = seq(0);
+        for k in 1..=280u64 {
+            let mut txn = begin(&pool, &mut log, &mut chain, last).unwrap();
+            // 每次插入（undo 记录 → 打开 undo 页），回收才有页可交还。
+            let row = row_bytes(format!("row-{k}").as_bytes());
+            insert_row(
+                &pool,
+                &mut log,
+                &mut chain,
+                &mut txn,
+                key,
+                &row,
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+            let commit_at = seq(k);
+            commit(&pool, &mut log, &mut chain, &mut txn, commit_at).unwrap();
+            // 无活跃快照 ⇒ 水位 = 当前提交序号（§12.7 的空集语义）。
+            let report = reclaim(&pool, &mut log, &mut chain, Some(commit_at)).unwrap();
+            assert!(!report.rewound, "还有最新已提交事务 ⇒ 不整段回卷");
+            last = commit_at;
+            // CKPT 角色（每轮发布，否则两组用尽后写者被挡——§11.9 的常态闭环：
+            // 写入量一小、组切换就要求上一组已降级）。
+            log.publish_checkpoint(&CheckpointProgress {
+                checkpoint_commit_seq: commit_at,
+                checkpoint_lsn: log.appended_lsn(),
+                current_commit_seq: commit_at,
+                oldest_snapshot_commit_seq: commit_at,
+                timestamp: 0,
+            })
+            .unwrap();
+        }
+        // **空间回收的判据**：280 个事务后追加位只到 4——每事务开新页的
+        // 膨胀被"归属可回收即重置复用"消化（稳态只占 2 张数据页）。
+        assert!(
+            append_pos(&chain) <= 4,
+            "undo 页数有界（append_pos = {}）",
+            append_pos(&chain)
+        );
+        // 进入静默窗口（无活跃快照）⇒ 最新事务也可回收 ⇒ 槽表全空 ⇒ **段回卷**，
+        // 空间回到段首（幂等；再跑一次不重复动作）。
+        let r = reclaim(&pool, &mut log, &mut chain, None).unwrap();
+        assert!(r.rewound, "槽表全空 ⇒ 段回卷");
+        assert_eq!(
+            append_pos(&chain),
+            bicdb_storage::undo::UNDO_FIRST_DATA_PAGE,
+            "append_pos 复位到段首"
+        );
+        assert!(!reclaim(&pool, &mut log, &mut chain, None).unwrap().rewound);
+        // 回卷后仍能开新事务并写行（幂等、不破坏段头/undo 页）。
+        let mut t = begin(&pool, &mut log, &mut chain, seq(281)).unwrap();
+        let row = row_bytes(b"after-rewind");
+        insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t,
+            key,
+            &row,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t, seq(281)).unwrap();
+        // 落盘后行可读（回收/回卷不破坏已有数据路径）。
+        pool.flush_workspace(WS).unwrap();
+    }
+
+    /// 读 undo 段的当前追加位置（测试辅助）。
+    fn append_pos(chain: &UndoChain<'_, '_>) -> u32 {
+        chain.segment().append_position().unwrap()
+    }
+
     #[test]
     fn rollback_undoes_the_insert_through_the_cache() {
         let io = mem();
@@ -1110,6 +1322,89 @@ mod tests {
         );
         assert_eq!(read_slot(&header, t1.slot).unwrap().commit_seq, seq(1));
         assert_eq!(read_slot(&header, t2.slot).unwrap().state, TxnState::Free);
+    }
+
+    #[test]
+    fn recycled_undo_page_survives_crash_recovery() {
+        // 页复用的重放守卫（`page_lsn` 前置）回归：被**重置复用**的撤销页
+        // 在其 rdba 上还有上一轮生命周期的 redo 记录——重放必须按 `page_lsn`
+        // 跳过它们，否则旧字节会被"复活"到新内容里，输家回滚会读到损坏链。
+        let io = mem();
+        let (mut undo_file, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        // 第一轮：写入并提交，随后**静默回收**（槽释放 + 水位前移 + 段回卷）——
+        // 这张撤销页从此"归属已回收"，可被下一个事务重置复用。
+        let r1 = row_bytes(b"first-cycle");
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let rid1 = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            &r1,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t1, seq(1)).unwrap();
+        let r = reclaim(&pool, &mut log, &mut chain, None).unwrap();
+        assert!(r.rewound, "静默窗口：槽表全空 ⇒ 回卷");
+        assert_eq!(
+            append_pos(&chain),
+            bicdb_storage::undo::UNDO_FIRST_DATA_PAGE
+        );
+
+        // 第二轮：**复用同一逻辑页**写入一个不提交的输家事务。
+        let r2 = row_bytes(b"second-cycle");
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let rid2 = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            &r2,
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
+        // 崩溃：日志耐久；**撤销页只在"先格式化落盘"那一步到过盘**（旧内容
+        // 的字节仍在同一块上——正是守卫要处理的局面）。
+        log.flush(log.appended_lsn()).unwrap();
+        drop(pool);
+
+        // 恢复：分析/重做/撤销。输家 t2 的回滚要**读它自己的撤销链**——
+        // 读到损坏的记录即失败，读到上一轮的旧字节则行恢复错值。
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let groups = online_groups(&io, &cf_ro, Path::new(WAL), spec()).unwrap();
+        let data_handle = {
+            // 重新打开数据文件（与上面的池同一路径/句柄语义）。
+            let h = bicdb_storage::datafile::DataFile::open(&io, Path::new(DATA_F))
+                .unwrap()
+                .handle();
+            h
+        };
+        let undo_handle = bicdb_storage::datafile::DataFile::open(&io, Path::new(UNDO_F))
+            .unwrap()
+            .handle();
+        let mut resolve = |rd: Rdba| match rd.file_id() {
+            1 => Some((undo_handle, rd.block_id())),
+            3 => Some((data_handle, rd.block_id())),
+            _ => None,
+        };
+        let report = recover(&io, &groups, lsn(0), &chain, &mut log, &mut resolve).unwrap();
+        assert_eq!(report.undo.txns_rolled_back, 1, "输家被回滚");
+
+        // 胜者的行在、输家的行被撤销——且撤销链读的是**本轮**的记录。
+        let page = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
+        assert_eq!(
+            heap::row(&page, rid1.row_id()),
+            Some(&stored_row(&r1, 0)[..]),
+            "第一轮的行保留"
+        );
+        assert_eq!(heap::row(&page, rid2.row_id()), None, "输家的行被撤销");
     }
 
     #[test]

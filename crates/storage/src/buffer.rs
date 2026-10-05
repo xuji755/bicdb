@@ -609,6 +609,14 @@ impl<'io> BufferPool<'io> {
         page: Page,
     ) -> Result<PageGuard<'_, 'io>, BufferError> {
         let mut inner = self.lock();
+        // **该键仍在池中 ⇒ 原位替换**：页被重置/复用（段回卷、重置复用的撤销页）
+        // 时调用方给的镜像就是权威内容——若走 `find_reusable`/`attach`，
+        // 桶里会留下**两个同键帧**，`find_frame` 命中的仍是旧的干净帧 ⇒
+        // 写回被静默跳过（新内容永远到不了盘上；实测的撤销页丢失即此）。
+        if let Some(idx) = inner.find_frame(key) {
+            inner.replace_in_place(idx, key, page);
+            return Ok(PageGuard { inner, idx });
+        }
         if let Some(victim) = inner.find_reusable() {
             inner.attach(victim, key, page);
             return Ok(PageGuard { inner, idx: victim });
@@ -1101,6 +1109,28 @@ impl Inner<'_> {
         let b = self.bucket_of(key);
         self.buckets[b].push(idx);
         self.cold.push_front(idx); // 新读入/重用 ⇒ 冷段头（不是热段）
+    }
+
+    /// **原位替换一个已驻留帧的内容**（同键重新装入）：帧在桶/链上的位置不变
+    /// （键未变），只换内容与记账——写列表里的旧条目按旧 `first_dirty` 摘除
+    /// （旧内容被权威镜像取代，不再需要写回）。
+    fn replace_in_place(&mut self, idx: usize, key: BufferKey, page: Page) {
+        debug_assert_eq!(
+            self.frames[idx].pins, 0,
+            "同键重装时不应有在途卫兵（单写者纪律）"
+        );
+        if let Some(lsn) = self.frames[idx].first_dirty.take() {
+            self.drop_write_entry(key.workspace, lsn, key.rdba);
+        }
+        self.frames[idx] = Frame {
+            key: Some(key),
+            page,
+            dirty: false,
+            first_dirty: None,
+            pins: 1,
+            touches: self.cfg.cool_count,
+            last_touch_ms: self.clock.now_ms(),
+        };
     }
 
     /// 从三条链里去重移除（顺序：热 → 冷 → AUX）。
@@ -1982,6 +2012,35 @@ mod tests {
         );
         // 再跑一次也不挂（幂等）。
         pool.make_free().unwrap();
+    }
+
+    #[test]
+    fn insert_new_on_a_resident_key_replaces_in_place() {
+        // 回归：页被**重置复用**（段回卷/撤销页重建）时 `insert_new` 会遇到
+        // "键已在池中"——必须**原位替换**。若照常 `find_reusable`/`attach`，
+        // 桶里留下**两个同键帧**：`find_frame` 命中旧的干净帧 ⇒ `flush` 判"不脏"
+        // 直接返回，新内容永远写不到盘上（撤销页丢失、链在重放后成环的实测根因）。
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        let k0 = BufferKey::new(WS_A, rdba(7, 0));
+        {
+            let g = pool.pin(k0).unwrap();
+            assert_eq!(g.as_bytes()[4096], 0xA0, "旧内容已驻留");
+        }
+        assert_eq!(pool.resident(), 1);
+
+        let mut fresh = Page::new(PageType::HeapTable, WS_A, 7, 0);
+        fresh.as_bytes_mut()[4096] = 0xEE;
+        {
+            let mut g = pool.insert_new(k0, fresh).unwrap();
+            g.mark_dirty(lsn(9));
+        }
+        assert_eq!(pool.resident(), 1, "原位替换：不产生第二个同键帧");
+        assert!(
+            pool.flush(k0).unwrap(),
+            "新内容要真的写出（不是被旧帧遮蔽）"
+        );
+        assert_eq!(h.read_byte(7, 0), 0xEE, "盘上是重置后的新内容");
     }
 
     #[test]

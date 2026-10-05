@@ -42,6 +42,11 @@ pub const UNDO_CONTROL_OFFSET: usize = SEG_EXTENSION_OFFSET + TXN_TABLE_LEN;
 /// 空闲链表尾哨兵。
 pub const NO_SLOT: u16 = 0xFFFF;
 
+/// **undo 段的第一个数据逻辑页**：逻辑页 0 = 段头页、逻辑页 1 = 首张段内位图页
+/// （`Segment::create` 的布局），数据页自 2 起——也是 [`reclaim_undo`] 段回卷
+/// （`rewind`）复位 `append_pos` 的目标值。
+pub const UNDO_FIRST_DATA_PAGE: u32 = 2;
+
 /// Undo 结构错误。
 #[derive(Debug, PartialEq, Eq)]
 pub enum UndoError {
@@ -421,6 +426,134 @@ pub fn free_slot(page: &mut Page, index: u16) -> Result<(), UndoError> {
     write_slot(page, index, &slot)?;
     write_control(page, &control)?;
     Ok(())
+}
+
+/// 一次撤销回收的报告（§4.6.5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimReport {
+    /// 释放（归还空闲链）的事务表槽数。
+    pub slots_freed: u32,
+    /// 推进后的回收水位（提交序号）——低于它的 undo 已被复用/可复用。
+    pub reclaim_seq: CommitSeq,
+    /// 仍保留的已提交事务数（诊断：水位被最老快照顶住时 > 0）。
+    pub committed_kept: u32,
+    /// 是否发生了**段回卷**（全部槽位已空 ⇒ `append_pos` 复位、空间交还写者）。
+    pub rewound: bool,
+}
+
+impl Default for ReclaimReport {
+    fn default() -> Self {
+        Self {
+            slots_freed: 0,
+            reclaim_seq: CommitSeq::from_raw(0).expect("0 在 48 位域内"),
+            committed_kept: 0,
+            rewound: false,
+        }
+    }
+}
+
+/// **回收撤销空间**（§4.6.5）：把"**已提交 且 `commit_seq < 最老快照`**"的事务
+/// 逐个出链——释放事务表槽（回空闲链、`wrap + 1`）并推进 `reclaim_seq` 水位。
+///
+/// - `oldest_snapshot = None`：当前**没有活跃快照** ⇒ 所有已提交事务都可回收；
+/// - `Some(s)`：只回收 `commit_seq < s` 的——`s` 及之后的在某个活跃快照下仍可见，
+///   其 undo 必须保留（长查询的保证；§4.6.5"保留由最老快照封顶"）。
+///
+/// **提交链不落链指针**：提交顺序 = 提交序号顺序（提交序号在提交时单调分配），
+/// 故"满足判据的全体"**就是** §4.6.5 说的"从 `commit_head` 起的连续前缀"——
+/// 256 个槽全扫一遍（O(256)、检查点/切换频率）比维护一条跨重启要重建的链简单。
+/// `commit_head`/`commit_tail` 作为**派生缓存**维护：回收后按剩余已提交槽重算。
+///
+/// **段回卷（`rewind`）**：回收后若槽表**全空**（无活动/待回滚/未回收的已提交），
+/// 则段内不再有任何活引用 ⇒ `append_pos` 复位到 [`UNDO_FIRST_DATA_PAGE`]，
+/// 空间交还写者（"低于水位的 undo 已被复用"的落点）。按 §4.6.4 的明示
+/// **不设空闲块池**——回卷是段级的整段复用，不逐块缓存。
+///
+/// **幂等**：重复调用不再释放更多；`reclaim_seq` 单调不减；`rewind` 只在全空时发生。
+pub fn reclaim_undo(
+    page: &mut Page,
+    oldest_snapshot: Option<CommitSeq>,
+    rewind: bool,
+) -> Result<ReclaimReport, UndoError> {
+    let control = read_control(page)?;
+    // 无活跃快照 ⇒ 水位取 48 位域的最大值（所有已提交事务都可回收）。
+    let limit = oldest_snapshot.map_or((1u64 << 48) - 1, |s| s.as_raw());
+    let mut freed = 0u32;
+    let mut kept = 0u32;
+    let mut high = control.reclaim_seq.as_raw();
+    for index in 0..control.slot_count {
+        let slot = read_slot(page, index)?;
+        if slot.state != TxnState::Committed {
+            continue;
+        }
+        if slot.commit_seq.as_raw() < limit {
+            high = high.max(slot.commit_seq.as_raw());
+            free_slot(page, index)?; // wrap + 1、压回空闲链；重写段控制
+            freed += 1;
+        } else {
+            kept += 1;
+        }
+    }
+
+    // 水位推进（单调）+ 提交链两端重算（派生缓存）。
+    let mut control = read_control(page)?;
+    let new_reclaim = CommitSeq::from_raw(high.max(control.reclaim_seq.as_raw()))
+        .ok_or(UndoError::MalformedRecord)?;
+    control.reclaim_seq = new_reclaim;
+    let (head, tail) = commit_ends(page, control.slot_count)?;
+    control.commit_head = head;
+    control.commit_tail = tail;
+
+    // 段回卷：槽表全空（无任何非 Free 槽）⇒ 无活引用，整段可复用。
+    let mut rewound = false;
+    if rewind && head == NO_SLOT && all_slots_free(page, control.slot_count)? {
+        let mut seg = crate::segment::read_header(page).map_err(|_| UndoError::NotSegmentHeader)?;
+        if seg.append_pos > UNDO_FIRST_DATA_PAGE {
+            seg.append_pos = UNDO_FIRST_DATA_PAGE;
+            crate::segment::write_header(page, &seg).map_err(|_| UndoError::NotSegmentHeader)?;
+            rewound = true;
+        }
+    }
+    write_control(page, &control)?;
+    Ok(ReclaimReport {
+        slots_freed: freed,
+        reclaim_seq: new_reclaim,
+        committed_kept: kept,
+        rewound,
+    })
+}
+
+/// 提交链两端（**派生**：最老/最新的未回收已提交**槽号**；无则 `NO_SLOT`）。
+fn commit_ends(page: &Page, slots: u16) -> Result<(u16, u16), UndoError> {
+    let mut head: Option<(u64, u16)> = None;
+    let mut tail: Option<(u64, u16)> = None;
+    for index in 0..slots {
+        let slot = read_slot(page, index)?;
+        if slot.state != TxnState::Committed {
+            continue;
+        }
+        let seq = slot.commit_seq.as_raw();
+        if head.map_or(true, |(h, _)| seq < h) {
+            head = Some((seq, index));
+        }
+        if tail.map_or(true, |(t, _)| seq >= t) {
+            tail = Some((seq, index));
+        }
+    }
+    Ok((
+        head.map_or(NO_SLOT, |(_, i)| i),
+        tail.map_or(NO_SLOT, |(_, i)| i),
+    ))
+}
+
+/// 槽表是否**全空**（无活动/待回滚/未回收的已提交事务）。
+pub fn all_slots_free(page: &Page, slots: u16) -> Result<bool, UndoError> {
+    for index in 0..slots {
+        if read_slot(page, index)?.state != TxnState::Free {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// **由 `txn_id` 直接定位槽**：槽号 + `wrap` 必须同时相符——
@@ -892,8 +1025,12 @@ impl From<crate::segment::SegmentError> for UndoChainError {
 pub struct UndoAppend {
     /// 撤销页的逻辑页号。
     pub logical: u32,
-    /// 是否新开了撤销页。
+    /// 是否新开了撤销页（含**重置复用**的页——见 `recycled`）。
     pub opened: bool,
+    /// 该页是**重置复用**（不是首次从 `append_pos` 新开）：位图与 `append_pos`
+    /// 不因它变化；写路径须把页 `page_lsn` 前置到当前追加位（重放守卫，
+    /// 见 `txn::write` 的格式化步骤）。
+    pub recycled: bool,
     /// 本页归属的事务（状态更新用）。
     pub txn_id: TxnId,
     /// 撤销页的（追加前、追加后）镜像。
@@ -989,12 +1126,46 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             }
             _ => false,
         };
+        // **页复用**（§4.6.5"低于水位的 undo 已被复用"的落点）：**换事务**时，
+        // 先找一个"归属事务已可回收"的既有页**重置**给新事务——旧记录已在
+        // 回收水位之下、无任何读者；不这样做则"每事务开新页"会让 undo 段随
+        // 事务数单调膨胀（页空间永不回收）。
+        let recycled_logical = if reuse {
+            None
+        } else {
+            self.find_recyclable_page()?
+        };
         let mut bitmap = None;
         let mut advance = None;
-        let (logical, undo_before, opened) = if reuse {
+        let (logical, undo_before, opened, recycled) = if reuse {
             let logical = self.current_logical.expect("已判定存在");
             let page = self.segment.read_page(logical)?;
-            (logical, page, false)
+            (logical, page, false, false)
+        } else if let Some(logical) = recycled_logical {
+            // 重置复用：构造全新页（丢弃旧内容）；`append_pos` 与段内位图都不动
+            // （该页早就分配过、级别已是 High）。
+            let block = self
+                .segment
+                .logical_block(logical)
+                .ok_or(SegmentSpaceError::BitmapCoverage)?;
+            let mut page = Page::new(
+                PageType::Undo,
+                self.segment.workspace_ref(),
+                self.segment.file_id(),
+                block,
+            );
+            crate::itl::write_itl(
+                &mut page,
+                0,
+                &crate::itl::ItlEntry {
+                    txn_id,
+                    undo_ptr: None,
+                    commit_seq: None,
+                    lock_cnt: 0,
+                    state: crate::itl::ItlState::Active,
+                },
+            )?;
+            (logical, page, true, true)
         } else {
             // 新页：下一个可写追加页。若它**就是位图页自身**（窗口首位），
             // 先**计划物化**（不在此直写——镜像随 plan 返回，写路径经池 + redo，
@@ -1057,7 +1228,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             let mut bmp_after = Page::from_bytes(Box::new(*bmp_before.as_bytes()));
             crate::bitmap::set_free_level(&mut bmp_after, bit, crate::bitmap::FreeLevel::High)?;
             bitmap = Some((bmp_logical, bmp_before, bmp_after));
-            (logical, page, true)
+            (logical, page, true, false)
         };
 
         let mut undo_after = Page::from_bytes(Box::new(*undo_before.as_bytes()));
@@ -1082,6 +1253,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         Ok(UndoAppend {
             logical,
             opened,
+            recycled,
             txn_id,
             undo_page: (undo_before, undo_after),
             bitmap,
@@ -1094,6 +1266,72 @@ impl<'io, 'f> UndoChain<'io, 'f> {
     /// 段的可变视图（写路径经池扩展段时用）。
     pub fn segment_mut(&mut self) -> &mut Segment<'io, 'f> {
         &mut self.segment
+    }
+
+    /// **找一个可重置复用的撤销页**：自段首数据页线性扫描已分配区
+    /// （`[UNDO_FIRST_DATA_PAGE, append_pos)`；页数有界——每页 16 KB，
+    /// 帧/页数与 undo 配额同阶），跳过段内位图页，命中**归属事务已可回收**
+    /// （[`UndoChain::page_recyclable`]）或"未写过/无归属"的页即返回。
+    ///
+    /// 返回 `None` ⇒ 没有可复用页，调用方走 `append_pos` 的 append-only 路径。
+    /// 扫描每页一次直读 + 一次事务表槽查（复用是"每事务至多一次"的事件，
+    /// 成本有界；P4 可加"上次复用位"游标作提示，不影响语义）。
+    fn find_recyclable_page(&self) -> Result<Option<u32>, UndoChainError> {
+        let header = self.segment.read_page(0)?;
+        let control = read_control(&header)?;
+        let end = self.segment.append_position()?;
+        let mut logical = UNDO_FIRST_DATA_PAGE;
+        while logical < end {
+            if self.segment.is_bitmap_page(logical) {
+                logical += 1;
+                continue;
+            }
+            // 不校验读：未写过的零页是"无归属、可复用"的合法情形，
+            // 不能让校验把"没写过"报成损坏（I/O 错误照常外传）。
+            let page = self.segment.read_page_raw(logical)?;
+            let reusable = match page.header() {
+                Some(h) if h.page_type == PageType::Undo => match crate::itl::read_itl(&page, 0) {
+                    Ok(entry) => self.page_recyclable(&header, &control, entry.txn_id)?,
+                    // 没有 ITL[0] 归属（异常/半成品页）：无活引用，可直接复用。
+                    Err(_) => true,
+                },
+                // 未写过/已格式化未用的页（崩溃残留）：空闲可复用。
+                _ => true,
+            };
+            if reusable {
+                return Ok(Some(logical));
+            }
+            logical += 1;
+        }
+        Ok(None)
+    }
+
+    /// 页的归属事务 `owner` 是否**已可回收**（页可重置复用）：
+    /// 槽已复用（`None`）或空闲、或已提交且**不高于回收水位**（§4.6.5）。
+    ///
+    /// 未提交/待回滚（其记录还必须能回滚）与"已提交但高于水位"（某个活跃
+    /// 快照还要它）都**不可复用**。
+    fn page_recyclable(
+        &self,
+        header: &Page,
+        control: &UndoControl,
+        owner: TxnId,
+    ) -> Result<bool, UndoChainError> {
+        Ok(match find_slot(header, owner)? {
+            None => true,
+            Some(slot) => match slot.state {
+                TxnState::Free => true,
+                TxnState::Committed => slot.commit_seq <= control.reclaim_seq,
+                TxnState::Active | TxnState::PendingRollback => false,
+            },
+        })
+    }
+
+    /// **段回卷后的写作器复位**（`reclaim_undo` 报 `rewound` 时调用）：
+    /// 缓存的当前页/归属事务作废——该页已交还复用，下一次追加重新分配。
+    pub fn note_rewind(&mut self) {
+        self.current_logical = None;
+        self.current_txn = None;
     }
 
     /// 链写作器状态更新（`plan_append` 之后必须调用）。
@@ -2672,6 +2910,78 @@ mod analysis_tests {
         let bytes_before = *page.as_bytes();
         repair_committed_slots(&mut page, &[(t0, seq(42))]).unwrap();
         assert_eq!(*page.as_bytes(), bytes_before);
+    }
+
+    #[test]
+    fn reclaim_frees_only_committed_below_the_oldest_snapshot() {
+        // §4.6.5：判据 = 已提交 且 commit_seq < 最老快照。
+        let mut page = header_page(&mem());
+        let mut slots = Vec::new();
+        for _ in 0..4 {
+            let (i, _) = allocate_slot(&mut page).unwrap();
+            slots.push(i);
+        }
+        // 三个已提交（序号 10/20/30）+ 一个仍活动。
+        for (k, &i) in slots.iter().take(3).enumerate() {
+            let mut s = read_slot(&page, i).unwrap();
+            s.state = TxnState::Committed;
+            s.commit_seq = seq((k as u64 + 1) * 10);
+            write_slot(&mut page, i, &s).unwrap();
+        }
+        // 水位 25：只回收序号 10、20；30 仍被快照需要；活动槽不动。
+        let report = reclaim_undo(&mut page, Some(seq(25)), true).unwrap();
+        assert_eq!(report.slots_freed, 2);
+        assert_eq!(report.committed_kept, 1);
+        assert_eq!(report.reclaim_seq, seq(20));
+        assert!(!report.rewound, "还有活动事务 ⇒ 不回卷");
+        assert_eq!(read_slot(&page, slots[0]).unwrap().state, TxnState::Free);
+        assert_eq!(read_slot(&page, slots[1]).unwrap().state, TxnState::Free);
+        assert_eq!(
+            read_slot(&page, slots[2]).unwrap().state,
+            TxnState::Committed
+        );
+        assert_eq!(read_slot(&page, slots[3]).unwrap().state, TxnState::Active);
+        // 释放的槽**立即**可再分配（wrap + 1 ⇒ txn_id 换代）。
+        let (reused, _) = allocate_slot(&mut page).unwrap();
+        assert!(reused == slots[0] || reused == slots[1], "从空闲链取回");
+        assert_eq!(read_slot(&page, reused).unwrap().wrap, 1);
+
+        // 幂等：再跑一次不释放更多。
+        let again = reclaim_undo(&mut page, Some(seq(25)), true).unwrap();
+        assert_eq!(again.slots_freed, 0);
+
+        // 提交链两端：仍剩槽 2（序号 30）。
+        let control = read_control(&page).unwrap();
+        assert_eq!(control.commit_head, slots[2]);
+        assert_eq!(control.commit_tail, slots[2]);
+    }
+
+    #[test]
+    fn reclaim_without_snapshot_then_rewinds_a_fully_free_table() {
+        let mut page = header_page(&mem());
+        let (i, _) = allocate_slot(&mut page).unwrap();
+        let mut s = read_slot(&page, i).unwrap();
+        s.state = TxnState::Committed;
+        s.commit_seq = seq(7);
+        write_slot(&mut page, i, &s).unwrap();
+        // 段头 append_pos 模拟已写过若干页。
+        let mut seg = crate::segment::read_header(&page).unwrap();
+        seg.append_pos = 9;
+        crate::segment::write_header(&mut page, &seg).unwrap();
+
+        let report = reclaim_undo(&mut page, None, true).unwrap();
+        assert_eq!(report.slots_freed, 1);
+        assert_eq!(report.reclaim_seq, seq(7));
+        assert!(report.rewound, "槽表全空 ⇒ 段回卷");
+        assert_eq!(
+            crate::segment::read_header(&page).unwrap().append_pos,
+            UNDO_FIRST_DATA_PAGE
+        );
+        // 回卷后水位不倒退（幂等重入）。
+        let again = reclaim_undo(&mut page, None, true).unwrap();
+        assert_eq!(again.slots_freed, 0);
+        assert!(!again.rewound, "append_pos 已在起点");
+        assert_eq!(again.reclaim_seq, seq(7));
     }
 
     #[test]

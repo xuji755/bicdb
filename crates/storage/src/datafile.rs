@@ -405,6 +405,15 @@ impl<'a> DataFile<'a> {
         self.coverage_limit().min(1u64 << 28)
     }
 
+    /// **读一页但不做完整性校验**（"这一页写没写过"的探测用：未写过的零页
+    /// 过不了校验，但那不是损坏）。I/O 错误照常外传。
+    pub fn read_page_unverified(&self, block: u32) -> Result<Page, DataFileError> {
+        if u64::from(block) >= self.head.blocks {
+            return Err(DataFileError::BlockOutOfRange { block });
+        }
+        pagefile::read_page(self.io, self.handle, block).map_err(DataFileError::Io)
+    }
+
     /// 读一页（两层完整性校验）。
     pub fn read_page(&self, block: u32) -> Result<Page, DataFileError> {
         if u64::from(block) >= self.head.blocks {

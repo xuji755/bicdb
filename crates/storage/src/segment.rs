@@ -937,6 +937,17 @@ impl<'io, 'f> Segment<'io, 'f> {
         Ok(read_header(&self.file.read_page(self.page0)?)?.append_pos)
     }
 
+    /// **读一页不校验**（未写过零页的探测；见 [`crate::datafile::DataFile::read_page_unverified`]）。
+    pub fn read_page_raw(&self, logical: u32) -> Result<Page, SegmentSpaceError> {
+        if self.is_bitmap_page(logical) {
+            return Err(SegmentSpaceError::BitmapCoverage);
+        }
+        let block = self
+            .logical_block(logical)
+            .ok_or(SegmentSpaceError::BitmapCoverage)?;
+        Ok(self.file.read_page_unverified(block)?)
+    }
+
     /// **按物理块号直写一页**（不经区映射/逻辑页——"先格式化落盘"用）。
     pub fn write_physical_page(
         &self,
