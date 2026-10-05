@@ -29,7 +29,7 @@ pub mod store;
 pub mod tree;
 
 pub use page::{Entry, IndexPage, IndexPageMut, KEY_LEN_INFINITY, MAX_ENTRY_LEN, MAX_KEY_LEN};
-pub use store::{MemStore, PageStore};
+pub use store::{IndexIo, MemStore, PageStore, PoolStore};
 pub use tree::{InsertOutcome, SplitKind, Tree};
 
 /// 索引层错误（**明确判定**，不静默）。
@@ -57,6 +57,8 @@ pub enum IndexError {
     },
     /// 页仓已满（测试仓的固定容量）。
     StoreFull,
+    /// 底层 I/O（池/页文件/日志；经 [`IndexIo`] 接入的执行器错误）。
+    Io(String),
 }
 
 impl std::fmt::Display for IndexError {
@@ -71,6 +73,7 @@ impl std::fmt::Display for IndexError {
             IndexError::NoSpace => f.write_str("索引页空间不足"),
             IndexError::BlockNotFound { block } => write!(f, "页仓中没有块 {block}"),
             IndexError::StoreFull => f.write_str("页仓已满"),
+            IndexError::Io(why) => write!(f, "索引 I/O：{why}"),
         }
     }
 }

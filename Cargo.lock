@@ -33,6 +33,7 @@ version = "0.0.0"
 dependencies = [
  "bicdb-common",
  "bicdb-storage",
+ "bicdb-workspace",
 ]
 
 [[package]]

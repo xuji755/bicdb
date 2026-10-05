@@ -100,6 +100,34 @@ impl<'s, S: PageStore> Tree<'s, S> {
         })
     }
 
+    /// **打开既有树**（树头来自段头页扩展区，§9.1.5 第 8 步）。
+    ///
+    /// **高度由页类型推**：从根下行**最左子指针**直到叶页——根/枝页（类型
+    /// 3/4）自述层级，树头因此只存 6B 的根页 ROWID（§5.11 的类型扩展区没有
+    /// 高度字段）。空头（全 0）请先 [`Tree::create`] 建初始空叶页再写头。
+    pub fn open(store: &'s mut S, file_id: u16, root: RowId) -> Result<Self, IndexError> {
+        let mut height = 0u32;
+        let mut block = crate::store::block_of(root);
+        loop {
+            let page = store.read(block)?;
+            let view = IndexPage::new(&page)?;
+            if view.is_leaf() {
+                break;
+            }
+            block = crate::store::block_of(view.left_child());
+            height += 1;
+            if height > 64 {
+                return Err(IndexError::Malformed("树高异常（疑似坏页/环）"));
+            }
+        }
+        Ok(Self {
+            store,
+            file_id,
+            root,
+            height,
+        })
+    }
+
     /// 树头（根页地址）——执行器把它写进段头页的 B+Tree 扩展区。
     #[must_use]
     pub fn root(&self) -> RowId {

@@ -8,8 +8,9 @@
 //! 本模块的单线程实现以"**一次一个页**"的纪律串行化——右移（叶链）、下行
 //! 闩耦合（父→子）都在这条纪律下成立。
 
+use bicdb_storage::buffer::{BufferError, BufferKey, BufferPool};
 use bicdb_storage::page::{Page, PageType};
-use bicdb_storage::rowid::{RowId, ROWID_LEN};
+use bicdb_storage::rowid::{Rdba, RowId, ROWID_LEN};
 
 use crate::IndexError;
 
@@ -46,6 +47,75 @@ pub fn no_link() -> RowId {
 /// 便于测试的零值。
 #[allow(dead_code)]
 const _: [u8; ROWID_LEN] = [0u8; ROWID_LEN];
+
+/// **执行器接入的 I/O 口**（索引页的**分配**与**写**）。
+///
+/// 树算法只经 [`PageStore`] 说话；这一层把"新页从哪来、改页怎么写"交给
+/// 执行器——写路径**必须带 redo**（§9.1.2：索引项随行的删除/插入移除、
+/// **不做独立的撤销**，但索引页与数据页一样受 WAL 保护：写前先落日志、
+/// 恢复幂等重放；分裂记录的**正文随记录**（§9.1.5 第 5 步）⇒ 盘上不存在的
+/// 新页也能被重放重建）。
+pub trait IndexIo {
+    /// **分配一张新页**（段空间管理；返回块号，内容由调用方随后写入）。
+    fn allocate_page(&mut self) -> Result<u32, IndexError>;
+    /// **把一页的新内容写下去**：执行器实现为"经池改页 + redo + 标脏"；
+    /// 盘上尚无该页（新分配）⇒ 直接以 `after` 装入。
+    fn apply_page(&mut self, block: u32, after: &Page) -> Result<(), IndexError>;
+}
+
+/// **池存取口**（执行器接入的最小形态）：读经**缓冲池**（命中拷副本；
+/// 未命中由池的定位器读盘），写与分配经 [`IndexIo`]。
+///
+/// **一次一个页**（§9.1.5）：树算法每次只读写一页——池的卫兵（内容锁）在
+/// 每次 `read`/`write` 内取放，**不跨调用持有**。
+pub struct PoolStore<'a, 'b, 'io, I: IndexIo> {
+    pool: &'a BufferPool<'b>,
+    io: &'io mut I,
+    file_id: u16,
+    ws: [u8; 8],
+}
+
+impl<'a, 'b, 'io, I: IndexIo> PoolStore<'a, 'b, 'io, I> {
+    /// 打开存取口（`ws` = 工作区标识；页键 =（工作区, `file_id` + 块号））。
+    pub fn new(pool: &'a BufferPool<'b>, io: &'io mut I, file_id: u16, ws: [u8; 8]) -> Self {
+        Self {
+            pool,
+            io,
+            file_id,
+            ws,
+        }
+    }
+
+    fn key_of(&self, block: u32) -> Result<BufferKey, IndexError> {
+        let rdba = Rdba::from_parts(self.file_id, block)
+            .ok_or(IndexError::Malformed("块号越出 ROWID 域"))?;
+        Ok(BufferKey::new(self.ws, rdba))
+    }
+}
+
+impl<I: IndexIo> PageStore for PoolStore<'_, '_, '_, I> {
+    fn read(&mut self, block: u32) -> Result<Page, IndexError> {
+        let key = self.key_of(block)?;
+        match self.pool.pin(key) {
+            Ok(guard) => Ok(Page::from_bytes(Box::new(*guard.as_bytes()))),
+            Err(BufferError::Unresolved { .. }) => Err(IndexError::BlockNotFound { block }),
+            Err(e) => Err(IndexError::Io(e.to_string())),
+        }
+    }
+
+    fn write(&mut self, block: u32, page: &mut Page) -> Result<(), IndexError> {
+        page.seal();
+        self.io.apply_page(block, page)
+    }
+
+    fn allocate(&mut self) -> Result<u32, IndexError> {
+        self.io.allocate_page()
+    }
+
+    fn block_count(&self) -> u32 {
+        u32::MAX // 池形态没有固定表上限（诊断口；段空间管理负责报满）
+    }
+}
 
 /// **内存页仓**（测试用）：固定上限的页数组，`allocate` 递增分配。
 #[derive(Debug)]

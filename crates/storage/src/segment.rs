@@ -118,6 +118,10 @@ pub enum SegmentError {
     EmptyExtent,
     /// 页格式损坏（字段越界）。
     Malformed,
+    /// 不是 B+Tree 段（树头读写要求 `seg_type = 2`）。
+    NotTreeSegment,
+    /// 树头的根页 ROWID 指向**别的文件**（段的文件号不符 = 布局错误）。
+    TreeHeadForeignFile,
 }
 
 impl std::fmt::Display for SegmentError {
@@ -135,6 +139,10 @@ impl std::fmt::Display for SegmentError {
             }
             SegmentError::EmptyExtent => f.write_str("区间项区数为 0"),
             SegmentError::Malformed => f.write_str("段头页字段越界——按损坏处理"),
+            SegmentError::NotTreeSegment => f.write_str("不是 B+Tree 段（树头要求 seg_type = 2）"),
+            SegmentError::TreeHeadForeignFile => {
+                f.write_str("树头的根页 ROWID 指向别的文件——布局错误")
+            }
         }
     }
 }
@@ -282,6 +290,39 @@ pub fn write_header(page: &mut Page, h: &SegmentHeader) -> Result<(), SegmentErr
     // 44..50 保留
     put_u48(b, SEG_BODY_OFFSET + 50, h.next_map_page);
     // 56..60 保留
+    Ok(())
+}
+
+/// **B+Tree 段的树头**（§9.1.5 第 8 步 / §5.11 类型 2 扩展区）：扩展区里
+/// 6B 的**根页 ROWID**（页地址形态，`row_id = 0`）；全 0 = **尚未初始化**
+/// （空索引由索引层建一张空叶页并写回）。
+pub fn read_tree_head(page: &Page) -> Result<crate::rowid::RowId, SegmentError> {
+    let header = read_header(page)?;
+    if header.seg_type != SegType::BTree {
+        return Err(SegmentError::NotTreeSegment);
+    }
+    let b = page.as_bytes();
+    let raw: [u8; 6] = b[SEG_EXTENSION_OFFSET..SEG_EXTENSION_OFFSET + 6]
+        .try_into()
+        .expect("6 字节");
+    Ok(crate::rowid::RowId::from_bytes(&raw))
+}
+
+/// **写树头**（根页 ROWID；只动扩展区 6B，公共部分与区间项不动）。
+/// `root` 必须落在本段的文件号上（跨段的树头是布局错误）。
+pub fn write_tree_head(page: &mut Page, root: crate::rowid::RowId) -> Result<(), SegmentError> {
+    let header = read_header(page)?;
+    if header.seg_type != SegType::BTree {
+        return Err(SegmentError::NotTreeSegment);
+    }
+    let _ = header;
+    if root != crate::rowid::RowId::from_bytes(&[0u8; 6])
+        && root.file_id() != page.header().map_or(root.file_id(), |h| h.file_id)
+    {
+        return Err(SegmentError::TreeHeadForeignFile); // 跨段的树头 = 布局错误
+    }
+    let b = page.as_bytes_mut();
+    b[SEG_EXTENSION_OFFSET..SEG_EXTENSION_OFFSET + 6].copy_from_slice(&root.to_bytes());
     Ok(())
 }
 
@@ -978,6 +1019,24 @@ impl<'io, 'f> Segment<'io, 'f> {
         }
     }
 
+    /// **分配一个可追加的数据页**（§4.3.1）：跳过段内位图页（必要时物化）、
+    /// 推进 `append_pos`（与 `hwm` 取大），段头页**就地写回**。
+    ///
+    /// 返回**逻辑页号**（物理块用 [`Segment::logical_block`] 换算）。
+    /// 直写形态（段头页直接落盘）：调用方若在事务里分配，应改走
+    /// "计划形态 + 经池 + redo"的路径（`plan_*`），本口供恢复/测试/建段期使用。
+    pub fn allocate_append_page(&mut self) -> Result<u32, SegmentSpaceError> {
+        let logical = self.prepare_append_page()?;
+        let mut h = read_header(&self.file.read_page(self.page0)?)?;
+        h.append_pos = logical + 1;
+        h.hwm = h.hwm.max(logical + 1);
+        let mut page = self.file.read_page(self.page0)?;
+        write_header(&mut page, &h)?;
+        self.file.write_page(self.page0, &mut page)?;
+        self.header = h;
+        Ok(logical)
+    }
+
     /// 段头（内存镜像）。
     #[must_use]
     pub fn header(&self) -> &SegmentHeader {
@@ -1246,6 +1305,41 @@ mod tests {
         // 页初始化标志不受影响（Page::new 已置 INITIALIZED）。
         assert_eq!(page.header().unwrap().flags & flags::INITIALIZED, 1);
         let _ = Lsn::from_raw(0); // 保持 Lsn 导入被使用（页头 page_lsn 类型）
+    }
+
+    #[test]
+    fn tree_head_roundtrips_and_rejects_foreign_files() {
+        // §9.1.5 第 8 步：B+Tree 段的树头 = 扩展区 6B 的根页 ROWID；
+        // 非 B+Tree 段拒绝；指向别的文件的 ROWID 拒绝（布局错误）。
+        use crate::rowid::RowId;
+        let mut page = seg_page(SegType::BTree, 7);
+        assert_eq!(
+            read_tree_head(&page).unwrap(),
+            RowId::from_bytes(&[0u8; 6]),
+            "初始为空头（0）"
+        );
+        // 页地址形态（`row_id = 0`）用专门构造口：`from_parts` 拒绝 row_id = 0。
+        let root = RowId::page_address(3, 2).expect("域内");
+        write_tree_head(&mut page, root).unwrap();
+        assert_eq!(read_tree_head(&page).unwrap(), root);
+        // 扩展区只动 6B：段头公共部分与区间项不受影响。
+        let before = read_header(&page).unwrap();
+        assert_eq!(before.seg_type, SegType::BTree);
+
+        // 非 B+Tree 段拒绝。
+        let heap = seg_page(SegType::Heap, 7);
+        assert!(matches!(
+            read_tree_head(&heap),
+            Err(SegmentError::NotTreeSegment)
+        ));
+
+        // 指向别的文件 ⇒ 拒绝（页头自述文件 3）。
+        let mut foreign = seg_page(SegType::BTree, 7);
+        let bad = RowId::page_address(4, 2).expect("域内");
+        assert!(matches!(
+            write_tree_head(&mut foreign, bad),
+            Err(SegmentError::TreeHeadForeignFile)
+        ));
     }
 }
 

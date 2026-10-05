@@ -74,6 +74,10 @@
   （`Some(p)` = 只写分区 p），`Dbwr::start`（全局）保留给 N=1。
   **`prestart(partition)` 钩子在线程体内、写回之前执行**——NUMA 线程创建时
   绑定的注入点（创建方在闭包里绑本线程；入参 = 该线程的分区号）。
+- **B+Tree 树头与段追加分配**（索引接入切片，2026-10-05）：`segment::{read_tree_head,
+  write_tree_head}`——类型 2 扩展区 6B 的根页 ROWID（非 B+Tree 段/指向别文件即拒绝；
+  高度不存，由页类型推出）；`Segment::allocate_append_page`——跳过位图页、推进
+  `append_pos` 与 `hwm`、段头页写回的**追加分配口**。
 - **O2：per-frame 状态对象**（§5.10 的 P4 并发路线 ③）：帧槽数组**稳定地址**，
   每帧 = 原子 `pins` + 内容 `RwLock<Option<Page>>`；**结构闩锁只护元数据/链/
   桶/写列表/统计**。`PageGuard`（独占写）**不持池闩锁**（"一次一个卫兵"纪律
