@@ -485,9 +485,51 @@ fn check_fragment_chains(heap: &Heap, report: &mut CheckReport) {
             cur = f.next;
         }
     }
-    // 孤立片段：不属于任何可达链（既不是链首、也没被走过）。
+    // 孤立片段：不属于任何可达链。**不一律降级为警告**——继续沿它走：
+    // 若进入环（不可达的环）⇒ 错误；只有真正断尾（next = None 或指向
+    // 不存在的片段）才是删除残留（警告）。多前驱对**任何片段**都查。
+    let mut warned: Vec<RowId> = Vec::new();
     for f in &frags {
-        if !visited.contains(&f.id) {
+        if visited.contains(&f.id) {
+            continue;
+        }
+        let parents = frags
+            .iter()
+            .filter(|p| p.id != f.id && p.next == Some(f.id))
+            .count();
+        if parents > 1 {
+            report.push(
+                Severity::Error,
+                "FRAGMENT_MULTI_PARENT",
+                fmt_rowid(f.id),
+                format!("片段被 {parents} 个前驱引用（链分叉）"),
+            );
+        }
+        let mut seen = vec![f.id];
+        let mut cur = f.next;
+        let mut looped = false;
+        while let Some(id) = cur {
+            if seen.contains(&id) {
+                looped = true;
+                break;
+            }
+            match frags.iter().find(|x| x.id == id) {
+                Some(g) => {
+                    seen.push(id);
+                    visited.push(id); // 同一条不可达链只处理一次
+                    cur = g.next;
+                }
+                None => break, // 断尾：停
+            }
+        }
+        if looped {
+            report.push(
+                Severity::Error,
+                "FRAGMENT_LOOP",
+                fmt_rowid(f.id),
+                "不可达的片段环（无链首指向，但链内成环）",
+            );
+        } else if !warned.contains(&f.id) {
             report.push(
                 Severity::Warning,
                 "FRAGMENT_ORPHAN",
@@ -495,6 +537,7 @@ fn check_fragment_chains(heap: &Heap, report: &mut CheckReport) {
                 "片段不属于任何可达链（可能为删除残留，待回收）",
             );
         }
+        warned.extend(seen);
     }
 }
 
@@ -608,6 +651,30 @@ mod tests {
             "{}",
             report.render()
         );
+    }
+
+    #[test]
+    fn unreachable_fragment_cycle_is_an_error() {
+        // 审核修复回归：**不可达**的片段环（链首被清空、环自身没有出口）
+        // 此前只报"孤立片段"警告并判 Usable——现按错误处理。
+        let policy = InsertPolicy::append_only();
+        let mut heap = Heap::new([6; 8], policy);
+        let big = row_of(&vec![9u8; PAGE_SIZE + 100]);
+        let id = fragment::insert_row(&mut heap, &big, &policy).unwrap();
+        let head = HeadFragment::new(heap.get(id).unwrap()).unwrap();
+        let head_len = head.header().data_start();
+        let mid = head.next().expect("碎片行有中片段");
+        // 链首的 next 清空 → 后续片段不可达；中片段自指成环。
+        heap.patch_record(id, head_len, &[0u8; 6]).unwrap();
+        heap.patch_record(mid, 4, &mid.to_bytes()).unwrap(); // 中片段 next 在偏移 4
+
+        let report = check_heap(&heap);
+        assert!(
+            report.findings.iter().any(|f| f.code == "FRAGMENT_LOOP"),
+            "{}",
+            report.render()
+        );
+        assert_eq!(report.verdict(), Verdict::Unrecoverable);
     }
 
     #[test]

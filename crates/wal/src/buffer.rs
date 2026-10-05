@@ -353,10 +353,20 @@ impl LogBuffer {
                 return Ok(Lsn::from_raw(synced).expect("48 位域内"));
             }
         }
-        // 1) latch 内摘页（不执行 I/O）。
+        // 1) latch 内摘页（不执行 I/O）——**同时冻结页分配位置**：摘走的页
+        //    已确定要写出去，后续 `append` 必须从它们**之后**分配新页；否则
+        //    在 I/O 窗口内追加会拿到已刷出页的起点、复用已持久化的 LSN
+        //    （多写者下的真缺陷；单写者下也能被"写 sink 期间回调 append"
+        //    这类重入触发）。失败路径无需回退：放回的旧页与窗口内新建的页
+        //    恰好前后相接（新页起于 `next_page_start` = 旧页之后）。
         let mut pages: Vec<LogPage> = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut state.pages)
+            let taken = std::mem::take(&mut state.pages);
+            if let Some(last) = taken.last() {
+                state.next_page_start =
+                    last.start_lsn().as_raw() + crate::logpage::LOG_PAGE_SIZE as u64;
+            }
+            taken
         };
 
         // 2) latch 外写与 sync。
@@ -391,9 +401,12 @@ impl LogBuffer {
                     + p.used() as u64
             })
             .unwrap_or_else(|| state.synced_lsn.load(Ordering::SeqCst));
+        // `next_page_start` 已在摘页时推进（冻结分配位置）；这里只做兜底。
         if let Some(last) = pages.last() {
-            state.next_page_start =
-                last.start_lsn().as_raw() + crate::logpage::LOG_PAGE_SIZE as u64;
+            let after = last.start_lsn().as_raw() + crate::logpage::LOG_PAGE_SIZE as u64;
+            if after > state.next_page_start {
+                state.next_page_start = after;
+            }
         }
         state.pool.append(&mut pages);
         let cur = state.synced_lsn.load(Ordering::SeqCst);
@@ -446,6 +459,59 @@ mod tests {
                 }],
             }],
         )
+    }
+
+    #[test]
+    fn append_during_flush_gets_a_fresh_page_and_lsn() {
+        // 审核修复回归：刷盘 I/O 窗口内的并发追加不得复用**已刷出页的起点**
+        // 与已持久化的 LSN（摘页时即冻结 `next_page_start`）。
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        /// 在第一次 `append_page` 时**重入** `append` 的 sink。
+        struct ReentrantSink {
+            buf: Arc<LogBuffer>,
+            reentered: AtomicBool,
+            inner: StdMutex<VecLogSink>,
+            new_lsn: StdMutex<Option<Lsn>>,
+        }
+        impl LogSink for ReentrantSink {
+            fn append_page(&mut self, page: &LogPage) -> std::io::Result<()> {
+                if !self.reentered.swap(true, AtomicOrdering::SeqCst) {
+                    let l = self
+                        .buf
+                        .append(|l| commit_rec(l, 7, 7))
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    *self.new_lsn.lock().unwrap() = Some(l);
+                }
+                self.inner.lock().unwrap().append_page(page)
+            }
+            fn sync(&mut self) -> std::io::Result<()> {
+                self.inner.lock().unwrap().sync()
+            }
+        }
+
+        let buf = Arc::new(LogBuffer::new(lsn(0)));
+        let first = buf.append(|l| commit_rec(l, 1, 1)).unwrap();
+        let mut sink = ReentrantSink {
+            buf: Arc::clone(&buf),
+            reentered: AtomicBool::new(false),
+            inner: StdMutex::new(VecLogSink::default()),
+            new_lsn: StdMutex::new(None),
+        };
+        let synced = buf.flush_to(buf.appended_lsn(), &mut sink).unwrap();
+        assert!(synced >= first);
+
+        let reentrant = sink.new_lsn.lock().unwrap().expect("sink 内追加过");
+        assert!(
+            reentrant.as_raw() >= crate::logpage::LOG_PAGE_SIZE as u64,
+            "重入追加必须落在新页（LSN = {}，首条 = {}）",
+            reentrant.as_raw(),
+            first.as_raw()
+        );
+        // 刷盘后把余下部分刷尽：重入的那条也在流里。
+        let mut plain = VecLogSink::default();
+        buf.flush_to(buf.appended_lsn(), &mut plain).unwrap();
     }
 
     #[test]

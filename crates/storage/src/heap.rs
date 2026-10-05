@@ -331,6 +331,12 @@ pub fn defrag(page: &mut Page) -> Result<usize, HeapError> {
     Ok(page.free_space().saturating_sub(before))
 }
 
+/// 块号（1 起）→ `pages` 下标；**块号 0 下溢为 None**（`ROWID` 允许编码出
+/// `block_id = 0`，损坏/构造值不得让下标运算在 debug 下 panic、release 下回绕）。
+fn page_index(block_id: u32) -> Option<usize> {
+    block_id.checked_sub(1).map(|b| b as usize)
+}
+
 /// 内存堆表（多页；页号顺序分配——段/区管理在后续切片接入）。
 #[derive(Debug)]
 pub struct Heap {
@@ -394,7 +400,7 @@ impl Heap {
         if block_id == 0 {
             return None;
         }
-        self.pages.get(block_id as usize - 1)
+        self.pages.get(page_index(block_id)?)
     }
 
     /// 追加一张空页并返回块号（段/区分配接入前的顺序分配）。
@@ -429,7 +435,7 @@ impl Heap {
     ) -> Result<RowId, HeapError> {
         let page = self
             .pages
-            .get_mut(block_id as usize - 1)
+            .get_mut(page_index(block_id).ok_or(HeapError::BadRow)?)
             .ok_or(HeapError::NoSuchRow)?;
         let row_no = insert_record(page, row, policy, status)?;
         page.seal();
@@ -450,7 +456,7 @@ impl Heap {
         }
         let page = self
             .pages
-            .get_mut(id.block_id() as usize - 1)
+            .get_mut(page_index(id.block_id()).ok_or(HeapError::BadRow)?)
             .ok_or(HeapError::NoSuchRow)?;
         let record = row(page, id.row_id()).ok_or(HeapError::NoSuchRow)?;
         if offset + bytes.len() > record.len() {
@@ -487,7 +493,7 @@ impl Heap {
         if id.file_id() != 1 {
             return None;
         }
-        let page = self.pages.get(id.block_id() as usize - 1)?;
+        let page = self.pages.get(page_index(id.block_id())?)?;
         row(page, id.row_id())
     }
 
@@ -498,7 +504,7 @@ impl Heap {
         }
         let page = self
             .pages
-            .get_mut(id.block_id() as usize - 1)
+            .get_mut(page_index(id.block_id()).ok_or(HeapError::BadRow)?)
             .ok_or(HeapError::NoSuchRow)?;
         delete_row(page, id.row_id())?;
         page.seal();
@@ -509,7 +515,7 @@ impl Heap {
     pub fn defrag_page(&mut self, block_id: u32) -> Result<usize, HeapError> {
         let page = self
             .pages
-            .get_mut(block_id as usize - 1)
+            .get_mut(page_index(block_id).ok_or(HeapError::BadRow)?)
             .ok_or(HeapError::NoSuchRow)?;
         let reclaimed = defrag(page)?;
         page.seal();
