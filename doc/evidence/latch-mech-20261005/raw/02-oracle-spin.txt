@@ -1,0 +1,39 @@
+
+============================================================
+  [问题诊断] willing-to-wait immediate latch 请求 模式 spin_count 自旋次数
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 1，摘要筛选通过 1，批次 1；本路已取尽
+  KnowledgeEntry：已取 32，摘要筛选通过 24，批次 1；本路已取尽
+  CaseStudy：已取 5，摘要筛选通过 4，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     PL/SQL 过程执行时挂起，V$SESSION_WAIT 显示等待库缓存锁（library cache latch）。根因是 SPIN_COUNT 参数设置为 450 过低，导致服务进程在耗尽自旋获取锁的尝试后频繁进入睡眠，引发锁争用。将 SPIN_COUNT 增加到 2000 后问题消失，但单 C。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:1061799.6 RUNNING A PL/SQL PROCEDURE HANGS WAITING ON LIBRARY CACHE LATCH  (排序分: 15.0)
+     └ 摘要：PL/SQL 过程执行时挂起，V$SESSION_WAIT 显示等待库缓存锁（library cache latch）。根因是 SPIN_COUNT 参数设置为 450 过低，导致服务进程在耗尽自旋获取锁的尝试后频繁进入睡眠，引发锁争用。将 SPIN_COUNT 增加到 2000 后问题消失，但单 C。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996681
+
+     [KnowledgeEntry] L1：Note:33984.1 Init.ora Parameter "_LATCH_SPIN_COUNT" [Hidden] Reference Note  (排序分: 15.0)
+     └ 摘要：_LATCH_SPIN_COUNT 是定义在 ksl.h 中的隐藏参数，控制进程获取 latch 前的自旋等待次数，与 SPIN_COUNT 参数相关。用于分析 latch 争用、自旋消耗和并发性能调优，错误设置可能影响 CPU 使用率或导致 latch 获取延迟异常。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997001
+
+     [KnowledgeEntry] L1：Note:32835.1 Init.ora Parameter "_LATCH_WAIT_POSTING" [Hidden] Reference Note  (排序分: 15.0)
+     └ 摘要：_LATCH_WAIT_POSTING 是 Oracle 8i 隐藏参数，控制 latch 等待投递机制。默认值为 1，仅对长等待 latch 启用等待投递；设为大于 1 则对所有 latch 启用；设为 0 则禁用。该机制与 SPIN_COUNT 协作：进程自旋后若未获得 latch，将睡眠重试，或。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997002
+
+     [KnowledgeEntry] L1：Note:38996.1 Init.ora Parameter "_SPIN_CPU_YIELD_FREQ" [Hidden] Reference Note  (排序分: 14.7)
+     └ 摘要：隐藏参数 _SPIN_CPU_YIELD_FREQ 控制 Oracle 进程在让出 CPU 之前的自旋次数，与 SPIN_COUNT 配合调节 latch 获取时的自旋行为，用于诊断高并发下的 CPU 消耗和 latch 竞争。在 Sequent 平台上需额外启用 no_preempt 内核选项，否则 ALERT 日志会。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997063
+
+     [CaseStudy] single_cpu_latch_spin_optimization  (排序分: 9.8)
+     └ 详情：现象：单CPU系统上CPU使用率高但吞吐量低。诊断：发现大量Latch自旋消耗CPU。处理：将SPIN_COUNT参数设置为1，避免进程在单CPU上无谓自旋，直接进入睡眠等待，释放CPU资源给其他进程。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1558986
+
+     [FaultModel] Latch争用陷阱：过度自旋浪费CPU  (排序分: 9.3)
+     └ 摘要：在多CPU系统上，如果SPIN_COUNT设置过高且CPU资源紧张，大量进程的自旋会耗尽CPU，导致系统吞吐量下降。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545400
+

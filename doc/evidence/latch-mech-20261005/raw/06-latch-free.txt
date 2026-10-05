@@ -1,0 +1,72 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed,KEOpSQLReviewed
+  名称: L1：Note:34576.1 WAITEVENT: "latch free" Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995922
+
+  ── 描述 ──
+  WAITEVENT:LATCH_FREE "latch free" Reference Note This is a reference note for the wait event "latch
+  free" which includes the following subsections: Brief definition Individual wait details (eg: For
+  waits seen in <View:V$SESSION_WAIT> ) Systemwide wait details (eg: For waits seen in
+  <View:V$SYSTEM_EVENT> ) Reducing waits / wait times See <Note:61998.1> for an introduction to Wait
+  Events. Definition: Source Symbol: ksllfe Versions: 7.0 - 9.2 Documentation: 9.0 Latches are like
+  short duration locks that protect critical bits of code. This wait indicates that the process is
+  waiting for a latch that is currently busy (held by another process). Individual Waits: Parameters:
+  P1 = Latch address P2 = Latch number P3 = Tries Latch address The address of the latch that the
+  process is waiting for. The hexadecimal value of P1 ( P1RAW ) can be used to determine which latch
+  is waited for thus: SELECT name, 'Child '||child#, gets, misses, sleeps FROM v$latch_children WHERE
+  addr=' &P1RAW ' UNION SELECT name, null, gets, misses, sleeps FROM v$latch WHERE addr=' &P1RAW ' ;
+  This will show "Child N" in the second column if the latch is a child latch. Latch number This is
+  the latch number that indexes the V$LATCHNAME view: SELECT * FROM v$latchname WHERE latch# = &P2 ;
+  Note that the latch number for a given set of latches can vary between releases / platforms so it is
+  best to avoid hard coding P2 or LATCH# in SQL scripts. Tries This is basically a counter that counts
+  the number of times we tried to get the latch (slow with spinning) and the process had to sleep. See
+  the "Wait Time" notes below. Wait Time: When a session waits on latch free it effectively sleeps for
+  a short time then re-tests the latch to see if it is free . If it still cannot be acquired then P3
+  is incremented and the session waits again. The wait time increases exponentially and does not
+  include spinning on the latch (active waiting). The maximum wait time depends on the number of
+  latches that the process is holding. There is an exponential back off (up to 2 seconds) between each
+  attempt to get the latch. For certain latches a waiting session may be posted once the latch is
+  free. Oracle9i uses this "latch posting" far more than Oracle8i (and earlier) releases. The
+  SECONDS_IN_WAIT figure in <View:V$SESSION_WAIT> shows the total time spent waiting for the latch
+  including all sleeps. Systemwide Waits: As a latch wait is typically quite short it is possible to
+  see a large number of latch waits which only account for a small percentage of time. If the TIME
+  spent waiting for latches is significant then it is best to determine which latches are suffering
+  from contention. Both STATSPACK and Bstat/estat reports include sections which show latch activity
+  in the period sampled. These sections are based on <View:V$LATCH> (which gives a summary of latch
+  activity since instance startup) and can give an indication of which latches are responsible for the
+  most time spent waiting for "latch free" thus: SELECT latch#, name, gets, misses, sleeps FROM
+  v$latch WHERE sleeps>0 ORDER BY sleeps ; Note that this select gives the worst latches at the BOTTOM
+  of the list. Some lines in this report are actually for multiple latches all of the same type. To
+  determine if the latch activity is concentrated on one particular latch in the set one can query
+  <View:V$LATCH_CHILDREN> (only available from 7.3 onwards): SELECT addr, latch#, gets, misses, sleeps
+  FROM v$latch_children WHERE sleeps>0 and latch# = &LATCH_NUMBER_WANTED ORDER BY sleeps ; This gives
+  the system wide number of waits for each child latch of the of the type you are looking at. If there
+  are multiple rows the important thing to note is whether the SLEEPS are reasonably distributed or if
+  there are one or two child latches responsible for 80% of the SLEEPS. If the contention is focused
+  on one or two child latches make a note of which children are seeing a problem - note the ADDR
+  column. One can also look at: Does the same session/s keep appearing in <View:V$LATCH_HOLDER>
+  Sessions with high latch waits in <View:V$SESSION_EVENT> (Although it is important to note that
+  innocent sessions may show high numbers of waits if some other session is repeatedly holding the
+  latch) Reducing Waits / Wait times: There is no general advice to reduce latch waits as the action
+  to take depends heavily on the latch type which is causing the waits. If there is no particular
+  latch and waits occur across all latches then check for CPU starvation or uneven O/S scheduling
+  policies - a CPU bound system will often show numerous latch waits across many types of latch. The
+  latches most likely to show high sleeps are listed below along with some possible actions: shared
+  pool latch Heavy use of literal SQL will stress this latch significantly. If your online application
+  makes heavy use of literal SQL statements then converting these to use bind variables will give
+  significant improvements in latch contention in this area. See <Note:62143.1> for issues affecting
+  the shared pool. library cache latches From Oracle 7.2 onwards the library cache latch has child
+  latches . Problems with these latches are typically due to heavy use of literal SQL or very poor
+  shared pool configuration. If your online application makes heavy use of literal SQL statements then
+  converting these to use bind variables will give significant improvements in latch contention in
+  this area. See <Note:62143.1> for issues affecting the shared pool. cache buffers lru chain latch
+  Setting <Parameter:DB_BLOCK_LRU_STATISTICS> to TRUE can adversely affect this latch - always ensure
+  DB_BLOCK_LRU_STATISTICS is set to FALSE. From Oracle 7.3 it is possible to have multiple of these
+  latches by specifying DB_BLOCK_LRU_LATCHES although this really needs multiple CPU's to be of most
+  benefit. Heavy contention for this latch is generally due to heavy buffer cache activity which can
+  be caused, for example, by: Repeatedly scanning large unselective indexes Oracle7/8.0 only: Sorting
+  in buffer cache a
+
+  ── 摘要 ──
+  latch free 等待事件表示会话等待获取某个 latch 时被阻塞，适用于诊断 latch 争用与 CPU 饥饿场景。P1 为 latch 地址，可关联 V$LATCH_CHILDREN 或 V$LATCH 定位具体 latch；P2 为 latch 编号，对应 V$LATCHNAME；P3 为睡眠尝试次数，反映阻塞程度。

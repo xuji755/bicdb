@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed
+  名称: LWLock 快速路径算法
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1877616
+
+  ── 描述 ──
+  LWLockAttemptLock 实现无竞争时 wait-free。SHARE 获取时只要没有排他者（LW_VAL_EXCLUSIVE 为 0）就可以原子加 1 共享计数。EXCLUSIVE 要求低
+  19 位全零（无共享者无排他者）。即使 CAS 失败，也会将原值写回，充当内存屏障（lwlock.c:829-838）。
+
+  ── 摘要 ──
+  快速路径（lwlock.c:795-856 LWLockAttemptLock）单次原子 CAS。SHARE 只检查排他位（old_state & LW_VAL_EXCLUSIVE 为 0 就加 1 计数）；EXCLUSIVE 要求低 19 位全零。CAS 失败也无条件写回原值充当内存屏障。

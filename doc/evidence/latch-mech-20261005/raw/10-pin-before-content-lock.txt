@@ -1,0 +1,11 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed
+  名称: 先 pin 后取内容锁的原因
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1876838
+
+  ── 描述 ──
+  如果先取内容锁再 pin，页可能在锁定前被时钟扫描或驱逐逐出，内容锁将失去保护对象。先 pin 可确保缓冲区在锁操作期间不会被逐出，这也是 per-buffer 锁语义的前提。
+
+  ── 摘要 ──
+  PG 要求先 pin 缓冲区再尝试取内容锁，来源于 README:35“One must pin a buffer before trying to lock it”；未 pin 的锁在语义上无意义，因为页可能已被逐出。

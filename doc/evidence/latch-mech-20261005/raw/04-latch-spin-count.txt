@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:33984.1 Init.ora Parameter "_LATCH_SPIN_COUNT" [Hidden] Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997001
+
+  ── 描述 ──
+  PARAMETER:LATCH_SPIN_COUNT Note Parameter: LATCH_SPIN_COUNT ~~~~~~~~~~~~~~~~~~~~~~~~~~~ Defined In:
+  ksl.h Versions: See <IVERS.LATCH_SPIN_COUNT> Values: Numeric Related: <Parameter:SPIN_COUNT>
+  Description: ~~~~~~~~~~~~ Amount to spin waiting for a latch Articles: ~~~~~~~~~ Overview of
+  Init.Ora Parameter Reference notes < Note:68462.1 >
+
+  ── 摘要 ──
+  _LATCH_SPIN_COUNT 是定义在 ksl.h 中的隐藏参数，控制进程获取 latch 前的自旋等待次数，与 SPIN_COUNT 参数相关。用于分析 latch 争用、自旋消耗和并发性能调优，错误设置可能影响 CPU 使用率或导致 latch 获取延迟异常。

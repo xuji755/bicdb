@@ -1,0 +1,43 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] latch 闩锁 自旋 spin willing-to-wait 争用
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 59，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 58，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     SUMMARY OF BUGS CAUSING DATABASE HANG OR SPIN Solution Oracle Confidential (INTERNAL). Do not distribute to customers Reason: These are Oracle bugs, and is only helpful as a reference not diagnosis... (AuthWiz 2.5.5) Click here to edit in wizard. Applies to: O
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:752876.1 SUMMARY OF BUGS CAUSING DATABASE HANG OR SPIN  (排序分: 14.4)
+     └ 摘要：该条目汇总了Oracle 9.2.0.4至11.1.0.7版本中引发数据库挂起或自旋的已知Bug，按根因分类：闩锁争用（如cache buffer chains latch被不存在进程持有、shared pool latch在AMM下自旋、row cache objects闩锁竞争）、资源管理器配置（如resmgr:waiting。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040423
+
+     [KnowledgeEntry] L1：SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2-c3  (排序分: 14.4)
+     └ 详情：SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2-c3
+SEVERE PERFORMANCE DEGRADATION DUE TO LATCH CONTENTION ON RAC ON IBM AIX 5.2
+.
+Copyright © 2006, Oracle. All rights reserved.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2044509
+
+     [KnowledgeEntry] L1：Mutex Latch Spin Causes High Cpu on Non-CAS Platforms (HP-UX PA-RISC ) [ID 433631.1]  (排序分: 14.4)
+     └ 摘要：在 HP-UX PA-RISC 等不支持 CAS (compare-and-swap) 架构的平台上，Oracle 10.2.0.1 - 10.2.0.3 使用 Mutex 闩锁模拟实现 mutex，受 Bug 5399325 影响，Mutex 闩锁自旋（latch spin）引发高 CPU 消耗。可通过设置 _kks_use_mutex_pin=false 临时规避，该参数控制。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047350
+
+     [KnowledgeEntry] L1：Note:413942.1 How to Identify Which Latch is Associated with a "latch free" wait  (排序分: 14.4)
+     └ 摘要：等待事件 latch free 是 Oracle 10g 之前的汇总闩锁等待，需通过 10046 trace 与 TKProf 定位具体闩锁。在 trace 的 WAIT # 行中提取 latch free 的 P2 字段，该值对应 V$LATCHNAME 的闩锁编号，查询即可获得闩锁名。该方法也适用于 10g 以后仍归。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047616
+
+     [CaseStudy] library_cache_latch_contention_case  (排序分: 9.1)
+     └ 详情：现象：系统出现大量'latch free'等待事件，等待对象为library cache latch。诊断：V$LATCH中library cache latch的SLEEPS值极高，V$SQLAREA中发现大量类似SQL但未共享。处理：修改应用程序使用绑定变量，减少硬解析次数，缓解闩锁竞争。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545900
+
+     [FaultModel] 闩锁竞争严重  (排序分: 8.6)
+     └ 摘要：现象：willing-to-wait latch hit ratio偏低且SLEEPS/MISS大。根因：多个进程频繁访问相同资源导致闩锁重试和睡眠。影响：CPU被闩锁重试浪费，性能急剧下降。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:325302
+

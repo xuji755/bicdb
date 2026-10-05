@@ -1,0 +1,11 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: Lightweight Locks (LWLocks) Concept
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:547554
+
+  ── 描述 ──
+  Lightweight Locks (LWLocks) Concept：轻量级锁持有时较短，支持共享和独占模式，无等待队列，无死锁检测但有可观测性。 分类：概念
+
+  ── 摘要 ──
+  轻量级锁持有时较短，支持共享和独占模式，无等待队列，无死锁检测但有可观测性。

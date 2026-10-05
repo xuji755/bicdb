@@ -1,0 +1,43 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] LWLock 轻量级锁 tranche 等待队列 实现
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 43，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 33，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     LWLock (轻量级锁)：用于保护共享数据结构的轻量级锁。 分类：概念
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] LWLock (轻量级锁)  (排序分: 10.0)
+     └ 详情：LWLock (轻量级锁)：用于保护共享数据结构的轻量级锁。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:547353
+
+     [KnowledgeEntry] Lightweight Locks (LWLocks) Concept  (排序分: 9.4)
+     └ 详情：Lightweight Locks (LWLocks) Concept：轻量级锁持有时较短，支持共享和独占模式，无等待队列，无死锁检测但有可观测性。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:547554
+
+     [KnowledgeEntry] LWLock等待队列FIFO与释放唤醒  (排序分: 9.4)
+     └ 详情：LWLockAcquire在无法获取锁时调用LWLockQueueSelf将进程加入锁的等待队列，该队列基于proclist实现FIFO。释放锁时由释放者唤醒等待队列的队首进程，但被唤醒者仍需要重新调用LWLockAttemptLock竞争，而不是被直接授予锁。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2069758
+
+     [KnowledgeEntry] PostgreSQL_锁等待队列机制  (排序分: 9.4)
+     └ 详情：PostgreSQL_锁等待队列机制：PostgreSQL使用锁等待队列管理锁请求，等待队列中的锁会阻塞后续可能冲突的锁请求，导致连锁阻塞。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:559913
+
+     [CaseStudy] 案例：过度索引导致规划时间退化和 LWLock 锁竞争  (排序分: 9.1)
+     └ 摘要：过度索引导致两个核心问题：一是查询规划时间随索引数量增加而显著退化，二是当表上索引数超过15个时，触发fastpath=false机制，高并发下大量会话争抢LWLock:LockManager锁。典型影响包括查询响应变慢、系统吞吐量下降。关键指标：拥有32个索引的表相比1个索引的表，规划时间退化4倍以上；关系数（表加索引）≥17时，出现大量LockManager等待状态。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:123159
+
+     [FaultModel] 锁等待队列级联阻塞  (排序分: 8.6)
+     └ 摘要：PostgreSQL锁等待队列中的锁会与后续请求的锁冲突，导致一个等待链，多个进程同时等待同一对象，但只有第一个等待者是真正的冲突。需识别并处理首个等待者。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1467669
+

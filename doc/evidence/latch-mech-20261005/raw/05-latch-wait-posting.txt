@@ -1,0 +1,22 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:32835.1 Init.ora Parameter "_LATCH_WAIT_POSTING" [Hidden] Reference Note
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1997002
+
+  ── 描述 ──
+  PARAMETER:LATCH_WAIT_POSTING Note Parameter: LATCH_WAIT_POSTING ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Oracle8i: HIDDEN Identifier: kslpsw Versions: See <IVERS.LATCH_WAIT_POSTING> Values: Related:
+  <Parameter:SPIN_COUNT> Description: ~~~~~~~~~~~~ Latch wait posting is another way of aquiring
+  latches. If a process cannot get a latch after its 'spin' period (See <Parameter:SPIN_COUNT> ) then
+  it will normally sleep, retry, sleep, retry until it obtains the latch (Unless it is a nowait latch
+  get). Latches can be defined as 'long wait' latches. These latches use latch wait posting (when
+  _latch_wait_posting is set to 1 (default)). Processes wanting such a latch add themselves to a list
+  of waiters for the latch. When the holding process releases the latch it posts the waiter. If
+  _latch_wait_posting is set to a value greater than 1 then the latch wait posting algorithm is used
+  for all latches. If it is left at 1 then it is used for 'long wait' latches only. If it is set to 0
+  then no latch wait posting occurs. Articles: Overview of Init.Ora Parameter Reference notes <
+  Note:68462.1 >
+
+  ── 摘要 ──
+  _LATCH_WAIT_POSTING 是 Oracle 8i 隐藏参数，控制 latch 等待投递机制。默认值为 1，仅对长等待 latch 启用等待投递；设为大于 1 则对所有 latch 启用；设为 0 则禁用。该机制与 SPIN_COUNT 协作：进程自旋后若未获得 latch，将睡眠重试，或。
