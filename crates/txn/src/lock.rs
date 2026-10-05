@@ -143,17 +143,27 @@ pub struct Deadlock {
     pub victim_work: u32,
 }
 
-/// **死锁检测**：等待超 `threshold_ms` 才触发（§5.4.2 ④）；读等待结构建图、
-/// 找环、选牺牲者。
-///
-/// 返回 `None` ⇒ 未到阈值 / 无环。环检测按事务标识有序遍历（可复现）。
+/// **死锁检测**（单机内存形态：直接从注册表取图——调用方须保证此处**不持**
+/// 门锁/闩锁；引擎形态用 [`detect_deadlock_from`] 配 [`WaitGate::snapshot`]）。
 pub fn detect_deadlock(
     registry: &WaitRegistry,
     chain: &UndoChain<'_, '_>,
     now_ms: u64,
     threshold_ms: u64,
 ) -> Result<Option<Deadlock>, bicdb_storage::undo::UndoChainError> {
-    let Some(oldest) = registry.oldest_wait_ms(now_ms) else {
+    detect_deadlock_from(&registry.snapshot(now_ms), chain, threshold_ms)
+}
+
+/// **死锁检测（基于冻结的等待图）**：等待超 `threshold_ms` 才触发（§5.4.2 ④）；
+/// 找环、选牺牲者（后者的链查找可能读盘——**本函数不持任何门锁**）。
+///
+/// 返回 `None` ⇒ 未到阈值 / 无环。环检测按事务标识有序遍历（可复现）。
+pub fn detect_deadlock_from(
+    graph: &WaitGraph,
+    chain: &UndoChain<'_, '_>,
+    threshold_ms: u64,
+) -> Result<Option<Deadlock>, bicdb_storage::undo::UndoChainError> {
+    let Some(oldest) = graph.oldest_wait_ms else {
         return Ok(None);
     };
     if oldest < threshold_ms {
@@ -161,9 +171,9 @@ pub fn detect_deadlock(
     }
     // 邻接表（等待者 → 持锁者）。
     let mut edges: BTreeMap<TxnId, Vec<TxnId>> = BTreeMap::new();
-    for (waiter, holder) in registry.edges() {
-        edges.entry(waiter).or_default().push(holder);
-        edges.entry(holder).or_default();
+    for (waiter, holder) in &graph.edges {
+        edges.entry(*waiter).or_default().push(*holder);
+        edges.entry(*holder).or_default();
     }
     if let Some(cycle) = find_cycle(&edges) {
         let victim = pick_victim(&cycle, chain)?;
@@ -245,6 +255,33 @@ fn pick_victim(
         }
     }
     Ok(best.expect("环非空"))
+}
+
+/// **等待图的冻结快照**：在门锁内取、**出锁后用**。
+///
+/// 为什么必须冻结（《Oracle vs PG》§7.3 的教训 + 本库设计口径）：死锁检测要
+/// 用持锁者的 `rec_count` 选牺牲者，那需要**查撤销链**（链页可能不在池里 ⇒
+/// 读盘）；若在门锁内做，就把"登记/挂起/唤醒"全卡在 I/O 上——PG 明言
+/// "检测在持有锁管理器锁时运行会放大竞争"，而我们的设计口径是
+/// "检测器对该结构**无锁读**，容忍一次瞬时不精确（下一轮再发现）"。
+/// 冻结快照正是两者的落法：图取完即放门锁，链查找在无锁区完成。
+#[derive(Debug, Clone, Default)]
+pub struct WaitGraph {
+    /// 边：等待者 → 持锁者。
+    pub edges: Vec<(TxnId, TxnId)>,
+    /// 最老等待已持续多少毫秒（`None` = 无人等待）。
+    pub oldest_wait_ms: Option<u64>,
+}
+
+impl WaitRegistry {
+    /// 冻结成等待图（`now_ms` 用于算最老等待时长）。
+    #[must_use]
+    pub fn snapshot(&self, now_ms: u64) -> WaitGraph {
+        WaitGraph {
+            edges: self.edges(),
+            oldest_wait_ms: self.oldest_wait_ms(now_ms),
+        }
+    }
 }
 
 /// 事务的"修改量"（`rec_count` 作代理）。
@@ -363,7 +400,13 @@ impl WaitGate {
         }
     }
 
-    /// 在门锁内执行一段只读逻辑（死锁检测等——等待图与挂起同锁 ⇒ 快照一致）。
+    /// **冻结等待图**（门锁内克隆、立即还锁）——死锁检测的输入。
+    pub fn snapshot(&self, now_ms: u64) -> WaitGraph {
+        self.lock().registry.snapshot(now_ms)
+    }
+
+    /// 在门锁内执行一段只读逻辑（**只许纯内存**：链查找等可能读盘的动作一律
+    /// 走 [`WaitGate::snapshot`] 出锁后做）。
     pub fn with_registry<T>(&self, f: impl FnOnce(&WaitRegistry) -> T) -> T {
         f(&self.lock().registry)
     }
@@ -504,5 +547,23 @@ mod tests {
         assert_eq!(gate.wake(tid(9)), vec![tid(2)]);
         // 取消者不再等在册（也就不会"醒来"）。
         assert!(!gate.park(tid(1), Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn wait_graph_snapshot_is_frozen_and_leaves_the_gate_free() {
+        // 死锁检测的输入 = **冻结快照**（门锁内克隆、立即还锁）：检测者随后
+        // 做链查找（可能读盘）时不持门锁——登记/挂起/唤醒不被卡住。
+        let gate = WaitGate::new();
+        gate.register(tid(1), tid(2), row(1), 0);
+        let graph = gate.snapshot(1_000);
+        assert_eq!(graph.edges, vec![(tid(1), tid(2))]);
+        assert_eq!(graph.oldest_wait_ms, Some(1_000));
+        // 快照后变更注册表：快照不变（冻结）。
+        assert!(gate.cancel(tid(1)));
+        assert_eq!(graph.edges.len(), 1, "冻结图不受后续变更影响");
+        assert_eq!(gate.snapshot(1_000).edges.len(), 0, "新快照反映现状");
+        // 门锁没被快照/检测占用：登记与唤醒立即生效。
+        gate.register(tid(3), tid(4), row(2), 0);
+        assert_eq!(gate.wake(tid(4)), vec![tid(3)]);
     }
 }

@@ -29,7 +29,7 @@ use bicdb_storage::buffer::{BufferKey, BufferPool};
 use bicdb_storage::undo::{TxnId, TxnState, UndoChain};
 use bicdb_wal::group::GroupWriter;
 
-use crate::lock::{Deadlock, WaitGate, WaitRegistry};
+use crate::lock::{Deadlock, WaitGate};
 use crate::snapshot::{SnapshotHandle, SnapshotRegistry};
 use crate::write::{self, StatementContext, StatementMark, Txn, TxnError, WaitPolicy};
 
@@ -292,15 +292,14 @@ impl<'a, 'b, 'io, 'f> StatementContext for LockCtx<'_, 'a, 'b, 'io, 'f> {
 
     fn detect(
         &mut self,
-        registry: &WaitRegistry,
-        now_ms: u64,
+        graph: &crate::lock::WaitGraph,
         threshold_ms: u64,
     ) -> Result<Option<Deadlock>, TxnError> {
+        // 图已冻结（门锁已还）；这里只做链查找（可能读盘）——**不持门锁**。
         let chain = self.engine.chain.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(crate::lock::detect_deadlock(
-            registry,
+        Ok(crate::lock::detect_deadlock_from(
+            graph,
             &chain,
-            now_ms,
             threshold_ms,
         )?)
     }

@@ -1069,11 +1069,11 @@ pub trait StatementContext {
     /// 试一次（背靠资源）。
     fn attempt(&mut self, txn: &mut Txn) -> Result<Self::Item, TxnError>;
 
-    /// 死锁检测（等待图由驱动给出；"我的链"由实现接）。
+    /// 死锁检测（**输入是冻结的等待图**——驱动在门锁内取好，实现只做链查找
+    /// 与选牺牲者：**不得在门锁内做可能读盘的动作**，见 `lock::WaitGraph`）。
     fn detect(
         &mut self,
-        registry: &crate::lock::WaitRegistry,
-        now_ms: u64,
+        graph: &crate::lock::WaitGraph,
         threshold_ms: u64,
     ) -> Result<Option<crate::lock::Deadlock>, TxnError>;
 
@@ -1114,14 +1114,12 @@ where
 
     fn detect(
         &mut self,
-        registry: &crate::lock::WaitRegistry,
-        now_ms: u64,
+        graph: &crate::lock::WaitGraph,
         threshold_ms: u64,
     ) -> Result<Option<crate::lock::Deadlock>, TxnError> {
-        Ok(crate::lock::detect_deadlock(
-            registry,
+        Ok(crate::lock::detect_deadlock_from(
+            graph,
             self.chain,
-            now_ms,
             threshold_ms,
         )?)
     }
@@ -1184,8 +1182,10 @@ pub fn drive<C: StatementContext>(
             Ok(v) => return Ok(v),
             Err(TxnError::RowLocked { holder, row }) => {
                 gate.register(txn.txn_id, holder, row, now());
-                let deadlock =
-                    gate.with_registry(|r| ctx.detect(r, now(), policy.deadlock_threshold_ms))?;
+                // **冻结等待图（门锁内、纯内存）→ 出锁再做链查找**：检测者
+                // 不得把"登记/挂起/唤醒"卡在链 I/O 上（`lock::WaitGraph` 文档）。
+                let graph = gate.snapshot(now());
+                let deadlock = ctx.detect(&graph, policy.deadlock_threshold_ms)?;
                 if let Some(dl) = deadlock {
                     if dl.victim == txn.txn_id {
                         let _ = gate.cancel(txn.txn_id);
