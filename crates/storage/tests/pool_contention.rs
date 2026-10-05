@@ -107,8 +107,8 @@ where
 #[ignore = "本地基准（跑法见模块文档）；不进 CI"]
 fn pool_paths_contention() {
     let secs = 1.0;
-    println!("| 路径 | 线程 | 吞吐（万次/秒） |");
-    println!("| --- | --- | --- |");
+    println!("| 路径 | 线程 | 吞吐（万次/秒） | `db_cache` 判读（§2.7 口径） |");
+    println!("| --- | --- | --- | --- |");
     for threads in [1usize, 2, 4, 8, 16, 32] {
         let pool = fixture(1, threads);
         // A：不同块 pin（各自独占；共享点 = 结构闩锁）。
@@ -151,18 +151,16 @@ fn pool_paths_contention() {
             }
             n
         });
+        let lc = pool.latch_stats().contention();
         println!(
-            "| A 不同块 `pin`（结构闩锁） | {threads} | {:.1} |",
-            a / 1e4
+            "| A 不同块 `pin`（结构闩锁） | {threads} | {:.1} | misses/gets={:.2} sleeps/gets={:.3} spin成功率={:.2} |",
+            a / 1e4,
+            lc.intensity,
+            lc.sleep_ratio,
+            lc.spin_success
         );
-        println!(
-            "| B 同块 `pin`（内容锁独占） | {threads} | {:.1} |",
-            b / 1e4
-        );
-        println!(
-            "| C 同块 `pin_shared`（内容锁共享） | {threads} | {:.1} |",
-            c / 1e4
-        );
+        println!("| B 同块 `pin`（内容锁独占） | {threads} | {:.1} | — |", b / 1e4);
+        println!("| C 同块 `pin_shared`（内容锁共享） | {threads} | {:.1} | — |", c / 1e4);
     }
     // D：分区数的影响（不同块 pin，4 分区）。
     for threads in [8usize, 32] {
@@ -181,9 +179,6 @@ fn pool_paths_contention() {
             }
             n
         });
-        println!(
-            "| D 不同块 `pin`（4 分区同哈希） | {threads} | {:.1} |",
-            d / 1e4
-        );
+        println!("| D 不同块 `pin`（4 分区同哈希） | {threads} | {:.1} | — |", d / 1e4);
     }
 }
