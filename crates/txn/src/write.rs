@@ -78,6 +78,12 @@ pub enum TxnError {
         /// 需要的字节数。
         need: usize,
     },
+    /// **行被其他事务锁住**（§5.4.2 ① 的等待分支）：调用方登记等待
+    /// （`lock::WaitRegistry`）、放 latch、重试；等久了由死锁检测（④）处置。
+    RowLocked {
+        /// 持锁者。
+        holder: bicdb_storage::undo::TxnId,
+    },
 }
 
 impl std::fmt::Display for TxnError {
@@ -99,6 +105,9 @@ impl std::fmt::Display for TxnError {
             ),
             TxnError::NoMigrationTarget { need } => {
                 write!(f, "行迁移需要 {need} 字节的可用页，分配口给不出")
+            }
+            TxnError::RowLocked { holder } => {
+                write!(f, "行被事务 {holder:?} 锁住：转入等待（§5.4.2）")
             }
         }
     }
@@ -205,8 +214,9 @@ pub fn insert_row(
         heap::insert_row(&mut probe, row, policy)?;
     }
 
-    // ② 占用 ITL 槽（复用/清除/新占用都在 `occupy_itl` 里，§5.4.1）。
-    let slot = occupy_itl(pool, log, chain, txn, &mut local, block)?;
+    // ② 占用 ITL 槽（复用/清除/新占用都在 `occupy_itl` 里，§5.4.1）——
+    //    新行随插入即被本事务锁住。
+    let (slot, _) = occupy_itl(pool, log, chain, txn, &mut local, block)?;
 
     // ③ 插行（快照上，**回填行头的 `itl_slot`**）+ 记"插入"撤销记录。
     let mut patched = row.to_vec();
@@ -255,7 +265,10 @@ pub fn delete_row(
     // 占用 ITL 条目（含清除/复用/新占用的记录与条目写入）——行锁与可见性
     // 的落点，**不能省**（本切片修复：此前 delete/update 在空槽上什么都不写，
     // 未提交删除/更新对所有快照可见）。
-    let _slot = occupy_itl(pool, log, chain, txn, &mut local, block)?;
+    // **加锁 + 占用 ITL 条目**（清除/复用/新占用 + `ITL 覆盖` 记录）——
+    // 行锁与可见性的落点；行被他人活动事务锁住 ⇒ `RowLocked`（调用方登记
+    // 等待后重试，§5.4.2 ①），**不得静默失败**。
+    lock_and_occupy(pool, log, chain, txn, &mut local, block, row_no)?;
     let rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?;
     append_undo_via_pool(
         pool,
@@ -331,7 +344,8 @@ pub fn update_row(
     if new_row.len() <= old_row.len() {
         // 不增：就地重写（等长到收缩同径——收缩时尾部旧字节一并进补丁，
         // 撤销按偏移写回即恢复原长；行区留下的洞由 defrag 处理，§6.8）。
-        let slot = occupy_itl(pool, log, chain, txn, &mut src_local, block)?;
+        // 加锁 + 占用 ITL（行被他人锁住 ⇒ `RowLocked`，同 delete）。
+        let slot = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
         let patches = row_patches(&old_row, new_row);
         append_undo_via_pool(
             pool,
@@ -393,7 +407,7 @@ pub fn update_row(
     let dest_before = *dest_local.as_bytes();
 
     // ① 源页：占用 ITL + "删除"记录（= 迁移的"旧位置"半边）。
-    let src_slot = occupy_itl(pool, log, chain, txn, &mut src_local, block)?;
+    let src_slot = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
     append_undo_via_pool(
         pool,
         log,
@@ -407,7 +421,8 @@ pub fn update_row(
     let dest_slot = if dest_same {
         src_slot
     } else {
-        occupy_itl(pool, log, chain, txn, &mut dest_local, dest_key)?
+        // 目的页上的**新行**：随插入即被本事务锁住（无既有锁可争）。
+        occupy_itl(pool, log, chain, txn, &mut dest_local, dest_key)?.0
     };
     let mut patched = new_row.to_vec();
     patched[1] = dest_slot as u8;
@@ -577,9 +592,9 @@ fn occupy_itl(
     txn: &Txn,
     local: &mut Page,
     block: BufferKey,
-) -> Result<u16, TxnError> {
+) -> Result<(u16, bool), TxnError> {
     match ensure_itl_entry(local, chain, txn.txn_id)? {
-        ItlAcquire::Existing(slot) => Ok(slot),
+        ItlAcquire::Existing(slot) => Ok((slot, false)),
         ItlAcquire::Fresh { slot, old } => {
             // `ITL 覆盖` 是**块级**动作：记录里的行号只借它的 file/block 定位块。
             let block_rowid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), 1)?;
@@ -603,10 +618,163 @@ fn occupy_itl(
                     txn_id: txn.txn_id,
                     undo_ptr: Some(head),
                     commit_seq: None,
-                    lock_cnt: 1,
+                    lock_cnt: 1, // 第一把行锁随占用计入
                     state: ItlState::Active,
                 },
             )?;
+            Ok((slot, true))
+        }
+    }
+}
+
+/// **行锁获取结果**（§5.4.2 ①）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOutcome {
+    /// 已持有——`reentrant` = 该行本就指向**本事务**的 ITL 条目（重入，
+    /// 不重复计 `lock_cnt`）。
+    Acquired {
+        /// 是否重入。
+        reentrant: bool,
+    },
+    /// 槽属**他人且其事务仍活动**：调用方转入等待（登记 + 放 latch + 重试）。
+    WouldWait {
+        /// 持锁者。
+        holder: bicdb_storage::undo::TxnId,
+    },
+}
+
+/// **在一页上判定某行的锁归属**（不做 I/O、不改页——判定与写入分离，
+/// 等待发生在 latch 之外，§5.4.2）。
+///
+/// 判据（§5.4.2 ①）：
+/// - 行头 `itl_slot` 无 / 越界 / 条目非活动 / 条目属**已提交或已回收**的事务
+///   ⇒ 可加锁（后两类由后续 `occupy_itl` 的"清除先行"复用）；
+/// - 条目**活动且是本事务** ⇒ 重入；
+/// - 条目**活动且是他人**（事务表里仍 `Active`/`PendingRollback`）⇒ 等待。
+pub fn decide_row_lock(
+    local: &Page,
+    chain: &UndoChain<'_, '_>,
+    txn: &Txn,
+    block: BufferKey,
+    row_no: u16,
+) -> Result<LockOutcome, TxnError> {
+    let row = heap::row(local, row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
+    let slot_byte = row[1];
+    if slot_byte == bicdb_storage::row::ITL_SLOT_NONE {
+        return Ok(LockOutcome::Acquired { reentrant: false });
+    }
+    let index = u16::from(slot_byte);
+    if index >= itl::itl_count(local)? {
+        // 页状态早于该行（PITR 有界重放的形态）：不算被锁。
+        return Ok(LockOutcome::Acquired { reentrant: false });
+    }
+    let entry = itl::read_itl(local, index)?;
+    if entry.state != ItlState::Active {
+        return Ok(LockOutcome::Acquired { reentrant: false });
+    }
+    if entry.txn_id == txn.txn_id {
+        // 字面重入；但仍要过**陈旧字节**这关（同下）：本行指向我的槽、我的链上
+        // 却没有本行的记录 ⇒ 那是旧占用者留下的槽号，恰好撞上我新占的槽——
+        // 本行其实**还没被锁**。
+        return Ok(
+            if holder_locked_this_row(chain, txn.txn_id, block, row_no)? {
+                LockOutcome::Acquired { reentrant: true }
+            } else {
+                LockOutcome::Acquired { reentrant: false }
+            },
+        );
+    }
+    // "活动外观"可能属于**早已提交但未清除**的事务——查事务表定夺
+    // （§4.6.3：已提交的槽不算"被锁"；已回收 ⇒ 更不算）。
+    match chain.lookup(entry.txn_id)? {
+        Some(slot) if matches!(slot.state, TxnState::Active | TxnState::PendingRollback) => {
+            // **陈旧字节消歧**：槽**可复用**（§5.4.1：非活动且 `lock_cnt = 0`）
+            // ⇒ 旧占用者的槽会被新事务**接管**，而旧占用者未碰过的行其
+            // `itl_slot` 字节就停在旧槽号上——那个槽现在写着**新事务**的名字，
+            // 行却没被新事务锁过（实测：t1 更新本块另一行后，t2 想改本行被
+            // 误判为"等 t1"）。判据：**锁与修改同源**——真的锁了本行的事务，
+            // 其撤销链里必有**针对本行**的记录（锁与记录同一步落）；没有 ⇒
+            // 字节是陈旧值，行可加锁。
+            if holder_locked_this_row(chain, entry.txn_id, block, row_no)? {
+                Ok(LockOutcome::WouldWait {
+                    holder: entry.txn_id,
+                })
+            } else {
+                Ok(LockOutcome::Acquired { reentrant: false })
+            }
+        }
+        _ => Ok(LockOutcome::Acquired { reentrant: false }),
+    }
+}
+
+/// **陈旧字节消歧**（见 [`decide_row_lock`] 的说明）：`holder` 的撤销链里有没有
+/// **针对本行**的记录。`ItlOverwrite` 是块级记录（其行号是占位 1），不参与判定。
+///
+/// 代价只落在**争用路径**上（行字节指向他人活动条目时）；步数按 `rec_count + 1`
+/// 设预算，受损链不得死循环（同 `rollback_chain` 的防线）。
+fn holder_locked_this_row(
+    chain: &UndoChain<'_, '_>,
+    holder: bicdb_storage::undo::TxnId,
+    block: BufferKey,
+    row_no: u16,
+) -> Result<bool, TxnError> {
+    let (file_id, block_id) = (block.rdba.file_id(), block.rdba.block_id());
+    let Some(slot) = chain.lookup(holder)? else {
+        return Ok(false); // 槽已回收 ⇒ 更不可能持锁
+    };
+    let mut at = slot.undo_current;
+    let mut budget = u64::from(slot.rec_count) + 1;
+    while let Some(pos) = at {
+        if budget == 0 {
+            return Err(TxnError::Chain(UndoChainError::Undo(
+                bicdb_storage::undo::UndoError::MalformedRecord,
+            )));
+        }
+        budget -= 1;
+        let record = chain.read(pos)?;
+        at = record.prev;
+        if record.op == UndoOp::ItlOverwrite {
+            continue;
+        }
+        if record.rowid.file_id() == file_id
+            && record.rowid.block_id() == block_id
+            && record.rowid.row_id() == row_no
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// **加锁并占用 ITL 条目**（写路径的前置：§5.4.2 ① 的完整落点）。
+///
+/// 返回可用的 ITL 槽号（重入时即该行既有的槽）；`WouldWait` ⇒
+/// [`TxnError::RowLocked`]——调用方登记等待后重试，**不得静默失败**。
+#[allow(clippy::too_many_arguments)]
+fn lock_and_occupy(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    txn: &Txn,
+    local: &mut Page,
+    block: BufferKey,
+    row_no: u16,
+) -> Result<u16, TxnError> {
+    match decide_row_lock(local, chain, txn, block, row_no)? {
+        LockOutcome::WouldWait { holder } => Err(TxnError::RowLocked { holder }),
+        LockOutcome::Acquired { reentrant: true } => {
+            // 同一行的重入：槽已就位，不重复计 `lock_cnt`。
+            let row = heap::row(local, row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
+            Ok(u16::from(row[1]))
+        }
+        LockOutcome::Acquired { reentrant: false } => {
+            let (slot, fresh) = occupy_itl(pool, log, chain, txn, local, block)?;
+            if fresh {
+                // 新占用：条目已按"第一把行锁"计 1（见 `occupy_itl`）。
+            } else {
+                // 本事务在该块已有条目（锁的是**另一行**）：行数 +1。
+                itl::lock(local, slot)?;
+            }
             Ok(slot)
         }
     }
@@ -1942,6 +2110,258 @@ mod tests {
             "指针已还原"
         );
         assert_eq!(heap::row(&dst, target.row_id()), None, "新行被撤销");
+    }
+
+    #[test]
+    fn second_writer_waits_then_succeeds_after_the_holder_ends() {
+        // §5.4.2 ①：行锁的"他人持锁 ⇒ 等待"分支；持锁者结束后唤醒重试成功。
+        let io = mem();
+        let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        // 已提交的行（前一个事务）。
+        let row = row_bytes(b"lock-target");
+        let mut t0 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let rid = insert_row(&pool, &mut log, &mut chain, &mut t0, key, &row, &policy).unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+
+        // t1 锁住它（等长更新——就地），不提交。
+        let v1 = row_bytes(b"lock-target"); // 同长
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid.row_id(),
+            &v1,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+
+        // t2 想改同一行 ⇒ `RowLocked`（等待分支），登记等待并唤醒语义由注册表承担。
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let mut reg = crate::lock::WaitRegistry::new();
+        let err = update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            rid.row_id(),
+            &v1,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap_err();
+        match err {
+            TxnError::RowLocked { holder } => {
+                assert_eq!(holder, t1.txn_id, "持锁者是 t1");
+                reg.register(
+                    t2.txn_id,
+                    holder,
+                    RowId::from_parts(3, 1, rid.row_id()).unwrap(),
+                    0,
+                );
+            }
+            other => panic!("应为 RowLocked：{other}"),
+        }
+        assert_eq!(reg.waiters_of(t1.txn_id).len(), 1);
+
+        // 持锁者结束（回滚）⇒ 唤醒其全部等待者；t2 重试成功。
+        rollback(&pool, &mut log, &mut chain, &mut t1).unwrap();
+        assert_eq!(
+            crate::lock::on_txn_end(&mut reg, t1.txn_id),
+            vec![t2.txn_id]
+        );
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            rid.row_id(),
+            &v1,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t2, seq(2)).unwrap();
+    }
+
+    #[test]
+    fn committed_holder_does_not_block_and_reentrant_lock_is_free() {
+        // §4.6.3/§5.4.2：**已提交的槽不算"被锁"**（延迟块清除下也如此）；
+        // 同事务重复锁同一行 = 重入，不重复计 `lock_cnt`；同块另一行 ⇒ +1。
+        let io = mem();
+        let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        let r1 = row_bytes(b"first-row");
+        let mut t0 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let rid1 = insert_row(&pool, &mut log, &mut chain, &mut t0, key, &r1, &policy).unwrap();
+        let rid2 = insert_row(&pool, &mut log, &mut chain, &mut t0, key, &r1, &policy).unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+        // 加锁（更新 rid1 与 rid2：同块两行 ⇒ lock_cnt = 2）。
+        let v = row_bytes(b"first-row");
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid1.row_id(),
+            &v,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid2.row_id(),
+            &v,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        let page = page_snapshot(&pool, key);
+        let slot = itl_of(&page, 0);
+        assert_eq!(slot.txn_id, t1.txn_id);
+        assert_eq!(slot.lock_cnt, 2, "同块两行锁 = 2");
+        // 重入（再改 rid1）不重复计数。
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid1.row_id(),
+            &v,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        assert_eq!(
+            itl_of(&page_snapshot(&pool, key), 0).lock_cnt,
+            2,
+            "重入不重复计"
+        );
+
+        // t1 提交：其槽变 `Committed` ⇒ 后继事务**不被阻塞**（已提交不算锁）。
+        commit(&pool, &mut log, &mut chain, &mut t1, seq(1)).unwrap();
+        // 注意：未清除的条目外观仍是 Active——锁判定查事务表定夺。
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            rid1.row_id(),
+            &v,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t2, seq(2)).unwrap();
+    }
+
+    #[test]
+    fn deadlock_detection_finds_the_cycle_and_picks_the_lighter_victim() {
+        // §5.4.2 ④：等待超阈值 → 环检测 → 牺牲者 = 已修改行数最少者。
+        let io = mem();
+        let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        let r = row_bytes(b"row-lock");
+        let mut t0 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let rid_a = insert_row(&pool, &mut log, &mut chain, &mut t0, key, &r, &policy).unwrap();
+        let rid_b = insert_row(&pool, &mut log, &mut chain, &mut t0, key, &r, &policy).unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+
+        // t1 锁 A（1 次更新）；t2 锁 B（2 次更新——修改量更大）。
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let v = row_bytes(b"row-lock");
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid_a.row_id(),
+            &v,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            rid_b.row_id(),
+            &v,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        let r2 = row_bytes(b"row-lock2");
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            rid_b.row_id(),
+            &r2,
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+
+        // 互相等待（把"等不到"登记进等待结构；资源字段仅诊断）。
+        let mut reg = crate::lock::WaitRegistry::new();
+        let a = RowId::from_parts(3, 1, rid_a.row_id()).unwrap();
+        let b = RowId::from_parts(3, 1, rid_b.row_id()).unwrap();
+        reg.register(t1.txn_id, t2.txn_id, b, 0);
+        reg.register(t2.txn_id, t1.txn_id, a, 0);
+
+        // 阈值未到 ⇒ 不检测。
+        assert!(crate::lock::detect_deadlock(&reg, &chain, 1_000, 3_000)
+            .unwrap()
+            .is_none());
+        // 超阈值 ⇒ 检出环，牺牲者 = 修改量少的 t1。
+        let dl = crate::lock::detect_deadlock(&reg, &chain, 5_000, 3_000)
+            .unwrap()
+            .expect("应检出死锁");
+        assert_eq!(dl.cycle.len(), 2);
+        assert!(dl.cycle.contains(&t1.txn_id) && dl.cycle.contains(&t2.txn_id));
+        assert_eq!(dl.victim, t1.txn_id, "牺牲者 = 已修改行数最少者");
+        assert!(dl.victim_work < 2 || dl.victim_work <= 2, "修改量代理值");
+
+        // 牺牲者"不再等待" ⇒ 环即解开（会话层的语句级回滚是其后续动作）。
+        reg.cancel(t1.txn_id);
+        assert!(crate::lock::detect_deadlock(&reg, &chain, 5_000, 3_000)
+            .unwrap()
+            .is_none());
     }
 
     /// 迁移分配口：**拒绝换页**（用例里的改长都应同页完成；跨页迁移由专门

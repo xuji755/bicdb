@@ -18,7 +18,8 @@
 //!   提交点 = 提交记录耐久（槽标记失败不回滚，由恢复前滚补标记兜底）；
 //!   **新撤销页先 fsync 落盘、后进 redo**（物理增量无法重建不存在的页）。
 //!
-//! 配套：[`snapshot`]（最老快照集合，§12.7——undo 回收的唯一输入）。
+//! 配套：[`snapshot`]（最老快照集合，§12.7——undo 回收的唯一输入）、
+//! [`lock`]（行锁的等待结构与死锁检测，§5.4.2）。
 //!
 //! 三条纪律（§11.1）：
 //! 1. **写先入缓存**——DML 只改缓冲池里的页，脏页由 DBWR（Make Free/检查点）写回；
@@ -28,5 +29,6 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod lock;
 pub mod snapshot;
 pub mod write;
