@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed
+  名称: DB_BLOCK_HASH_BUCKETS
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:153944
+
+  ── 描述 ──
+  DB_BLOCK_HASH_BUCKETS是隐藏参数_DB_BLOCK_HASH_BUCKETS，用于设置数据库块哈希桶数量，默认值为db_block_buffers/4。调整此参数可影响哈希链长度和
+  cache buffers chains latch的争用情况，通常不需要修改。应用场景：仅在诊断或调优latch竞争时考虑，不建议随意调整。配置 config
+  _DB_BLOCK_HASH_BUCKETS Hash buckets cache buffers chains latch
+
+  ── 摘要 ──
+  隐藏参数_DB_BLOCK_HASH_BUCKETS用于设置数据库块哈希桶的数量，默认值为db_block_buffers除以4。调整该参数会影响哈希链的长度以及cache buffers chains latch的争用情况，但通常无需修改。

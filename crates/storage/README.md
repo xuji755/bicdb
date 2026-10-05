@@ -50,8 +50,9 @@
   校验"40 区、块 1 起连续"。代价：每文件固定多占 5 MiB（用户裁定：留够位置
   支持扩展到最大、性能最好）。
 - **DB Cache v2**（`buffer`，§5.10 完整设计；结构照 Oracle `kcbwds`/`kcbbh`）：
-  **哈希定位** = 键对桶数**取模** → 链上扫描（桶数取**质数**，≥2×容量 ⇒
-  期望链长 ≤ 0.5；桶数组 + 一把 latch 保护一组桶，照 `kcbz.h` 形态）、
+  **哈希定位** = **`DBA mod 桶数`** → 链上扫描（桶数取**质数**、默认 ≈
+  **容量/4**——Oracle `_DB_BLOCK_HASH_BUCKETS` 默认口径；桶数组 + 一把 latch
+  保护一组桶，照 `kcbz.h` 形态）、
   **热段/冷段**（`HBMAX = 容量/4`，新帧落冷段头）、**LRU-AUX**（前台优先扫）、
   **touch count：三秒规则 + 老化减半**（Note 104937.1：命中合并窗口
   `dbagingtouchtime`；达热判据升热段并置驻留值 `_STAY_COUNT`；冷却/退回置
@@ -59,7 +60,8 @@
   缓冲 = AUX → 冷段尾（上限 = 容量/4）→ **Make Free**（内联 DBWR 批处理：
   写列表**头**按序写、WAL 规则 2、写完入 AUX）；统计照 X$KCBWDS 口径
   （`fb_wait`/`free_inspected`/`dirty_inspected`/`pinned_inspected`/`hot_moved`/
-  `aux_moved`/`aging_steps`）；`CacheConfig` 全部可调、`Clock` 可注入。
+  `aux_moved`/`aging_steps`）；`touch_count(key)` 即 `x$bh.TCH` 的对应口
+  （热块诊断链路：桶链长 + TCH）。`CacheConfig` 全部可调、`Clock` 可注入。
   v1 的键/写列表/WAL 规则 2/诊断口径全部保留——只换链系与调度。
 - **缓冲池 v1 骨架**（`buffer`，§5.10，P3）：**实例级共享**、键 =（工作区标识, RDBA）、
   页头身份逐项核对（串页防线）；LRU 淘汰 + **每工作区脏链**（按首次变脏 LSN

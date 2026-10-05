@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] cache buffers chains latch 争用 热块 hot block hash buckets 调整
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     "CACHE BUFFERS CHAINS" LATCH CONTENTION AFTER UPGRADE TO 8.1.7 FROM 8.0.6 < TAR>: 13447588.600 ========================= < PROBLEM>: 1. Clear description of the problem encountered: Customer upgraded their production database to8.1.7 from 8.0.6, no other chang
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1："CACHE BUFFERS CHAINS" LATCH CONTENTION AFTER UPGRADE TO 8.1.7 FROM 8.0.6  (排序分: 14.4)
+     └ 摘要："CACHE BUFFERS CHAINS" LATCH CONTENTION AFTER UPGRADE TO 8.1.7 FROM 8.0.6："CACHE BUFFERS CHAINS" LATCH CONTENTION AFTER UPGRADE TO 8.1.7 FROM 8.0.6。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2045104
+
+     [KnowledgeEntry] L1：Note:163424.1 How To Identify a Hot Block Within The Database Buffer Cache. Open-Remarks: See <RemarksOn:NOTE:163424.1>  (排序分: 14.4)
+     └ 摘要：通过 v$latch_children 查看 cache buffers chains 闩锁的 sleep 计数，定位争用严重的子闩锁地址，再结合 x$bh 的 TCH 列与 dba_extents 关联段，识别缓冲区缓存中的热块，用于诊断热块导致的闩锁争用与性能问题。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996588
+
+     [KnowledgeEntry] L1：Note:163424.1 How To Identify a Hot Block Within The Database Buffer Cache.  (排序分: 14.4)
+     └ 摘要：当数据库出现 cache buffers chains latch 争用时，可通过查询 v$latch_children 找出 SLEEPS 最高的子锁地址 ADDR，将该地址作为 hladdr 关联 x$bh 和 dba_extents，利用 TCH 列判断热点块，用于诊断特定块引发的 latch 争用，并可通过调整应用逻。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040314
+
+     [KnowledgeEntry] L1：CACHE BUFFERS CHAINS CONTENTION  (排序分: 14.4)
+     └ 摘要：cache buffers chains contention 表示会话争用 cache buffers chains latch，通常因高并发访问同一数据块或热点块引发。案例中 10.2.0.2 数据库反复崩溃，PMON 或 CKPT 进程消失，崩溃前出现大量该 latch 请求，CPU 飙升至 100%。系统状态显示等待。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043088
+
+     [FaultModel] Cache Buffers Chains Latch  (排序分: 9.9)
+     └ 摘要：Cache buffers chains latch竞争，多个会话并发访问同一hash b
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:19585
+
+     [CaseStudy] 通过AWR报告识别Latch争用  (排序分: 9.1)
+     └ 摘要：场景：数据库性能下降，怀疑存在Latch争用问题。诊断：通过AWR报告中的Latch活动部分（Latch Activity）识别争用。关键指标包括：Latch名称（如shared pool、cache buffers chains）、请求次数（Gets）、等待次数（Misses）、睡眠次数（Sleeps）以及等待时间（Wait Time）。高Sleeps或高Wait Time表明严重争用。例如，cache buffers chains latch争用通常与热块（Hot Block）相关，shared pool latch争用与硬解析频繁相关。处理：根据具体Latch类型采取针对性措施，如优化SQL减少热块、使用绑定变量减少硬解析、调整参数（如_kgl_latch_count）或增加Latch数量。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531972
+

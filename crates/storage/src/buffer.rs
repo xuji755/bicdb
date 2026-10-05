@@ -14,7 +14,7 @@
 //!
 //! | 机制 | 落点 |
 //! | --- | --- |
-//! | **找块** | 桶 = `hash(工作区, rdba) mod 桶数（质数）`；未命中 → 找空闲帧 → 读页 → 身份核对 → 挂桶 |
+//! | **找块** | 桶 = **`DBA mod 桶数`**（桶数取质数，默认 ≈ 容量/4——Oracle `_DB_BLOCK_HASH_BUCKETS` 口径）；未命中 → 找空闲帧 → 读页 → 身份核对 → 挂桶 |
 //! | **腾块** | 前台先扫 **AUX**、再扫**冷段尾**（跳过钉住；脏块已在写列表 ⇒ 跳过）；扫不到 ⇒ **Make Free**（内联 DBWR 批处理：写列表头按序写） |
 //! | **写回** | 写列表**头**（= 最老首次变脏）逐块写；**WAL 规则 2**（redo 未持久化则推迟/催刷）；写完 → 清脏 → **入 AUX** |
 //!
@@ -97,7 +97,8 @@ impl Clock for SystemClock {
 /// 标"自定"——全部可调）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheConfig {
-    /// 哈希桶数（**质数**；默认 ≈ 2×容量，最小 7）。
+    /// 哈希桶数（**质数**；默认 ≈ 容量/4，最小 7——Oracle `_DB_BLOCK_HASH_BUCKETS`
+    /// 的默认口径 `db_block_buffers / 4`，取质数）。
     pub buckets: usize,
     /// 热段上限占比的分母（`HBMAX = 容量 / 该值`；Oracle `HBMAX` 语义，取值自定）。
     pub hot_fraction: usize,
@@ -119,7 +120,7 @@ impl CacheConfig {
     #[must_use]
     pub fn for_capacity(capacity: usize) -> Self {
         Self {
-            buckets: prime_at_least(2 * capacity.max(1)),
+            buckets: prime_at_least((capacity / 4).max(1)),
             hot_fraction: 4,
             touch_interval_ms: 3_000,
             cool_count: 0,
@@ -441,6 +442,14 @@ impl<'io> BufferPool<'io> {
             .and_then(|s| s.iter().next().map(|(lsn, _)| *lsn))
     }
 
+    /// 某帧的 **TCH**（touch count——对应 `x$bh` 的 `TCH` 列；热块诊断在
+    /// Oracle 侧即"TCH 越高，块被访问越频繁"）。
+    #[must_use]
+    pub fn touch_count(&self, key: BufferKey) -> Option<u32> {
+        let inner = self.lock();
+        inner.find_frame(key).map(|idx| inner.frames[idx].touches)
+    }
+
     /// 某帧在哪条链上（`hot` / `cold` / `aux`；诊断与测试）。
     #[must_use]
     pub fn chain_of(&self, key: BufferKey) -> Option<&'static str> {
@@ -563,16 +572,12 @@ impl Inner<'_> {
         self.frames.len() - self.virgin.len()
     }
 
-    /// 桶号（质数桶数；哈希跨工作区稳定）。
+    /// 桶号 = **DBA（rdba）对桶数取模**（Oracle `_DB_BLOCK_HASH_BUCKETS` 的原文
+    /// 口径："hash the required DBA by this number"）；跨工作区的同址块落同桶
+    /// ——链上再按完整键比对。
     fn bucket_of(&self, key: BufferKey) -> usize {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
-        for b in key.workspace {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h ^= u64::from(key.rdba.file_id()) | (u64::from(key.rdba.block_id()) << 16);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        (h % self.buckets.len() as u64) as usize
+        let dba = (u64::from(key.rdba.file_id()) << 28) | u64::from(key.rdba.block_id());
+        (dba % self.buckets.len() as u64) as usize
     }
 
     /// 桶内找帧。
@@ -1247,6 +1252,14 @@ mod tests {
         }
         let total: usize = (0..pool.bucket_count()).map(|b| pool.bucket_len(b)).sum();
         assert_eq!(total, 2, "两个块各挂一个桶");
+        // 桶号 = DBA mod 桶数（Oracle 原文口径）——直接验证放置位置。
+        let bucket = (u64::from(7u16) << 28) % pool.bucket_count() as u64;
+        assert_eq!(
+            pool.bucket_len(bucket as usize),
+            1,
+            "块 0 落在 DBA 取模的桶"
+        );
+        assert_eq!(pool.touch_count(k0), Some(0), "TCH 从冷却值 0 起");
         // 命中计数照旧。
         {
             let _g = pool.pin(k0).unwrap();
