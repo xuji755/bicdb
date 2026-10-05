@@ -39,7 +39,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use bicdb_common::seq::Lsn;
+use bicdb_common::seq::{CommitSeq, Lsn};
 use bicdb_storage::controlfile::{
     ArchiveMode, CheckpointProgress, ControlFile, ControlFileError, LogArchiveState, LogRunState,
     RedoEntries, RedoGroup, MAX_REDO_GROUPS, NO_CURRENT_GROUP,
@@ -273,6 +273,21 @@ pub struct GroupWriter<'io, 'cf> {
     group_ends: [Option<Lsn>; MAX_REDO_GROUPS],
     /// 本组自激活以来追加的记录数（0 ⇒ 强制切换无需刷盘）。
     records_in_group: u64,
+    /// **最近一次提交记录**的提交序号（切换点采样的"当前提交序号"来源——
+    /// 写线程看不到事务层，但它写过的提交记录自带序号，无需外部喂；
+    /// §11.10、待讨论清单第 35 条）。
+    last_commit_seq: Option<CommitSeq>,
+    /// 切换点采样的墙钟源（毫秒；默认系统时钟，测试可换固定函数。
+    /// 返回 0 表示"无时间语义"——该次不采样，与检查点路径的约定一致）。
+    clock_ms: fn() -> u64,
+}
+
+/// 切换点采样的默认墙钟源（Unix 毫秒；取不到返回 0 = 不采样）。
+fn system_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl std::fmt::Debug for GroupWriter<'_, '_> {
@@ -335,6 +350,8 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             written_pages: vec![0; spec.group_count as usize],
             group_ends: [None; MAX_REDO_GROUPS],
             records_in_group: 0,
+            last_commit_seq: None,
+            clock_ms: system_clock_ms,
         };
         writer.activate(0)?; // 首组：序列号 = 1
         Ok(writer)
@@ -423,6 +440,8 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             written_pages,
             group_ends,
             records_in_group: 0,
+            last_commit_seq: None,
+            clock_ms: system_clock_ms,
         })
     }
 
@@ -470,11 +489,18 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         };
         // 交给缓冲时以**它分配的 LSN**为准（当前页恰好放满时它会进位到新页；
         // 预检的 probe 可能与之不同）——仅在不一致时重建。
+        // 提交记录的序号顺手记下（**落盘成功才生效**）——切换点采样用它。
+        let commit_seq = record.commit_seq();
         let mut reuse = Some(record);
         let lsn = self.buffer.append(|lsn| match reuse.take() {
             Some(r) if r.lsn == lsn => r,
             _ => build(lsn),
         })?;
+        if let Some(raw) = commit_seq {
+            if let Some(seq) = CommitSeq::from_raw(raw) {
+                self.last_commit_seq = Some(seq);
+            }
+        }
         self.records_in_group += 1;
         Ok(lsn)
     }
@@ -677,7 +703,23 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         };
         self.entries.current_group = next;
         self.cf.write_redo_entries(&self.entries)?;
+
+        // 4) **切换点的墙钟采样**（§11.10；待讨论清单第 35 条）：以"截至切换时
+        //    最后一次提交的序号 + 现在"落一对——墙钟目标点的插值在**两次检查点
+        //    之间**也有分段依据（切换比检查点频繁得多）。首个组激活时尚无提交，
+        //    自然跳过；时钟返回 0 视为「无时间语义」，不采样。
+        if let Some(seq) = self.last_commit_seq {
+            let ms = (self.clock_ms)();
+            if ms != 0 {
+                self.cf.append_sample_pair(seq, ms)?;
+            }
+        }
         Ok(next)
+    }
+
+    /// **换时钟**（测试/运维用）：切换点采样的墙钟源。
+    pub fn set_clock_ms(&mut self, clock: fn() -> u64) {
+        self.clock_ms = clock;
     }
 
     // -- 检查点与归档（状态迁移算法的发布口）----------------------------------
@@ -706,7 +748,9 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         Ok(demoted)
     }
 
-    /// **追加墙钟采样对**（§11.10：时间点目标点的插值用；检查点周期调用）。
+    /// **追加墙钟采样对**（§11.10：时间点目标点的插值用）——检查点处由
+    /// 调用方喂 `progress.timestamp`；**日志切换处由写线程自动补喂**
+    /// （`last_commit_seq` + 墙钟，见 `activate` 第 4 步）。
     pub fn append_sample_pair(
         &mut self,
         seq: bicdb_common::seq::CommitSeq,
@@ -1385,6 +1429,52 @@ mod tests {
         assert_eq!(w.entries().groups[0].run, LogRunState::Active);
         let (g1, _) = scan_group(&io, 1, 4);
         assert_eq!(g1[0], RedoRecord::log_switch(g1[0].lsn, 1, 2));
+    }
+
+    #[test]
+    fn switch_point_feeds_a_wall_clock_sample_pair() {
+        // 待讨论清单第 35 条：切换点自动补喂采样对——写线程从它写过的
+        // **提交记录**里取提交序号，无需外部喂；时钟可注入（固定值）。
+        fn fixed_clock() -> u64 {
+            424_242
+        }
+        let io = mem();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(3, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(3, 1, 4).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        w.set_clock_ms(fixed_clock);
+        // 首个组激活时无提交 ⇒ 不采样。
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        assert!(cf_ro.sample_pairs().unwrap().is_empty());
+
+        // 写一条提交记录（序号 7），再强制切换 ⇒ 落一对 (7, 424242)。
+        w.append(|l| RedoRecord::commit(l, 1, 7)).unwrap();
+        w.switch_group().unwrap();
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let seven = CommitSeq::from_raw(7).unwrap();
+        assert_eq!(cf_ro.sample_pairs().unwrap(), vec![(seven, 424_242)]);
+
+        // 再切换一次（期间无新提交）：序号不前进，时间戳更新——插值仍安全。
+        w.switch_group().unwrap();
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        assert_eq!(
+            cf_ro.sample_pairs().unwrap(),
+            vec![(seven, 424_242), (seven, 424_242)]
+        );
     }
 
     #[test]
