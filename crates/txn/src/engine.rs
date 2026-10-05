@@ -427,7 +427,7 @@ mod tests {
         let engine = Box::leak(Box::new(Engine::new(
             pool,
             wal,
-            UndoChain::open(segment),
+            UndoChain::open(segment).with_pool(pool),
             seq(0),
         )));
         (engine, BufferKey::new(WS, Rdba::from_parts(3, 1).unwrap()))

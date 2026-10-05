@@ -971,6 +971,8 @@ pub enum UndoChainError {
     Bitmap(crate::bitmap::BitmapError),
     /// 页内 ITL 操作错误。
     Itl(crate::itl::ItlError),
+    /// 经池读撤销页失败（`PoolSource` 形态）。
+    Pool(String),
 }
 
 impl std::fmt::Display for UndoChainError {
@@ -982,6 +984,7 @@ impl std::fmt::Display for UndoChainError {
             UndoChainError::BitmapCoverage => f.write_str("段内位图覆盖不足（多页位图随后）"),
             UndoChainError::Bitmap(e) => write!(f, "段内位图：{e}"),
             UndoChainError::Itl(e) => write!(f, "ITL：{e}"),
+            UndoChainError::Pool(why) => write!(f, "经池读撤销页：{why}"),
         }
     }
 }
@@ -1048,10 +1051,118 @@ pub struct UndoAppend {
 }
 
 /// undo 段上的链写入器（当前页与归属事务的写作状态）。
+/// **撤销页的读取源**（链的**内部读**与 CR/回滚共用它）。
+///
+/// - `Direct`（默认）：直读段文件——恢复/诊断等**无池**的单线程形态；
+/// - `Pool`：经缓冲池——活系统形态。**撤销页因此可以 no-force**（与数据页同规，
+///   由 WAL 规则 2 保护）：写路径不再需要逐页 `flush` 让"文件与池一致"
+///   （§12.3.1 的"直读纪律"由此被**经池**取代；优化方案 P1 的落点）。
+pub trait UndoPageSource: Send + Sync {
+    /// 读逻辑页（`seg` 提供逻辑页 → 物理块的换算）。
+    fn page(&self, seg: &Segment<'_, '_>, logical: u32) -> Result<Page, UndoChainError>;
+
+    /// 绑定池的身份（地址）——`None` = 直读（无池）。写路径用它校验
+    /// "链绑的池"与"手上写的池"是**同一个**（`TxnError::UnboundUndoChain`）。
+    fn pool_addr(&self) -> Option<usize>;
+
+    /// 任意**物理块**的当前镜像（段/文件计划器的读-改-写基准）。
+    /// `None` = 无池形态：计划器退回直读段文件。
+    fn current_block(&self, workspace: [u8; 8], file_id: u16, block: u32) -> Option<Page>;
+
+    /// **探页**（不校验；未写过的零页是合法结果——`find_recyclable_page`
+    /// 用）：池内命中即当前像；未命中/无法读回则直读文件兜底。
+    fn page_raw(&self, seg: &Segment<'_, '_>, logical: u32) -> Result<Page, UndoChainError>;
+}
+
+/// 直读段文件（恢复/诊断）。
+pub struct DirectSource;
+
+impl UndoPageSource for DirectSource {
+    fn page(&self, seg: &Segment<'_, '_>, logical: u32) -> Result<Page, UndoChainError> {
+        Ok(seg.read_page(logical)?)
+    }
+
+    fn pool_addr(&self) -> Option<usize> {
+        None
+    }
+
+    fn current_block(&self, _workspace: [u8; 8], _file_id: u16, _block: u32) -> Option<Page> {
+        None
+    }
+
+    fn page_raw(&self, seg: &Segment<'_, '_>, logical: u32) -> Result<Page, UndoChainError> {
+        Ok(seg.read_page_raw(logical)?)
+    }
+}
+
+/// 经缓冲池读（活系统；撤销页 no-force）。
+pub struct PoolSource<'p, 'b> {
+    pool: &'p crate::buffer::BufferPool<'b>,
+}
+
+impl<'p, 'b> PoolSource<'p, 'b> {
+    /// 绑定缓冲池。
+    #[must_use]
+    pub fn new(pool: &'p crate::buffer::BufferPool<'b>) -> Self {
+        Self { pool }
+    }
+}
+
+impl UndoPageSource for PoolSource<'_, '_> {
+    fn page(&self, seg: &Segment<'_, '_>, logical: u32) -> Result<Page, UndoChainError> {
+        use crate::buffer::BufferKey;
+        use crate::rowid::Rdba;
+        let block = seg
+            .logical_block(logical)
+            .ok_or(UndoChainError::Undo(UndoError::MalformedRecord))?;
+        let rdba = Rdba::from_parts(seg.file_id(), block)
+            .ok_or(UndoChainError::Undo(UndoError::MalformedRecord))?;
+        let key = BufferKey::new(seg.workspace_ref(), rdba);
+        let guard = self
+            .pool
+            .pin(key)
+            .map_err(|e| UndoChainError::Pool(e.to_string()))?;
+        Ok(Page::from_bytes(Box::new(*guard.as_bytes())))
+    }
+
+    fn pool_addr(&self) -> Option<usize> {
+        Some(std::ptr::from_ref(self.pool) as usize)
+    }
+
+    fn current_block(&self, workspace: [u8; 8], file_id: u16, block: u32) -> Option<Page> {
+        let rdba = crate::rowid::Rdba::from_parts(file_id, block)?;
+        let guard = self
+            .pool
+            .pin(crate::buffer::BufferKey::new(workspace, rdba))
+            .ok()?;
+        Some(Page::from_bytes(Box::new(*guard.as_bytes())))
+    }
+
+    fn page_raw(&self, seg: &Segment<'_, '_>, logical: u32) -> Result<Page, UndoChainError> {
+        let block = seg
+            .logical_block(logical)
+            .ok_or(UndoChainError::Undo(UndoError::MalformedRecord))?;
+        let rdba = crate::rowid::Rdba::from_parts(seg.file_id(), block)
+            .ok_or(UndoChainError::Undo(UndoError::MalformedRecord))?;
+        // 池内命中 = 当前像（no-force 下文件可能落后）；未命中/不可读回 ⇒
+        // 直读文件（I/O 错误会在直读这一步照常外传）。
+        if let Ok(guard) = self
+            .pool
+            .pin(crate::buffer::BufferKey::new(seg.workspace_ref(), rdba))
+        {
+            return Ok(Page::from_bytes(Box::new(*guard.as_bytes())));
+        }
+        Ok(seg.read_page_raw(logical)?)
+    }
+}
+
+/// **撤销链**（一个事务/一段的追加与回读口）。
 pub struct UndoChain<'io, 'f> {
     segment: Segment<'io, 'f>,
     current_logical: Option<u32>,
     current_txn: Option<TxnId>,
+    /// 读取源（`None` = 直读段文件——恢复/诊断形态）。
+    source: Option<Box<dyn UndoPageSource + 'io>>,
 }
 
 impl std::fmt::Debug for UndoChain<'_, '_> {
@@ -1070,6 +1181,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             segment,
             current_logical: None,
             current_txn: None,
+            source: None,
         }
     }
 
@@ -1081,7 +1193,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
 
     /// **分配一个事务表槽**（事务开始；持久化段头页）。
     pub fn allocate_slot(&mut self) -> Result<u16, UndoChainError> {
-        let mut page = self.segment.read_page(0)?;
+        let mut page = self.page(0)?;
         let (index, _) = allocate_slot(&mut page)?;
         self.segment.write_page(0, &mut page)?;
         Ok(index)
@@ -1103,7 +1215,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         rowid: RowId,
         payload: UndoPayload,
     ) -> Result<UndoAppend, UndoChainError> {
-        let mut header_before = self.segment.read_page(0)?;
+        let mut header_before = self.page(0)?;
         let mut txn_slot = read_slot(&header_before, slot_index)?;
         if txn_slot.state == TxnState::Free {
             return Err(UndoChainError::SlotNotActive(slot_index));
@@ -1121,7 +1233,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         // 复用当前页（限于同一事务）或新开一页。
         let reuse = match (self.current_logical, self.current_txn) {
             (Some(logical), Some(txn)) if txn == txn_id => {
-                let page = self.segment.read_page(logical)?;
+                let page = self.page(logical)?;
                 fits(&page, len)
             }
             _ => false,
@@ -1139,7 +1251,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
         let mut advance = None;
         let (logical, undo_before, opened, recycled) = if reuse {
             let logical = self.current_logical.expect("已判定存在");
-            let page = self.segment.read_page(logical)?;
+            let page = self.page(logical)?;
             (logical, page, false, false)
         } else if let Some(logical) = recycled_logical {
             // 重置复用：构造全新页（丢弃旧内容）；`append_pos` 与段内位图都不动
@@ -1170,11 +1282,20 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             // 新页：下一个可写追加页。若它**就是位图页自身**（窗口首位），
             // 先**计划物化**（不在此直写——镜像随 plan 返回，写路径经池 + redo，
             // `fresh` 先格式化 fsync）。
-            let mut logical = self.segment.append_position()?;
+            let mut logical = self.append_position()?;
             let mut fresh_bitmap: Option<Page> = None;
             if self.segment.is_bitmap_page(logical) {
                 let (i, _, _) = self.segment.bitmap_slot(logical);
-                let adv = self.segment.plan_materialize_bitmap_page(i)?;
+                // 计划器的读-改-写基准取**当前镜像**（绑池 = 池视角；P1 起
+                // 元数据页 no-force，文件像可能落后）。
+                let adv = {
+                    let src = self.source.as_deref();
+                    let workspace = self.segment.workspace_ref();
+                    let file_id = self.segment.file_id();
+                    let mut current =
+                        |block: u32| src.and_then(|s| s.current_block(workspace, file_id, block));
+                    self.segment.plan_materialize_bitmap_page(i, &mut current)?
+                };
                 // 段头**以后像为基**（`append_pos` 已推进、`bitmap_pages` 已 +1）
                 // ——否则本次的链头/槽更新会把这两个字段写回旧值。
                 header_before = Page::from_bytes(Box::new(*adv.header_after.as_bytes()));
@@ -1188,9 +1309,17 @@ impl<'io, 'f> UndoChain<'io, 'f> {
                     .ok_or(SegmentSpaceError::BitmapCoverage)?; // 位图页的下一逻辑页
             }
             if self.segment.logical_block(logical).is_none() {
-                // 兜底直写（非池路径；池路径由 `ensure_undo_capacity` 先计划扩展）。
+                // 兜底直写（**非池路径**；池路径由 `ensure_undo_capacity` 先计划
+                // 扩展）。池绑定下走到这里 = 破坏"元数据页经池"的纪律——报错
+                // 而非静默直写（直写会与池像分叉）。
+                if self.source.is_some() {
+                    return Err(UndoChainError::Pool(
+                        "池绑定链需要扩展段：应由写路径先计划扩展（ensure_undo_capacity）"
+                            .to_string(),
+                    ));
+                }
                 self.segment.extend()?;
-                header_before = self.segment.read_page(0)?;
+                header_before = self.page(0)?;
                 txn_slot = read_slot(&header_before, slot_index)?;
             }
             let block = self
@@ -1223,7 +1352,7 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             let (_, bit, bmp_logical) = self.segment.bitmap_slot(logical);
             let bmp_before = match &fresh_bitmap {
                 Some(p) if bmp_logical == logical - 1 => Page::from_bytes(Box::new(*p.as_bytes())),
-                _ => self.segment.read_page(bmp_logical)?,
+                _ => self.page(bmp_logical)?,
             };
             let mut bmp_after = Page::from_bytes(Box::new(*bmp_before.as_bytes()));
             crate::bitmap::set_free_level(&mut bmp_after, bit, crate::bitmap::FreeLevel::High)?;
@@ -1277,9 +1406,9 @@ impl<'io, 'f> UndoChain<'io, 'f> {
     /// 扫描每页一次直读 + 一次事务表槽查（复用是"每事务至多一次"的事件，
     /// 成本有界；P4 可加"上次复用位"游标作提示，不影响语义）。
     fn find_recyclable_page(&self) -> Result<Option<u32>, UndoChainError> {
-        let header = self.segment.read_page(0)?;
+        let header = self.page(0)?;
         let control = read_control(&header)?;
-        let end = self.segment.append_position()?;
+        let end = self.append_position()?;
         let mut logical = UNDO_FIRST_DATA_PAGE;
         while logical < end {
             if self.segment.is_bitmap_page(logical) {
@@ -1288,7 +1417,10 @@ impl<'io, 'f> UndoChain<'io, 'f> {
             }
             // 不校验读：未写过的零页是"无归属、可复用"的合法情形，
             // 不能让校验把"没写过"报成损坏（I/O 错误照常外传）。
-            let page = self.segment.read_page_raw(logical)?;
+            // **必须经读取源**（P1 起撤销页 no-force：文件里可能还是零页，
+            // 而池里的页**已有归属**——直读会把"有主页"误判成可复用，
+            // 重置掉某个活跃快照仍需要的记录；实测：未提交删除的 CR 用例）。
+            let page = self.page_raw(logical)?;
             let reusable = match page.header() {
                 Some(h) if h.page_type == PageType::Undo => match crate::itl::read_itl(&page, 0) {
                     Ok(entry) => self.page_recyclable(&header, &control, entry.txn_id)?,
@@ -1384,17 +1516,77 @@ impl<'io, 'f> UndoChain<'io, 'f> {
     /// **按 `txn_id` 查事务表槽**（一致性读的可见性判定用）：`None` =
     /// 槽已复用（`wrap` 不符）——在 CR 里即"**必已提交且旧于一切有效快照**"。
     pub fn lookup(&self, txn_id: TxnId) -> Result<Option<TxnSlot>, UndoChainError> {
-        let page = self.segment.read_page(0)?;
+        let page = self.page(0)?;
         Ok(find_slot(&page, txn_id)?)
     }
 
     /// **按位置读一条撤销记录**（经区映射反查逻辑页）。
+    /// **绑定缓冲池**（活系统形态）：链的内部读与 [`UndoChain::read`] 都经池——
+    /// 撤销页随即可以 no-force（写路径不再逐页 `flush`；优化方案 P1）。
+    #[must_use]
+    pub fn with_pool<'p, 'b>(mut self, pool: &'p crate::buffer::BufferPool<'b>) -> Self
+    where
+        'p: 'io,
+        'b: 'io,
+    {
+        self.source = Some(Box::new(PoolSource::new(pool)));
+        self
+    }
+
+    /// **链的页读取**（按读取源；未绑定 ⇒ 直读段文件）。**执行器侧的
+    /// 段头/记录读也应走它**（P1 起撤销页 no-force，直读会看到旧内容）。
+    pub fn page(&self, logical: u32) -> Result<Page, UndoChainError> {
+        match &self.source {
+            Some(src) => src.page(&self.segment, logical),
+            None => Ok(self.segment.read_page(logical)?),
+        }
+    }
+
+    /// 是否经池读（诊断/测试）。
+    #[must_use]
+    pub fn reads_through_pool(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// 绑定池的地址（`None` = 直读形态）——写路径校验"链的池 == 写的池"。
+    #[must_use]
+    pub fn bound_pool_addr(&self) -> Option<usize> {
+        self.source.as_ref().and_then(|s| s.pool_addr())
+    }
+
+    /// **追加位置**（段头页的 `append_pos`；**经读取源**——no-force 下
+    /// 文件里的段头页会落后，直读会把它当成"还停在首区"而**重复使用同一
+    /// 逻辑页**，覆盖活跃事务的撤销记录）。
+    pub fn append_position(&self) -> Result<u32, UndoChainError> {
+        Ok(read_header(&self.page(0)?)?.append_pos)
+    }
+
+    /// **探页**：不校验、未写过零页合法（`find_recyclable_page` 用）；
+    /// 经读取源（池优先），无源时直读。
+    pub fn page_raw(&self, logical: u32) -> Result<Page, UndoChainError> {
+        match &self.source {
+            Some(src) => src.page_raw(&self.segment, logical),
+            None => Ok(self.segment.read_page_raw(logical)?),
+        }
+    }
+
+    /// **物理块的当前镜像**（段/文件计划器的读-改-写基准；`None` = 直读兜底）。
+    #[must_use]
+    pub fn current_block(&self, block: u32) -> Option<Page> {
+        let workspace = self.segment.workspace_ref();
+        let file_id = self.segment.file_id();
+        self.source
+            .as_ref()
+            .and_then(|s| s.current_block(workspace, file_id, block))
+    }
+
+    /// 读一条撤销记录（按读取源：直读段文件 或 经池）。
     pub fn read(&self, at: RowId) -> Result<UndoRecord, UndoChainError> {
         let logical = self
             .segment
             .logical_of_block(at.block_id())
             .ok_or(UndoChainError::Undo(UndoError::MalformedRecord))?;
-        let page = self.segment.read_page(logical)?;
+        let page = self.page(logical)?;
         Ok(get_record(&page, at.row_id())?)
     }
 }

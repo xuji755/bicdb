@@ -562,9 +562,16 @@ impl<'a> DataFile<'a> {
     /// 受影响页的（页内序号, 前像, 后像）——写路径经缓冲池落盘（生成 redo，
     /// §11.5.3"页/区分配是系统操作"）。**决策已定**（位已置在后像里），
     /// 调用方写盘后即完成。
-    pub fn plan_allocate_extent(&mut self) -> Result<PlannedExtent, DataFileError> {
+    ///
+    /// `current`：**物理块 → 当前镜像**（活系统 = 池视角；`None` = 直读兜底）。
+    /// 位图页是读-改-写：no-force（P1）下文件落后于池，基准必须取"当前"，
+    /// 否则会把池里已置的位写回旧值（重复分配同一区）。
+    pub fn plan_allocate_extent(
+        &mut self,
+        current: &mut dyn FnMut(u32) -> Option<Page>,
+    ) -> Result<PlannedExtent, DataFileError> {
         for idx in 0..self.runs.len() {
-            let mut map = self.load_run(idx)?;
+            let mut map = self.load_run(idx, &mut *current)?;
             // **前像先拍**（allocate 会就地把位翻过去）。
             let before: Vec<Page> = map.pages().iter().map(clone_page).collect();
             if let Some(extent) = map.allocate() {
@@ -594,8 +601,9 @@ impl<'a> DataFile<'a> {
     /// [`DataFile::data_limit`]（文件大小 / 预留覆盖的较小者）即回收该位并报
     /// [`DataFileError::FileFull`]——增长走 [`DataFile::extend`]。
     pub fn allocate_extent(&mut self) -> Result<ExtentNo, DataFileError> {
+        let mut direct = |_: u32| None; // 直写形态：基准 = 文件（无池）
         for idx in 0..self.runs.len() {
-            let mut map = self.load_run(idx)?;
+            let mut map = self.load_run(idx, &mut direct)?;
             if let Some(extent) = map.allocate() {
                 if u64::from(extent.first_block()) + u64::from(extent.blocks())
                     > u64::from(self.data_limit())
@@ -611,11 +619,19 @@ impl<'a> DataFile<'a> {
     }
 
     /// 装载一个位图区（8 页；`own_index` 自校验）。
-    fn load_run(&self, index: usize) -> Result<ExtentMap, DataFileError> {
+    fn load_run(
+        &self,
+        index: usize,
+        current: &mut dyn FnMut(u32) -> Option<Page>,
+    ) -> Result<ExtentMap, DataFileError> {
         let start = self.runs[index];
         let mut pages = Vec::with_capacity(BITMAP_PAGES_PER_RUN);
         for i in 0..BITMAP_PAGES_PER_RUN {
-            pages.push(self.read_page(start + i as u32)?);
+            let block = start + i as u32;
+            pages.push(match current(block) {
+                Some(p) => p,
+                None => self.read_page(block)?,
+            });
         }
         Ok(ExtentMap::from_pages(index as u8, pages)?)
     }
@@ -716,7 +732,12 @@ mod tests {
             file.allocate_extent(),
             Err(DataFileError::FileFull)
         ));
-        assert_eq!(file.load_run(0).unwrap().allocated(), 2, "失败分配不泄漏位");
+        let mut direct = |_: u32| None;
+        assert_eq!(
+            file.load_run(0, &mut direct).unwrap().allocated(),
+            2,
+            "失败分配不泄漏位"
+        );
     }
 
     #[test]

@@ -65,6 +65,10 @@ pub enum TxnError {
     RowId(RowIdRangeError),
     /// 缓存中的页与"前像"不符（不该发生——单写者下即失步信号）。
     StaleCache,
+    /// **undo 链未绑定（或绑错了）缓冲池**：写路径的撤销页是 **no-force**
+    /// 的（§12.3.1；优化方案 P1）——新内容只在池里，链的直读会看到旧文件。
+    /// 修复：`UndoChain::open(...).with_pool(&pool)`，且**就是**手上这个池。
+    UnboundUndoChain,
     /// 段访问。
     Segment(bicdb_storage::segment::SegmentSpaceError),
     /// **新行超过单页可容纳**（就地转链路径——片段链的池实现随后续切片，
@@ -115,6 +119,9 @@ impl std::fmt::Display for TxnError {
             TxnError::Itl(e) => write!(f, "写路径 ITL：{e}"),
             TxnError::RowId(e) => write!(f, "写路径行号：{e}"),
             TxnError::StaleCache => f.write_str("写路径：缓存页与预期前像不符"),
+            TxnError::UnboundUndoChain => f.write_str(
+                "写路径：undo 链未绑定缓冲池（撤销页 no-force——用 UndoChain::with_pool）",
+            ),
             TxnError::Segment(e) => write!(f, "写路径段访问：{e}"),
             TxnError::UpdateTooLong { len } => write!(
                 f,
@@ -191,7 +198,8 @@ pub fn begin(
     chain: &mut UndoChain<'_, '_>,
     snapshot: CommitSeq,
 ) -> Result<Txn, TxnError> {
-    let header_before = chain.segment().read_page(0)?;
+    require_pool_bound(chain, pool)?;
+    let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     let (slot, txn_slot) = bicdb_storage::undo::allocate_slot(&mut header_after)?;
     let txn_id = txn_id_of(slot, &txn_slot);
@@ -227,6 +235,7 @@ pub fn insert_row(
     row: &[u8],
     policy: &InsertPolicy,
 ) -> Result<RowId, TxnError> {
+    require_pool_bound(chain, pool)?;
     // 单闩锁纪律：**不在持有卫兵时调用池**——先在快照上改，再分步回写。
     let (data_before, mut local) = {
         let g = pool.pin(block)?;
@@ -281,6 +290,7 @@ pub fn delete_row(
     block: BufferKey,
     row_no: u16,
 ) -> Result<(), TxnError> {
+    require_pool_bound(chain, pool)?;
     let (data_before, mut local) = {
         let g = pool.pin(block)?;
         (*g.as_bytes(), Page::from_bytes(Box::new(*g.as_bytes())))
@@ -352,6 +362,7 @@ pub fn update_row(
     policy: &InsertPolicy,
     alloc: &mut dyn FnMut(usize) -> Result<BufferKey, TxnError>,
 ) -> Result<UpdateOutcome, TxnError> {
+    require_pool_bound(chain, pool)?;
     let (src_before, mut src_local) = {
         let g = pool.pin(block)?;
         (*g.as_bytes(), Page::from_bytes(Box::new(*g.as_bytes())))
@@ -525,14 +536,23 @@ fn ensure_undo_capacity(
     txn: &Txn,
 ) -> Result<(), TxnError> {
     // 以**磁盘上的段头页**为准（plan_append 也直读它）。
-    let next = bicdb_storage::segment::read_header(&chain.segment().read_page(0)?)
+    let next = bicdb_storage::segment::read_header(&chain.page(0)?)
         .map_err(|e| TxnError::Segment(bicdb_storage::segment::SegmentSpaceError::Format(e)))?
         .append_pos;
     if chain.segment().logical_block(next).is_some() {
         return Ok(());
     }
     let ws = workspace_of(chain);
-    let planned = chain.segment_mut().plan_extend()?;
+    let file_id = chain.segment().file_id();
+    let planned = {
+        // 计划器的读-改-写基准 = **池视角**（撤销页 no-force；文件像会落后）。
+        let mut current = |block: u32| -> Option<Page> {
+            let rdba = Rdba::from_parts(file_id, block)?;
+            let guard = pool.pin(BufferKey::new(ws, rdba)).ok()?;
+            Some(Page::from_bytes(Box::new(*guard.as_bytes())))
+        };
+        chain.segment_mut().plan_extend(&mut current)?
+    };
     for (rdba, before, after) in planned.images {
         let key = BufferKey::new(ws, rdba);
         write_undo_page_change(
@@ -571,7 +591,7 @@ enum ItlAcquire {
 /// 宁可让它占着不可复用，也不把可能的活动事务误判成已提交。
 /// 清除字节随后续语句的页差异一并入 redo（比"清除不生成 redo"保守，语义等价）。
 fn cleanout_committed(page: &mut Page, chain: &UndoChain<'_, '_>) -> Result<(), TxnError> {
-    let header = chain.segment().read_page(0)?;
+    let header = chain.page(0)?;
     for i in 0..itl::itl_count(page)? {
         let e = itl::read_itl(page, i)?;
         if e.state != ItlState::Active {
@@ -823,6 +843,7 @@ pub fn commit(
     txn: &mut Txn,
     commit_seq: CommitSeq,
 ) -> Result<(), TxnError> {
+    require_pool_bound(chain, pool)?;
     let lsn = log.append(|l| RedoRecord::commit(l, txn.raw(), commit_seq.as_raw()))?;
     log.flush(lsn)?; // **提交点**：此后事务已提交（不可再回滚）
 
@@ -841,7 +862,7 @@ fn mark_slot_committed(
     txn: &Txn,
     commit_seq: CommitSeq,
 ) -> Result<(), TxnError> {
-    let header_before = chain.segment().read_page(0)?;
+    let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     let mut slot = read_slot(&header_after, txn.slot)?;
     slot.state = TxnState::Committed;
@@ -866,7 +887,8 @@ pub fn rollback(
     chain: &mut UndoChain<'_, '_>,
     txn: &mut Txn,
 ) -> Result<u64, TxnError> {
-    let header = chain.segment().read_page(0)?;
+    require_pool_bound(chain, pool)?;
+    let header = chain.page(0)?;
     let mut at = read_slot(&header, txn.slot)?.undo_current;
     let mut count = 0u64;
     while let Some(pos) = at {
@@ -886,7 +908,7 @@ pub fn rollback(
         count += 1;
     }
     // 释放槽（经池、带 redo）。
-    let header_before = chain.segment().read_page(0)?;
+    let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     free_slot(&mut header_after, txn.slot)?;
     let key = undo_page_key(chain, 0)?;
@@ -917,6 +939,7 @@ pub fn lock_row(
     block: BufferKey,
     row_no: u16,
 ) -> Result<bool, TxnError> {
+    require_pool_bound(chain, pool)?;
     let guard = pool.pin(block)?;
     let before = *guard.as_bytes();
     let mut local = Page::from_bytes(Box::new(before));
@@ -988,7 +1011,7 @@ impl StatementMark {
 
 /// **取语句回滚点**（读事务表槽的 `undo_current`）。
 pub fn statement_mark(chain: &mut UndoChain<'_, '_>, txn: &Txn) -> Result<StatementMark, TxnError> {
-    let header = chain.segment().read_page(0)?;
+    let header = chain.page(0)?;
     let slot = read_slot(&header, txn.slot)?;
     Ok(StatementMark {
         at: slot.undo_current,
@@ -1011,8 +1034,9 @@ pub fn rollback_to_mark(
     txn: &mut Txn,
     mark: StatementMark,
 ) -> Result<u64, TxnError> {
+    require_pool_bound(chain, pool)?;
     let mut at = {
-        let header = chain.segment().read_page(0)?;
+        let header = chain.page(0)?;
         read_slot(&header, txn.slot)?.undo_current
     };
     let mut count = 0u64;
@@ -1036,7 +1060,7 @@ pub fn rollback_to_mark(
         count += 1;
     }
     // 槽头置回回滚点（幂等：没变就不写）。
-    let header_before = chain.segment().read_page(0)?;
+    let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     let mut slot = read_slot(&header_after, txn.slot)?;
     if slot.undo_current != mark.at {
@@ -1247,7 +1271,8 @@ pub fn reclaim(
     chain: &mut UndoChain<'_, '_>,
     oldest_snapshot: Option<CommitSeq>,
 ) -> Result<ReclaimReport, TxnError> {
-    let header_before = chain.segment().read_page(0)?;
+    require_pool_bound(chain, pool)?;
+    let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     let report = reclaim_undo(&mut header_after, oldest_snapshot, true)?;
     if header_after.as_bytes() == header_before.as_bytes() {
@@ -1273,6 +1298,14 @@ pub fn reclaim(
 
 /// **undo 段的页改动**：经池写入后**立即落盘**（见模块文档）。
 #[allow(clippy::too_many_arguments)]
+/// **撤销页的一页变更**（经池 + redo；**不在这里 flush**）。
+///
+/// 历史上这里写后立即 `pool.flush`，让"直读段文件"的读者（CR/回滚/链内部）看到
+/// 最新内容（§12.3.1 的直读纪律）。**P1（2026-10-05）**：链的读取源改为
+/// **经缓冲池**（`UndoChain::with_pool`）⇒ 撤销页转 **no-force**（与数据页同规，
+/// 由 WAL 规则 2 保护）——前台 pwrite 从"稳态 2 次/条 DML"降到 **0**（探针
+/// `probe_frontend_pwrites_per_record`）。恢复/诊断形态不绑池，仍直读段文件，
+/// 撤销页由 redo 重放重建（`AppendUndo` 的"新页先格式化落盘再进 redo"规则不变）。
 fn write_undo_page_change(
     pool: &BufferPool<'_>,
     log: &mut GroupWriter<'_, '_>,
@@ -1282,9 +1315,7 @@ fn write_undo_page_change(
     after: &[u8],
     is_new: bool,
 ) -> Result<(), TxnError> {
-    if write_page_change(pool, log, txn_raw, key, before, after, is_new)?.is_some() {
-        pool.flush(key)?;
-    }
+    let _ = write_page_change(pool, log, txn_raw, key, before, after, is_new)?;
     Ok(())
 }
 
@@ -1300,6 +1331,15 @@ fn undo_page_key(chain: &UndoChain<'_, '_>, logical: u32) -> Result<BufferKey, T
 
 fn workspace_of(chain: &UndoChain<'_, '_>) -> [u8; 8] {
     chain.segment().workspace_ref()
+}
+
+/// 写路径前置条件：链必须绑定**同一个**缓冲池（撤销页 no-force——链的直读
+/// 会看到池里还没有的文件旧像；`begin`/DML/`commit` 的内部读都在链上）。
+fn require_pool_bound(chain: &UndoChain<'_, '_>, pool: &BufferPool<'_>) -> Result<(), TxnError> {
+    match chain.bound_pool_addr() {
+        Some(addr) if addr == std::ptr::from_ref(pool) as usize => Ok(()),
+        _ => Err(TxnError::UnboundUndoChain),
+    }
 }
 
 /// 在数据页上占用一个 **ITL 槽**（复用优先；否则扩展）。
@@ -1366,15 +1406,22 @@ fn append_undo_via_pool(
     //    未推进，下次原样重写）。
     if plan.opened {
         // **新撤销页：先格式化落盘（fsync）、再让它进 redo**（见上），且
-        // **`page_lsn` 前置到当前追加位**——该 rdba 可能已有**上一轮生命周期**
-        // 的 redo 记录（段回卷 / 重置复用的页、以及文件层复用的块），重放按
-        // `page_lsn` 跳过更早的记录；不前置（= 0）会把旧记录字节"复活"到新
-        // 内容上（输家回滚读到损坏链）。`before` 与盘上镜像同为这一份字节，
-        // 与后续 diff 的基准保持一致（实测：缺此规则时回收页恢复用例失败）。
+        // **`page_lsn` 前置到"当前追加位的前一字节"**——该 rdba 可能已有
+        // **上一轮生命周期**的 redo 记录（段回卷 / 重置复用的页、以及文件层
+        // 复用的块），重放按 `page_lsn` 跳过更早的记录；不前置（= 0）会把旧
+        // 记录字节"复活"到新内容上（输家回滚读到损坏链）。
+        // **为什么是 `−1` 而不是当前追加位本身**：记录 LSN = 其起始字节位，
+        // 而 `appended_lsn()` 恰好就是**下一条记录的 LSN**——stamp 成它，会让
+        // 重放按 `<=` 门把**本页本轮的第一条记录**一并跳掉。页已 flush 的旧
+        // 纪律下这不致命（盘上已是终像），但撤销页 **no-force**（P1）后盘上
+        // 只有空页像 ⇒ 第一条记录的槽目录变更永久丢失（实测：回收页/崩溃
+        // 恢复用例 `MalformedRecord`）。`−1` 仍 ≥ 上一轮全部记录的 LSN，
+        // 守卫不受影响。
         let mut formatted = Page::from_bytes(Box::new(*plan.undo_page.0.as_bytes()));
-        let lsn_now = log.appended_lsn();
+        let stamp = Lsn::from_raw(log.appended_lsn().as_raw().saturating_sub(1))
+            .ok_or(TxnError::StaleCache)?;
         let mut header = formatted.header().ok_or(TxnError::StaleCache)?;
-        header.page_lsn = lsn_now;
+        header.page_lsn = stamp;
         formatted.write_header(&header);
         chain.segment().write_page(plan.logical, &mut formatted)?;
         chain.segment().sync()?;
@@ -1552,7 +1599,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -1571,6 +1617,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -1687,7 +1734,8 @@ mod tests {
         // 低于水位的槽释放、可再分配；高处的保留；水位单调、幂等。
         let io = mem();
         let (mut undo_file, _data_handle, pool, mut cf) = harness(&io, ArchiveMode::ArchiveLog);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let mut t1 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
         commit(&pool, &mut log, &mut chain, &mut t1, seq(10)).unwrap();
@@ -1699,7 +1747,7 @@ mod tests {
         assert_eq!(report.slots_freed, 1);
         assert_eq!(report.committed_kept, 1);
         assert_eq!(report.reclaim_seq, seq(10));
-        let header = chain.segment().read_page(0).unwrap();
+        let header = chain.page(0).unwrap(); // 经池（撤销页 no-force）
         assert_eq!(read_slot(&header, t1.slot).unwrap().state, TxnState::Free);
         assert_eq!(
             read_slot(&header, t2.slot).unwrap().state,
@@ -1716,7 +1764,7 @@ mod tests {
         assert_eq!(report.reclaim_seq, seq(20));
         let mut t3 = begin(&pool, &mut log, &mut chain, seq(21)).unwrap();
         assert!(t3.slot == t1.slot || t3.slot == t2.slot, "从空闲链取回");
-        let header = chain.segment().read_page(0).unwrap(); // 重读（上面的副本已旧）
+        let header = chain.page(0).unwrap(); // 重读（上面的副本已旧；经池）
         assert_eq!(read_slot(&header, t3.slot).unwrap().wrap, 1, "wrap 换代");
         commit(&pool, &mut log, &mut chain, &mut t3, seq(21)).unwrap();
     }
@@ -1728,7 +1776,8 @@ mod tests {
         let io = mem();
         // 非归档模式：本用例只关心回收与组复用，归档由 group 的专门用例覆盖。
         let (mut undo_file, _data_handle, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let key = BufferKey::new(WS, rdba(3, 1));
         let mut last = seq(0);
@@ -1798,9 +1847,9 @@ mod tests {
         pool.flush_workspace(WS).unwrap();
     }
 
-    /// 读 undo 段的当前追加位置（测试辅助）。
+    /// 读 undo 段的当前追加位置（测试辅助；经链读取源——池视角）。
     fn append_pos(chain: &UndoChain<'_, '_>) -> u32 {
-        chain.segment().append_position().unwrap()
+        chain.append_position().unwrap()
     }
 
     #[test]
@@ -1809,7 +1858,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -1828,6 +1876,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -1874,7 +1923,8 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
+        // 段头物理块（恢复侧重开段用；见崩溃段落）。
+        let seg_page0 = segment.page0_block();
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -1893,6 +1943,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -1935,7 +1986,16 @@ mod tests {
 
         // **崩溃**：日志刷出（它才是耐久源；数据页/undo 页始终没回写）。
         log.flush(log.appended_lsn()).unwrap();
+        drop(chain); // 链借了池：先解绑链，再丢池
         drop(pool); // 丢掉缓存，不 flush —— 页文件停在 DML 前
+
+        // 恢复侧**直读链**（无池）：撤销页不再前台 flush（P1）——begin/回滚对
+        // 段头与撤销页的修改由重做阶段按 redo 重放重建到文件上。
+        let mut undo_file2 =
+            bicdb_storage::datafile::DataFile::open(&io, Path::new(UNDO_F)).unwrap();
+        let chain = UndoChain::open(
+            bicdb_storage::segment::Segment::open(&mut undo_file2, seg_page0).unwrap(),
+        );
 
         // 恢复。
         let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
@@ -1972,9 +2032,17 @@ mod tests {
         // 跳过它们，否则旧字节会被"复活"到新内容里，输家回滚会读到损坏链。
         let io = mem();
         let (mut undo_file, _data_handle, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let key = BufferKey::new(WS, rdba(3, 1));
+        // 段头物理块（恢复侧重开段用）。
+        let seg_page0 = {
+            let probe = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+            probe.segment().page0_block()
+        };
+        let mut chain = UndoChain::open(
+            bicdb_storage::segment::Segment::open(&mut undo_file, seg_page0).unwrap(),
+        )
+        .with_pool(&pool);
 
         // 第一轮：写入并提交，随后**静默回收**（槽释放 + 水位前移 + 段回卷）——
         // 这张撤销页从此"归属已回收"，可被下一个事务重置复用。
@@ -2014,10 +2082,18 @@ mod tests {
         // 崩溃：日志耐久；**撤销页只在"先格式化落盘"那一步到过盘**（旧内容
         // 的字节仍在同一块上——正是守卫要处理的局面）。
         log.flush(log.appended_lsn()).unwrap();
+        drop(chain); // 链借了池：先丢链再丢池（= 崩溃）
         drop(pool);
 
         // 恢复：分析/重做/撤销。输家 t2 的回滚要**读它自己的撤销链**——
         // 读到损坏的记录即失败，读到上一轮的旧字节则行恢复错值。
+        // **P1 起恢复侧用直读链（无池）**：撤销页不再被前台 flush，而是由
+        // 重做阶段按 redo 重放重建到文件上（`crash_after_dml_*` 同规）。
+        let mut undo_file2 =
+            bicdb_storage::datafile::DataFile::open(&io, Path::new(UNDO_F)).unwrap();
+        let chain = UndoChain::open(
+            bicdb_storage::segment::Segment::open(&mut undo_file2, seg_page0).unwrap(),
+        );
         let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
         let groups = online_groups(&io, &cf_ro, Path::new(WAL), spec()).unwrap();
         let data_handle = {
@@ -2054,7 +2130,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -2073,6 +2148,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -2195,7 +2271,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         // 两页数据文件：第 2 页作为迁移目标。
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
@@ -2217,6 +2292,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -2311,7 +2387,8 @@ mod tests {
             let mut page = Page::new(PageType::HeapTable, WS, 3, 2);
             pagefile::write_page(&io, data_handle, 2, &mut page).unwrap();
         }
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let policy = InsertPolicy::in_place(0);
         let key1 = BufferKey::new(WS, rdba(3, 1));
@@ -2370,7 +2447,8 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
+        // 段头物理块（恢复侧重开段用；见崩溃段落）。
+        let seg_page0 = segment.page0_block();
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -2391,6 +2469,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -2439,7 +2518,15 @@ mod tests {
 
         // **崩溃**：日志耐久；数据页/undo 页留在池里（no-force）。
         log.flush(log.appended_lsn()).unwrap();
+        drop(chain); // 链借了池：先解绑链，再丢池
         drop(pool);
+
+        // 恢复侧**直读链**（无池；P1：撤销页由重做重建到文件上）。
+        let mut undo_file2 =
+            bicdb_storage::datafile::DataFile::open(&io, Path::new(UNDO_F)).unwrap();
+        let chain = UndoChain::open(
+            bicdb_storage::segment::Segment::open(&mut undo_file2, seg_page0).unwrap(),
+        );
 
         // 恢复：分析/重做/撤销。
         let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
@@ -2472,7 +2559,8 @@ mod tests {
         // §5.4.2 ①：行锁的"他人持锁 ⇒ 等待"分支；持锁者结束后唤醒重试成功。
         let io = mem();
         let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let policy = InsertPolicy::in_place(0);
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -2560,7 +2648,8 @@ mod tests {
         // 同事务重复锁同一行 = 重入，不重复计 `lock_cnt`；同块另一行 ⇒ +1。
         let io = mem();
         let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let policy = InsertPolicy::in_place(0);
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -2644,7 +2733,8 @@ mod tests {
         // §5.4.2 ④：等待超阈值 → 环检测 → 牺牲者 = 已修改行数最少者。
         let io = mem();
         let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let policy = InsertPolicy::in_place(0);
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -2748,7 +2838,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -2767,6 +2856,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -2841,7 +2931,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -2860,6 +2949,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -2921,7 +3011,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -2940,6 +3029,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -2988,7 +3078,6 @@ mod tests {
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4)
             .unwrap()
             .with_coverage(8); // 窗口缩到 8 页：约 200 事务内走到位图页
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -3007,6 +3096,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -3093,7 +3183,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -3112,6 +3201,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -3168,16 +3258,15 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         // 推 append_pos 到首区之外（1 区 = 8 逻辑页）。
         {
-            let mut page = chain.segment().read_page(0).unwrap();
+            let mut page = segment.read_page(0).unwrap();
             let mut h = bicdb_storage::segment::read_header(&page).unwrap();
             h.append_pos = 8;
             bicdb_storage::segment::write_header(&mut page, &h).unwrap();
-            chain.segment().write_page(0, &mut page).unwrap();
+            segment.write_page(0, &mut page).unwrap();
         }
-        assert_eq!(chain.segment().header().extent_count, 1);
+        assert_eq!(segment.header().extent_count, 1);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -3196,6 +3285,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -3259,7 +3349,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -3278,6 +3367,7 @@ mod tests {
             FakeWal,
         )
         .unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -3303,8 +3393,9 @@ mod tests {
         )
         .unwrap();
 
-        // 直读链：槽的链头可读、两条记录类别正确（undo 页已 flush，直读可见）。
-        let header = chain.segment().read_page(0).unwrap();
+        // 链上可读：槽的链头、两条记录类别（撤销页 no-force——**经链读**，
+        // 文件里还没有本轮字节；见 §12.3.1 的读取纪律）。
+        let header = chain.page(0).unwrap();
         let head = read_slot(&header, txn.slot).unwrap().undo_current.unwrap();
         let rec = chain.read(head).unwrap();
         assert_eq!(rec.op, UndoOp::Insert);
@@ -3400,7 +3491,6 @@ mod tests {
         let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
-        let mut chain = UndoChain::open(segment);
         let data_handle = {
             let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
             let h = data_file.handle();
@@ -3421,6 +3511,8 @@ mod tests {
             bicdb_storage::buffer::CacheConfig::for_capacity(8),
         )
         .unwrap();
+        // 撤销页 no-force（P1）：链绑池，内部读才看得见池里的新像。
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
         let mut cf = ControlFile::format(
             &io,
             Path::new(A),
@@ -3438,7 +3530,9 @@ mod tests {
         // 与稳态（同页追加）。
         writes.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut rids = Vec::new();
+        let mut per_insert = Vec::new();
         for i in 0..3u8 {
+            let before = writes.load(std::sync::atomic::Ordering::Relaxed);
             rids.push(
                 insert_row(
                     &pool,
@@ -3451,14 +3545,20 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let n = writes.load(std::sync::atomic::Ordering::Relaxed);
-            eprintln!("[probe] 第 {} 条 insert 累计前台 pwrite = {n}", i + 1);
+            let delta = writes.load(std::sync::atomic::Ordering::Relaxed) - before;
+            per_insert.push(delta);
+            eprintln!("[probe] 第 {} 条 insert 前台 pwrite = {delta}", i + 1);
         }
-        let total = writes.load(std::sync::atomic::Ordering::Relaxed);
-        eprintln!("[probe] 首条（含开新页）= 见上；稳态 ≈ ({total} − 首条)/2（P1 目标：稳态 0）");
+        eprintln!("[probe] 判读：首条 = 1（**新撤销页**按 §11.5.4 先格式化落盘 fsync");
+        eprintln!("[probe] ——1 次/页，不是 1 次/条；重放无法重建不存在的页）；稳态 = 0。");
+        assert_eq!(
+            &per_insert[1..],
+            &[0, 0],
+            "P1：稳态 DML 前台不得有 pwrite（撤销页 no-force，WAL 规则 2 保护）"
+        );
         assert!(
-            total > 0,
-            "当前形态应有前台 pwrite（P1 落地后此断言改为稳态 == 0）"
+            per_insert[0] <= 1,
+            "首条只允许新页格式化那一次（实测 {per_insert:?}）"
         );
         let _ = rids;
     }
@@ -3469,7 +3569,8 @@ mod tests {
         // **不回滚此前的成功语句**。
         let io = mem();
         let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let policy = InsertPolicy::in_place(0);
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -3540,7 +3641,8 @@ mod tests {
     fn statement_mark_without_changes_is_a_noop_and_idempotent() {
         let io = mem();
         let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let policy = InsertPolicy::in_place(0);
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -3602,7 +3704,8 @@ mod tests {
         // 事务仍在（不释锁），等待被取消（牺牲者不再等待 ⇒ 环解开）。
         let io = mem();
         let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
-        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut chain =
+            UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap()).with_pool(&pool);
         let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
         let policy = InsertPolicy::in_place(0);
         let key = BufferKey::new(WS, rdba(3, 1));
@@ -3811,7 +3914,7 @@ mod tests {
             &ArchiveRecord::new(ArchiveMode::NoArchive),
         )
         .unwrap();
-        let chain = std::sync::Mutex::new(UndoChain::open(segment));
+        let chain = std::sync::Mutex::new(UndoChain::open(segment).with_pool(&pool));
         let log = std::sync::Mutex::new(
             GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap(),
         );

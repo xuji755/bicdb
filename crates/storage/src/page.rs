@@ -826,7 +826,9 @@ mod tests {
         assert_eq!(leaf.verify(), PageCheck::Ok, "16 字节页尾下校验依然通过");
     }
 
+    // 该断言是 `debug_assert!`（热路径不背运行时检查）——只在 debug 构建下成立。
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "file_id 有效 10 位")]
     fn file_id_beyond_ten_bits_panics() {
         let _ = Page::new(PageType::HeapTable, ref_of(1), FILE_ID_MAX + 1, 0);

@@ -19,13 +19,19 @@
   `rollback` = 沿链补偿（逐条经池、带 redo）→ 释放槽。
 - **ITL 归属**：行头 `itl_slot` 由写路径**回填**（调用方给的字节会被改写）；
   撤销记录一律可失败预检先行（不在链上留幽灵记录）。
-- **两条纪律**：
+- **三条纪律**：
   · **单闩锁纪律**：持 `PageGuard` 时不得再调池（N=1 会自锁）——修改在页
     快照上完成，再分步经池回写；"未记 redo 的脏页"没有存在窗口；
-  · **undo 页经池 + 写后立即 flush**：链的读取（回滚/CR）是直读段文件的，
-    立即落盘让池/文件一致；数据页保持 no-force（提交路径无数据页 I/O）。
+  · **链读经读取源**（P1）：`UndoChain` 绑池（`with_pool`）后，链的**一切**
+    内部读（记录、段头、`append_pos`、探页）走池视角——撤销页与数据页同规
+    **no-force**；写路径持池入口强制校验绑定（`TxnError::UnboundUndoChain`）；
+    恢复/诊断用 `Direct`（无池直读）。前台 pwrite：稳态 **0/条**、首条 1
+    （新页先格式化，1 次/页）；
+  · **计划器基准取池像**：`plan_extend`/`plan_allocate_extent`/
+    `plan_materialize_bitmap_page` 的读-改-写基准由调用方以
+    `CurrentPages` 提供（文件像会把池里已改的字节写回旧值）。
 - **撤销段扩展经池 + redo**（`ensure_undo_capacity`）：`plan_extend` 的页镜像
-  逐页写 redo 后 flush。
+  逐页写 redo；no-force（P1）。
 - **更新类撤销**：`Update` 载荷 = 行内偏移补丁 + 旧 `itl_slot`；v1 限**等长
   就地**更新（改长明确报错，留给行迁移切片）。
 - 用例：insert/commit 落盘与日志、rollback、**端到端崩溃恢复**

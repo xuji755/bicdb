@@ -581,6 +581,24 @@ impl From<crate::bitmap::BitmapError> for SegmentSpaceError {
     }
 }
 
+/// 计划器的**当前镜像提供者**：物理块 → 当前镜像。
+///
+/// 活系统形态 = 缓冲池视角（撤销页/元数据页 no-force，文件落后于池）；
+/// `None` = 该块不在提供者视野内，计划器退回直读段文件（恢复/无池形态）。
+pub type CurrentPages<'a> = &'a mut dyn FnMut(u32) -> Option<Page>;
+
+/// 取物理块的当前镜像：优先提供者，否则直读段文件。
+fn current_page(
+    seg: &Segment<'_, '_>,
+    block: u32,
+    current: CurrentPages<'_>,
+) -> Result<Page, SegmentSpaceError> {
+    match current(block) {
+        Some(p) => Ok(p),
+        None => Ok(seg.file.read_page(block)?),
+    }
+}
+
 /// 一个段：段头 + 区映射的内存镜像 + 其所在的数据文件。
 ///
 /// 布局约定（每个段的**首区**）：逻辑页 0 = 段头页、逻辑页 1 = **首个段内
@@ -804,13 +822,21 @@ impl<'io, 'f> Segment<'io, 'f> {
     /// **计划扩展**（**不写盘**）：分配新区 + 段头页（区映射/计数）+ 段内
     /// 位图页的（前像、后像）——写路径经缓冲池落盘（redo 保护，
     /// §11.5.3"页/区分配是系统操作"）。决策已在返回镜像里定下。
-    pub fn plan_extend(&mut self) -> Result<PlannedExtend, SegmentSpaceError> {
-        let planned = self.file.plan_allocate_extent()?;
+    ///
+    /// `current`：**物理块 → 当前镜像**（活系统 = 池视角；`None` = 直读兜底）。
+    /// 这些（前像、后像）会被调用方**整体覆盖**到池里，所以前像必须取"当前"
+    /// 而非"文件里的"——撤销页 no-force（P1）后文件落后于池，用文件像做基准
+    /// 会把池里已改的字节（如段头页上的事务表）**写回旧值**。
+    pub fn plan_extend(
+        &mut self,
+        current: CurrentPages<'_>,
+    ) -> Result<PlannedExtend, SegmentSpaceError> {
+        let planned = self.file.plan_allocate_extent(current)?;
         let rdba = Rdba::from_parts(self.file.file_id(), planned.extent.first_block())
             .expect("块号在 28 位内");
 
         // 段头页（前/后）：区映射 + 计数。
-        let header_before = self.file.read_page(self.page0)?;
+        let header_before = current_page(self, self.page0, current)?;
         let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
         let map = append_extent(&mut header_after, ExtentEntry::new(rdba, 1))?;
         let header_after_state = read_header(&header_after)?;
@@ -838,10 +864,10 @@ impl<'io, 'f> Segment<'io, 'f> {
             let (entry_idx, _) = match idx {
                 Some(i) => (i, ()),
                 None => {
-                    let before = self.file.read_page(
-                        self.logical_block(bmp_logical)
-                            .ok_or(SegmentSpaceError::BitmapCoverage)?,
-                    )?;
+                    let block = self
+                        .logical_block(bmp_logical)
+                        .ok_or(SegmentSpaceError::BitmapCoverage)?;
+                    let before = current_page(self, block, current)?;
                     let after = Page::from_bytes(Box::new(*before.as_bytes()));
                     bmp_images.push((bmp_logical, before, after));
                     (bmp_images.len() - 1, ())
@@ -893,11 +919,12 @@ impl<'io, 'f> Segment<'io, 'f> {
     pub fn plan_materialize_bitmap_page(
         &mut self,
         i: u32,
+        current: CurrentPages<'_>,
     ) -> Result<PlannedAdvance, SegmentSpaceError> {
         let (_, _, bmp_logical) = self.bitmap_slot(i * self.coverage);
         let mut images: Vec<(Rdba, Page, Page)> = Vec::new();
         while self.logical_block(bmp_logical).is_none() {
-            let planned = self.plan_extend()?;
+            let planned = self.plan_extend(&mut *current)?;
             images.extend(planned.images);
         }
         let block = self
@@ -924,7 +951,7 @@ impl<'io, 'f> Segment<'io, 'f> {
         }
 
         // 段头页：append_pos 跳过位图页、bitmap_pages +1。
-        let header_before = self.file.read_page(self.page0)?;
+        let header_before = current_page(self, self.page0, &mut *current)?;
         let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
         let mut h = read_header(&header_after)?;
         h.append_pos = bmp_logical + 1;
@@ -974,6 +1001,9 @@ impl<'io, 'f> Segment<'io, 'f> {
     }
 
     /// **当前追加位置**（只读：直读段头页的 `append_pos`）。
+    ///
+    /// **活系统形态用 [`crate::undo::UndoChain::append_position`]**（经读取源
+    /// ——撤销页 no-force 后文件里的段头页会落后，直读会重复使用同一撤销页）。
     pub fn append_position(&self) -> Result<u32, SegmentSpaceError> {
         Ok(read_header(&self.file.read_page(self.page0)?)?.append_pos)
     }
