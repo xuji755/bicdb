@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn uncommitted_insert_is_invisible() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let slot = chain.allocate_slot().unwrap();
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn committed_after_snapshot_is_invisible_before() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let slot = chain.allocate_slot().unwrap();
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn itl_overwrite_rolls_back_and_exposes_the_previous_txn() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let t1 = chain.allocate_slot().unwrap();
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn recycled_slot_means_visible() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let slot = chain.allocate_slot().unwrap();
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn missing_itl_undo_record_is_reported() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let slot = chain.allocate_slot().unwrap();
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn round_limit_guards_against_non_terminating_undo() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let slot = chain.allocate_slot().unwrap();
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn prev_cycle_is_reported() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let slot = chain.allocate_slot().unwrap();
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn rejects_non_data_pages() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let chain = UndoChain::open(segment);
         let page = Page::new(PageType::SegmentHeader, [0u8; WORKSPACE_REF_LEN], 1, 0);

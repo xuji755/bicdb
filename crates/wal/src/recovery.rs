@@ -619,7 +619,7 @@ mod recover_tests {
         let spec = GroupSpec::new(2, 1, 64).unwrap();
 
         // ---- 夹具：undo 段（两个事务）+ 数据文件（块 0，初始为空页） ----
-        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
@@ -887,7 +887,7 @@ mod pitr_tests {
         let spec = GroupSpec::new(2, 1, 64).unwrap();
 
         // ---- 夹具（undo 三槽 + 数据页初始空） ----
-        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = undo_file.handle();
         let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);

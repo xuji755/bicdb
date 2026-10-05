@@ -1,10 +1,11 @@
 //! 数据文件与文件头页（§3.2 / §5.6 / §5.11）：文件头、位图空间头、
-//! LMT 位图区的**尾部增长**、区分配。
+//! **预留式增长**、区分配。
 //!
 //! ```text
-//! 块 0            文件头页（类型 11）——内含"位图空间头"
-//! 块 1 起         数据区（段的区；块 = 1 + 区号 × 8）
-//! 文件尾部区      位图区（每个 = 1 个区 = 8 页；从尾部往前分配）
+//! 块 0                     文件头页（类型 11）——内含"位图空间头"
+//! 块 1..=1+320             位图区（**全量预留**：40 区 × 8 页 = 320 页，
+//!                          块 1 起连续；一次建好、此后**永不搬移**）
+//! 块 321 起                数据区（段的区；块 = 321 + 区号 × 8）
 //!
 //! 文件头页页体：偏移 68  file_id 2B │ role 1B │ format_version 1B │ flags 2B │
 //!                        当前大小 6B（块数）│ workspace_ref 8B
@@ -12,9 +13,11 @@
 //!                        runs[] 4B×40（各位图区的起始块号）│ 保留
 //! ```
 //!
-//! **数据区与位图区相向而行**（§5.11）：数据从块 1 往后、位图区从尾部往前；
-//! 两者相遇即"文件满"（明确报错——**增长协议**（把位图区搬到新尾部再追加
-//! 数据块）随后切片，见待讨论清单）。
+//! **预留式增长**（2026-10-05 定案）：位图区按**该文件能长到的最大规模**
+//! 一次预留够（40 区覆盖 ≈ 5 TB > 4 TiB 的文件上限），于是——
+//! **增长 = 纯尾部追加数据块**（[`DataFile::extend`]）：不搬位图、不改格式、
+//! 不与数据区"相向而行"。代价是每个文件固定多占 5 MiB（40 × 8 × 16 KiB），
+//! 换来增长路径零复制——按"性能最好"取舍。
 //!
 //! **"当前大小"记在文件头**（§2.6 的对偶）：控制文件只存创建时大小，
 //! 可变量以文件自身为准——扩展因此不必碰控制文件的双副本。
@@ -37,8 +40,8 @@ pub const BITMAP_SPACE_HEAD_OFFSET: usize = 88;
 pub const BITMAP_RUNS_OFFSET: usize = 92;
 /// 位图区上限（§5.11：4 TiB 上限下 ≤ 33，留余量到 40）。
 pub const MAX_BITMAP_RUNS: usize = 40;
-/// 建文件的最小块数：块 0 文件头 + 至少一个数据区 + 至少一个位图区。
-pub const MIN_FILE_BLOCKS: u64 = 1 + 8 + 8;
+/// 建文件的最小块数：块 0 文件头 + **全量预留的位图区**（320 页）+ 至少一个数据区。
+pub const MIN_FILE_BLOCKS: u64 = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64 + 8;
 
 /// 数据文件错误（**明确判定**）。
 #[derive(Debug)]
@@ -58,10 +61,22 @@ pub enum DataFileError {
         /// 最小块数。
         min: u64,
     },
-    /// **数据区与位图区相遇**——文件满（增长协议随后切片）。
+    /// 数据区已到上限（文件大小 / 预留覆盖）——文件满；增长走 [`DataFile::extend`]。
     FileFull,
-    /// 位图区数到顶。
-    TooManyRuns,
+    /// `extend` 的目标不大于当前大小（含缩小）——拒绝。
+    NotGrowing {
+        /// 当前块数。
+        blocks: u64,
+        /// 请求的块数。
+        requested: u64,
+    },
+    /// 越过预留位图区的覆盖上限（文件能长到的最大规模）。
+    BeyondCoverage {
+        /// 请求的块数。
+        requested: u64,
+        /// 覆盖上限（块）。
+        limit: u64,
+    },
     /// 本页不是该文件应有的块（块号越界）。
     BlockOutOfRange {
         /// 块号。
@@ -79,12 +94,15 @@ impl std::fmt::Display for DataFileError {
             DataFileError::SmallFile { blocks, min } => {
                 write!(f, "文件 {blocks} 块低于最小 {min} 块")
             }
-            DataFileError::FileFull => {
-                f.write_str("数据区与位图区相遇——文件满（增长协议随后切片）")
-            }
-            DataFileError::TooManyRuns => {
-                write!(f, "位图区数已达上限 {MAX_BITMAP_RUNS}")
-            }
+            DataFileError::FileFull => f.write_str("数据区已到上限——文件满（增长走 extend）"),
+            DataFileError::NotGrowing { blocks, requested } => write!(
+                f,
+                "文件增长要求更大的尺寸：当前 {blocks} 块，请求 {requested} 块"
+            ),
+            DataFileError::BeyondCoverage { requested, limit } => write!(
+                f,
+                "文件尺寸越过预留位图区覆盖上限：请求 {requested} 块，上限 {limit} 块"
+            ),
             DataFileError::BlockOutOfRange { block } => write!(f, "块 {block} 越出文件"),
         }
     }
@@ -188,7 +206,7 @@ pub fn write_bitmap_runs(page: &mut Page, runs: &[u32]) -> Result<(), DataFileEr
         return Err(DataFileError::NotAFileHeader);
     }
     if runs.len() > MAX_BITMAP_RUNS {
-        return Err(DataFileError::TooManyRuns);
+        return Err(DataFileError::Malformed);
     }
     let b = page.as_bytes_mut();
     b[BITMAP_SPACE_HEAD_OFFSET] = runs.len() as u8;
@@ -258,11 +276,24 @@ impl<'a> DataFile<'a> {
             },
             runs: Vec::new(),
         };
+        // **位图区全量预留**：块 1 起连续 40 区 × 8 页，一次建好、永不搬移。
+        let runs: Vec<u32> = (0..MAX_BITMAP_RUNS as u32)
+            .map(|k| 1 + k * BITMAP_PAGES_PER_RUN as u32)
+            .collect();
         let mut header = Page::new(PageType::FileHeader, workspace_ref, file_id, 0);
         write_file_head(&mut header, &file.head)?;
-        write_bitmap_runs(&mut header, &[])?;
+        write_bitmap_runs(&mut header, &runs)?;
         file.write_page(0, &mut header)?;
-        file.allocate_bitmap_run()?;
+        file.runs = runs;
+        for (k, &start) in file.runs.clone().iter().enumerate() {
+            let base = k as u16 * BITMAP_PAGES_PER_RUN as u16;
+            for i in 0..BITMAP_PAGES_PER_RUN {
+                let block = start + i as u32;
+                let mut page = Page::new(PageType::Bitmap, workspace_ref, file_id, block);
+                bitmap::init(&mut page, BitmapKind::ExtentMap, base + i as u16)?;
+                file.write_page(block, &mut page)?;
+            }
+        }
         Ok(file)
     }
 
@@ -275,8 +306,14 @@ impl<'a> DataFile<'a> {
         })?;
         let head = read_file_head(&header)?;
         let runs = read_bitmap_runs(&header)?;
-        for &run in &runs {
-            if u64::from(run) + BITMAP_PAGES_PER_RUN as u64 > head.blocks {
+        // 预留式布局的形状校验：**40 区、块 1 起连续**。
+        if runs.len() != MAX_BITMAP_RUNS {
+            return Err(DataFileError::Malformed);
+        }
+        for (k, &run) in runs.iter().enumerate() {
+            if run != 1 + k as u32 * BITMAP_PAGES_PER_RUN as u32
+                || u64::from(run) + BITMAP_PAGES_PER_RUN as u64 > head.blocks
+            {
                 return Err(DataFileError::Malformed);
             }
         }
@@ -318,14 +355,19 @@ impl<'a> DataFile<'a> {
         &self.runs
     }
 
-    /// **数据区上限**（块号，开区间）：最靠内的位图区起点；无位图区时为文件尾。
+    /// **数据区上限**（块号，开区间）：文件大小与"预留位图区覆盖上限"的较小者。
     #[must_use]
     pub fn data_limit(&self) -> u32 {
-        self.runs
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or(self.head.blocks as u32)
+        self.head.blocks.min(self.coverage_limit()) as u32
+    }
+
+    /// 预留位图区的覆盖上限（块数）——文件能长到的最大规模。
+    #[must_use]
+    pub fn coverage_limit(&self) -> u64 {
+        crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
+            + MAX_BITMAP_RUNS as u64
+                * crate::bitmap::BITS_PER_RUN as u64
+                * crate::bitmap::EXTENT_BLOCKS as u64
     }
 
     /// 读一页（两层完整性校验）。
@@ -360,64 +402,36 @@ impl<'a> DataFile<'a> {
         Ok(())
     }
 
-    /// **在尾部建立一个位图区**（数据区与位图区相向而行；相遇即文件满）。
+    /// **文件增长**（§3.3）：尾部追加。位图区**全量预留且在前部**——增长
+    /// 不碰上它，因此就是 `set_len` + 更新文件头的"当前大小"，**零搬移**。
     ///
-    /// 返回位图区号（= 顺序号，决定其管理的区号段与 `own_index` 基）。
-    pub fn allocate_bitmap_run(&mut self) -> Result<u8, DataFileError> {
-        let index = self.runs.len();
-        if index >= MAX_BITMAP_RUNS {
-            return Err(DataFileError::TooManyRuns);
+    /// 上限 = 预留位图区的覆盖（≈ 5 TB，覆盖 4 TiB 的文件上限）。
+    pub fn extend(&mut self, new_blocks: u64) -> Result<(), DataFileError> {
+        if new_blocks <= self.head.blocks {
+            return Err(DataFileError::NotGrowing {
+                blocks: self.head.blocks,
+                requested: new_blocks,
+            });
         }
-        let inner = self
-            .runs
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or(self.head.blocks as u32);
-        if u64::from(inner) < 1 + BITMAP_PAGES_PER_RUN as u64 {
-            return Err(DataFileError::FileFull);
+        let limit = self.coverage_limit();
+        if new_blocks > limit {
+            return Err(DataFileError::BeyondCoverage {
+                requested: new_blocks,
+                limit,
+            });
         }
-        let start = inner as u64 - BITMAP_PAGES_PER_RUN as u64;
-        let data_end = u64::from(self.data_end_block()?);
-        if start < data_end {
-            return Err(DataFileError::FileFull); // 数据区已到——相遇
-        }
-
-        let base = index as u16 * BITMAP_PAGES_PER_RUN as u16;
-        for i in 0..BITMAP_PAGES_PER_RUN {
-            let block = (start + i as u64) as u32;
-            let mut page = Page::new(
-                PageType::Bitmap,
-                self.head.workspace_ref,
-                self.head.file_id,
-                block,
-            );
-            bitmap::init(&mut page, BitmapKind::ExtentMap, base + i as u16)?;
-            self.write_page(block, &mut page)?;
-        }
-        self.runs.push(start as u32);
-
-        // 更新文件头页的位图空间头。
+        self.io
+            .set_len(self.handle, new_blocks * PAGE_SIZE as u64)?;
+        self.head.blocks = new_blocks;
         let mut header = self.read_page(0)?;
-        write_bitmap_runs(&mut header, &self.runs)?;
+        write_file_head(&mut header, &self.head)?;
         self.write_page(0, &mut header)?;
-        Ok(index as u8)
+        Ok(())
     }
 
-    /// **数据区水位**（已分配区的末块；无分配则为块 1）。
-    fn data_end_block(&self) -> Result<u32, DataFileError> {
-        let mut end = 1u32;
-        for idx in 0..self.runs.len() {
-            let map = self.load_run(idx)?;
-            if let Some(e) = map.highest_allocated() {
-                end = end.max(e.first_block() + e.blocks());
-            }
-        }
-        Ok(end)
-    }
-
-    /// **分配一个区**：按位图区顺序取最低空闲区；候选越出数据区上限
-    /// （撞上位图区）即回收该位并报 [`DataFileError::FileFull`]。
+    /// **分配一个区**：按位图区顺序取最低空闲区；候选越出
+    /// [`DataFile::data_limit`]（文件大小 / 预留覆盖的较小者）即回收该位并报
+    /// [`DataFileError::FileFull`]——增长走 [`DataFile::extend`]。
     pub fn allocate_extent(&mut self) -> Result<ExtentNo, DataFileError> {
         for idx in 0..self.runs.len() {
             let mut map = self.load_run(idx)?;
@@ -458,12 +472,17 @@ impl<'a> DataFile<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use bicdb_workspace::io::MemFileIo;
 
     use super::*;
+    use crate::bitmap::{BITS_PER_RUN, DATA_AREA_FIRST_BLOCK, EXTENT_BLOCKS};
 
     const F: &str = "/mem/data1.dat";
     const WS: [u8; 8] = [9, 9, 9, 9, 9, 9, 9, 9];
+    /// 预留 320 页 + 至少一个数据区 ⇒ 400 块起步（测试统一用）。
+    const BLOCKS: u64 = 400;
 
     fn mem() -> MemFileIo {
         let io = MemFileIo::new();
@@ -472,83 +491,157 @@ mod tests {
     }
 
     #[test]
-    fn create_lays_out_header_and_tail_run() {
+    fn create_reserves_the_whole_bitmap_area() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+        let file = DataFile::create(&io, Path::new(F), 3, 3, WS, BLOCKS).unwrap();
         assert_eq!(file.file_id(), 3);
-        assert_eq!(file.blocks(), 64);
-        assert_eq!(file.runs(), &[56], "位图区在尾部（64−8）");
-        assert_eq!(file.data_limit(), 56);
+        assert_eq!(file.blocks(), BLOCKS);
+        // 40 个位图区、块 1 起连续（1, 9, ..., 313）。
+        let runs = file.runs();
+        assert_eq!(runs.len(), MAX_BITMAP_RUNS);
+        assert_eq!(runs[0], 1);
+        assert_eq!(runs[MAX_BITMAP_RUNS - 1], 1 + 39 * 8);
+        for (k, &run) in runs.iter().enumerate() {
+            assert_eq!(run, 1 + k as u32 * BITMAP_PAGES_PER_RUN as u32);
+        }
+        assert_eq!(
+            file.data_limit(),
+            BLOCKS as u32,
+            "数据区上限 = 文件大小（尾部不再有位图）"
+        );
 
         let header = file.read_page(0).unwrap();
         let head = read_file_head(&header).unwrap();
-        assert_eq!(head.file_id, 3);
-        assert_eq!(head.role, 3);
-        assert_eq!(head.blocks, 64);
+        assert_eq!(head.blocks, BLOCKS);
         assert_eq!(head.workspace_ref, WS);
-        assert_eq!(read_bitmap_runs(&header).unwrap(), vec![56]);
+        assert_eq!(read_bitmap_runs(&header).unwrap(), runs);
 
-        // 位图页：kind = 区分配图、own_index = 0..8。
-        let p = file.read_page(56).unwrap();
+        // 位图页：kind = 区分配图、own_index 从 0 起逐页递增。
+        let p = file.read_page(1).unwrap();
         assert_eq!(bitmap::kind(&p).unwrap(), BitmapKind::ExtentMap);
         assert_eq!(bitmap::own_index(&p).unwrap(), 0);
+        let p = file.read_page(9).unwrap();
+        assert_eq!(
+            bitmap::own_index(&p).unwrap(),
+            8,
+            "第 2 区第一页的 own_index"
+        );
+    }
 
-        // 第一个区 = 块 1..9。
+    #[test]
+    fn first_extent_starts_after_the_reserved_area() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, BLOCKS).unwrap();
         let e = file.allocate_extent().unwrap();
-        assert_eq!((e.as_raw(), e.first_block()), (0, 1));
+        assert_eq!(
+            (e.as_raw(), e.first_block()),
+            (0, 321),
+            "区 0 从预留区之后起"
+        );
+        let e = file.allocate_extent().unwrap();
+        assert_eq!(e.first_block(), 329);
         file.sync().unwrap();
     }
 
     #[test]
-    fn allocation_stops_at_data_limit_and_does_not_leak_bits() {
+    fn allocation_stops_at_data_limit_without_leaking_bits() {
         let io = mem();
-        // 17 块：仅容一个区（块 1..9）+ 位图区（块 9..17）。
-        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 17).unwrap();
-        assert_eq!(file.data_limit(), 9);
-        let e = file.allocate_extent().unwrap();
-        assert_eq!(e.first_block(), 1);
-        // 第二个区会越出上限（9+8 = 17 > 9）⇒ 文件满，且**位不泄漏**。
+        // 预留区 + 2 个数据区（块 321..337）。
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 337).unwrap();
+        assert_eq!(file.data_limit(), 337);
+        assert_eq!(file.allocate_extent().unwrap().first_block(), 321);
+        assert_eq!(file.allocate_extent().unwrap().first_block(), 329);
         assert!(matches!(
             file.allocate_extent(),
             Err(DataFileError::FileFull)
         ));
-        let map = file.load_run(0).unwrap();
-        assert_eq!(map.allocated(), 1, "失败的分配不留下已分配位");
+        assert_eq!(file.load_run(0).unwrap().allocated(), 2, "失败分配不泄漏位");
     }
 
     #[test]
-    fn reopen_preserves_head_and_runs() {
+    fn extend_grows_at_the_tail_without_moving_bitmaps() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 337).unwrap();
+        let runs_before = file.runs().to_vec();
+        assert!(file.allocate_extent().is_ok());
+        assert!(file.allocate_extent().is_ok());
+        assert!(matches!(
+            file.allocate_extent(),
+            Err(DataFileError::FileFull)
+        ));
+
+        // 增长：纯尾部追加，位图区一字不动。
+        file.extend(353).unwrap();
+        assert_eq!(file.blocks(), 353);
+        assert_eq!(file.runs(), &runs_before[..], "位图区不搬移");
+        assert_eq!(file.data_limit(), 353);
+        assert_eq!(
+            file.allocate_extent().unwrap().first_block(),
+            337,
+            "新块可用"
+        );
+
+        // 文件头页里的"当前大小"已更新（持久化）。
+        let head = read_file_head(&file.read_page(0).unwrap()).unwrap();
+        assert_eq!(head.blocks, 353);
+
+        // 拒绝：不增长 / 缩小 / 越覆盖上限。
+        assert!(matches!(
+            file.extend(353),
+            Err(DataFileError::NotGrowing { .. })
+        ));
+        assert!(matches!(
+            file.extend(100),
+            Err(DataFileError::NotGrowing { .. })
+        ));
+        assert!(matches!(
+            file.extend(file.coverage_limit() + 1),
+            Err(DataFileError::BeyondCoverage { .. })
+        ));
+    }
+
+    #[test]
+    fn reopen_preserves_head_runs_and_allocation() {
         let io = mem();
         {
-            let file = DataFile::create(&io, Path::new(F), 5, 1, WS, 32).unwrap();
+            let file = DataFile::create(&io, Path::new(F), 5, 1, WS, 400).unwrap();
             file.sync().unwrap();
             file.close().unwrap();
         }
         let mut file = DataFile::open(&io, Path::new(F)).unwrap();
         assert_eq!(file.file_id(), 5);
-        assert_eq!(file.blocks(), 32);
-        assert_eq!(file.runs(), &[24]);
-        // 重开后分配照常。
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 1);
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 9);
+        assert_eq!(file.blocks(), 400);
+        assert_eq!(file.runs().len(), MAX_BITMAP_RUNS);
+        assert_eq!(file.allocate_extent().unwrap().first_block(), 321);
+        assert_eq!(file.allocate_extent().unwrap().first_block(), 329);
     }
 
     #[test]
-    fn two_runs_meet_data_area() {
+    fn malformed_layout_is_rejected_on_open() {
         let io = mem();
-        // 33 块：位图区 0 = 25..33；再建位图区 1 = 17..25。
-        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 33).unwrap();
-        assert_eq!(file.runs(), &[25]);
-        let idx = file.allocate_bitmap_run().unwrap();
-        assert_eq!(idx, 1);
-        assert_eq!(file.runs(), &[25, 17]);
-        assert_eq!(file.data_limit(), 17);
-        // 区 0、1（块 1..17）可分配；再往下撞位图区 ⇒ 满。
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 1);
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 9);
+        {
+            let file = DataFile::create(&io, Path::new(F), 3, 3, WS, 400).unwrap();
+            file.close().unwrap();
+        }
+        // 把 runs[0] 改坏（不再从块 1 起）→ 打开拒绝。
+        {
+            let h = io
+                .open(
+                    Path::new(F),
+                    bicdb_workspace::io::OpenOptions::new()
+                        .read(true)
+                        .write(true),
+                )
+                .unwrap();
+            let mut page = pagefile::read_page_verified(&io, h, 0).unwrap();
+            let b = page.as_bytes_mut();
+            b[BITMAP_RUNS_OFFSET..BITMAP_RUNS_OFFSET + 4].copy_from_slice(&7u32.to_le_bytes());
+            pagefile::write_page(&io, h, 0, &mut page).unwrap();
+            io.close(h).unwrap();
+        }
         assert!(matches!(
-            file.allocate_extent(),
-            Err(DataFileError::FileFull)
+            DataFile::open(&io, Path::new(F)),
+            Err(DataFileError::Malformed)
         ));
     }
 
@@ -556,8 +649,17 @@ mod tests {
     fn small_file_is_rejected() {
         let io = mem();
         assert!(matches!(
-            DataFile::create(&io, Path::new(F), 3, 3, WS, 16),
+            DataFile::create(&io, Path::new(F), 3, 3, WS, MIN_FILE_BLOCKS - 1),
             Err(DataFileError::SmallFile { .. })
         ));
+        // 覆盖上限的定量：40 区 × 每区位数 × 8 块 + 预留。
+        let expected = DATA_AREA_FIRST_BLOCK as u64
+            + MAX_BITMAP_RUNS as u64 * BITS_PER_RUN as u64 * EXTENT_BLOCKS as u64;
+        assert_eq!(
+            DataFile::create(&io, Path::new("/mem/data2.dat"), 3, 3, WS, MIN_FILE_BLOCKS)
+                .unwrap()
+                .coverage_limit(),
+            expected
+        );
     }
 }

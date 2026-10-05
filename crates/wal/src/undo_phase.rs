@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn rolls_back_a_loser_and_writes_compensation_redo() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = file.handle();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn compensation_redo_replays_after_lost_page_write() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = file.handle();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn crash_mid_undo_replays_the_whole_chain() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = file.handle();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn free_slots_are_skipped() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = file.handle();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn analysis_repair_and_undo_form_a_pipeline() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let undo_handle = file.handle();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);

@@ -1338,7 +1338,7 @@ mod tests {
     #[test]
     fn undo_segment_init_allocate_and_free() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 512).unwrap();
         let seg = create_undo_segment(&mut file, 2, 3, 4).unwrap();
 
         // 事务表与段控制就位。
@@ -1573,7 +1573,7 @@ mod chain_tests {
     fn chain_appends_links_and_reads_back() {
         let io = MemFileIo::new();
         io.add_dir("/mem");
-        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
 
@@ -1620,7 +1620,7 @@ mod chain_tests {
     fn second_transaction_gets_its_own_page() {
         let io = MemFileIo::new();
         io.add_dir("/mem");
-        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
 
@@ -1651,7 +1651,7 @@ mod chain_tests {
     fn page_rollover_keeps_chain_continuous() {
         let io = MemFileIo::new();
         io.add_dir("/mem");
-        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let slot = chain.allocate_slot().unwrap();
@@ -1698,7 +1698,7 @@ mod chain_tests {
     fn append_requires_active_slot() {
         let io = MemFileIo::new();
         io.add_dir("/mem");
-        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let err = chain
@@ -2059,7 +2059,7 @@ mod rollback_tests {
         let bytes = row_bytes(1, b"beta");
 
         // undo 段 + 链 + 事务槽。
-        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain = UndoChain::open(segment);
         let txn = chain.allocate_slot().unwrap();
@@ -2109,7 +2109,7 @@ mod rollback_tests {
 
         // 单条回放的中途状态也可验证：只回放链头（Delete），行应恢复。
         // （重新构造一遍，避免与上面的净效果混淆。）
-        let mut file = DataFile::create(&io, Path::new("/mem/undo2.dat"), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new("/mem/undo2.dat"), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         let mut chain2 = UndoChain::open(segment);
         let txn2 = chain2.allocate_slot().unwrap();
@@ -2229,7 +2229,7 @@ mod analysis_tests {
 
     /// 新建 undo 段头页（真实段 → 页 0；扩展区就位）。测试只看内存页，不写回。
     fn header_page(io: &MemFileIo) -> Page {
-        let mut file = DataFile::create(io, Path::new(F), 1, 1, WS, 64).unwrap();
+        let mut file = DataFile::create(io, Path::new(F), 1, 1, WS, 512).unwrap();
         let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
         segment.read_page(0).unwrap()
     }

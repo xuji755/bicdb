@@ -57,8 +57,12 @@ pub const BITMAP_PAGES_PER_RUN: usize = EXTENT_BLOCKS as usize;
 pub const BITS_PER_RUN: usize = BITS_PER_BITMAP_PAGE * BITMAP_PAGES_PER_RUN;
 /// 位图区数上限（4 TiB 上限下需 33；留余量到 40）。
 pub const MAX_BITMAP_RUNS: usize = 40;
-/// 数据区第一个块（块 0 是文件头页）。
-pub const DATA_AREA_FIRST_BLOCK: u32 = 1;
+/// 数据区第一个块：块 0 是文件头页，**位图区全量预留**紧随其后
+/// （`MAX_BITMAP_RUNS × BITMAP_PAGES_PER_RUN` 页 = 40 × 8 = 320 页），
+/// 数据区从预留区之后开始（§5.11 的"预留式增长"）。
+///
+/// 预留使**位图区永不搬移**：文件增长 = 纯尾部追加数据块（`DataFile::extend`）。
+pub const DATA_AREA_FIRST_BLOCK: u32 = 1 + MAX_BITMAP_RUNS as u32 * BITMAP_PAGES_PER_RUN as u32;
 
 /// 位图种类（页体头 `kind`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,7 +538,11 @@ mod tests {
 
         let first = map.allocate().unwrap();
         assert_eq!(first, ExtentNo::from_raw(0));
-        assert_eq!(first.first_block(), 1, "区 0 从块 1 起");
+        assert_eq!(
+            first.first_block(),
+            DATA_AREA_FIRST_BLOCK,
+            "区 0 从预留区之后起"
+        );
         assert_eq!(first.blocks(), 8);
         assert_eq!(map.allocate().unwrap().as_raw(), 1, "低位优先");
         assert_eq!(map.allocated(), 2);
@@ -568,7 +576,10 @@ mod tests {
         // 第 1 页已满 → 分配到第 2 张位图页的第 0 位。
         let crossing = map.allocate().unwrap();
         assert_eq!(crossing.as_raw(), BITS_PER_BITMAP_PAGE as u32);
-        assert_eq!(crossing.first_block(), 1 + BITS_PER_BITMAP_PAGE as u32 * 8);
+        assert_eq!(
+            crossing.first_block(),
+            DATA_AREA_FIRST_BLOCK + BITS_PER_BITMAP_PAGE as u32 * 8
+        );
 
         // 在第 1 页放出一个空位 → 再次分配取它（仍低位优先）。
         {

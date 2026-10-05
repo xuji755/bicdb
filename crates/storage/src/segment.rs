@@ -928,10 +928,14 @@ mod space_tests {
     #[test]
     fn create_segment_lays_out_header_bitmap_and_extent() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
         let seg = Segment::create(&mut file, SegType::Heap, 11, 12, 4, 10, 0x0001).unwrap();
 
-        assert_eq!(seg.page0_block(), 1, "首区首块");
+        assert_eq!(
+            seg.page0_block(),
+            crate::bitmap::DATA_AREA_FIRST_BLOCK,
+            "首区首块 = 预留区之后"
+        );
         let h = seg.header();
         assert_eq!(h.seg_type, SegType::Heap);
         assert_eq!((h.obj, h.dataobj), (11, 12));
@@ -947,13 +951,17 @@ mod space_tests {
         assert_eq!(h.map_format, SEG_MAP_FORMAT);
         assert_eq!(
             seg.extents(),
-            &[ExtentEntry::new(Rdba::from_parts(3, 1).unwrap(), 1)]
+            &[ExtentEntry::new(
+                Rdba::from_parts(3, crate::bitmap::DATA_AREA_FIRST_BLOCK).unwrap(),
+                1
+            )]
         );
 
         // 逻辑页 0 = 段头页；逻辑页 1 = 空闲级别位图页。
-        assert_eq!(seg.logical_block(0), Some(1));
-        assert_eq!(seg.logical_block(1), Some(2));
-        assert_eq!(seg.logical_block(7), Some(8));
+        let d0 = crate::bitmap::DATA_AREA_FIRST_BLOCK;
+        assert_eq!(seg.logical_block(0), Some(d0));
+        assert_eq!(seg.logical_block(1), Some(d0 + 1));
+        assert_eq!(seg.logical_block(7), Some(d0 + 7));
         assert_eq!(seg.logical_block(8), None, "第二个区尚未分配");
         let bmp = seg.read_page(1).unwrap();
         assert_eq!(bitmap::kind(&bmp).unwrap(), BitmapKind::FreeLevel);
@@ -967,18 +975,22 @@ mod space_tests {
     #[test]
     fn extend_merges_and_marks_levels() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
         let mut seg = Segment::create(&mut file, SegType::Heap, 1, 2, 4, 10, 0).unwrap();
         let e = seg.extend().unwrap();
-        assert_eq!(e.first_block(), 9);
+        assert_eq!(e.first_block(), crate::bitmap::DATA_AREA_FIRST_BLOCK + 8);
         // 相邻 ⇒ 合并为一条（1 区 → 2 区）。
         assert_eq!(
             seg.extents(),
-            &[ExtentEntry::new(Rdba::from_parts(3, 1).unwrap(), 2)]
+            &[ExtentEntry::new(
+                Rdba::from_parts(3, crate::bitmap::DATA_AREA_FIRST_BLOCK).unwrap(),
+                2
+            )]
         );
         assert_eq!(seg.header().extent_count, 2);
-        assert_eq!(seg.logical_block(8), Some(9), "新区首页");
-        assert_eq!(seg.logical_block(15), Some(16));
+        let d0 = crate::bitmap::DATA_AREA_FIRST_BLOCK;
+        assert_eq!(seg.logical_block(8), Some(d0 + 8), "新区首页");
+        assert_eq!(seg.logical_block(15), Some(d0 + 15));
         // 新区的数据页在段内位图标 High（逻辑页 8..16）。
         let bmp = seg.read_page(1).unwrap();
         for k in 8..16u32 {
@@ -990,33 +1002,41 @@ mod space_tests {
     fn open_reloads_segment() {
         let io = mem();
         {
-            let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+            let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
             let mut seg = Segment::create(&mut file, SegType::Temporary, 5, 6, 2, 0, 0).unwrap();
             seg.extend().unwrap();
             file.sync().unwrap();
             file.close().unwrap();
         }
         let mut file = DataFile::open(&io, Path::new(F)).unwrap();
-        let seg = Segment::open(&mut file, 1).unwrap();
+        let seg = Segment::open(&mut file, crate::bitmap::DATA_AREA_FIRST_BLOCK).unwrap();
         assert_eq!(seg.header().seg_type, SegType::Temporary);
         assert_eq!(seg.header().extent_count, 2);
-        assert_eq!(seg.logical_block(15), Some(16));
+        assert_eq!(
+            seg.logical_block(15),
+            Some(crate::bitmap::DATA_AREA_FIRST_BLOCK + 15)
+        );
     }
 
     #[test]
     fn formatted_page_roundtrip_through_logical_mapping() {
         let io = mem();
-        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 64).unwrap();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
         let seg = Segment::create(&mut file, SegType::Heap, 1, 2, 4, 10, 0).unwrap();
 
         // 未格式化的数据页读取会失败（未初始化页不得使用）。
         assert!(seg.read_page(2).is_err());
 
-        // 插入路径会先"格式化"页（这里是它的替身）：新建页 + 写。
-        let mut page = Page::new(PageType::HeapTable, [0u8; WORKSPACE_REF_LEN], 3, 3);
+        // 插入路径会先"格式化"页（这里是它的替身）：新建页（**块号 = 该区第 3 块**）+ 写。
+        let block = crate::bitmap::DATA_AREA_FIRST_BLOCK + 2;
+        let mut page = Page::new(PageType::HeapTable, [0u8; WORKSPACE_REF_LEN], 3, block);
         seg.write_page(2, &mut page).unwrap();
         let back = seg.read_page(2).unwrap();
         assert_eq!(back.as_bytes(), page.as_bytes());
-        assert_eq!(back.header().unwrap().block_id, 3, "逻辑页 2 ↔ 物理块 3");
+        assert_eq!(
+            back.header().unwrap().block_id,
+            block,
+            "逻辑页 2 ↔ 该区第 3 块（预留区之后）"
+        );
     }
 }
