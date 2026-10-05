@@ -29,7 +29,17 @@ fn main() -> ExitCode {
                 eprintln!("页序号非法：{idx}");
                 return ExitCode::from(2);
             };
-            let Some(chunk) = bytes.get(index * PAGE_SIZE..(index + 1) * PAGE_SIZE) else {
+            let Some(span) = index
+                .checked_mul(PAGE_SIZE)
+                .and_then(|start| Some(start..start.checked_add(PAGE_SIZE)?))
+            else {
+                eprintln!(
+                    "页序号 {index} 超出镜像范围（共 {} 页）",
+                    bytes.len() / PAGE_SIZE
+                );
+                return ExitCode::from(2);
+            };
+            let Some(chunk) = bytes.get(span) else {
                 eprintln!(
                     "页序号 {index} 超出镜像范围（共 {} 页）",
                     bytes.len() / PAGE_SIZE

@@ -296,7 +296,7 @@ pub fn defrag(page: &mut Page) -> Result<usize, HeapError> {
     // 收集活动记录（槽位下标升序；先拷贝，避免覆盖）。
     let mut live: Vec<(usize, Vec<u8>)> = Vec::new();
     for i in 0..slots {
-        let slot = page.slot(i).expect("槽位在界内");
+        let slot = page.slot(i).ok_or(HeapError::BadRow)?;
         if slot.status() == SlotStatus::Free {
             continue;
         }
@@ -323,8 +323,8 @@ pub fn defrag(page: &mut Page) -> Result<usize, HeapError> {
         // 记录总量超出可用区（槽位重叠的损坏页）：拒绝，不越界写。
         cursor = cursor.checked_sub(bytes.len()).ok_or(HeapError::BadRow)?;
         page.as_bytes_mut()[cursor..cursor + bytes.len()].copy_from_slice(bytes);
-        let entry = SlotEntry::new(cursor as u16, page.slot(*i).expect("槽位在界内").status())
-            .ok_or(HeapError::BadRow)?;
+        let status = page.slot(*i).ok_or(HeapError::BadRow)?.status();
+        let entry = SlotEntry::new(cursor as u16, status).ok_or(HeapError::BadRow)?;
         page.set_slot(*i, entry);
     }
     page.set_free_end(cursor);

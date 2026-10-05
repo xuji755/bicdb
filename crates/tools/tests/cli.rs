@@ -143,5 +143,18 @@ fn page_dump_shows_header_slots_and_extracts_a_page() {
         .expect("运行 page_dump");
     assert_eq!(out.status.code(), Some(2));
 
+    // 审核修复回归（F3）：**乘法溢出的页序号**（debug 会 panic / release 会
+    // 回绕到第 0 页）必须走"非法/超范围"退出路径。
+    let out = Command::new(env!("CARGO_BIN_EXE_page_dump"))
+        .arg(&image)
+        .arg("1152921504606846976") // 2^60
+        .output()
+        .expect("运行 page_dump");
+    assert_eq!(out.status.code(), Some(2), "溢出序号按超范围处理");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("超出"),
+        "给出明确诊断"
+    );
+
     fs::remove_dir_all(&dir).expect("清理测试目录");
 }

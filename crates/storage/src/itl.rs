@@ -167,7 +167,11 @@ impl std::error::Error for ItlError {}
 /// 当前 `itl_count`（页头事务区）。
 pub fn itl_count(page: &Page) -> Result<u16, ItlError> {
     let header = page.header().ok_or(ItlError::Malformed)?;
-    Ok(header.itl_count.max(1))
+    let count = header.itl_count.max(1);
+    if usize::from(count) > Page::MAX_ITL_ENTRIES {
+        return Err(ItlError::Malformed); // 损坏页：条数超出格式上限
+    }
+    Ok(count)
 }
 
 /// 读一条 ITL（槽号须在当前 `itl_count` 内）。

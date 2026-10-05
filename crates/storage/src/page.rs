@@ -481,6 +481,10 @@ impl Page {
     }
 
     /// 固定头末尾（`itl_count == 1` 为 68；每多一槽 +24）。
+    ///
+    /// **对损坏页封顶**：`itl_count` 是页上字段，损坏值（如 60000）会让
+    /// 固定头末尾算到页外——这里按格式上限夹取，让上层访问器退化为
+    /// "无可用空间/越界即 None"，而不是在切片处 panic。
     #[must_use]
     pub fn fixed_header_end(&self) -> usize {
         let itl = u16::from_le_bytes(
@@ -488,13 +492,20 @@ impl Page {
                 .try_into()
                 .expect("2 字节"),
         );
-        FIXED_HEADER_LEN + (itl.max(1) as usize - 1) * ITL_ENTRY_LEN
+        let itl = (itl.max(1) as usize).min(Self::MAX_ITL_ENTRIES);
+        FIXED_HEADER_LEN + (itl - 1) * ITL_ENTRY_LEN
     }
 
+    /// ITL 条目数的**格式上限**（页头固定区能容纳的条数）。
+    pub const MAX_ITL_ENTRIES: usize = 1 + (PAGE_SIZE - FIXED_HEADER_LEN) / ITL_ENTRY_LEN;
+
     /// `free_start`（**可推导、不存**）：固定头末尾 + 槽位目录长度。
+    /// 越出页尾的损坏值夹取到页尾（`free_space` 随之为 0）。
     #[must_use]
     pub fn free_start(&self) -> usize {
-        self.fixed_header_end() + self.slot_count() as usize * SLOT_ENTRY_LEN
+        self.fixed_header_end()
+            .saturating_add(self.slot_count() as usize * SLOT_ENTRY_LEN)
+            .min(PAGE_SIZE)
     }
 
     /// `slot_count`。
@@ -526,9 +537,11 @@ impl Page {
         ) as usize
     }
 
-    /// 设置 `free_end`。
+    /// 设置 `free_end`（**release 下夹取到页内**——debug_assert 仍抓程序员错误；
+    /// 夹取是为了让"损坏输入驱动的状态"不会变成越页写）。
     pub fn set_free_end(&mut self, end: usize) {
         debug_assert!(end <= PAGE_SIZE, "free_end 必须落在页内");
+        let end = end.min(PAGE_SIZE - 1);
         self.bytes[FREE_END_OFFSET..FREE_END_OFFSET + 2]
             .copy_from_slice(&(end as u16).to_le_bytes());
     }
@@ -552,6 +565,9 @@ impl Page {
             return None;
         }
         let at = self.fixed_header_end() + index * SLOT_ENTRY_LEN;
+        if at + SLOT_ENTRY_LEN > PAGE_SIZE {
+            return None; // 损坏页：目录越出页尾
+        }
         let raw = u16::from_le_bytes(
             self.bytes[at..at + SLOT_ENTRY_LEN]
                 .try_into()

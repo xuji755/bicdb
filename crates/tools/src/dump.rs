@@ -60,7 +60,10 @@ pub fn page_dump(page: &Page) -> String {
     let _ = writeln!(s, "槽位目录：");
     let slot_count = page.slot_count();
     for i in 0..slot_count as usize {
-        let slot = page.slot(i).expect("槽位在界内");
+        let Some(slot) = page.slot(i) else {
+            let _ = writeln!(s, "  [{:>4}] （目录越界/页损坏）", i + 1);
+            continue;
+        };
         let row_no = i as u16 + 1;
         let status = match slot.status() {
             SlotStatus::Free => "空闲",
@@ -176,6 +179,19 @@ mod tests {
     use bicdb_storage::heap::{self, InsertPolicy};
     use bicdb_storage::page::PageType;
     use bicdb_storage::row::assemble_row;
+
+    #[test]
+    fn corrupt_itl_count_does_not_panic() {
+        // 审核修复回归（F2）：损坏的 `itl_count`（超出格式上限）——转储必须
+        // 降级输出，而不是在槽位访问处 panic。
+        let mut page = Page::new(PageType::HeapTable, [0xAB; 8], 3, 7);
+        let mut header = page.header().unwrap();
+        header.itl_count = 60000;
+        page.write_header(&header);
+        page.seal();
+        let text = page_dump(&page);
+        assert!(text.contains("HeapTable"), "{text}");
+    }
 
     #[test]
     fn dump_shows_header_and_slots() {

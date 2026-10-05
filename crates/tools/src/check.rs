@@ -255,7 +255,15 @@ pub fn check_page(page: &Page, report: &mut CheckReport, location: &str) {
     // 4. 逐槽位解析记录、检查区间与重叠。
     let mut spans: Vec<(usize, usize, u16)> = Vec::new();
     for i in 0..header.slot_count as usize {
-        let slot = page.slot(i).expect("槽位在界内");
+        let Some(slot) = page.slot(i) else {
+            report.push(
+                Severity::Error,
+                "SLOT_DIR_OUT_OF_PAGE",
+                location,
+                format!("槽位目录第 {i} 项越出页尾（页损坏）"),
+            );
+            break;
+        };
         let row_no = i as u16 + 1;
         let loc = format!("{location} 槽{row_no}");
         if slot.status() == SlotStatus::Free {
@@ -284,6 +292,10 @@ pub fn check_page(page: &Page, report: &mut CheckReport, location: &str) {
             continue;
         }
         let record = &bytes[start..end];
+        if record.is_empty() {
+            report.push(Severity::Error, "ROW_EMPTY", &loc, "槽位指向零长度记录");
+            continue;
+        }
         match slot.status() {
             SlotStatus::Normal => {
                 if record[0] & row::row_flags::FRAGMENT != 0 {
@@ -392,6 +404,7 @@ fn check_fragment_chains(heap: &Heap, report: &mut CheckReport) {
     }
     let mut frags: Vec<Frag> = Vec::new();
     for (block_id, page) in heap.pages_iter() {
+        let file_id = page.header().map_or(1, |h| h.file_id);
         for row_no in 1..=page.slot_count() {
             if heap::slot_status(page, row_no) != Some(SlotStatus::FragmentHead) {
                 continue;
@@ -399,9 +412,12 @@ fn check_fragment_chains(heap: &Heap, report: &mut CheckReport) {
             let Some(bytes) = heap::row(page, row_no) else {
                 continue;
             };
-            let Ok(id) = RowId::from_parts(1, block_id, row_no) else {
+            let Ok(id) = RowId::from_parts(file_id, block_id, row_no) else {
                 continue;
             };
+            if bytes.is_empty() {
+                continue; // 零长片段：无标志位可读（`heap::row` 对畸形槽可能返回空）
+            }
             let is_head_shape = bytes[0] & row::row_flags::FRAGMENT_HEAD != 0;
             let next = if is_head_shape {
                 HeadFragment::new(bytes).ok().and_then(|h| h.next())
@@ -664,6 +680,33 @@ mod tests {
             report.render()
         );
         assert_eq!(report.verdict(), Verdict::Unrecoverable);
+    }
+
+    #[test]
+    fn zero_length_record_is_reported_not_panicked() {
+        // 审核修复回归（F1）：槽位指向零长度记录（`row_len` 字段为 0）——
+        // 旧代码在 `record[0]` 直接 panic；现报具名损坏。
+        let mut page = Page::new(PageType::HeapTable, [6; 8], 1, 1);
+        let start = page.row_area_floor() - 16;
+        page.set_free_end(start);
+        page.set_slot_count(1).unwrap();
+        page.set_slot(
+            0,
+            bicdb_storage::page::SlotEntry::new(
+                start as u16,
+                bicdb_storage::page::SlotStatus::Normal,
+            )
+            .unwrap(),
+        );
+        page.seal();
+
+        let mut report = CheckReport::default();
+        check_page(&page, &mut report, "页0");
+        assert!(
+            report.findings.iter().any(|f| f.code == "ROW_EMPTY"),
+            "{}",
+            report.render()
+        );
     }
 
     #[test]
