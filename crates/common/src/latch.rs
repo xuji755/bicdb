@@ -41,8 +41,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
-/// 默认真自旋次数（见模块文档的权衡说明）。
-pub const DEFAULT_SPIN: u32 = 40;
+/// 默认真自旋预算（见模块文档的权衡说明）。
+///
+/// **实测定的 8**（128 核 Neoverse-N1 单 socket，`tests/lock_contention.rs`
+/// 的 A/B，见 `doc/evidence/latch-ab-20261005/`）：
+///
+/// | 预算 | 2 线程 | 8 | 32 | 128（万次/秒） |
+/// | --- | --- | --- | --- | --- |
+/// | 0（纯睡眠） | 876 | 453 | 426 | 408 |
+/// | **8** | **2248** | **439** | **453** | **433** |
+/// | 40 | 2611 | 376 | 235 | 276 |
+///
+/// 预算 8：低争用拿住"大预算"约 86% 的收益，高争用**不再掉崖**（40 号在
+/// 32/128 线程比纯睡眠还慢——每次探测都是 RMW，N 个自旋者把持有者的行搅成负和）。
+pub const DEFAULT_SPIN: u32 = 8;
 
 /// 单段自旋次数上限（PG `MAX_SPINS_PER_DELAY` 的同位物——段长指数增长到这里封顶）。
 pub const MAX_SPINS_PER_DELAY: u32 = 16;
