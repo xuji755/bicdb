@@ -1519,7 +1519,7 @@ mod tests {
             let mut inner = pool.lock();
             inner.make_free(&h.io).unwrap();
             assert!(
-                inner.write_list.get(&WS_A).is_none(),
+                !inner.write_list.contains_key(&WS_A),
                 "失步条目按自身 LSN 清除"
             );
         }
