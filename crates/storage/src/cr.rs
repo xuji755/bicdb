@@ -132,10 +132,10 @@ pub fn reconstruct(
     chain: &UndoChain<'_, '_>,
 ) -> Result<Page, CrError> {
     let header = page.header().ok_or(CrError::NotDataPage)?;
-    if !matches!(
-        header.page_type,
-        PageType::HeapTable | PageType::Temporary | PageType::Undo
-    ) {
+    if !matches!(header.page_type, PageType::HeapTable | PageType::Temporary) {
+        // **撤销页不参与 CR**：它的 ITL[0] 是"页归属"（由 `plan_append`
+        // 直接写入、链上没有对应的 `ITL 覆盖` 终止符）——走 CR 必被
+        // 判成数据不一致。撤销页的内容**直读**（`UndoChain::read`）。
         return Err(CrError::NotDataPage);
     }
     let (file_id, block_id) = (header.file_id, header.block_id);
@@ -612,8 +612,13 @@ mod tests {
             reconstruct(&page, seq(1), &chain),
             Err(CrError::NotDataPage)
         ));
-        // 但 undo 页可重建（行前像的读取路径）。
+        // **撤销页不参与 CR**（P3 审核修复）：它的 ITL[0] 是"页归属"、
+        // 链上没有对应的 `ITL 覆盖` 终止符——走 CR 必判数据不一致。
+        // 撤销页的内容直读（`UndoChain::read`）。
         let undo_page = Page::new(PageType::Undo, [0u8; WORKSPACE_REF_LEN], 1, 5);
-        assert!(reconstruct(&undo_page, seq(1), &chain).is_ok());
+        assert!(matches!(
+            reconstruct(&undo_page, seq(1), &chain),
+            Err(CrError::NotDataPage)
+        ));
     }
 }

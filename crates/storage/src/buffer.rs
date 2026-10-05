@@ -646,8 +646,13 @@ impl Inner<'_> {
     }
 
     /// 找一个可复用帧：**AUX 优先**（干净候选），再扫**冷段尾**（跳过钉住与脏）。
+    ///
+    /// **只选不摘**：选中者从链上的移除由 [`Inner::attach`] 完成（成功读入 +
+    /// 身份核对之后）。这样"resolve 失败 / 页损坏 / 身份不符"的读入失败不会
+    /// 把帧丢在任何链之外——容量不会随失败单调泄漏。（单闩锁下 pin 全程持锁，
+    /// 选与摘之间没有并发窗口。）
     fn find_reusable(&mut self) -> Option<usize> {
-        // 0) 从未用过的帧最便宜。
+        // 0) 从未用过的帧最便宜（不在任何链上，attach 时无需摘链）。
         if let Some(idx) = self.virgin.pop() {
             return Some(idx);
         }
@@ -655,12 +660,11 @@ impl Inner<'_> {
         //    **脏帧必须排除**：AUX 的语义是"写完的干净候选"，而 pin 命中与
         //    `mark_dirty` 都不会把帧移出 AUX——漏了这个判据，再次改脏的帧会被
         //    前台无写回直接覆盖（已提交更新静默丢失 + 写列表孤儿）。
-        if let Some(p) = self
+        if let Some(&idx) = self
             .aux
             .iter()
-            .position(|&i| self.frames[i].pins == 0 && !self.frames[i].dirty)
+            .find(|&&i| self.frames[i].pins == 0 && !self.frames[i].dirty)
         {
-            let idx = self.aux.remove(p).expect("位置在界内");
             self.stats.free_inspected += 1;
             self.stats.evictions += 1;
             return Some(idx);
@@ -685,8 +689,6 @@ impl Inner<'_> {
                 self.stats.aging_steps += 1;
                 continue;
             }
-            let p = self.cold.len() - 1 - k;
-            let idx = self.cold.remove(p).expect("位置在界内");
             self.stats.evictions += 1;
             return Some(idx);
         }
@@ -1459,6 +1461,32 @@ mod tests {
         assert_eq!(pool.stats().aging_steps, 1, "发生过一次老化减半");
         assert_eq!(pool.stats().evictions, 1);
         assert_eq!(pool.stats().writes, 0, "干净块不需写回");
+    }
+
+    #[test]
+    fn failed_pin_does_not_leak_frames() {
+        // 审核修复回归（C3）：resolve 失败的读入不得把 victim 帧丢在任何链
+        // 之外——否则容量随失败单调泄漏，反复失败最终命中本不可达的
+        // `FreeBufferWait`。
+        let h = harness();
+        let pool = h.pool(1, h.fake_wal());
+        let k0 = BufferKey::new(WS_A, rdba(7, 0));
+        {
+            let _g = pool.pin(k0).unwrap();
+        }
+        // resolver 给不出的组合（工作区 B 配文件 7）。
+        let bad = BufferKey::new(WS_B, rdba(7, 0));
+        for _ in 0..8 {
+            let err = pool.pin(bad).unwrap_err();
+            assert!(
+                matches!(err, BufferError::Unresolved { .. }),
+                "失败仍是'定位不到'，不是'无空闲缓冲'：{err}"
+            );
+        }
+        assert_eq!(pool.stats().fb_wait, 0, "容量未泄漏");
+        // 旧键仍可命中（帧未被丢出链）。
+        let g = pool.pin(k0).unwrap();
+        assert_eq!(g.as_bytes()[4096], 0xA0);
     }
 
     #[test]

@@ -116,11 +116,15 @@ impl std::error::Error for BitmapError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExtentNo(u32);
 
+/// 全局区号的**格式上限**（位图区总数 × 每区可寻址的区数）。
+pub const MAX_EXTENTS: u32 = MAX_BITMAP_RUNS as u32 * BITS_PER_RUN as u32;
+
 impl ExtentNo {
-    /// 由全局区号构造。
+    /// 由全局区号构造；**超出格式上限返回 `None`**（否则 `first_block` 的
+    /// `1 + 区号×8` 会溢出/算到文件外）。
     #[must_use]
-    pub fn from_raw(raw: u32) -> Self {
-        Self(raw)
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        (raw < MAX_EXTENTS).then_some(Self(raw))
     }
 
     /// 全局区号。
@@ -256,16 +260,13 @@ pub fn find_free(page: &Page, from: u32) -> Option<u32> {
     None
 }
 
-/// 已分配位数。
-#[must_use]
-pub fn allocated_count(page: &Page) -> u32 {
-    if require_extent_map(page).is_err() {
-        return 0;
-    }
-    page.as_bytes()[BITS_OFFSET..BITS_OFFSET + BITS_BYTES]
+/// 已分配位数（**非区分配图页报错**——"页不对"不得伪装成"已分配 0 个"）。
+pub fn allocated_count(page: &Page) -> Result<u32, BitmapError> {
+    require_extent_map(page)?;
+    Ok(page.as_bytes()[BITS_OFFSET..BITS_OFFSET + BITS_BYTES]
         .iter()
         .map(|b| b.count_ones())
-        .sum()
+        .sum())
 }
 
 /// 读 2 位空闲级别（`kind = 1`；每页一个单元）。
@@ -337,6 +338,9 @@ impl ExtentMap {
         if pages.len() != BITMAP_PAGES_PER_RUN {
             return Err(BitmapError::BitOutOfRange);
         }
+        if usize::from(run_index) >= MAX_BITMAP_RUNS {
+            return Err(BitmapError::BitOutOfRange); // 区号超出 40 个位图区
+        }
         let base = u16::from(run_index) * BITMAP_PAGES_PER_RUN as u16;
         for (i, page) in pages.iter().enumerate() {
             if kind(page)? != BitmapKind::ExtentMap {
@@ -360,9 +364,9 @@ impl ExtentMap {
         for (pi, page) in self.pages.iter().enumerate().rev() {
             for bit in (0..BITS_PER_BITMAP_PAGE as u32).rev() {
                 if is_allocated(page, bit).unwrap_or(false) {
-                    return Some(ExtentNo::from_raw(
+                    return ExtentNo::from_raw(
                         base + pi as u32 * BITS_PER_BITMAP_PAGE as u32 + bit,
-                    ));
+                    );
                 }
             }
         }
@@ -383,9 +387,9 @@ impl ExtentMap {
                 // **不逐次 seal**：分配是批量行为，页写回时由 pagefile 统一
                 // seal（校验和与页尾副本在写盘前落定）。
                 let global = i as u32 * BITS_PER_BITMAP_PAGE as u32 + bit;
-                return Some(ExtentNo::from_raw(
+                return ExtentNo::from_raw(
                     u32::from(self.run_index) * BITS_PER_RUN as u32 + global,
-                ));
+                );
             }
         }
         None
@@ -407,7 +411,10 @@ impl ExtentMap {
     /// 本区已分配数。
     #[must_use]
     pub fn allocated(&self) -> u32 {
-        self.pages.iter().map(allocated_count).sum()
+        self.pages
+            .iter()
+            .filter_map(|p| allocated_count(p).ok())
+            .sum()
     }
 
     fn locate(&self, extent: ExtentNo) -> Result<(usize, u32), BitmapError> {
@@ -455,7 +462,7 @@ mod tests {
             Err(BitmapError::BadOwnIndex),
             "读错来源必须可检出"
         );
-        assert_eq!(allocated_count(&page), 0);
+        assert_eq!(allocated_count(&page).unwrap(), 0);
         assert_eq!(page.verify(), PageCheck::Ok);
     }
 
@@ -470,7 +477,7 @@ mod tests {
             assert_eq!(bit, expected);
             set_allocated(&mut page, bit).unwrap();
         }
-        assert_eq!(allocated_count(&page), 3);
+        assert_eq!(allocated_count(&page).unwrap(), 3);
         assert!(is_allocated(&page, 0).unwrap() && is_allocated(&page, 2).unwrap());
         assert!(!is_allocated(&page, 3).unwrap());
 
@@ -537,7 +544,7 @@ mod tests {
         assert_eq!(map.capacity(), 1_043_456);
 
         let first = map.allocate().unwrap();
-        assert_eq!(first, ExtentNo::from_raw(0));
+        assert_eq!(first, ExtentNo::from_raw(0).unwrap());
         assert_eq!(
             first.first_block(),
             DATA_AREA_FIRST_BLOCK,
@@ -548,14 +555,14 @@ mod tests {
         assert_eq!(map.allocated(), 2);
 
         // 回收后复用。
-        let mid = ExtentNo::from_raw(0);
+        let mid = ExtentNo::from_raw(0).unwrap();
         map.free(mid).unwrap();
         assert!(!map.is_allocated(mid).unwrap());
         assert_eq!(map.allocate().unwrap(), mid, "低位优先复用空闲区");
 
         // 跨位图区的区号拒绝。
         assert_eq!(
-            map.free(ExtentNo::from_raw(BITS_PER_RUN as u32)),
+            map.free(ExtentNo::from_raw(BITS_PER_RUN as u32).unwrap()),
             Err(BitmapError::BitOutOfRange)
         );
         // 页自洽（写完由调用方 seal；这里手动收尾）。
@@ -600,6 +607,9 @@ mod tests {
             "第 1 个位图区从全局区号 1043456 起"
         );
         assert_eq!(own_index(&map.pages()[0]).unwrap(), 8, "own_index 基 = 1×8");
-        assert!(map.free(ExtentNo::from_raw(0)).is_err(), "不属于本区");
+        assert!(
+            map.free(ExtentNo::from_raw(0).unwrap()).is_err(),
+            "不属于本区"
+        );
     }
 }

@@ -379,6 +379,12 @@ pub fn append_extent(
 }
 
 /// 合并逻辑（纯函数；测试直接钉住）。
+/// 把新区间项插进区映射并**相邻合并**。
+///
+/// **隐含前提**：映射项按 `(file_id, block_id)` 升序 ⇔ 逻辑页序——
+/// 即"后分配的区物理块号更大"。当前的分配只有"尾部增长"一种来源，
+/// 前提成立；**区回收/复用落地时必须重审**（低块号回填会让
+/// [`Segment::logical_of_block`] 的按序累加错乱）。
 fn merge_extent(entries: &mut Vec<ExtentEntry>, entry: ExtentEntry) -> bool {
     // 找插入位置（按逻辑序 = 起始块（file_id, block_id）升序）。
     let key = |e: &ExtentEntry| (e.start.file_id(), e.start.block_id());
@@ -445,10 +451,12 @@ pub struct PlannedExtend {
     pub images: Vec<(Rdba, Page, Page)>,
 }
 
-/// 第 `i` 个段内位图页覆盖的逻辑页范围 `[i×65216, (i+1)×65216)`。
+/// 第 `index` 个段内位图页覆盖的逻辑页区间 `[起, 止)`（**诊断/测试用**；
+/// 生产路径用 [`Segment::bitmap_slot`]）。`index × coverage` 以 u64 计算后
+/// 收窄——大 index 不会回绕。
 #[must_use]
 pub const fn bitmap_page_range(index: u32) -> (u32, u32) {
-    let start = index * BITMAP_PAGE_COVERAGE;
+    let start = (index as u64 * BITMAP_PAGE_COVERAGE as u64) as u32;
     (start, start + BITMAP_PAGE_COVERAGE)
 }
 

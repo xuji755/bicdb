@@ -240,17 +240,25 @@ impl Supervisor {
             });
         }
         let counter = Arc::clone(&active.queued);
-        // 闭包被池接收后持有守卫；被拒时 `try_send` 把闭包交还并随之丢弃，
-        // 守卫的 Drop 自动归还额度。
+        // 闭包被池接收后持有守卫（Drop 归还额度）。**被拒时闭包不会执行**——
+        // 守卫从未构造，必须在此**显式归还**刚加的额度，否则每次
+        // `InstanceQueueFull` 都让该工作区的在途计数永久 +1，最终假性"队列满"。
+        let queued = Arc::clone(&active.queued);
         match self.pool.submit(move || {
             let _slot = QueueSlot(counter);
             task();
         }) {
             Ok(()) => Ok(()),
-            Err(PoolError::QueueFull) => Err(TaskRejected::InstanceQueueFull {
-                capacity: self.pool.capacity(),
-            }),
-            Err(PoolError::Closed) => Err(TaskRejected::Closed),
+            Err(PoolError::QueueFull) => {
+                queued.fetch_sub(1, Ordering::AcqRel);
+                Err(TaskRejected::InstanceQueueFull {
+                    capacity: self.pool.capacity(),
+                })
+            }
+            Err(PoolError::Closed) => {
+                queued.fetch_sub(1, Ordering::AcqRel);
+                Err(TaskRejected::Closed)
+            }
         }
     }
 

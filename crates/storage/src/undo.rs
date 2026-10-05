@@ -51,6 +51,9 @@ pub enum UndoError {
     SlotOutOfRange(u16),
     /// 空闲链表损坏（环/越界）。
     FreeListCorrupt,
+    /// **事务表已满**（256 槽全被活动/未回收事务占用）——不是损坏；调用方等待
+    /// 或触发回收（§4.6.5），不得当成"链表损坏"。
+    NoFreeSlot,
     /// 撤销记录载荷非法（长度与 op 不符、列列表越界……）。
     MalformedRecord,
     /// 撤销记录操作码未知。
@@ -69,6 +72,7 @@ impl std::fmt::Display for UndoError {
             UndoError::NotSegmentHeader => f.write_str("不是段头页"),
             UndoError::SlotOutOfRange(s) => write!(f, "事务表槽号 {s} 越界"),
             UndoError::FreeListCorrupt => f.write_str("事务表空闲链表损坏"),
+            UndoError::NoFreeSlot => f.write_str("事务表已满（256 槽全占用）——等待/回收后重试"),
             UndoError::MalformedRecord => f.write_str("撤销记录载荷非法"),
             UndoError::UnknownOp(op) => write!(f, "撤销记录操作码 {op} 未知"),
             UndoError::WrongSegType => f.write_str("段类型不是 Undo"),
@@ -386,7 +390,7 @@ fn check_undo_segment(page: &Page) -> Result<(), UndoError> {
 pub fn allocate_slot(page: &mut Page) -> Result<(u16, TxnSlot), UndoError> {
     let mut control = read_control(page)?;
     if control.free_head == NO_SLOT {
-        return Err(UndoError::FreeListCorrupt); // 无空闲槽（256 并发写事务已满）
+        return Err(UndoError::NoFreeSlot); // 事务表满（256 槽全占用）——等待/回收
     }
     let index = control.free_head;
     let mut slot = read_slot(page, index)?;
@@ -1142,6 +1146,12 @@ pub enum RollbackError {
     },
     /// **更新类撤销需要行布局（定长区宽度）**——由行/更新切片接入。
     UpdateNeedsLayout,
+    /// **`prev` 成环**（步数超过槽内 `rec_count + 1`）——受损链，必须报错，
+    /// 不得死循环（CR 同款防线）。
+    ChainCycle,
+    /// undo 链读取错误（**保真外传**——格式错/段空间错/段内位图错各有着落，
+    /// 不压成一句"读取失败"）。
+    Chain(UndoChainError),
 }
 
 impl std::fmt::Display for RollbackError {
@@ -1168,6 +1178,8 @@ impl std::fmt::Display for RollbackError {
             RollbackError::UpdateNeedsLayout => {
                 f.write_str("更新类撤销需要行布局（定长区宽度）——行/更新切片接入")
             }
+            RollbackError::ChainCycle => f.write_str("撤销链 prev 成环（受损链）"),
+            RollbackError::Chain(e) => write!(f, "回滚 undo 链：{e}"),
         }
     }
 }
@@ -1183,6 +1195,12 @@ impl From<std::io::Error> for RollbackError {
 impl From<UndoError> for RollbackError {
     fn from(e: UndoError) -> Self {
         RollbackError::Undo(e)
+    }
+}
+
+impl From<UndoChainError> for RollbackError {
+    fn from(e: UndoChainError) -> Self {
+        RollbackError::Chain(e)
     }
 }
 
@@ -1385,25 +1403,25 @@ pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), Ro
 
 /// **沿链回滚**：从 `head` 起沿 `prev_undo` 走到底，逐条执行补偿动作。
 ///
+/// `budget` = 该事务槽的 `rec_count + 1`（调用方给出）：步数超过它即
+/// `prev` 成环，报 [`RollbackError::ChainCycle`]——受损链不得造成死循环。
 /// 返回回放的记录数。
 pub fn rollback_chain(
     io: &dyn FileIo,
     chain: &UndoChain<'_, '_>,
     head: Option<RowId>,
+    budget: u64,
     resolve: &mut PageResolver<'_>,
 ) -> Result<u64, RollbackError> {
     let mut at = head;
     let mut count = 0u64;
     while let Some(pos) = at {
-        let record = chain.read(pos).map_err(|e| {
-            RollbackError::Page(match e {
-                UndoChainError::Undo(e) => {
-                    let _ = e;
-                    "撤销记录读取失败"
-                }
-                _ => "撤销记录读取失败",
-            })
-        })?;
+        if count >= budget {
+            return Err(RollbackError::ChainCycle);
+        }
+        // 保真：链各自的错误原样外传（Undo 格式错/段空间错各有着落），
+        // 不压成统一字符串。
+        let record = chain.read(pos)?;
         rollback_record(io, &record, resolve)?;
         at = record.prev;
         count += 1;
@@ -1422,10 +1440,10 @@ pub fn rollback_transaction(
         .segment()
         .read_page(0)
         .map_err(|_| RollbackError::Page("undo 段头页不可读"))?;
-    let head = read_slot(&page, slot_index)
-        .map_err(RollbackError::Undo)?
-        .undo_current;
-    let count = rollback_chain(io, chain, head, resolve)?;
+    let slot = read_slot(&page, slot_index).map_err(RollbackError::Undo)?;
+    let head = slot.undo_current;
+    let budget = u64::from(slot.rec_count) + 1;
+    let count = rollback_chain(io, chain, head, budget, resolve)?;
 
     // 事务表槽收尾：置空闲（释放时推进 wrap）。
     let mut page = chain

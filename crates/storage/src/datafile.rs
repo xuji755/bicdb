@@ -272,6 +272,19 @@ impl<'a> DataFile<'a> {
                 min: MIN_FILE_BLOCKS,
             });
         }
+        // 创建也受硬上限约束（块号 28 位 / 位图覆盖）——否则可建出"块号
+        // 编不出来"的文件，其后每次分配区都在 `Rdba` 处失败。
+        let hard = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
+            + MAX_BITMAP_RUNS as u64
+                * crate::bitmap::BITS_PER_RUN as u64
+                * crate::bitmap::EXTENT_BLOCKS as u64;
+        let hard = hard.min(1u64 << 28);
+        if blocks > hard {
+            return Err(DataFileError::BeyondCoverage {
+                requested: blocks,
+                limit: hard,
+            });
+        }
         let handle = io.open(
             path,
             OpenOptions::new().read(true).write(true).create_new(true),
@@ -369,19 +382,27 @@ impl<'a> DataFile<'a> {
         &self.runs
     }
 
-    /// **数据区上限**（块号，开区间）：文件大小与"预留位图区覆盖上限"的较小者。
+    /// **数据区上限**（块号，开区间）：文件大小与 [`DataFile::block_limit`] 的较小者。
     #[must_use]
     pub fn data_limit(&self) -> u32 {
-        self.head.blocks.min(self.coverage_limit()) as u32
+        self.head.blocks.min(self.block_limit()) as u32
     }
 
-    /// 预留位图区的覆盖上限（块数）——文件能长到的最大规模。
+    /// 预留位图区的覆盖上限（块数）——位图能寻址的最大规模。
     #[must_use]
     pub fn coverage_limit(&self) -> u64 {
         crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
             + MAX_BITMAP_RUNS as u64
                 * crate::bitmap::BITS_PER_RUN as u64
                 * crate::bitmap::EXTENT_BLOCKS as u64
+    }
+
+    /// **文件块数硬上限** = min（位图覆盖上限，**块号 28 位上限**）。
+    /// 后者是 `Rdba`/`ROWID` 的编码位宽（`1 << 28` 块 = 4 TiB）——越过它，
+    /// 块号不再可编址（`Rdba::from_parts` 会失败）。
+    #[must_use]
+    pub fn block_limit(&self) -> u64 {
+        self.coverage_limit().min(1u64 << 28)
     }
 
     /// 读一页（两层完整性校验）。
@@ -427,7 +448,7 @@ impl<'a> DataFile<'a> {
                 requested: new_blocks,
             });
         }
-        let limit = self.coverage_limit();
+        let limit = self.block_limit();
         if new_blocks > limit {
             return Err(DataFileError::BeyondCoverage {
                 requested: new_blocks,
@@ -436,10 +457,14 @@ impl<'a> DataFile<'a> {
         }
         self.io
             .set_len(self.handle, new_blocks * PAGE_SIZE as u64)?;
-        self.head.blocks = new_blocks;
+        // **头页写成功之后**才提交内存尺寸：中途失败时同值重试仍然可行
+        // （先改内存会让"磁盘头仍旧值、内存已新值"卡死——`NotGrowing`）。
         let mut header = self.read_page(0)?;
-        write_file_head(&mut header, &self.head)?;
+        let mut head = self.head;
+        head.blocks = new_blocks;
+        write_file_head(&mut header, &head)?;
         self.write_page(0, &mut header)?;
+        self.head = head;
         Ok(())
     }
 
@@ -707,5 +732,22 @@ mod tests {
                 .coverage_limit(),
             expected
         );
+    }
+
+    #[test]
+    fn growth_is_capped_by_block_id_width() {
+        // 审核修复回归：块号 28 位（4 TiB）是硬上限——位图覆盖（≈5 TiB）
+        // 更大也不能越过去（越过即 `Rdba` 编不出来）。
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file = DataFile::create(&io, Path::new("/mem/f.dat"), 1, 1, WS, 512).unwrap();
+        assert_eq!(file.block_limit(), 1u64 << 28);
+        assert!(file.coverage_limit() > file.block_limit());
+        let err = file.extend((1u64 << 28) + 1).unwrap_err();
+        assert!(matches!(err, DataFileError::BeyondCoverage { .. }), "{err}");
+        // 失败**不推进内存尺寸**（块号上限的失败路径同样如此）——随后
+        // 一次正常增长仍然可行、且头页落盘。
+        file.extend(600).unwrap();
+        assert_eq!(file.blocks(), 600);
     }
 }

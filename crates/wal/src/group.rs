@@ -923,6 +923,15 @@ fn scan_used_group(
                 reason: "中部有坏页而其后仍有数据",
             });
         }
+    } else if scan.pages_scanned < group_pages as u64
+        && any_nonzero_page_after(io, handle, scan.pages_scanned, group_pages as u64)?
+    {
+        // **中部空洞**：空页断点之后仍有非零页——不是尾部截断，按损坏拒绝
+        // （否则该断点之后的记录被静默丢弃，违反"损坏必须有名有姓"）。
+        return Err(GroupError::Damaged {
+            group,
+            reason: "中部有空页而其后仍有数据",
+        });
     }
     Ok(Some((scan.pages_scanned, start)))
 }
@@ -968,7 +977,7 @@ fn best_member_scan(
         order = (0..usize::from(spec.member_count)).collect();
     }
     let mut best: Option<(u64, Lsn, usize)> = None;
-    let mut damaged = false;
+    let mut first_damage: Option<GroupError> = None;
     for m in order {
         match scan_used_group(io, files[m], group, spec.group_pages) {
             Ok(None) => {} // 空文件：跳过
@@ -977,14 +986,19 @@ fn best_member_scan(
                     best = Some((pages, start, m));
                 }
             }
-            Err(_) => damaged = true, // 坏成员：跳过，健康镜像顶替
+            Err(e) => {
+                // 坏成员：跳过（健康镜像顶替），但**记住具体原因**——若最终
+                // 无可用成员，报它（比"全部损坏"这种笼统文案可诊断得多）。
+                if first_damage.is_none() {
+                    first_damage = Some(e);
+                }
+            }
         }
     }
-    if best.is_none() && damaged {
-        return Err(GroupError::Damaged {
-            group,
-            reason: "无可用成员（候选全部损坏）",
-        });
+    if best.is_none() {
+        if let Some(e) = first_damage {
+            return Err(e);
+        }
     }
     Ok(best)
 }
@@ -996,8 +1010,12 @@ fn any_nonzero_page_after(
     from: u64,
     file_pages: u64,
 ) -> Result<bool, GroupError> {
+    // 以**实际文件长度**为准（声明容量可能大于当前长度——`scan_log` 同规）；
+    // 越过 EOF 去读会把"文件较短"误判成 I/O 损坏。
+    let size = io.size(handle)?;
+    let usable = (size / LOG_PAGE_SIZE as u64).min(file_pages);
     let mut buf = Box::new([0u8; LOG_PAGE_SIZE]);
-    for page in from..file_pages {
+    for page in from..usable {
         io.read_exact_at(handle, buf.as_mut_slice(), page * LOG_PAGE_SIZE as u64)?;
         if buf.iter().any(|&b| b != 0) {
             return Ok(true);
@@ -1737,6 +1755,50 @@ mod tests {
             .contents(&format!("{WAL}/{}", member_file_name(0, 1)))
             .unwrap();
         assert_eq!(m1, m2, "重建后两成员逐字节一致");
+    }
+
+    #[test]
+    fn mid_log_hole_is_reported_not_silently_truncated() {
+        // 审核修复回归：**空页断点之后仍有非零页**（中部空洞）——必须报损坏，
+        // 不得当作"尾部截断"把洞之后的记录静默丢掉。
+        let io = mem();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let spec = GroupSpec::new(2, 1, 8).unwrap();
+        let mut w = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec, lsn(0)).unwrap();
+        for i in 0..40u64 {
+            w.append(|l| RedoRecord::commit(l, i + 1, i + 1)).unwrap();
+        }
+        w.flush(w.appended_lsn()).unwrap();
+        assert!(scan_group(&io, 0, 8).1 >= 3, "至少 3 页");
+        w.close().unwrap();
+
+        // 把第 2 张页清零（洞），其后仍有数据。
+        let h = io
+            .open(
+                Path::new(&format!("{WAL}/{}", member_file_name(0, 0))),
+                bicdb_workspace::io::OpenOptions::new()
+                    .read(true)
+                    .write(true),
+            )
+            .unwrap();
+        io.write_at(h, &[0u8; LOG_PAGE_SIZE], LOG_PAGE_SIZE as u64)
+            .unwrap();
+        io.close(h).unwrap();
+
+        let mut cf2 = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let err = GroupWriter::open(&io, &mut cf2, Path::new(WAL), spec).unwrap_err();
+        assert!(
+            matches!(err, GroupError::Damaged { reason, .. } if reason.contains("空页")),
+            "{err}"
+        );
     }
 
     #[test]

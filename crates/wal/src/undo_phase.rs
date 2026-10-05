@@ -160,6 +160,11 @@ pub fn rollback_losers(
         if txn_slot.state == TxnState::Free {
             continue; // 已撤完（重复调用/陈旧列表）——不二次 `wrap`
         }
+        if txn_slot.state == TxnState::Committed {
+            // 防御守卫：**已提交的事务绝不回滚**（调用方传错列表不得造成
+            // 已提交数据丢失；正常流水线只传 `repair_committed_slots` 的输家）。
+            continue;
+        }
         let txn_raw = txn_id_of(slot, &txn_slot).as_raw();
 
         // ① 置"待回滚"（诊断）。

@@ -283,6 +283,10 @@ fn put_u64(b: &mut [u8], off: usize, v: u64) {
 }
 
 fn put_u48(b: &mut [u8], off: usize, v: u64) {
+    // 值域是**编码方的责任**：超出 48 位在此截断，而 decode 侧会以
+    // `OutOfDomain` 拒绝——变成"写得进、读不回"。所有现存调用方的值都
+    // 远在域内；这条断言让将来的误用当场暴露（debug 构建）。
+    debug_assert!(v <= SEQ_MAX, "put_u48 值超出 48 位域");
     b[off..off + 6].copy_from_slice(&v.to_le_bytes()[..6]);
 }
 
@@ -934,6 +938,7 @@ impl DataFileRecord {
         out[2] = self.role;
         out[3] = self.status;
         put_u16(out, 4, self.flags);
+        debug_assert!(self.creation_blocks <= SEQ_MAX, "创建大小超出 48 位编码域");
         put_u48(out, 6, self.creation_blocks);
         put_u64(out, 12, self.created_at);
         out[24..24 + DATA_FILE_PATH_LEN].copy_from_slice(&self.path);
