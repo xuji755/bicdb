@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 索引快速全扫描 索引全扫描 范围扫描 区别
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 25，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 59，批次 1；相关证据已满足，仍有未取候选
+  正文核实 1 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     文本以查询 select emp_name from emp where emp_name is not null 为例，说明在 emp_name 上有索引且包含所有 emp_name 不为空的值时，可以使用索引全扫描。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 索引全扫描（Index Full Scan）与索引快速全扫描（Index Fast Full Scan）  (排序分: 9.4)
+     └ 详情：文本以查询 select emp_name from emp where emp_name is not null 为例，说明在 emp_name 上有索引且包含所有 emp_name 不为空的值时，可以使用索引全扫描。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259347
+
+     [KnowledgeEntry] 索引快速全扫描（Index Fast Full Scan）  (排序分: 9.4)
+     └ 摘要：索引快速全扫描（Index Fast Full Scan）是Oracle 7.3引入的一种索引扫描方式，与传统的索引范围扫描不同，它支持并行化操作。该方式会读取索引的所有块，包括分支块，但实际仅使用叶块中的数据，类似于全表扫描的机制。它适用于需要访问索引中所有条目的场景，例如收集统计信息。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:246255
+
+     [KnowledgeEntry] 索引快速全扫描并行化  (排序分: 9.4)
+     └ 摘要：索引快速全扫描（FFS）从Oracle 7.3版本起引入，允许并行扫描索引，它像全表扫描一样读取所有块，丢弃分支块仅使用叶块。并行性分为分区内并行（多个从属进程扫描同一分区的部分）和分区间并行（同时扫描多个分区）。分区视图仅支持分区内并行，而Oracle 8分区表同时支持两者。分区B树索引通过快速全扫描和范围扫描支持分区间并行；位图索引则在星型连接等操作中支持两种并行性，并包括全局位图索引。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1556837
+
+     [KnowledgeEntry] 集群因子只影响索引范围扫描和索引全扫描  (排序分: 9.4)
+     └ 详情：集群因子通过以上物理I/O影响性能，只有涉及回表的索引范围扫描和索引全扫描才会受明显影响。当索引扫描不回表（如覆盖索引）或返回数据量很少时，回表物理I/O次数很少或为零，集群因子大小对SQL性能影响可以忽略。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2065847
+
+     [CaseStudy] 索引快速全扫描并行查询示例  (排序分: 9.1)
+     └ 摘要：查询 "select count(deptno) from big_emp" 使用索引快速全扫描并行执行。生产者从属进程集使用 PIV_SSF 提示对索引进行快速全扫描，QC 作为消费者。从属 SQL 使用特殊语法直接引用索引："SELECT /*+ PIV_SSF */ COUNT(*) FROM :I."BIG_EMP"."BIG_EMP_IND" A1 WHERE ROWID BETWEEN :B1 AND :B2"。在 Oracle7.3 中通过缓冲区缓存读取，Oracle8 中使用直接读取。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1545969
+
+     [FaultModel] 函数索引快速全扫描内部错误  (排序分: 8.6)
+     └ 摘要：Bug 28132202/31006011导致CBO进行索引快速全扫描时，对函数索引列的断言检查失败，ORA-600[qkaffsindex3]错误。需应用补丁或禁用函数索引快速全扫描。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1580215
+

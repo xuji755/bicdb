@@ -906,6 +906,32 @@ impl<'io, 'f> Segment<'io, 'f> {
         })
     }
 
+    /// **高水位**（内存镜像；§4.3.1）。
+    #[must_use]
+    pub fn hwm(&self) -> u32 {
+        self.header.hwm
+    }
+
+    // **扫描上界**由调用方按表类型选（§4.3.1）：`in_place` 取 [`Segment::hwm`]，
+    // `append_only` 取 [`Segment::append_position`]——表类型在目录/表选项里，
+    // 段层不重复存；扫描方在 `[0, bound)` 上做区读（§5.12）。
+
+    /// **计划推进高水位**（**只增**；§4.3.1）：返回段头页的（前像、后像）——
+    /// 调用方经池写 redo（系统操作，§11.5.3）。**降低 HWM 直接拒绝**（只有
+    /// TRUNCATE/重组类独占操作可以降，走独立入口）。
+    pub fn plan_advance_hwm(&mut self, new_hwm: u32) -> Result<(Page, Page), SegmentSpaceError> {
+        if new_hwm < self.header.hwm {
+            return Err(SegmentSpaceError::Format(SegmentError::Malformed));
+        }
+        let header_before = self.file.read_page(self.page0)?;
+        let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
+        let mut h = read_header(&header_after)?;
+        h.hwm = new_hwm;
+        write_header(&mut header_after, &h)?;
+        self.header = read_header(&header_after)?;
+        Ok((header_before, header_after))
+    }
+
     /// **当前追加位置**（只读：直读段头页的 `append_pos`）。
     pub fn append_position(&self) -> Result<u32, SegmentSpaceError> {
         Ok(read_header(&self.file.read_page(self.page0)?)?.append_pos)
@@ -1344,6 +1370,22 @@ mod space_tests {
             block,
             "逻辑页 2 ↔ 该区第 3 块（预留区之后）"
         );
+    }
+
+    #[test]
+    fn plan_advance_hwm_is_monotonic_and_planned() {
+        // §4.3.1：HWM 推进是**只增**的计划操作（段头前后像交调用方经池写 redo）。
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
+        let mut seg = Segment::create(&mut file, SegType::Heap, 2, 3, 4, 0, 0).unwrap();
+        assert_eq!(seg.hwm(), 2, "创建后 HWM = 2（逻辑页 0/1 是元数据）");
+        let (before, after) = seg.plan_advance_hwm(9).unwrap();
+        assert_eq!(read_header(&before).unwrap().hwm, 2, "前像 = 旧值");
+        assert_eq!(read_header(&after).unwrap().hwm, 9, "后像 = 新值");
+        assert_eq!(seg.hwm(), 9, "内存镜像同步推进");
+        // **降低被拒绝**（只有 TRUNCATE/重组类独占操作能降）。
+        assert!(seg.plan_advance_hwm(8).is_err());
+        assert_eq!(seg.hwm(), 9, "拒绝后不变");
     }
 
     #[test]

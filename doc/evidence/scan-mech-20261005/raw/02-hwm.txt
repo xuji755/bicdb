@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 高水位 HWM 全表扫描 段
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 24，摘要筛选通过 18，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 53，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 43，摘要筛选通过 33，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     TABLE_SCANS_SHORT_TABLES 统计量记录对“短表”的全表扫描次数，短表定义为高水位标记低于 SMALL_TABLE_THRESHOLD 的普通表或低于 CACHE_SIZE_THRESHOLD 的缓存表。需特别关注：若缓存表 HWM 超过 CACHE_SIZE_THRESHOLD，即使表为空也不会被缓存。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:33794.1 STATISTIC: V7 SQL "table_scans_short_tables" Open-Remarks: See <RemarksOn:NOTE:33794.1>  (排序分: 14.7)
+     └ 摘要：TABLE_SCANS_SHORT_TABLES 统计量记录对“短表”的全表扫描次数，短表定义为高水位标记低于 SMALL_TABLE_THRESHOLD 的普通表或低于 CACHE_SIZE_THRESHOLD 的缓存表。需特别关注：若缓存表 HWM 超过 CACHE_SIZE_THRESHOLD，即使表为空也不会被缓存。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995755
+
+     [KnowledgeEntry] L1：How to find Objects Fragmentated below High water mark [ID 337651.1]  (排序分: 14.7)
+     └ 摘要：提供 SQL 脚本用于通过计算 DBA_TABLES 中 BLOCKS 与 NUM_ROWS*AVG_ROW_LEN 的差值，估算表在高水位以下浪费的空间。需提前使用 compute statistics 收集统计信息，脚本会提示输入 schema 名称，列出表名及低于 HWM 的 MB 数，按碎片大小降序排。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043305
+
+     [KnowledgeEntry] L1：Note:9469117.8 ORA-1499. Table/Index row count mismatch [ID 563070.1]  (排序分: 14.7)
+     └ 摘要：ORA-1499 错误由 ANALYZE TABLE ... VALIDATE STRUCTURE CASCADE 触发，trace 文件记录 Table/Index row count mismatch，表明全表扫描与索引扫描返回行数不一致，常因表高水位标记（HWM）异常导致索引扫描返回更多行。该错误可伴随 ORA-600 [kdsgrp1] 或。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043199
+
+     [KnowledgeEntry] L1：Note:563070.1 ORA-1499. Table/Index row count mismatch  (排序分: 14.7)
+     └ 摘要：ORA-1499 表示执行 analyze table validate structure cascade 时检测到表与索引行数不匹配，trace 文件记录 Table/Index row count mismatch，通常由表的高水位（HWM）异常导致全表扫描返回行数少于索引扫描。该错误可能伴随 ORA-600 [kdsgrp1] 或 ORA-60。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047731
+
+     [CaseStudy] LOB HWM CONTENTION :Using AWR Reports to Identify the Problem; Confirm and Verify the Fix [ID 837883.1]  (排序分: 10.0)
+     └ 摘要：LOB HWM CONTENTION :Using AWR Reports to Identify the Problem; Confirm and Verify the Fix [ID 837883.1]
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:406286
+
+     [FaultModel] HWM太低导致大量块在HWM之上的未格式化状态（直接路径加载后）  (排序分: 9.5)
+     └ 摘要：现象：直接路径加载大量数据后，HWM 以上有大量未格式化块，但 HWM 以下块的空闲空间未被利用，导致空间浪费和后续插入性能下降。根因：直接路径插入后未及时回收 HWM 以下的空间，后续普通插入需先搜索 HWM 以下块，但 HWM 之上有大量空块未被使用。影响：表空间利用率降低，插入性能变差。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:322735
+

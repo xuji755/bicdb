@@ -121,6 +121,45 @@ pub fn read_page_verified(
     }
 }
 
+/// **区读（多块读）**：一次 `pread` 读入 `count` 个**连续**块，逐块做两层
+/// 完整性校验（§5.12：全表扫描 / 索引快速全扫描 / 批量回表的读形态）。
+///
+/// - `count = 0` ⇒ 空返回；越出文件尾 ⇒ `Io`（`read_exact_at` 的
+///   `UnexpectedEof`）——调用方用扫描边界（§4.3.1）保证不越界读；
+/// - 单块损坏按 [`PageFileError::Damaged`] 报**具体块号**（不是整段笼统失败）。
+pub fn read_run(
+    io: &dyn FileIo,
+    handle: FileHandle,
+    first_block: u32,
+    count: u32,
+) -> Result<Vec<Page>, PageFileError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let total = PAGE_SIZE
+        .checked_mul(count as usize)
+        .ok_or_else(|| io::Error::other("区读长度溢出"))?;
+    let mut buf = vec![0u8; total];
+    let offset = u64::from(first_block) * BLOCK_SIZE as u64;
+    io.read_exact_at(handle, &mut buf, offset)?;
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let mut page_buf = Box::new([0u8; PAGE_SIZE]);
+        page_buf.copy_from_slice(&buf[i * PAGE_SIZE..(i + 1) * PAGE_SIZE]);
+        let page = Page::from_bytes(page_buf);
+        match page.verify() {
+            PageCheck::Ok => out.push(page),
+            check => {
+                return Err(PageFileError::Damaged {
+                    block: first_block + i as u32,
+                    check,
+                })
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// 持久性点：数据落盘（`fdatasync`）。
 pub fn sync(io: &dyn FileIo, handle: FileHandle) -> io::Result<()> {
     io.sync_data(handle)

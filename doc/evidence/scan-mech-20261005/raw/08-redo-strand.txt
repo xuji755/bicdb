@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] redo 私有 strand log buffer latch 并发 提交
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 60，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 60，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Alert Log Messages: Private Strand Flush Not Complete Symptoms Cause Solution References (AuthWiz 2.5.3) Created from SR 16301756.6 with ODM Click here to edit in wizard. This document is being delivered to you via Oracle Support's Rapid Visibility (RaV) proce
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:372557.1 Alert Log Messages: Private Strand Flush Not Complete  (排序分: 14.4)
+     └ 摘要：在Oracle 10g中，警告日志出现“Private strand flush not complete”表示日志切换时私有strand的redo信息未完全写入当前在线日志，导致切换等待。这与10g引入的redo strand机制有关，用于减少redo分配latch竞争，动态调整strand数量。该消息。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2042654
+
+     [KnowledgeEntry] L1：A look into oracle redo, part 11: log writer worker processes | Frits Hoogland Weblog-c2  (排序分: 14.4)
+     └ 摘要：讨论了 Oracle redo 私有 strand 与公共 strand 机制：私有 strand 是进程独占的缓冲区，用于减少公共 redo strand 上的 redo allocation latch 争用，提交时批量刷入公共 strand 再写入联机日志。大事务需提前刷新，可查询 X$KTIFF 查看未完全缓。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2046002
+
+     [KnowledgeEntry] L1：Redo Parallelism && In Memory Undo-c1  (排序分: 14.4)
+     └ 摘要：为解决高并发下redo allocation latch争用，Oracle引入shared strand将log buffer划分为多块，受参数_log_parallelism_max、_log_parallelism_dynamic控制，每strand由单独latch保护。10g新增private strand，在shared pool中分配65K私有内存，事务可直接在其内。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040012
+
+     [KnowledgeEntry] L1：Note:372557.1 Alert Log Messages: Private Strand Flush Not Complete  (排序分: 14.4)
+     └ 摘要：Private strand flush not complete 消息出现在 alert log 中，表示在日志切换时私有 redo strand 未完成写出，需要等待 redo 信息全部写入日志文件后才能切换。这是 10.2 版本中引入的 redo strand 机制的预期行为，与 log_parallelism 参数相关。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2041197
+
+     [CaseStudy] Alert Log Messages: Private Strand Flush Not Complete  (排序分: 9.1)
+     └ 摘要：[问题现象] Alert Log报错“Private Strand Flush Not Complete”，[根因] 私有redo log strand刷新未完成（常见于Oracle 10.2.0.2版本），[影响/典型场景] 大事务或频繁日志切换时数据库可能hang或性能下降。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:403080
+
+     [FaultModel] Redo Allocation Latch争用  (排序分: 8.6)
+     └ 摘要：进程在分配redo log buffer空间时因等待重做分配闩锁（redo allocation latch）出现等待事件，常见于大量日志生成场景。根本原因是频繁的redo写入导致日志缓冲区空间不足，需要等待分配。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324213
+

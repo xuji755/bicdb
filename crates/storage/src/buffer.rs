@@ -254,6 +254,10 @@ pub struct BufferStats {
     pub hot_moved: u64,
     /// **老化减半**（aging）的次数——扫描遇到高计数候选、减半后继续（不走淘汰）。
     pub aging_steps: u64,
+    /// **区读（多块读）次数**——一次 `pread` 覆盖一段连续页（§5.12）。
+    pub run_reads: u64,
+    /// 区读覆盖的页数。
+    pub run_pages: u64,
     /// 写完成后放入 AUX 的次数（AUX_MOV）。
     pub aux_moved: u64,
 }
@@ -547,6 +551,83 @@ impl<'io> BufferPool<'io> {
         Ok(PageGuard { inner, idx: victim })
     }
 
+    /// **命中即拷副本**（**不触发读盘**）：扫描批查池用（§5.12）。
+    /// 不 touch（扫描语义——不让一次性扫描顶热计数；§5.10 的"一次性扫描
+    /// 不该污染热段"由此在 API 上显式化）。
+    #[must_use]
+    pub fn copy_if_resident(&self, key: BufferKey) -> Option<Page> {
+        let inner = self.lock();
+        let idx = inner.find_frame(key)?;
+        Some(inner.frames[idx].page.clone())
+    }
+
+    /// **装入一页"净页"**（从文件读来的盘上内容）：不标脏、不生成 redo；
+    /// 帧落**冷段**（新读入语义，§5.10）。已驻留则保留先到者。
+    ///
+    /// 与 [`BufferPool::insert_new`] 的区别：这里是**净页**（盘上内容的副本），
+    /// 那边是"尚未落盘的新分配页"（前像为零页、必须"先 fsync 后进 redo"，
+    /// §11.5.4）——两种装入语义不得混用。
+    pub fn load_clean(&self, key: BufferKey, page: Page) -> Result<(), BufferError> {
+        let mut inner = self.lock();
+        load_clean_locked(&mut inner, self.io, key, page)
+    }
+
+    /// **扫描区读（多块读）**（§5.12）：对 `[first, first+count)` 的**连续**
+    /// 页——命中者直接拷副本（不 touch）；有缺失则**一次 `pread`** 读入整段，
+    /// 缺失页 `load_clean` 装入（净页、冷段），返回与请求同序的页副本。
+    ///
+    /// - 一段区读**不跨文件**（`first + count` 必须落在同一文件内，由调用方
+    ///   用扫描边界 §4.3.1 保证）；
+    /// - 读入的页可以是**任意版本**——可见性由调用方在副本上做 CR（§12.3）。
+    pub fn read_run(
+        &self,
+        workspace: [u8; 8],
+        first: Rdba,
+        count: u32,
+    ) -> Result<Vec<Page>, BufferError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut inner = self.lock();
+        let mut out: Vec<Option<Page>> = Vec::with_capacity(count as usize);
+        let mut missing = false;
+        let key_at = |i: u32| -> Option<BufferKey> {
+            let block = first.block_id().checked_add(i)?;
+            let rdba = Rdba::from_parts(first.file_id(), block)?;
+            Some(BufferKey::new(workspace, rdba))
+        };
+        for i in 0..count {
+            let key = key_at(i).ok_or(BufferError::Unresolved { rdba: first })?;
+            match inner.find_frame(key) {
+                Some(idx) => out.push(Some(inner.frames[idx].page.clone())),
+                None => {
+                    out.push(None);
+                    missing = true;
+                }
+            }
+        }
+        if !missing {
+            return Ok(out.into_iter().flatten().collect());
+        }
+        let (handle, base) =
+            (inner.resolve)(&workspace, first).ok_or(BufferError::Unresolved { rdba: first })?;
+        let pages = pagefile::read_run(self.io, handle, base, count).map_err(|e| match e {
+            PageFileError::Damaged { .. } => BufferError::Damaged { rdba: first },
+            PageFileError::Io(e) => BufferError::Io(e),
+        })?;
+        inner.stats.run_reads += 1;
+        inner.stats.run_pages += u64::from(count);
+        for (i, page) in pages.into_iter().enumerate() {
+            if out[i].is_none() {
+                let key = key_at(i as u32).ok_or(BufferError::Unresolved { rdba: first })?;
+                let copy = page.clone();
+                load_clean_locked(&mut inner, self.io, key, page)?;
+                out[i] = Some(copy);
+            }
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
+
     /// 写回某一页（若脏）。返回是否真的写了。
     pub fn flush(&self, key: BufferKey) -> Result<bool, BufferError> {
         let mut inner = self.lock();
@@ -822,6 +903,35 @@ impl Inner<'_> {
         }
         Ok(())
     }
+}
+
+/// **装入净页**（`load_clean` 与 `read_run` 共用；调用方须已持状态锁）。
+fn load_clean_locked<'io>(
+    inner: &mut Inner<'io>,
+    io: &dyn FileIo,
+    key: BufferKey,
+    page: Page,
+) -> Result<(), BufferError> {
+    if inner.find_frame(key).is_some() {
+        return Ok(()); // 先到者为准
+    }
+    let victim = match inner.find_reusable() {
+        Some(v) => v,
+        None => {
+            inner.make_free(io)?;
+            match inner.find_reusable() {
+                Some(v) => v,
+                None => {
+                    inner.stats.fb_wait += 1;
+                    return Err(BufferError::FreeBufferWait);
+                }
+            }
+        }
+    };
+    inner.attach(victim, key, page);
+    // `attach` 以"钉住"入场（pins = 1）——扫描装入立即放掉（净页、未钉住）。
+    inner.frames[victim].pins = 0;
+    Ok(())
 }
 
 /// **页卫兵**（`PageGuard`）：钉住一帧，`Drop` = unpin。

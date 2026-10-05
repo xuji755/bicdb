@@ -1,0 +1,454 @@
+//! 扫描 I/O 原语：**区读（多块读）**与**按块批量回表**（§5.12 / §9.4）。
+//!
+//! ```text
+//! 索引扫描产出 ROWID 流
+//!   → sort_rowids（按 (file, block, slot) 排序）
+//!   → fetch_rows：同块的多行共享**一次区读 + 一次 CR 块重建**
+//! ```
+//!
+//! # 两条纪律
+//!
+//! 1. **先排序再批量**：`fetch_rows` 不做排序（它按请求顺序回填结果，分组按
+//!    首次出现序）——**排序是调用方的责任**（`sort_rowids` 提供），排过序的
+//!    请求才让同块多行相邻、让 CR 只做一次/块；未排序时最坏退化为"每行一次
+//!    重建"（仍然正确，只是慢）。
+//! 2. **批量不改变语义**：CR 快照在整个扫描期固定（§12.1）；批内批间一致。
+//!    返回 `None` 表示"该行在快照下不存在"（已删/未提交/槽复用）——与
+//!    点查的语义完全相同。
+
+use bicdb_common::seq::CommitSeq;
+
+use crate::buffer::{BufferError, BufferPool};
+use crate::cr::{self, CrError};
+use crate::heap;
+use crate::rowid::{Rdba, RowId};
+use crate::undo::UndoChain;
+
+/// 扫描原语错误。
+#[derive(Debug)]
+pub enum ScanError {
+    /// 缓冲池。
+    Pool(BufferError),
+    /// CR 重建。
+    Cr(CrError),
+    /// ROWID 编不出块地址（越域）。
+    BadRowId {
+        /// 原始 ROWID。
+        rowid: RowId,
+    },
+    /// 区读返回空（`count = 0`；正常路径不可达——防御性具名）。
+    EmptyRun {
+        /// 请求的块地址。
+        rdba: Rdba,
+    },
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanError::Pool(e) => write!(f, "扫描读池：{e}"),
+            ScanError::Cr(e) => write!(f, "扫描 CR：{e}"),
+            ScanError::BadRowId { rowid } => write!(f, "扫描：ROWID {rowid} 越出块地址域"),
+            ScanError::EmptyRun { rdba } => write!(
+                f,
+                "扫描：区读返回空（文件 {} 块 {}）",
+                rdba.file_id(),
+                rdba.block_id()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
+impl From<BufferError> for ScanError {
+    fn from(e: BufferError) -> Self {
+        ScanError::Pool(e)
+    }
+}
+
+impl From<CrError> for ScanError {
+    fn from(e: CrError) -> Self {
+        ScanError::Cr(e)
+    }
+}
+
+/// 按 `(file_id, block_id, slot)` **三级全序**排序 ROWID（回表批量的第一步；
+/// §9.4）。排序后同块的多行相邻，`fetch_rows` 对每块只做一次 CR。
+pub fn sort_rowids(ids: &mut [RowId]) {
+    ids.sort_unstable_by_key(|r| (r.file_id(), r.block_id(), r.row_id()));
+}
+
+/// **批量回表**：取出这批 ROWID 在 `snapshot` 下的行（§9.4）。
+///
+/// - 返回与请求**同序**的 `Vec<Option<Vec<u8>>>`；`None` = 该行在快照下不
+///   存在（已删/未提交/槽已复用）——与点查语义一致；
+/// - 同块的多行共享**一次区读（`count = 1`）**与**一次 CR 块重建**——
+///   未按块排序时结果仍正确，但每块的重建次数会退化（见模块文档）。
+pub fn fetch_rows(
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+    snapshot: CommitSeq,
+    rows: &[RowId],
+) -> Result<Vec<Option<Vec<u8>>>, ScanError> {
+    let workspace = chain.segment().workspace_ref();
+    let mut out: Vec<Option<Vec<u8>>> = vec![None; rows.len()];
+
+    // 按块分组（保序：处理顺序 = 首次出现的块序；输出按原下标回填）。
+    let mut groups: Vec<(Rdba, Vec<(usize, u16)>)> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let rdba =
+            Rdba::from_parts(r.file_id(), r.block_id()).ok_or(ScanError::BadRowId { rowid: *r })?;
+        match groups.iter_mut().find(|(k, _)| *k == rdba) {
+            Some((_, items)) => items.push((i, r.row_id())),
+            None => groups.push((rdba, vec![(i, r.row_id())])),
+        }
+    }
+
+    for (rdba, items) in groups {
+        let mut pages = pool.read_run(workspace, rdba, 1)?;
+        let page = pages.pop().ok_or(ScanError::EmptyRun { rdba })?;
+        // **一次 CR 块重建**服务本块全部请求行。
+        let cr_page = cr::reconstruct(&page, snapshot, chain)?;
+        for (idx, row_no) in items {
+            out[idx] = heap::row(&cr_page, row_no).map(<[u8]>::to_vec);
+        }
+    }
+    Ok(out)
+}
+
+/// 便捷形态：已经按块排序的 ROWID 流**逐块回表**时，直接给块与行号。
+///
+/// （供扫描器在"同一块的 ROWID 连续出现"时跳过分组——语义与
+/// [`fetch_rows`] 相同。）
+pub fn fetch_block_rows(
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+    snapshot: CommitSeq,
+    rdba: Rdba,
+    row_nos: &[u16],
+) -> Result<Vec<Option<Vec<u8>>>, ScanError> {
+    let workspace = chain.segment().workspace_ref();
+    let mut pages = pool.read_run(workspace, rdba, 1)?;
+    let page = pages.pop().ok_or(ScanError::EmptyRun { rdba })?;
+    let cr_page = cr::reconstruct(&page, snapshot, chain)?;
+    Ok(row_nos
+        .iter()
+        .map(|n| heap::row(&cr_page, *n).map(<[u8]>::to_vec))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bicdb_common::seq::Lsn;
+    use bicdb_workspace::io::{FileHandle, FileIo, MemFileIo, OpenOptions};
+
+    use super::*;
+    use crate::buffer::{BufferKey, WalGuard};
+    use crate::datafile::DataFile;
+    use crate::heap::{self, InsertPolicy};
+    use crate::itl::{ItlEntry, ItlState};
+    use crate::page::{Page, PageType};
+    use crate::pagefile;
+    use crate::row::assemble_row;
+    use crate::undo::{create_undo_segment, read_slot, txn_id_of, UndoOp, UndoPayload};
+
+    const WS: [u8; 8] = [9u8; 8];
+    const DATA_F: &str = "/mem/scan.dat";
+    const UNDO_F: &str = "/mem/scan_undo.dat";
+
+    fn lsn(v: u64) -> Lsn {
+        Lsn::from_raw(v).unwrap()
+    }
+
+    fn seq(v: u64) -> CommitSeq {
+        CommitSeq::from_raw(v).unwrap()
+    }
+
+    fn row(payload: &[u8]) -> Vec<u8> {
+        assemble_row(0, 1, &[false], &[], &[payload]).unwrap()
+    }
+
+    fn rid(block: u32, slot: u16) -> RowId {
+        RowId::from_parts(3, block, slot).unwrap()
+    }
+
+    /// 假 WAL：水位视为已全落盘（扫描路径不触发 WAL）。
+    struct NoWal;
+    impl WalGuard for NoWal {
+        fn durable_lsn(&self) -> Lsn {
+            lsn(u64::MAX >> 16)
+        }
+        fn ensure_durable(&mut self, _t: Lsn) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 记 `read_exact_at` 次数的 I/O 包装（断言"一次 pread = 多块读"）。
+    struct CountingIo {
+        inner: MemFileIo,
+        reads: AtomicUsize,
+    }
+    impl CountingIo {
+        fn new() -> Self {
+            Self {
+                inner: MemFileIo::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+    impl FileIo for CountingIo {
+        fn open(&self, path: &Path, opts: OpenOptions) -> std::io::Result<FileHandle> {
+            self.inner.open(path, opts)
+        }
+        fn open_dir(&self, path: &Path) -> std::io::Result<FileHandle> {
+            self.inner.open_dir(path)
+        }
+        fn read_at(&self, h: FileHandle, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+            self.inner.read_at(h, buf, off)
+        }
+        fn read_exact_at(&self, h: FileHandle, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read_exact_at(h, buf, off)
+        }
+        fn write_at(&self, h: FileHandle, buf: &[u8], off: u64) -> std::io::Result<()> {
+            self.inner.write_at(h, buf, off)
+        }
+        fn size(&self, h: FileHandle) -> std::io::Result<u64> {
+            self.inner.size(h)
+        }
+        fn set_len(&self, h: FileHandle, len: u64) -> std::io::Result<()> {
+            self.inner.set_len(h, len)
+        }
+        fn sync_data(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_data(h)
+        }
+        fn sync_all(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_all(h)
+        }
+        fn sync_dir(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_dir(h)
+        }
+        fn close(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.close(h)
+        }
+    }
+
+    fn pool_over(io: &CountingIo, data: FileHandle, capacity: usize) -> BufferPool<'_> {
+        BufferPool::new(
+            io,
+            capacity,
+            move |ws, r| (*ws == WS && r.file_id() == 3).then_some((data, r.block_id())),
+            NoWal,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn read_run_reads_once_then_hits_the_pool() {
+        let io = CountingIo::new();
+        io.inner.add_dir("/mem");
+        let data = pagefile::create(&io, Path::new(DATA_F), 16).unwrap();
+        let mut ids = Vec::new();
+        for b in 1..=8u32 {
+            let mut p = Page::new(PageType::HeapTable, WS, 3, b);
+            ids.push(heap::insert_row(&mut p, &row(b"x"), &InsertPolicy::in_place(0)).unwrap());
+            pagefile::write_page(&io, data, b, &mut p).unwrap();
+        }
+        let pool = pool_over(&io, data, 16);
+        let first = Rdba::from_parts(3, 1).unwrap();
+
+        let before = io.reads();
+        let pages = pool.read_run(WS, first, 8).unwrap();
+        assert_eq!(pages.len(), 8, "整段返回");
+        assert_eq!(io.reads() - before, 1, "一次 pread 覆盖 8 页（多块读）");
+        assert_eq!(
+            heap::row(&pages[0], ids[0]),
+            Some(&row(b"x")[..]),
+            "第一页内容正确"
+        );
+        assert_eq!(
+            heap::row(&pages[7], ids[7]),
+            Some(&row(b"x")[..]),
+            "最后一页内容正确"
+        );
+        assert_eq!(pool.stats().run_reads, 1);
+        assert_eq!(pool.stats().run_pages, 8);
+        assert_eq!(pool.dirty_len(WS), 0, "装入的是净页（不标脏）");
+
+        // 第二次：全部命中 —— 零物理读。
+        let before = io.reads();
+        let pages = pool.read_run(WS, first, 8).unwrap();
+        assert_eq!(io.reads(), before, "第二次零物理读");
+        assert_eq!(pages.len(), 8);
+        // 装入的帧落**冷段**（扫描不升热）。
+        assert_eq!(pool.chain_of(BufferKey::new(WS, first)), Some("cold"));
+        assert_eq!(pool.touch_count(BufferKey::new(WS, first)), Some(0));
+    }
+
+    #[test]
+    fn read_run_uses_pool_copy_for_resident_pages() {
+        let io = CountingIo::new();
+        io.inner.add_dir("/mem");
+        let data = pagefile::create(&io, Path::new(DATA_F), 16).unwrap();
+        for b in 1..=8u32 {
+            let mut p = Page::new(PageType::HeapTable, WS, 3, b);
+            heap::insert_row(&mut p, &row(b"y"), &InsertPolicy::in_place(0)).unwrap();
+            pagefile::write_page(&io, data, b, &mut p).unwrap();
+        }
+        let pool = pool_over(&io, data, 16);
+        // 先把第 3 页读进池并**改动池内副本**（不标脏）——区读必须返回池内副本。
+        let k3 = BufferKey::new(WS, Rdba::from_parts(3, 3).unwrap());
+        {
+            let mut g = pool.pin(k3).unwrap();
+            g.as_bytes_mut()[5000] = 0x99;
+        }
+        let before = io.reads();
+        let pages = pool
+            .read_run(WS, Rdba::from_parts(3, 1).unwrap(), 8)
+            .unwrap();
+        assert_eq!(io.reads() - before, 1, "缺失页仍一次 pread");
+        assert_eq!(pages[2].as_bytes()[5000], 0x99, "驻留页以池内为准");
+        assert_eq!(pages[0].as_bytes()[5000], 0x00, "缺失页来自文件");
+    }
+
+    #[test]
+    fn batch_fetch_preserves_order_and_none_semantics() {
+        let io = CountingIo::new();
+        io.inner.add_dir("/mem");
+        let data = pagefile::create(&io, Path::new(DATA_F), 16).unwrap();
+        let r1 = row(b"aaa");
+        let r2 = row(b"bbb");
+        let ra = row(b"ccc");
+        {
+            let mut p1 = Page::new(PageType::HeapTable, WS, 3, 1);
+            heap::insert_row(&mut p1, &r1, &InsertPolicy::in_place(0)).unwrap();
+            heap::insert_row(&mut p1, &r2, &InsertPolicy::in_place(0)).unwrap();
+            pagefile::write_page(&io, data, 1, &mut p1).unwrap();
+            let mut p2 = Page::new(PageType::HeapTable, WS, 3, 2);
+            heap::insert_row(&mut p2, &ra, &InsertPolicy::in_place(0)).unwrap();
+            pagefile::write_page(&io, data, 2, &mut p2).unwrap();
+        }
+        let pool = pool_over(&io, data, 16);
+        // 未建任何 undo 记录的空链（CR 无操作）。
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let chain = UndoChain::open(segment);
+
+        // 乱序请求 + 一个不存在的行号。
+        let reqs = vec![rid(2, 1), rid(1, 2), rid(1, 1), rid(1, 99)];
+        let out = fetch_rows(&pool, &chain, seq(0), &reqs).unwrap();
+        assert_eq!(out[0].as_deref(), Some(ra.as_slice()), "块 2 行 1");
+        assert_eq!(out[1].as_deref(), Some(r2.as_slice()), "块 1 行 2");
+        assert_eq!(out[2].as_deref(), Some(r1.as_slice()), "块 1 行 1");
+        assert_eq!(out[3], None, "不存在的行号为 None");
+
+        // 排序 helper：三级全序（块 → 槽）。
+        let mut v = reqs.clone();
+        sort_rowids(&mut v);
+        assert_eq!(
+            v.iter()
+                .map(|r| (r.block_id(), r.row_id()))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (1, 2), (1, 99), (2, 1)],
+            "按 (块, 槽) 全序"
+        );
+    }
+
+    #[test]
+    fn batch_fetch_applies_cr_once_per_block() {
+        // 页上两行；T1 删除第 1 行且未提交 ⇒ 快照下第 1 行仍可见（CR 生效）。
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let data = pagefile::create(&io, Path::new(DATA_F), 16).unwrap();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let slot = chain.allocate_slot().unwrap();
+        let hdr = chain.segment().read_page(0).unwrap();
+        let txn_id = txn_id_of(slot, &read_slot(&hdr, slot).unwrap());
+
+        let r1 = row(b"one");
+        let r2 = row(b"two");
+        {
+            let mut p = Page::new(PageType::HeapTable, WS, 3, 1);
+            heap::insert_row(&mut p, &r1, &InsertPolicy::in_place(0)).unwrap();
+            heap::insert_row(&mut p, &r2, &InsertPolicy::in_place(0)).unwrap();
+            crate::itl::write_itl(
+                &mut p,
+                0,
+                &ItlEntry {
+                    txn_id,
+                    undo_ptr: None,
+                    commit_seq: None,
+                    lock_cnt: 1,
+                    state: ItlState::Active,
+                },
+            )
+            .unwrap();
+            pagefile::write_page(&io, data, 1, &mut p).unwrap();
+        }
+        // 链：ITL 覆盖（原为空闲）+ 删除第 1 行。
+        chain
+            .append(
+                slot,
+                UndoOp::ItlOverwrite,
+                0,
+                RowId::from_parts(3, 1, 1).unwrap(),
+                UndoPayload::ItlOverwrite {
+                    txn_id,
+                    itl_slot: 0,
+                    old: None,
+                },
+            )
+            .unwrap();
+        chain
+            .append(
+                slot,
+                UndoOp::Delete,
+                0,
+                RowId::from_parts(3, 1, 1).unwrap(),
+                UndoPayload::FullRow(r1.clone()),
+            )
+            .unwrap();
+
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |ws, r| (*ws == WS && r.file_id() == 3).then_some((data, r.block_id())),
+            NoWal,
+        )
+        .unwrap();
+        // 未提交（快照 0）⇒ 删除被 CR 撤销、两行都可见。
+        let out = fetch_rows(
+            &pool,
+            &chain,
+            seq(0),
+            &[
+                RowId::from_parts(3, 1, 1).unwrap(),
+                RowId::from_parts(3, 1, 2).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out[0].as_deref(), Some(r1.as_slice()), "被删行经 CR 恢复");
+        assert_eq!(out[1].as_deref(), Some(r2.as_slice()), "另一行不受影响");
+
+        // fetch_block_rows 便捷形态：同块多行、同语义。
+        let out = fetch_block_rows(
+            &pool,
+            &chain,
+            seq(0),
+            Rdba::from_parts(3, 1).unwrap(),
+            &[1, 2],
+        )
+        .unwrap();
+        assert_eq!(out[0].as_deref(), Some(r1.as_slice()));
+        assert_eq!(out[1].as_deref(), Some(r2.as_slice()));
+    }
+}

@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 提交 确认 客户端 log file sync LGWR 写入 返回
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 63，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     log file sync 等待事件指示用户会话因提交事务而等待 LGWR 将日志缓冲区数据写入联机重做日志文件的过程。高等待通常源于 LGWR 的 I/O 性能问题或应用提交过于频繁，诊断时需收集 AWR 报告及 LGWR 跟踪文件，并对比 log file sync 与。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:10318123.8 Troubleshooting: "log file sync" Waits (文档 ID 1376916.1)  (排序分: 15.0)
+     └ 摘要：log file sync 等待事件指示用户会话因提交事务而等待 LGWR 将日志缓冲区数据写入联机重做日志文件的过程。高等待通常源于 LGWR 的 I/O 性能问题或应用提交过于频繁，诊断时需收集 AWR 报告及 LGWR 跟踪文件，并对比 log file sync 与。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2044255
+
+     [KnowledgeEntry] L1：Note:1205673.1 故障排除："log file sync"等待 (文档 ID 1626301.1)  (排序分: 15.0)
+     └ 摘要：log file sync等待表示用户会话提交时等待LGWR将日志缓冲区中的redo写入在线重做日志文件并收到确认，涵盖从通知LGWR到接收完成信号的时间间隔。与log file parallel write紧密关联，后者反映LGWR实际写IO耗时，若log file parallel write平。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047423
+
+     [KnowledgeEntry] L1：Note:741178.1 'Log File Sync' problem Checklist for 10.2  (排序分: 15.0)
+     └ 摘要：log file sync 等待事件表示前台进程等待 LGWR 确认其日志缓冲区已刷写至在线重做日志，高延迟通常与 LGWR 写入性能、提交频率以及特定 Bug 相关。该检查清单覆盖 10.2 版本，列出多个已知缺陷，如 Bug 6193945（RAC 下 LGWR CPU 高使用。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040674
+
+     [KnowledgeEntry] L1：Script to Collect Log File Sync Diagnostic Information (lfsdiag.sql) (文档 ID 1064487.1)-c2  (排序分: 15.0)
+     └ 摘要：Log file sync 等待事件表示用户会话提交时等待 LGWR 将重做日志写入磁盘。该脚本 lfsdiag.sql 用于收集诊断信息，包括 commit_logging、commit_wait、commit_write 等参数配置，ASH 中最差的 log file sync 等待分钟及对应 LGWR 的 log file parallel writ。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2049392
+
+     [CaseStudy] INSTANCE CRASH BY LGWR PROCESS WITH ORA-600 [2103]-c2  (排序分: 10.0)
+     └ 摘要：LGWR进程导致实例崩溃，报ORA-600 [2103]，根因为Bug 6267208，影响服务严重丢失，典型场景为多个数据库实例因LGWR进程异常终止。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:397461
+
+     [FaultModel] ORA-4021 ADG LGWR解析锁等待超时  (排序分: 9.5)
+     └ 摘要：ORA-4021错误在ADG环境下由LGWR进程等待exclusive parse lock超时引起，LGWR需要持有该锁编译SQL，但其他会话长时间占用同对象锁，导致LGWR超时并可能引起数据库挂起或宕机。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1560727
+

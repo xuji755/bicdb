@@ -1,0 +1,58 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：A look into oracle redo, part 11: log writer worker processes | Frits Hoogland Weblog-c2
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2046002
+
+  ── 描述 ──
+  A look into oracle redo, part 11: log writer worker processes | Frits Hoogland Weblog-c2 A look into
+  oracle redo, part 11: log writer worker processes | Frits Hoogland Weblog Thanks Frits for sharing
+  Thomas Saviour Reply ↓ Frits Hoogland said: September 29, 20181:00 pm Hi Thomas, thank you for
+  reading! Private strands are private to a process, and work closely together with In-Memory Undo. I
+  got a blogpost that shows some of the specifics for both:
+  https://fritshoogland.wordpress.com/2016/11/15/redo-a-blogpost/ I haven’t investigated private
+  strands as much as I did investigate regular redo generation of a process. Plus there are additional
+  reasons private strands are not used; I do believe RAC disables private strands for example. My
+  current thinking is the idea of private strands is the following: traditional redo generation means
+  all generated redo needs access to a public redo strand. By using private strands, the redo
+  generation is done to a buffer that is unique to a single process, so it can’t run into a taken redo
+  allocation latch. However, when the transaction is committed, the generated redo is flushed from the
+  private strand into a public strand, because only the public strands are written to the online redo
+  log files. So my current reasoning is that private strands are a way to batch redo generation into
+  the public strands. Any additions or comments are welcome, I did not validate this statement, it is
+  based on my investigations on regular redo generation, as well as investigating private strands
+  generally. Second note: I hardly run into databases that have serialisation issues with the redo
+  allocation latch. Some of them might be using private strands, but as I indicated: RAC disables
+  private strand usage too, and these too almost consistently do not have redo allocation latch issues
+  too. This means that as far as I see it now, by creating multiple public strands, Oracle mitigated
+  an issue that was present in certain scenario’s in the past. Reply ↓ Ora600Tom said: September 29,
+  20184:42 pm Thanks Frits. After posting the question, I realized, the consolidated redo vector
+  copied from Private redo strands to the Public Strands, so there is no scope for worker processes.
+  However, the idea of “flushed from Private strands to Public strands during commit” is not digesting
+  to me as 1. A large transaction can generate much more redo which may not fit into a Private
+  strands. In such cases, Private strands needs flush the redo to the Public strands (or directly to
+  the log file) well before the commit. 2. Again for a large transaction, it is unconvincing that
+  Oracle will move the entire redo from Private strands to Public and again to log files. Is it not a
+  double work Thanks for the discussion! Regards Thomas Saviour Reply ↓ Frits Hoogland said: September
+  29, 20184:50 pm Perhaps I should have been more clear. The purpose of private strands is to take the
+  pressure off the redo allocation latches. This is a simplification, but essentially it’s a private
+  buffer that sits in front of the public redo strands, and could reduce the number of redo allocation
+  latch gets for the public redo strands. And yes, there are many cases where the private strands can
+  not buffer the entire transaction and need to be flushed to the public ones, see x$ktiff for
+  documented reasons. What I also tried expressing is that I don’t see a lot of contention for redo
+  allocation latches nowadays, which is probably because of multiple public strands. Reply ↓ Ora600Tom
+  said: September 29, 20185:19 pm Thanks for the quick reply! Reply ↓ Leave a Reply Cancel reply Fill
+  in your details below or click an icon to log in: Email (required) (Address never made public) Name
+  (required) Website You are commenting using your WordPress.com account. ( Log Out / Change ) You are
+  commenting using your Twitter account. ( Log Out / Change ) You are commenting using your Facebook
+  account. ( Log Out / Change ) Cancel Connecting to %s Notify me of new comments via email. Notify me
+  of new posts via email. Δ This site uses Akismet to reduce spam. Learn how your comment data is
+  processed. Blog at WordPress.com. Follow Following Frits Hoogland Weblog Join 4,038 other followers
+  Sign me up Already have a WordPress.com account Log in now. Frits Hoogland Weblog Customize Follow
+  Following Sign up Log in Copy shortlink Report this content View post in Reader Manage subscriptions
+  Collapse this bar Privacy & Cookies: This site uses cookies. By continuing to use this website, you
+  agree to their use. To find out more, including how to control cookies, see here: Cookie Policy %d
+  bloggers like this: ad
+
+  ── 摘要 ──
+  讨论了 Oracle redo 私有 strand 与公共 strand 机制：私有 strand 是进程独占的缓冲区，用于减少公共 redo strand 上的 redo allocation latch 争用，提交时批量刷入公共 strand 再写入联机日志。大事务需提前刷新，可查询 X$KTIFF 查看未完全缓。

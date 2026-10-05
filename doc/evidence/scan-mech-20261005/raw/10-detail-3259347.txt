@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 索引全扫描（Index Full Scan）与索引快速全扫描（Index Fast Full Scan）
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3259347
+
+  ── 描述 ──
+  文本以查询 select emp_name from emp where emp_name is not null 为例，说明在 emp_name 上有索引且包含所有 emp_name
+  不为空的值时，可以使用索引全扫描。
+
+  ── 摘要 ──
+  索引全扫描包括两种不同方式：索引全扫描（index full scan）和索引快速全扫描（index fast full scan）。
