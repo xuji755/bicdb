@@ -46,7 +46,7 @@ use bicdb_storage::controlfile::{
 };
 use bicdb_workspace::io::{FileHandle, FileIo, OpenOptions};
 
-use crate::buffer::{LogBuffer, WalError};
+use crate::buffer::{LogBuffer, LogSink, WalError};
 use crate::file::{scan_log, FileLogSink, LogFileError};
 use crate::logpage::{LogPage, LOG_PAGE_SIZE};
 use crate::record::RedoRecord;
@@ -73,8 +73,8 @@ impl GroupSpec {
         if !(2..=MAX_REDO_GROUPS as u8).contains(&group_count) {
             return Err(GroupError::Spec("组数应在 2..=8（至少 2 组轮换）"));
         }
-        if member_count != 1 {
-            return Err(GroupError::Spec("本切片仅支持单成员（成员镜像随后）"));
+        if member_count == 0 || member_count > 8 {
+            return Err(GroupError::Spec("成员数应在 1..=8"));
         }
         if group_pages == 0 {
             return Err(GroupError::Spec("每组至少 1 页"));
@@ -97,6 +97,59 @@ impl GroupSpec {
 #[must_use]
 pub fn member_file_name(group: u8, member: u8) -> String {
     format!("redo_g{}_m{}", group + 1, member + 1)
+}
+
+/// **成员镜像的写扇出**：一页写给全部成员；某成员失败即标记并跳过它，
+/// **全坏才整体失败**（§11.9：镜像掉一个降级继续，掉光才是故障）。
+struct TeeSink<'io> {
+    sinks: Vec<FileLogSink<'io>>,
+    failed: Vec<bool>,
+}
+
+impl LogSink for TeeSink<'_> {
+    fn append_page(&mut self, page: &LogPage) -> std::io::Result<()> {
+        let mut ok = 0;
+        let mut last = None;
+        for (i, sink) in self.sinks.iter_mut().enumerate() {
+            if self.failed[i] {
+                continue;
+            }
+            match sink.append_page(page) {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    self.failed[i] = true;
+                    last = Some(e);
+                }
+            }
+        }
+        if ok == 0 {
+            Err(last.unwrap_or_else(|| std::io::Error::other("全部成员写入失败")))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        let mut ok = 0;
+        let mut last = None;
+        for (i, sink) in self.sinks.iter_mut().enumerate() {
+            if self.failed[i] {
+                continue;
+            }
+            match sink.sync() {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    self.failed[i] = true;
+                    last = Some(e);
+                }
+            }
+        }
+        if ok == 0 {
+            Err(last.unwrap_or_else(|| std::io::Error::other("全部成员 sync 失败")))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// 切换受阻（写者暂停的两类原因，§11.9 的"等待与告警"）。
@@ -328,7 +381,26 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             if !used {
                 continue; // 从未用过：文件保持全零
             }
-            let (pages, start) = scan_used_group(io, files[g][0], g as u8, spec.group_pages)?;
+            // 成员挑选（同 `online_groups`）：健康成员里取已写前缀最长者。
+            let rusty = entries.groups[g].member_stale;
+            let mut order: Vec<u8> = (0..spec.member_count)
+                .filter(|m| rusty & (1 << m) == 0)
+                .collect();
+            if order.is_empty() {
+                order = (0..spec.member_count).collect();
+            }
+            let mut best: Option<(u64, Lsn)> = None;
+            for m in order {
+                let (pages, start) =
+                    scan_used_group(io, files[g][usize::from(m)], g as u8, spec.group_pages)?;
+                if best.as_ref().map_or(true, |(p, _)| pages > *p) {
+                    best = Some((pages, start));
+                }
+            }
+            let (pages, start) = best.ok_or(GroupError::Damaged {
+                group: g as u8,
+                reason: "无可用成员",
+            })?;
             written_pages[g] = pages;
             group_ends[g] = Some(lsn_add(start, pages * LOG_PAGE_SIZE as u64)?);
         }
@@ -416,21 +488,79 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// **刷盘到 `target`**（组提交语义由 [`LogBuffer`] 承担）：把当前组的
     /// 未刷页写入其成员文件并 sync；失败时页被放回（重试可继续）。
     pub fn flush(&mut self, target: Lsn) -> Result<Lsn, GroupError> {
-        let handle = self.files[self.current as usize][0];
-        let mut sink = FileLogSink::resume(
-            self.io,
-            handle,
+        let g = self.current as usize;
+        let pages = self.written_pages[g];
+        let handles: Vec<_> = self.files[g].clone();
+        let mut tee = TeeSink {
+            sinks: handles
+                .iter()
+                .map(|h| {
+                    FileLogSink::resume(
+                        self.io,
+                        *h,
+                        self.current_start,
+                        self.spec.group_pages as u64,
+                        pages,
+                    )
+                })
+                .collect(),
+            failed: vec![false; handles.len()],
+        };
+        let synced = self.buffer.flush_to(target, &mut tee)?;
+        self.written_pages[g] = tee.sinks[0].written_pages();
+        self.group_ends[g] = Some(lsn_add(
             self.current_start,
-            self.spec.group_pages as u64,
-            self.written_pages[self.current as usize],
-        );
-        let synced = self.buffer.flush_to(target, &mut sink)?;
-        self.written_pages[self.current as usize] = sink.written_pages();
-        self.group_ends[self.current as usize] = Some(lsn_add(
-            self.current_start,
-            sink.written_pages() * LOG_PAGE_SIZE as u64,
+            self.written_pages[g] * LOG_PAGE_SIZE as u64,
         )?);
+
+        // **成员失败 ⇒ 标 STALE**（降级为单成员继续；发布进控制文件）。
+        let mut changed = false;
+        for (m, bad) in tee.failed.iter().enumerate() {
+            if *bad {
+                self.entries.groups[g].member_stale |= 1 << m;
+                changed = true;
+            }
+        }
+        if changed {
+            self.cf.write_redo_entries(&self.entries)?;
+        }
         Ok(synced)
+    }
+
+    /// **重建成员镜像**（§11.9 的 `STALE` 恢复）：从健康成员复制已用前缀，
+    /// 清除该成员的 `STALE` 位并发布。幂等。
+    pub fn rebuild_member(&mut self, group: u8, member: u8) -> Result<(), GroupError> {
+        let g = usize::from(group);
+        let m = usize::from(member);
+        if g >= self.spec.group_count as usize || m >= self.spec.member_count as usize {
+            return Err(GroupError::Spec("组号/成员号越界"));
+        }
+        if self.entries.groups[g].member_stale & (1 << m) == 0 {
+            return Ok(()); // 没坏，不用重建
+        }
+        let source = (0..self.spec.member_count as usize)
+            .find(|&k| k != m && self.entries.groups[g].member_stale & (1 << k) == 0)
+            .ok_or(GroupError::Spec("没有健康成员可作重建源"))?;
+        let bytes = self.written_pages[g] * LOG_PAGE_SIZE as u64;
+        let mut buf = vec![0u8; LOG_PAGE_SIZE];
+        let mut copied = 0u64;
+        while copied < bytes {
+            let n = (bytes - copied).min(LOG_PAGE_SIZE as u64) as usize;
+            self.io
+                .read_exact_at(self.files[g][source], &mut buf[..n], copied)?;
+            self.io.write_at(self.files[g][m], &buf[..n], copied)?;
+            copied += n as u64;
+        }
+        self.io.sync_data(self.files[g][m])?;
+        self.entries.groups[g].member_stale &= !(1 << m);
+        self.cf.write_redo_entries(&self.entries)?;
+        Ok(())
+    }
+
+    /// 某组的成员镜像位（诊断）。
+    #[must_use]
+    pub fn member_stale(&self, group: u8) -> u8 {
+        self.entries.groups[usize::from(group)].member_stale
     }
 
     // -- 切换 ---------------------------------------------------------------
@@ -514,6 +644,7 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             }
         }
         self.entries.groups[next as usize] = RedoGroup {
+            member_stale: 0, // 新激活：镜像视为健康（旧位随序列号换代清零）
             sequence: seq,
             run: LogRunState::Current,
             archive: LogArchiveState::None,
@@ -682,9 +813,29 @@ pub fn online_groups(
         if entry.run == LogRunState::Unused && entry.sequence == 0 {
             continue;
         }
-        let path = dir.join(member_file_name(g as u8, 0));
-        let handle = io.open(&path, OpenOptions::new().read(true))?;
-        let (pages, start) = scan_used_group(io, handle, g as u8, spec.group_pages)?;
+        // **成员挑选**（§11.9）：健康成员里取"已写前缀最长"者——
+        // `STALE` 成员不参与；全 `STALE` 时（防御）退回全部候选。
+        let mut order: Vec<u8> = (0..spec.member_count)
+            .filter(|m| entry.member_stale & (1 << m) == 0)
+            .collect();
+        if order.is_empty() {
+            order = (0..spec.member_count).collect();
+        }
+        let mut best: Option<(u64, Lsn, FileHandle)> = None;
+        for m in order {
+            let path = dir.join(member_file_name(g as u8, m));
+            let handle = io.open(&path, OpenOptions::new().read(true))?;
+            let (pages, start) = scan_used_group(io, handle, g as u8, spec.group_pages)?;
+            if best.as_ref().map_or(true, |(p, _, _)| pages > *p) {
+                best = Some((pages, start, handle));
+            }
+        }
+        let Some((pages, start, handle)) = best else {
+            return Err(GroupError::Damaged {
+                group: g as u8,
+                reason: "无可用成员",
+            });
+        };
         out.push(OnlineGroup {
             group: g as u8,
             sequence: entry.sequence,
@@ -1181,7 +1332,9 @@ mod tests {
     fn spec_validation() {
         assert!(matches!(GroupSpec::new(1, 1, 4), Err(GroupError::Spec(_))));
         assert!(matches!(GroupSpec::new(9, 1, 4), Err(GroupError::Spec(_))));
-        assert!(matches!(GroupSpec::new(2, 2, 4), Err(GroupError::Spec(_))));
+        // 多成员（镜像）本切片已支持；越界仍拒绝。
+        assert!(GroupSpec::new(2, 2, 4).is_ok(), "双成员镜像合法");
+        assert!(matches!(GroupSpec::new(2, 9, 4), Err(GroupError::Spec(_))));
         assert!(matches!(GroupSpec::new(2, 1, 0), Err(GroupError::Spec(_))));
         assert!(GroupSpec::new(2, 1, 34).is_ok());
     }
@@ -1224,5 +1377,218 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, GroupError::RecordTooLarge { .. }), "{err}");
+    }
+
+    /// 可定向失败的 Io 包层（成员 m2 的写失败）。
+    struct FlakyIo {
+        inner: MemFileIo,
+        paths: std::sync::Mutex<std::collections::HashMap<FileHandle, String>>,
+        fail_on: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FlakyIo {
+        fn new() -> Self {
+            Self {
+                inner: MemFileIo::new(),
+                paths: std::sync::Mutex::new(std::collections::HashMap::new()),
+                fail_on: std::sync::Mutex::new(None),
+            }
+        }
+        fn arm(&self, needle: &str) {
+            *self.fail_on.lock().unwrap() = Some(needle.to_string());
+        }
+        fn disarm(&self) {
+            *self.fail_on.lock().unwrap() = None;
+        }
+        fn contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.inner.contents(Path::new(path))
+        }
+    }
+
+    impl bicdb_workspace::io::FileIo for FlakyIo {
+        fn open(
+            &self,
+            path: &Path,
+            opts: bicdb_workspace::io::OpenOptions,
+        ) -> std::io::Result<FileHandle> {
+            let h = self.inner.open(path, opts)?;
+            self.paths
+                .lock()
+                .unwrap()
+                .insert(h, path.to_string_lossy().to_string());
+            Ok(h)
+        }
+        fn open_dir(&self, path: &Path) -> std::io::Result<FileHandle> {
+            self.inner.open_dir(path)
+        }
+        fn read_at(&self, h: FileHandle, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+            self.inner.read_at(h, buf, off)
+        }
+        fn write_at(&self, h: FileHandle, buf: &[u8], off: u64) -> std::io::Result<()> {
+            if let Some(needle) = self.fail_on.lock().unwrap().as_ref() {
+                let paths = self.paths.lock().unwrap();
+                if paths.get(&h).is_some_and(|p| p.contains(needle.as_str())) {
+                    return Err(std::io::Error::other("注入：目标成员写失败"));
+                }
+            }
+            self.inner.write_at(h, buf, off)
+        }
+        fn size(&self, h: FileHandle) -> std::io::Result<u64> {
+            self.inner.size(h)
+        }
+        fn set_len(&self, h: FileHandle, len: u64) -> std::io::Result<()> {
+            self.inner.set_len(h, len)
+        }
+        fn sync_data(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_data(h)
+        }
+        fn sync_all(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_all(h)
+        }
+        fn sync_dir(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.sync_dir(h)
+        }
+        fn close(&self, h: FileHandle) -> std::io::Result<()> {
+            self.inner.close(h)
+        }
+    }
+
+    #[test]
+    fn members_receive_identical_bytes() {
+        let io = mem();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 2).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 2, 8).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        w.append(|l| RedoRecord::commit(l, 7, 1)).unwrap();
+        w.append(|l| RedoRecord::commit(l, 8, 2)).unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+
+        let m1 = io
+            .contents(Path::new(&format!("{WAL}/{}", member_file_name(0, 0))))
+            .unwrap();
+        let m2 = io
+            .contents(Path::new(&format!("{WAL}/{}", member_file_name(0, 1))))
+            .unwrap();
+        assert_eq!(m1, m2, "两成员逐字节一致");
+        assert!(m1.iter().any(|&b| b != 0), "确实写了内容");
+        assert_eq!(w.member_stale(0), 0);
+    }
+
+    #[test]
+    fn member_failure_marks_stale_and_rebuild_restores() {
+        let io = FlakyIo::new();
+        io.inner.add_dir("/mem");
+        io.inner.add_dir(WAL);
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 2).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 2, 8).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+        let before = io
+            .contents(&format!("{WAL}/{}", member_file_name(0, 1)))
+            .unwrap();
+
+        // 成员 2 的写从此失败：继续写入应降级为单成员 + 标 STALE。
+        io.arm("_m2");
+        w.append(|l| RedoRecord::commit(l, 9, 3)).unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+        assert_eq!(w.member_stale(0), 0b10, "成员 2（bit1）被标 STALE");
+        let good = io
+            .contents(&format!("{WAL}/{}", member_file_name(0, 0)))
+            .unwrap();
+        let bad = io
+            .contents(&format!("{WAL}/{}", member_file_name(0, 1)))
+            .unwrap();
+        assert_ne!(good, bad, "坏成员落后");
+        assert_eq!(bad, before, "坏成员自失败起不再改写");
+
+        // 重建：复制已用前缀 → 逐字节一致、位清除。
+        io.disarm();
+        w.rebuild_member(0, 1).unwrap();
+        assert_eq!(w.member_stale(0), 0);
+        let rebuilt = io
+            .contents(&format!("{WAL}/{}", member_file_name(0, 1)))
+            .unwrap();
+        assert_eq!(rebuilt, good, "重建后两成员一致");
+        // 控制文件里的位也清了。
+        let entries = cf.redo_entries().unwrap();
+        assert_eq!(entries.groups[0].member_stale, 0);
+    }
+
+    #[test]
+    fn open_uses_the_longest_member() {
+        let io = mem();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 2).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 2, 8).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        for i in 0..5u64 {
+            w.append(|l| RedoRecord::commit(l, i + 1, i + 1)).unwrap();
+        }
+        w.flush(w.appended_lsn()).unwrap();
+        let end_before = w.group_end_lsn(0).unwrap();
+        w.close().unwrap();
+
+        // 截掉成员 1 的一半（模拟定长文件被截断）：重开应挑更长的成员 2。
+        let h = io
+            .open(
+                Path::new(&format!("{WAL}/{}", member_file_name(0, 0))),
+                bicdb_workspace::io::OpenOptions::new()
+                    .read(true)
+                    .write(true),
+            )
+            .unwrap();
+        io.set_len(h, 512).unwrap();
+        io.close(h).unwrap();
+
+        let w = GroupWriter::open(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 2, 8).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(w.group_end_lsn(0), Some(end_before), "以更长成员为准续写");
+        assert_eq!(w.current_group(), 0);
     }
 }

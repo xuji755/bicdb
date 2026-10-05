@@ -482,6 +482,9 @@ pub struct RedoGroup {
     pub run: LogRunState,
     /// 归档状态。
     pub archive: LogArchiveState,
+    /// **成员镜像状态位**（bit k = 成员 k 标 `STALE`；0 = 全部健康）。
+    /// 落在条目的 6B 保留区第 1 字节（2026-10-05 定案：v1 成员数 ≤ 8）。
+    pub member_stale: u8,
 }
 
 impl RedoGroup {
@@ -490,6 +493,7 @@ impl RedoGroup {
         sequence: 0,
         run: LogRunState::Unused,
         archive: LogArchiveState::None,
+        member_stale: 0,
     };
 }
 
@@ -533,6 +537,11 @@ impl RedoEntries {
                 reason: "成员数应在 1..=8",
             });
         }
+        let member_mask: u8 = if self.member_count >= 8 {
+            0xFF
+        } else {
+            (1u8 << self.member_count) - 1
+        };
         let mut current_seen = None;
         for (i, g) in self
             .groups
@@ -540,6 +549,11 @@ impl RedoEntries {
             .enumerate()
             .take(usize::from(self.group_count))
         {
+            if g.member_stale & !member_mask != 0 {
+                return Err(ControlFileError::InconsistentRedo {
+                    reason: "成员镜像位超出成员数",
+                });
+            }
             match g.run {
                 LogRunState::Unused => {
                     if g.sequence != 0 {
@@ -592,6 +606,7 @@ impl RedoEntries {
             put_u32(out, off, g.sequence);
             out[off + 4] = g.run.as_u8();
             out[off + 5] = g.archive.as_u8();
+            out[off + 6] = g.member_stale; // 6B 保留区的第 1 字节：成员镜像位
         }
     }
 
@@ -612,6 +627,7 @@ impl RedoEntries {
                 sequence: get_u32(b, off),
                 run,
                 archive,
+                member_stale: b[off + 6],
             };
         }
         Ok(Self {
@@ -1676,6 +1692,7 @@ mod tests {
         let p = progress(21, 8192);
         let mut r = redo_default();
         r.groups[0] = RedoGroup {
+            member_stale: 0,
             sequence: 1,
             run: LogRunState::Current,
             archive: LogArchiveState::None,
@@ -1873,6 +1890,7 @@ mod tests {
         // 存在 CURRENT 组但 current_group 未指 ⇒ 拒绝。
         let mut r = redo_default();
         r.groups[0] = RedoGroup {
+            member_stale: 0,
             sequence: 5,
             run: LogRunState::Current,
             archive: LogArchiveState::None,
