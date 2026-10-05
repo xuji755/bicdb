@@ -133,7 +133,14 @@ fn activation_is_routed_by_identity_and_bounded_by_admission() {
     let base = unique_base("activate");
     let registry = registry_with_alice_bob_public(&base);
     let limits = small_limits(2, 2, 8); // 只容纳 2 个活跃工作区
-    let mut supervisor = Supervisor::boot(SupervisorConfig { limits }, registry).expect("启动");
+    let mut supervisor = Supervisor::boot(
+        SupervisorConfig {
+            limits,
+            ..SupervisorConfig::default()
+        },
+        registry,
+    )
+    .expect("启动");
 
     let alice = AuthenticatedSubject::new(UserId::from_raw(ALICE).unwrap());
     let bob = AuthenticatedSubject::new(UserId::from_raw(BOB).unwrap());
@@ -190,7 +197,14 @@ fn workspace_queue_limit_rejects_without_stealing_others_quota() {
     let registry = registry_with_alice_bob_public(&base);
     // 单线程 + 每工作区排队额度 2；活跃工作区额度放到 4（本用例测的是队列，不是准入）。
     let limits = small_limits(4, 1, 2);
-    let mut supervisor = Supervisor::boot(SupervisorConfig { limits }, registry).expect("启动");
+    let mut supervisor = Supervisor::boot(
+        SupervisorConfig {
+            limits,
+            ..SupervisorConfig::default()
+        },
+        registry,
+    )
+    .expect("启动");
 
     let alice = AuthenticatedSubject::new(UserId::from_raw(ALICE).unwrap());
     let bob = AuthenticatedSubject::new(UserId::from_raw(BOB).unwrap());
@@ -257,7 +271,14 @@ fn maintenance_is_not_starved_by_the_execution_pool() {
     let base = unique_base("maint");
     let registry = registry_with_alice_bob_public(&base);
     let limits = small_limits(2, 1, 4); // 唯一执行线程
-    let mut supervisor = Supervisor::boot(SupervisorConfig { limits }, registry).expect("启动");
+    let mut supervisor = Supervisor::boot(
+        SupervisorConfig {
+            limits,
+            ..SupervisorConfig::default()
+        },
+        registry,
+    )
+    .expect("启动");
 
     let alice = AuthenticatedSubject::new(UserId::from_raw(ALICE).unwrap());
     let ctx = supervisor.activate(&alice, Some("main")).unwrap().clone();

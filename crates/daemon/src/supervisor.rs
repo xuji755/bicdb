@@ -26,13 +26,18 @@ use bicdb_workspace::{AuthenticatedSubject, WorkspaceContext, WorkspaceId};
 
 use crate::limits::{InstanceLimits, LimitsError};
 use crate::maintenance::Maintenance;
+use crate::numa::{NumaBinder, NumaConfig, NumaStatus};
 use crate::pool::{ExecPool, PoolError};
 
-/// 监督器配置（`Default` = P0 冻结的上限取值）。
+/// 监督器配置（`Default` = P0 冻结的上限取值；NUMA 默认**关闭**）。
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorConfig {
     /// 实例级上限（[`InstanceLimits::default`] = P0 冻结值）。
     pub limits: InstanceLimits,
+    /// **NUMA 第二级绑定**（默认关闭；详设 `doc/numa绑定设计_v0.1.md`）。
+    /// 启用后：工作区任务的执行线程在运行前被放进其节点的 cpuset——
+    /// **本地性是优化不是正确性**：任何失败都只记录、不改变行为。
+    pub numa: NumaConfig,
 }
 
 /// 启动失败（fail closed：不带着校验不过的状态启动）。
@@ -119,6 +124,10 @@ pub struct Supervisor {
     active: HashMap<WorkspaceId, ActiveWorkspace>,
     pool: ExecPool,
     maintenance: Maintenance,
+    /// NUMA 绑定器（`None` = 未启用或降级；原因见 `numa_reason`）。
+    numa: Option<Arc<NumaBinder>>,
+    /// 降级原因（启用但准备失败时记录；诊断用）。
+    numa_reason: Option<String>,
 }
 
 impl Supervisor {
@@ -166,13 +175,37 @@ impl Supervisor {
         let pool = ExecPool::new(config.limits.execution_threads, pool_capacity);
         let maintenance = Maintenance::start(64);
 
+        // NUMA：启用时尽力准备；**失败只降级、不 fail-closed**（它是优化）。
+        let (numa, numa_reason) = if config.numa.enabled {
+            match NumaBinder::start(&config.numa) {
+                Ok(binder) => (Some(Arc::new(binder)), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             limits: config.limits,
             registry,
             active: HashMap::new(),
             pool,
             maintenance,
+            numa,
+            numa_reason,
         })
+    }
+
+    /// NUMA 绑定状态（诊断；详设 §9）。
+    #[must_use]
+    pub fn numa_status(&self) -> NumaStatus {
+        match (&self.numa, &self.numa_reason) {
+            (Some(binder), _) => binder.status(),
+            (None, Some(reason)) => NumaStatus::Degraded {
+                reason: reason.clone(),
+            },
+            (None, None) => NumaStatus::Disabled,
+        }
     }
 
     /// 激活一个工作区并生成它的上下文。
@@ -244,8 +277,14 @@ impl Supervisor {
         // 守卫从未构造，必须在此**显式归还**刚加的额度，否则每次
         // `InstanceQueueFull` 都让该工作区的在途计数永久 +1，最终假性"队列满"。
         let queued = Arc::clone(&active.queued);
+        // NUMA 绑定点（详设 §5 阶段 A）：运行任务前把**当前线程**放进该
+        // 工作区节点的 cpuset；失败只记诊断，**任务照常执行**。
+        let numa = self.numa.clone();
         match self.pool.submit(move || {
             let _slot = QueueSlot(counter);
+            if let Some(binder) = &numa {
+                binder.bind_current_thread(workspace);
+            }
             task();
         }) {
             Ok(()) => Ok(()),

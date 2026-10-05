@@ -4,10 +4,13 @@
 //!
 //! - 设计依据：§15 多线程与Agent访问协议（P0 冻结第 8 项的额度取值）
 //! - 对应阶段：**P1**（已启动）
-//! - 当前状态：**v0.1**——[`supervisor`]（启动自检 fail-closed、上下文生成、
+//! - 当前状态：**v0.2**——[`supervisor`]（启动自检 fail-closed、上下文生成、
 //!   活跃工作区准入与两层资源拒绝）、[`pool`]（有界执行池：线程数固定、
 //!   队列有界、满即拒绝）、[`maintenance`]（**专用维护线程**，REQ-RES-003
-//!   "不被普通请求饿死"）、[`limits`]（P0 冻结额度与校验）。
+//!   "不被普通请求饿死"）、[`limits`]（P0 冻结额度与校验）、
+//!   （v0.2）[`numa`]（**NUMA 第二级绑定**：拓扑/cgroup 探测、cpuset 组
+//!   准备、线程绑定落点——零 unsafe 的文件路径；详设
+//!   `doc/numa绑定设计_v0.1.md`；本地性是优化不是正确性）。
 //!
 //! 三条结构事实：
 //! 1. **身份来自认证结果**——激活只收 [`bicdb_workspace::AuthenticatedSubject`]，
@@ -20,10 +23,14 @@
 
 pub mod limits;
 pub mod maintenance;
+pub mod numa;
 pub mod pool;
 pub mod supervisor;
 
 pub use limits::InstanceLimits;
 pub use maintenance::Maintenance;
+pub use numa::{
+    BindMode, BindOutcome, CgroupVersion, NumaBinder, NumaConfig, NumaError, NumaStatus, Topology,
+};
 pub use pool::{ExecPool, PoolError};
 pub use supervisor::{ActivateError, BootError, Supervisor, SupervisorConfig, TaskRejected};
