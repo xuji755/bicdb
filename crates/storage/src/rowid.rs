@@ -44,6 +44,21 @@ impl std::error::Error for RowIdRangeError {}
 pub struct RowId(u64);
 
 impl RowId {
+    /// **页地址形态**：`(file_id, block_id, row_id = 0)`——索引的枝/根条目、
+    /// 叶链指针、树头都用它（§9.1.3"子页 ROWID 的 `row_id` 置 0，宽度统一"）。
+    ///
+    /// 与"行 ROWID"是两个取值域：行号 1..=1023（0 保留为「无」），而页地址
+    /// **恒 0**。给页地址一个显式的构造口，免得用 1 冒充当"无行号"的语义。
+    pub fn page_address(file_id: u16, block_id: u32) -> Result<Self, RowIdRangeError> {
+        if file_id >= (1 << FILE_ID_BITS) || block_id >= (1 << BLOCK_ID_BITS) {
+            return Err(RowIdRangeError);
+        }
+        Ok(Self(
+            (u64::from(file_id) << (BLOCK_ID_BITS + ROW_ID_BITS))
+                | (u64::from(block_id) << ROW_ID_BITS),
+        ))
+    }
+
     /// 由三段字段拼装；各段越界（含 `row_id == 0`）即拒绝。
     pub fn from_parts(file_id: u16, block_id: u32, row_id: u16) -> Result<Self, RowIdRangeError> {
         if file_id >= (1 << FILE_ID_BITS)

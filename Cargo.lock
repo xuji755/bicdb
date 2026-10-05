@@ -28,6 +28,10 @@ version = "0.0.0"
 [[package]]
 name = "bicdb-index"
 version = "0.0.0"
+dependencies = [
+ "bicdb-common",
+ "bicdb-storage",
+]
 
 [[package]]
 name = "bicdb-memory"
