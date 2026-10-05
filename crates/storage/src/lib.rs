@@ -80,4 +80,5 @@ pub mod row;
 pub mod rowid;
 pub mod scan;
 pub mod segment;
+pub mod temp;
 pub mod undo;

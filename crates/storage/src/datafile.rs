@@ -255,6 +255,12 @@ impl std::fmt::Debug for DataFile<'_> {
     }
 }
 
+/// **file 2（临时）** 的文件号（§2.2 的文件角色约定）。
+pub const TEMP_FILE_ID: u16 = 2;
+
+/// file 2 的角色字节（与文件号一致——§2.2 的角色表）。
+pub const TEMP_FILE_ROLE: u8 = 2;
+
 impl<'a> DataFile<'a> {
     /// **新建数据文件**：写块 0（文件头 + 空位图空间头）、在尾部建立一个
     /// 位图区（8 张区分配图页）。
@@ -321,6 +327,81 @@ impl<'a> DataFile<'a> {
                 file.write_page(block, &mut page)?;
             }
         }
+        Ok(file)
+    }
+
+    /// **打开（或创建）file 2 并重置为空**（§4.8 的"打开即重置"）：重写**文件头
+    /// 与页分配位图**——上次是正常关闭还是崩溃一视同仁（临时数据在两次会话
+    /// 之间没有意义，也因此**不进 WAL、不进备份**）。
+    ///
+    /// 长度取 `max(既有, blocks)`（只增不缩：位图已整体清空，旧块号不构成
+    /// 引用——临时段池与它同生共死）。
+    pub fn open_temp_reset(
+        io: &'a dyn FileIo,
+        path: &Path,
+        workspace_ref: [u8; 8],
+        blocks: u64,
+    ) -> Result<Self, DataFileError> {
+        if blocks < MIN_FILE_BLOCKS {
+            return Err(DataFileError::SmallFile {
+                blocks,
+                min: MIN_FILE_BLOCKS,
+            });
+        }
+        let handle = io.open(
+            path,
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )?;
+        let size = io.size(handle)?;
+        let blocks = (size / PAGE_SIZE as u64).max(blocks);
+        let hard = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
+            + MAX_BITMAP_RUNS as u64
+                * crate::bitmap::BITS_PER_RUN as u64
+                * crate::bitmap::EXTENT_BLOCKS as u64;
+        if blocks > hard.min(1u64 << 28) {
+            return Err(DataFileError::BeyondCoverage {
+                requested: blocks,
+                limit: hard.min(1u64 << 28),
+            });
+        }
+        io.set_len(handle, blocks * PAGE_SIZE as u64)?;
+        let mut file = Self {
+            io,
+            handle,
+            head: FileHead {
+                file_id: TEMP_FILE_ID,
+                role: TEMP_FILE_ROLE,
+                format_version: crate::page::FORMAT_VERSION,
+                flags: 0,
+                blocks,
+                workspace_ref,
+            },
+            runs: Vec::new(),
+        };
+        // 与 `create` 同规：位图区全量预留（块 1 起连续 40 区 × 8 页）。
+        let runs: Vec<u32> = (0..MAX_BITMAP_RUNS as u32)
+            .map(|k| 1 + k * BITMAP_PAGES_PER_RUN as u32)
+            .collect();
+        let mut header = Page::new(PageType::FileHeader, workspace_ref, TEMP_FILE_ID, 0);
+        write_file_head(&mut header, &file.head)?;
+        write_bitmap_runs(&mut header, &runs)?;
+        file.write_page(0, &mut header)?;
+        file.runs = runs;
+        for (k, &start) in file.runs.clone().iter().enumerate() {
+            let base = k as u16 * BITMAP_PAGES_PER_RUN as u16;
+            for i in 0..BITMAP_PAGES_PER_RUN {
+                let block = start + i as u32;
+                let mut page = Page::new(PageType::Bitmap, workspace_ref, TEMP_FILE_ID, block);
+                bitmap::init(&mut page, BitmapKind::ExtentMap, base + i as u16)?;
+                file.write_page(block, &mut page)?;
+            }
+        }
+        // 重置是"会话开始"的持久动作：落盘后再交用（否则崩溃后可能读到旧位图）。
+        file.sync()?;
         Ok(file)
     }
 
