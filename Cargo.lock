@@ -18,6 +18,8 @@ version = "0.0.0"
 name = "bicdb-daemon"
 version = "0.0.0"
 dependencies = [
+ "bicdb-common",
+ "bicdb-storage",
  "bicdb-workspace",
 ]
 

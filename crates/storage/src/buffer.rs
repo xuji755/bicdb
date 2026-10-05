@@ -213,6 +213,15 @@ pub enum BufferError {
         /// 请求的分区数。
         partitions: usize,
     },
+    /// **工作集未排空**（重绑定要求"无在途会话"，详设 §7）：仍有脏帧或钉住帧。
+    /// 唯一的净帧以外的帧都意味着 Draining 没做完（或有人正在用）——拒绝，
+    /// 不静默丢帧。
+    DrainBlocked {
+        /// 仍脏的帧数。
+        dirty: usize,
+        /// 仍被钉住的帧数。
+        pinned: usize,
+    },
 }
 
 impl std::fmt::Display for BufferError {
@@ -250,6 +259,10 @@ impl std::fmt::Display for BufferError {
             BufferError::BadPartitionCount { partitions } => {
                 write!(f, "缓冲池分区数非法（{partitions}）：必须是 1 或 2 的幂")
             }
+            BufferError::DrainBlocked { dirty, pinned } => write!(
+                f,
+                "工作集未排空：仍有脏帧 {dirty}、钉住帧 {pinned}（重绑定要求无在途会话）"
+            ),
         }
     }
 }
@@ -334,10 +347,27 @@ pub struct FlushReport {
     pub low_water: Option<Lsn>,
 }
 
+/// 工作集**排空**报告（重绑定协议的 Draining，详设 §7）：
+/// ① 刷尽脏页（按写列表序）→ ② 丢弃全部净帧（释放页缓冲）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainReport {
+    /// 写回的页数（Draining ①）。
+    pub pages_written: u64,
+    /// 丢弃的净帧数（Draining ②；页缓冲已释放，帧回"未分配"态）。
+    pub frames_dropped: usize,
+}
+
 /// 一个缓冲帧（内存专有；`kcbbh` 对应物——**不落盘**）。
 struct Frame {
     key: Option<BufferKey>,
-    page: Page,
+    /// 帧的页缓冲——**首次装入时才分配**（`None` = 未用过的帧）。
+    ///
+    /// 为什么惰性（§5.10 NUMA 第二级绑定）：帧内存的**首次触碰决定它落在哪个
+    /// 节点**——构造时不分配，装页由"已在节点组内的线程"完成（读盘缓冲在
+    /// `pin` 命中失败路径上分配），本地性于是"零额外代码"成立；
+    /// `drop_clean_frames`（重绑定的 Draining ②）把缓冲**释放**回未分配态，
+    /// 下一次装入重新按新绑定落位。
+    page: Option<Page>,
     /// 脏标志（同时在写列表里）。
     dirty: bool,
     /// **首次变脏的 LSN**（写列表/检查点队列排序键）。
@@ -353,13 +383,24 @@ impl Frame {
     fn empty() -> Self {
         Self {
             key: None,
-            page: Page::from_bytes(Box::new([0u8; crate::page::PAGE_SIZE])),
+            page: None,
             dirty: false,
             first_dirty: None,
             pins: 0,
             touches: 0,
             last_touch_ms: 0,
         }
+    }
+
+    /// 已装入帧的页缓冲（**未装入的帧不得调用**——由"键在位 ⇔ 页在位"不变量
+    /// 保证；装页只走 `attach`/`replace_in_place`，清帧只走 `drop_clean_frames`）。
+    fn loaded(&self) -> &Page {
+        self.page.as_ref().expect("已装入的帧必有页缓冲")
+    }
+
+    /// 已装入帧的页缓冲（可变）。
+    fn loaded_mut(&mut self) -> &mut Page {
+        self.page.as_mut().expect("已装入的帧必有页缓冲")
     }
 }
 
@@ -774,7 +815,7 @@ impl<'io> BufferPool<'io> {
     pub fn copy_if_resident(&self, key: BufferKey) -> Option<Page> {
         let inner = self.lock_of(&key.workspace);
         let idx = inner.find_frame(key)?;
-        Some(inner.frames[idx].page.clone())
+        Some(inner.frames[idx].loaded().clone())
     }
 
     /// **装入一页"净页"**（从文件读来的盘上内容）：不标脏、不生成 redo；
@@ -849,7 +890,7 @@ impl<'io> BufferPool<'io> {
             for i in 0..count {
                 let key = key_at(i).ok_or(BufferError::Unresolved { rdba: first })?;
                 match inner.find_frame(key) {
-                    Some(idx) => out.push(Some(inner.frames[idx].page.clone())),
+                    Some(idx) => out.push(Some(inner.frames[idx].loaded().clone())),
                     None => {
                         out.push(None);
                         any_missing = true;
@@ -915,6 +956,68 @@ impl<'io> BufferPool<'io> {
             }
         }
         Ok(report)
+    }
+
+    /// **排空一个工作集**（重绑定协议的 Draining，详设 §7 的第 1–2 步）：
+    /// ① 按写列表序刷尽该分区**全部**工作区的脏页；② 丢弃全部净帧
+    /// （页缓冲释放、帧回"未分配"态）。两步之间有脏帧/钉住帧 ⇒
+    /// [`BufferError::DrainBlocked`]（**不静默丢帧**）。
+    ///
+    /// 之后调用方执行 Rebinding（更新节点组/绑定），本集下次装入的帧内存
+    /// **首次触碰落在新节点**——**不搬内存**（缓冲是副本，可重建）。
+    pub fn drain_partition(&self, partition: usize) -> Result<DrainReport, BufferError> {
+        let mut report = DrainReport::default();
+        // ① 刷尽：写列表按（首次变脏 LSN, rdba）升序——循环取最老头即全序。
+        loop {
+            match self.write_back_step(partition, WriteTarget::OldestHead)? {
+                None => break,
+                Some(wrote) => {
+                    if wrote {
+                        report.pages_written += 1;
+                    }
+                }
+            }
+        }
+        // ② 丢净帧。
+        report.frames_dropped = self.drop_clean_frames(partition)?;
+        Ok(report)
+    }
+
+    /// **丢弃一个工作集的全部净帧**（Draining ②）：干净、未钉住的帧逐个
+    /// 释放（摘链、清桶、**释放页缓冲**），帧回到"未分配"态以便重新落位。
+    /// 有脏帧或钉住帧 ⇒ [`BufferError::DrainBlocked`]（先 `drain_partition`
+    /// 的 ①，且重绑定应在**无在途会话**时进行）。
+    ///
+    /// `pinned` 判据当前**不可达**：卫兵持的是分区闩锁（`PageGuard` ⊇
+    /// `LatchGuard`），有人在钉住就进不来这里。它是对 **O2（per-frame 状态
+    /// 对象、守卫 ≠ 持锁）** 的预置——那条纪律一变，这里就是真判据；
+    /// 也防"未来的钉住来源不经卫兵"的误用（宁拒不丢）。
+    pub fn drop_clean_frames(&self, partition: usize) -> Result<usize, BufferError> {
+        let mut inner = self.lock(partition);
+        let dirty = inner.frames.iter().filter(|f| f.dirty).count();
+        let pinned = inner.frames.iter().filter(|f| f.pins > 0).count();
+        if dirty > 0 || pinned > 0 {
+            return Err(BufferError::DrainBlocked { dirty, pinned });
+        }
+        let mut dropped = 0usize;
+        for idx in 0..inner.frames.len() {
+            if inner.frames[idx].key.is_some() {
+                inner.release_frame(idx);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// 一个分区里**已分配页缓冲**的帧数（诊断；重绑定前后核对
+    /// "净帧的内存确实释放了"）。
+    #[must_use]
+    pub fn allocated_frames(&self, partition: usize) -> usize {
+        self.lock(partition)
+            .frames
+            .iter()
+            .filter(|f| f.page.is_some())
+            .count()
     }
 
     /// **Make Free**（§5.10 的 MKFREE 流程内联版）：写列表头按序写回一批；
@@ -1208,7 +1311,7 @@ impl Inner {
         handle: FileHandle,
         block: u32,
     ) -> WriteJob {
-        let page = &self.frames[idx].page;
+        let page = self.frames[idx].loaded();
         let page_lsn = page
             .header()
             .map_or(Lsn::from_raw(0).expect("0 合法"), |h| h.page_lsn);
@@ -1236,7 +1339,7 @@ impl Inner {
         if self.frames[idx].key != Some(job.key) {
             return; // 帧已换人（脏帧不可被淘汰；防御）
         }
-        if self.frames[idx].page.header().map_or(0, |h| h.mod_seq) != job.mod_seq {
+        if self.frames[idx].loaded().header().map_or(0, |h| h.mod_seq) != job.mod_seq {
             return; // 期间被再改脏：保持脏
         }
         if let Some(lsn) = self.frames[idx].first_dirty.take() {
@@ -1266,7 +1369,7 @@ impl Inner {
         }
         self.frames[idx] = Frame {
             key: Some(key),
-            page,
+            page: Some(page),
             dirty: false,
             first_dirty: None,
             pins: 1,
@@ -1291,13 +1394,30 @@ impl Inner {
         }
         self.frames[idx] = Frame {
             key: Some(key),
-            page,
+            page: Some(page),
             dirty: false,
             first_dirty: None,
             pins: 1,
             touches: self.cfg.cool_count,
             last_touch_ms: clock.now_ms(),
         };
+    }
+
+    /// **释放一帧**（Draining ② 的丢净帧）：摘链、清桶、**释放页缓冲**，
+    /// 帧回"未分配"态（virgin）。前置：干净且未钉住（`drop_clean_frames`
+    /// 已整体体检——这里再核就当不变量）。
+    fn release_frame(&mut self, idx: usize) {
+        debug_assert!(!self.frames[idx].dirty);
+        debug_assert_eq!(self.frames[idx].pins, 0);
+        Self::detach_from_chains(&mut self.hot, &mut self.cold, &mut self.aux, idx);
+        if let Some(old) = self.frames[idx].key.take() {
+            let ob = self.bucket_of(old);
+            if let Some(p) = self.buckets[ob].iter().position(|&i| i == idx) {
+                self.buckets[ob].remove(p);
+            }
+        }
+        self.frames[idx] = Frame::empty();
+        self.virgin.push(idx);
     }
 
     /// 从三条链里去重移除（顺序：热 → 冷 → AUX）。
@@ -1361,13 +1481,13 @@ impl PageGuard<'_> {
 impl std::ops::Deref for PageGuard<'_> {
     type Target = Page;
     fn deref(&self) -> &Page {
-        &self.inner.frames[self.idx].page
+        self.inner.frames[self.idx].loaded()
     }
 }
 
 impl std::ops::DerefMut for PageGuard<'_> {
     fn deref_mut(&mut self) -> &mut Page {
-        &mut self.inner.frames[self.idx].page
+        self.inner.frames[self.idx].loaded_mut()
     }
 }
 
@@ -2529,5 +2649,144 @@ mod tests {
         assert_eq!(pool.dirty_len(WS_A), 0, "写回后条目出列");
         let page = pagefile::read_page(&io, a, 0).unwrap();
         assert_eq!(page.as_bytes()[4096], 0x88, "新版本落盘");
+    }
+
+    // -- NUMA 重绑定支撑：帧惰性分配 / 排空（Draining）----------------------
+
+    #[test]
+    fn frame_buffers_allocate_on_first_use_and_drain_frees_them() {
+        // §5.10 NUMA：帧内存**首次触碰才分配**（装页的线程决定它落在哪个
+        // 节点），Draining ② 释放它——重绑定后下次装入按新绑定重新落位。
+        let h = harness();
+        let pool = h.pool(4, h.fake_wal());
+        let p = pool.partition_of(&WS_A);
+        assert_eq!(pool.allocated_frames(p), 0, "空池不分配任何页缓冲");
+        {
+            let _g = pool.pin(BufferKey::new(WS_A, rdba(7, 0))).unwrap();
+        }
+        assert_eq!(pool.allocated_frames(p), 1, "装页即分配");
+        let report = pool.drain_partition(p).unwrap();
+        assert_eq!(report.pages_written, 0, "无脏页：没有写回");
+        assert_eq!(report.frames_dropped, 1);
+        assert_eq!(pool.allocated_frames(p), 0, "净帧的页缓冲已释放");
+        assert_eq!(pool.resident(), 0);
+        // 再装入：从文件重新读（不搬内存——缓冲是副本，可重建）。
+        let g = pool.pin(BufferKey::new(WS_A, rdba(7, 0))).unwrap();
+        assert_eq!(g.as_bytes()[4096], 0xA0, "内容从盘上重建");
+    }
+
+    #[test]
+    fn drain_partition_flushes_dirty_pages_then_drops_clean_frames() {
+        let h = harness();
+        let pool = h.pool(4, h.fake_wal());
+        let p = pool.partition_of(&WS_A);
+        for (block, byte, l) in [(0u32, 0x11u8, 5u64), (1, 0x22, 3)] {
+            let mut g = pool.pin(BufferKey::new(WS_A, rdba(7, block))).unwrap();
+            g.as_bytes_mut()[4096] = byte;
+            h.set_page_lsn(&mut g, l);
+            g.mark_dirty(lsn(l));
+        }
+        let report = pool.drain_partition(p).unwrap();
+        assert_eq!(report.pages_written, 2, "两页脏页按写列表序写回");
+        assert_eq!(report.frames_dropped, 2);
+        assert_eq!(h.read_byte(7, 0), 0x11);
+        assert_eq!(h.read_byte(7, 1), 0x22);
+        assert_eq!(pool.dirty_len(WS_A), 0, "写列表清空");
+        assert_eq!(pool.resident(), 0, "排空后无驻留帧");
+    }
+
+    #[test]
+    fn drop_clean_frames_refuses_while_frames_are_dirty() {
+        // 丢净帧**不静默丢脏帧**（那就是数据丢失）——先 flush，再丢。
+        let h = harness();
+        let pool = h.pool(4, h.fake_wal());
+        let p = pool.partition_of(&WS_A);
+        {
+            let mut g = pool.pin(BufferKey::new(WS_A, rdba(7, 0))).unwrap();
+            g.as_bytes_mut()[4096] = 0x33;
+            g.mark_dirty(lsn(1));
+        }
+        assert!(matches!(
+            pool.drop_clean_frames(p),
+            Err(BufferError::DrainBlocked {
+                dirty: 1,
+                pinned: 0
+            })
+        ));
+        assert!(pool.flush(BufferKey::new(WS_A, rdba(7, 0))).unwrap());
+        assert_eq!(pool.drop_clean_frames(p).unwrap(), 1);
+        assert_eq!(h.read_byte(7, 0), 0x33, "脏页在丢弃之前已经落盘");
+    }
+
+    #[test]
+    fn draining_one_partition_leaves_the_other_untouched() {
+        // **帧区间按集独立**（§5.10 NUMA）：排空一个工作集不动另一个——
+        // 重绑定的粒度是工作集（分区），不是整池。
+        // 夹具：WS_A（[1;8]）与 WS_D（[4;8]）在 N=2 下不同分区（实测哈希）。
+        let mem = MemFileIo::new();
+        mem.add_dir("/mem");
+        const WS_D: [u8; 8] = [4u8; 8];
+        let da = mem
+            .open(
+                Path::new("/mem/da.dat"),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        let dd = mem
+            .open(
+                Path::new("/mem/dd.dat"),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        for (h, ws, fid) in [(da, WS_A, 7u16), (dd, WS_D, 9)] {
+            mem.set_len(h, crate::page::PAGE_SIZE as u64).unwrap();
+            let mut page = Page::new(PageType::HeapTable, ws, fid, 0);
+            page.as_bytes_mut()[4096] = 0x5A;
+            pagefile::write_page(&mem, h, 0, &mut page).unwrap();
+        }
+        let pool = BufferPool::with_partitions(
+            &mem,
+            2,
+            2,
+            move |ws, r| {
+                if *ws == WS_A && r.file_id() == 7 {
+                    Some((da, r.block_id()))
+                } else if *ws == WS_D && r.file_id() == 9 {
+                    Some((dd, r.block_id()))
+                } else {
+                    None
+                }
+            },
+            FakeWal {
+                durable: std::sync::atomic::AtomicU64::new(0),
+                fail: false,
+                log: Arc::new(Mutex::new(Vec::new())),
+            },
+            SystemClock,
+            CacheConfig::for_capacity(2),
+        )
+        .unwrap();
+        let (pa, pd) = (pool.partition_of(&WS_A), pool.partition_of(&WS_D));
+        assert_ne!(pa, pd, "夹具的两个工作区必须落不同分区");
+        let ka = BufferKey::new(WS_A, rdba(7, 0));
+        let kd = BufferKey::new(WS_D, rdba(9, 0));
+        {
+            let _ga = pool.pin(ka).unwrap();
+            let _gd = pool.pin(kd).unwrap();
+        }
+        assert_eq!(pool.resident(), 2);
+        assert_eq!(pool.drain_partition(pa).unwrap().frames_dropped, 1);
+        assert_eq!(pool.allocated_frames(pa), 0, "被排空的分区已释放帧");
+        assert_eq!(pool.allocated_frames(pd), 1, "另一分区不受影响");
+        assert_eq!(pool.resident(), 1);
+        // 受影响分区的键：重新装入（miss）；另一分区：仍是命中。
+        let before = pool.stats();
+        {
+            let _ga = pool.pin(ka).unwrap();
+            let _gd = pool.pin(kd).unwrap();
+        }
+        let after = pool.stats();
+        assert_eq!(after.misses - before.misses, 1, "只有被排空的页重新读盘");
+        assert_eq!(after.hits - before.hits, 1, "另一分区的帧原样命中");
     }
 }

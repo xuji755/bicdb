@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bicdb_daemon::numa::{BindMode, NumaStatus};
+use bicdb_common::seq::Lsn;
+use bicdb_daemon::numa::{BindMode, BindOutcome, NumaStatus};
 use bicdb_daemon::{InstanceLimits, NumaConfig, Supervisor, SupervisorConfig};
 use bicdb_workspace::registry::{WorkspaceEntry, WorkspaceRegistry};
 use bicdb_workspace::{AuthenticatedSubject, Quota, RootName, UserId, WorkspaceId, WorkspaceRoot};
@@ -261,5 +262,126 @@ fn disabled_by_default() {
     .expect("启动");
     assert!(matches!(supervisor.numa_status(), NumaStatus::Disabled));
     supervisor.shutdown();
+    fs::remove_dir_all(&base).expect("清理测试目录");
+}
+
+// -- 重绑定协议（详设 §7）：Draining（真缓冲池）→ Rebinding（cgroup）--------
+
+/// 假 sysfs：node0（CPU 0-3）+ node1（CPU 4-7）。
+fn fake_sysfs_two(base: &Path) -> PathBuf {
+    let sysfs = base.join("sysfs");
+    fs::create_dir_all(sysfs.join("node0")).unwrap();
+    fs::create_dir_all(sysfs.join("node1")).unwrap();
+    fs::write(sysfs.join("node0/cpulist"), "0-3\n").unwrap();
+    fs::write(sysfs.join("node1/cpulist"), "4-7\n").unwrap();
+    sysfs
+}
+
+/// 无 WAL 的守卫（重绑定用例只关心页落盘次序，不考 redo）。
+struct NoWal;
+
+impl bicdb_storage::buffer::WalGuard for NoWal {
+    fn durable_lsn(&self) -> Lsn {
+        Lsn::from_raw(0).expect("0 合法")
+    }
+    fn ensure_durable(&self, _target: Lsn) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn rebinding_drains_the_pool_then_moves_the_cgroup_binding() {
+    // 端到端：改脏 → Draining（刷尽 + 丢净帧）→ Rebinding（改绑 node1）→
+    // 再绑定落新组 → 下一次装入按新绑定重新分配（**不搬内存**）。
+    use bicdb_storage::buffer::{BufferKey, BufferPool, CacheConfig, SystemClock};
+    use bicdb_storage::page::{Page, PageType};
+    use bicdb_storage::pagefile;
+    use bicdb_storage::rowid::Rdba;
+    use bicdb_workspace::io::{FileIo, MemFileIo, OpenOptions};
+
+    let base = unique_base("rebind");
+    preprovision(&base, 0);
+    preprovision(&base, 1);
+    let ws1 = WorkspaceId::from_raw(1).unwrap();
+    let numa = NumaConfig {
+        enabled: true,
+        mode: BindMode::AttachExisting,
+        cgroup_root: base.join("cg"),
+        sysfs_root: fake_sysfs_two(&base),
+        probe: fake_probe(&base),
+        assignments: vec![(ws1, 0)],
+    };
+    let binder = bicdb_daemon::numa::NumaBinder::start(&numa).expect("绑定器就绪");
+    assert_eq!(binder.bind_current_thread(ws1), BindOutcome::Bound);
+
+    // 真缓冲池：工作区 1 的文件（file_id 7）一页，初始内容 0x00。
+    let mem = MemFileIo::new();
+    mem.add_dir("/mem");
+    let f = mem
+        .open(
+            Path::new("/mem/rb.dat"),
+            OpenOptions::new().read(true).write(true).create_new(true),
+        )
+        .unwrap();
+    mem.set_len(f, bicdb_storage::page::PAGE_SIZE as u64)
+        .unwrap();
+    let ws_bytes = [1u8; 8];
+    {
+        let mut page = Page::new(PageType::HeapTable, ws_bytes, 7, 0);
+        pagefile::write_page(&mem, f, 0, &mut page).unwrap();
+    }
+    let pool = BufferPool::with_partitions(
+        &mem,
+        1,
+        4,
+        move |ws, r| {
+            if *ws == ws_bytes && r.file_id() == 7 {
+                Some((f, r.block_id()))
+            } else {
+                None
+            }
+        },
+        NoWal,
+        SystemClock,
+        CacheConfig::for_capacity(4),
+    )
+    .unwrap();
+    let key = BufferKey::new(ws_bytes, Rdba::from_parts(7, 0).unwrap());
+    {
+        let mut g = pool.pin(key).unwrap();
+        g.as_bytes_mut()[4096] = 0xAB;
+        let mut h = g.header().unwrap();
+        h.page_lsn = Lsn::from_raw(1).expect("1 合法");
+        g.write_header(&h);
+        g.mark_dirty(Lsn::from_raw(1).expect("1 合法"));
+    }
+    let p = pool.partition_of(&ws_bytes);
+    assert_eq!(pool.allocated_frames(p), 1);
+
+    // Draining：刷尽 + 丢净帧（帧缓冲释放——重绑定后按新节点重新分配）。
+    let report = pool.drain_partition(p).unwrap();
+    assert_eq!(report.pages_written, 1, "脏页写回");
+    assert_eq!(report.frames_dropped, 1);
+    assert_eq!(pool.allocated_frames(p), 0, "净帧的页缓冲已释放");
+    let on_disk = pagefile::read_page_verified(&mem, f, 0).unwrap();
+    assert_eq!(on_disk.as_bytes()[4096], 0xAB, "新内容已落盘");
+
+    // Rebinding：改绑 node1（预置组；世代号前进 ⇒ 线程缓存失效）。
+    assert_eq!(binder.rebind(ws1, 1).unwrap(), 1);
+    fs::write(base.join("cg/bicdb-node1/threads/cgroup.threads"), "").unwrap();
+    assert_eq!(binder.bind_current_thread(ws1), BindOutcome::Bound);
+    assert!(
+        !fs::read_to_string(base.join("cg/bicdb-node1/threads/cgroup.threads"))
+            .unwrap()
+            .is_empty(),
+        "重绑定后线程落新节点组"
+    );
+
+    // 下一次装入：从盘重建（帧内存重新分配 = 新节点上的首次触碰）。
+    let g = pool.pin(key).unwrap();
+    assert_eq!(g.as_bytes()[4096], 0xAB, "内容从盘上重建");
+    drop(g);
+    assert_eq!(pool.allocated_frames(p), 1, "帧缓冲按需重新分配");
+
     fs::remove_dir_all(&base).expect("清理测试目录");
 }

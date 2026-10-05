@@ -19,7 +19,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use bicdb_workspace::WorkspaceId;
 
@@ -363,10 +363,19 @@ pub enum BindOutcome {
     Failed,
 }
 
+/// 绑定器实例号发号器（进程内唯一）。
+static BINDER_SEQ: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
-    /// 线程级缓存：本线程当前所在的节点组（去抖——共享池线程连续跑同一
-    /// 工作区的任务时不再重复写 cgroup）。
-    static BOUND_NODE: std::cell::RefCell<Option<u32>> = const { std::cell::RefCell::new(None) };
+    /// 线程级缓存：本线程当前所在的**节点组 + 世代号**（去抖——共享池线程
+    /// 连续跑同一工作区的任务时不再重复写 cgroup）。
+    ///
+    /// 带世代号是**重绑定**的失效机制：`rebind` 自增 `NumaBinder::epoch`，
+    /// 于是所有线程的缓存立即过期，下一次绑定重写 cgroup——否则缓存在旧
+    /// 节点上的线程会一直"命中"而不迁移。**实例号**再防"同进程两个绑定器
+    /// （测试/多实例）撞出假命中"。
+    static BOUND_NODE: std::cell::RefCell<Option<(u64, u32, u64)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// 当前线程的 tid（零 unsafe：`/proc/thread-self` 是 Linux 3.17+ 的
@@ -379,12 +388,23 @@ fn current_tid() -> Result<u32, NumaError> {
         .ok_or(NumaError::Unsupported("无法取得当前线程 tid"))
 }
 
-/// NUMA 绑定器（探测 + 组准备 + 线程绑定）。
+/// NUMA 绑定器（探测 + 组准备 + 线程绑定 + 重绑定）。
 #[derive(Debug)]
 pub struct NumaBinder {
+    /// 实例号（进程内唯一；线程级缓存的第一段键——防多绑定器假命中）。
+    instance: u64,
     version: CgroupVersion,
-    groups: HashMap<u32, NodeGroup>,
-    assignments: Vec<(WorkspaceId, u32)>,
+    /// 已就绪的节点组（**重绑定会按需补建** ⇒ 内部可变）。
+    groups: RwLock<HashMap<u32, NodeGroup>>,
+    /// 生效映射（重绑定更新 ⇒ 内部可变）。
+    assignments: RwLock<Vec<(WorkspaceId, u32)>>,
+    /// 准备新组所需的拓扑与配置（重绑定用；配置与硬件漂移的防呆在
+    /// [`Topology::discover`]——`cpuset.cpus/mems` 一律来自拓扑，不来自配置）。
+    topology: Topology,
+    mode: BindMode,
+    cgroup_root: PathBuf,
+    /// **世代号**：重绑定自增——线程级绑定缓存的失效判据（详设 §7）。
+    epoch: AtomicU64,
     failures: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
@@ -405,33 +425,82 @@ impl NumaBinder {
         let _mount = find_cpuset_mount(&mounts_content, version)
             .ok_or(NumaError::Unsupported("找不到 cpuset/cgroup2 挂载点"))?;
 
+        let binder = Self {
+            instance: BINDER_SEQ.fetch_add(1, Ordering::Relaxed),
+            version,
+            groups: RwLock::new(HashMap::new()),
+            assignments: RwLock::new(config.assignments.clone()),
+            topology,
+            mode: config.mode,
+            cgroup_root: config.cgroup_root.clone(),
+            epoch: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+        };
         let mut groups = HashMap::new();
         for (_, node) in &config.assignments {
             if groups.contains_key(node) {
                 continue;
             }
-            let info = topology
-                .node(*node)
-                .ok_or(NumaError::BadTopology("映射到了不存在的节点"))?;
-            let cpus = format_cpulist(&info.cpus);
-            let mems = node.to_string();
-            let group = match config.mode {
-                BindMode::Provision => {
-                    Self::provision_group(&config.cgroup_root, *node, &cpus, &mems, version)?
-                }
-                BindMode::AttachExisting => {
-                    Self::attach_group(&config.cgroup_root, *node, &cpus, &mems, version)?
-                }
-            };
-            groups.insert(*node, group);
+            groups.insert(*node, binder.prepare_group(*node)?);
         }
-        Ok(Self {
-            version,
-            groups,
-            assignments: config.assignments.clone(),
-            failures: AtomicU64::new(0),
-            last_error: Mutex::new(None),
+        *binder.groups.write().expect("绑定的组表") = groups;
+        Ok(binder)
+    }
+
+    /// 准备（或复用已就绪的）一个节点组：`cpuset.cpus` 来自**拓扑**、
+    /// `cpuset.mems` = 节点号（详设 §4：不从配置取，防配置与硬件漂移）。
+    fn prepare_group(&self, node: u32) -> Result<NodeGroup, NumaError> {
+        if let Some(g) = self.groups.read().expect("绑定的组表").get(&node) {
+            return Ok(g.clone());
+        }
+        let info = self
+            .topology
+            .node(node)
+            .ok_or(NumaError::BadTopology("映射到了不存在的节点"))?;
+        let cpus = format_cpulist(&info.cpus);
+        let mems = node.to_string();
+        Ok(match self.mode {
+            BindMode::Provision => {
+                Self::provision_group(&self.cgroup_root, node, &cpus, &mems, self.version)?
+            }
+            BindMode::AttachExisting => {
+                Self::attach_group(&self.cgroup_root, node, &cpus, &mems, self.version)?
+            }
         })
+    }
+
+    /// **重绑定**（详设 §7 的 Rebinding 步）：把工作区改绑到新节点。
+    ///
+    /// - 新节点组缺失 ⇒ 按启动同一路径**先准备**（Provision 建树 /
+    ///   AttachExisting 只检查）；失败即 `Err`（调用方记降级，
+    ///   **映射不变**——不半途改绑）；
+    /// - 映射更新（未在映射里的工作区 ⇒ 新增一条）；
+    /// - **自增世代号**：所有线程的绑定缓存立即失效，下次任务运行前重写
+    ///   cgroup（线程级缓存的跨线程失效手段）；
+    /// - **前置条件（调用方）**：该工作区的池侧工作集已完成 Draining
+    ///   （`BufferPool::drain_partition`）且**无在途会话**——绑定不搬内存，
+    ///   帧内存随下次装入落新节点；本方法只动运行期绑定，**磁盘格式零改动**。
+    ///
+    /// 返回新节点号（与入参一致；便于调用方串接诊断）。
+    pub fn rebind(&self, workspace: WorkspaceId, node: u32) -> Result<u32, NumaError> {
+        let group = self.prepare_group(node)?;
+        self.groups.write().expect("绑定的组表").insert(node, group);
+        {
+            let mut a = self.assignments.write().expect("绑定的映射表");
+            match a.iter_mut().find(|(w, _)| *w == workspace) {
+                Some(entry) => entry.1 = node,
+                None => a.push((workspace, node)),
+            }
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
+        Ok(node)
+    }
+
+    /// 世代号（诊断/测试：重绑定把它推进一步）。
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// `Provision`：写控制文件建树（v2：`subtree_control` → 节点组 →
@@ -555,6 +624,8 @@ impl NumaBinder {
     #[must_use]
     pub fn node_of(&self, workspace: WorkspaceId) -> Option<u32> {
         self.assignments
+            .read()
+            .expect("绑定的映射表")
             .iter()
             .find(|(w, _)| *w == workspace)
             .map(|(_, n)| *n)
@@ -575,21 +646,33 @@ impl NumaBinder {
     /// 状态快照（诊断）。
     #[must_use]
     pub fn status(&self) -> NumaStatus {
-        let mut groups: Vec<NodeGroup> = self.groups.values().cloned().collect();
+        let mut groups: Vec<NodeGroup> = self
+            .groups
+            .read()
+            .expect("绑定的组表")
+            .values()
+            .cloned()
+            .collect();
         groups.sort_by_key(|g| g.node);
         NumaStatus::Enabled {
             version: self.version,
             groups,
-            assignments: self.assignments.clone(),
+            assignments: self.assignments.read().expect("绑定的映射表").clone(),
         }
     }
 
     /// 把 `tid` 绑到节点组（写 `tasks`（v1）或 `cgroup.threads`（v2））。
     pub fn bind_tid(&self, node: u32, tid: u32) -> Result<(), NumaError> {
-        let group = self.groups.get(&node).ok_or(NumaError::NotPrepared {
-            node,
-            reason: "节点组未就绪",
-        })?;
+        let group = self
+            .groups
+            .read()
+            .expect("绑定的组表")
+            .get(&node)
+            .cloned()
+            .ok_or(NumaError::NotPrepared {
+                node,
+                reason: "节点组未就绪",
+            })?;
         let path = group.bind_dir.join(group.bind_file);
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -609,12 +692,13 @@ impl NumaBinder {
         let Some(node) = self.node_of(workspace) else {
             return BindOutcome::Unassigned;
         };
-        if BOUND_NODE.with(|c| *c.borrow()) == Some(node) {
-            return BindOutcome::Bound; // 缓存命中：本线程已在目标组
+        let epoch = self.epoch.load(Ordering::Acquire);
+        if BOUND_NODE.with(|c| *c.borrow()) == Some((self.instance, node, epoch)) {
+            return BindOutcome::Bound; // 缓存命中：本线程已在目标组（且未重绑定）
         }
         match current_tid().and_then(|tid| self.bind_tid(node, tid)) {
             Ok(()) => {
-                BOUND_NODE.with(|c| *c.borrow_mut() = Some(node));
+                BOUND_NODE.with(|c| *c.borrow_mut() = Some((self.instance, node, epoch)));
                 BindOutcome::Bound
             }
             Err(e) => {
@@ -841,6 +925,93 @@ mod tests {
             fs::read_to_string(base.join("cg2/bicdb-node0/threads/cgroup.threads")).unwrap(),
             "77"
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn rebind_prepares_the_new_group_and_invalidates_the_thread_cache() {
+        // 详设 §7 的 Rebinding 步：改绑 → 新组按需准备 → 映射更新 →
+        // **世代号自增**（线程级缓存跨线程失效）。
+        let base = tmp("rebind");
+        let sysfs = fake_sysfs(&base);
+        let probe = fake_probe(&base, "0::/\n", "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0\n");
+        let root = base.join("cg");
+        let cfg = NumaConfig {
+            enabled: true,
+            mode: BindMode::Provision,
+            cgroup_root: root.clone(),
+            sysfs_root: sysfs,
+            probe,
+            assignments: vec![(ws(1), 0)],
+        };
+        let binder = NumaBinder::start(&cfg).unwrap();
+        // 假 fs 上没有内核供给的 cgroup.threads——两台节点的叶各补一个空文件。
+        for node in [0u32, 1] {
+            let leaf = root.join(format!("bicdb-node{node}/threads"));
+            fs::create_dir_all(&leaf).unwrap();
+            fs::write(leaf.join("cgroup.threads"), "").unwrap();
+        }
+        // 先绑当前线程（落 node0，并写进线程缓存）。
+        assert_eq!(binder.bind_current_thread(ws(1)), BindOutcome::Bound);
+        let node0_bind =
+            fs::read_to_string(root.join("bicdb-node0/threads/cgroup.threads")).unwrap();
+        assert!(!node0_bind.is_empty(), "node0 的叶里出现本线程 tid");
+        let epoch0 = binder.epoch();
+
+        // 改绑 node1：新组按需准备（Provision 建树 + 控制文件）。
+        assert_eq!(binder.rebind(ws(1), 1).unwrap(), 1);
+        assert_eq!(binder.node_of(ws(1)), Some(1), "映射已更新");
+        assert!(binder.epoch() > epoch0, "世代号前进 ⇒ 缓存失效");
+        assert_eq!(
+            fs::read_to_string(root.join("bicdb-node1/cpuset.cpus")).unwrap(),
+            "4-7",
+            "新组的 cpuset.cpus 来自拓扑"
+        );
+
+        // 再绑：缓存已被世代号判废 ⇒ 重写 cgroup，落 node1。
+        fs::write(root.join("bicdb-node1/threads/cgroup.threads"), "").unwrap();
+        assert_eq!(binder.bind_current_thread(ws(1)), BindOutcome::Bound);
+        let node1_bind =
+            fs::read_to_string(root.join("bicdb-node1/threads/cgroup.threads")).unwrap();
+        assert!(!node1_bind.is_empty(), "重绑定后写入新节点组");
+        assert_eq!(
+            fs::read_to_string(root.join("bicdb-node0/threads/cgroup.threads")).unwrap(),
+            node0_bind,
+            "旧组不再被写"
+        );
+
+        // 绑定到不存在的节点：明确失败，**映射不变**（不半途改绑）。
+        assert!(matches!(
+            binder.rebind(ws(1), 9),
+            Err(NumaError::BadTopology(_))
+        ));
+        assert_eq!(binder.node_of(ws(1)), Some(1));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn rebind_can_assign_a_workspace_that_had_no_mapping() {
+        let base = tmp("rebind-new");
+        let sysfs = fake_sysfs(&base);
+        let probe = fake_probe(&base, "0::/\n", "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0\n");
+        let root = base.join("cg");
+        let cfg = NumaConfig {
+            enabled: true,
+            mode: BindMode::AttachExisting,
+            cgroup_root: root.clone(),
+            sysfs_root: sysfs,
+            probe,
+            assignments: vec![(ws(1), 0)],
+        };
+        fs::create_dir_all(root.join("bicdb-node0/threads")).unwrap();
+        fs::write(root.join("bicdb-node0/threads/cgroup.threads"), "").unwrap();
+        fs::create_dir_all(root.join("bicdb-node1/threads")).unwrap();
+        fs::write(root.join("bicdb-node1/threads/cgroup.threads"), "").unwrap();
+        let binder = NumaBinder::start(&cfg).unwrap();
+        assert_eq!(binder.node_of(ws(2)), None);
+        // AttachExisting 只检查预置树——预置了就绪，改绑照常。
+        assert_eq!(binder.rebind(ws(2), 1).unwrap(), 1);
+        assert_eq!(binder.node_of(ws(2)), Some(1), "未映射的工作区被显式指派");
         fs::remove_dir_all(&base).unwrap();
     }
 
