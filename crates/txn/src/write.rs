@@ -79,10 +79,27 @@ pub enum TxnError {
         need: usize,
     },
     /// **行被其他事务锁住**（§5.4.2 ① 的等待分支）：调用方登记等待
-    /// （`lock::WaitRegistry`）、放 latch、重试；等久了由死锁检测（④）处置。
+    /// （`lock::WaitRegistry`/`WaitGate`）、放 latch、重试；等久了由死锁
+    /// 检测（④）处置。[`execute_with_wait`] 是这条路径的现成驱动。
     RowLocked {
         /// 持锁者。
         holder: bicdb_storage::undo::TxnId,
+        /// 被等的那一行（等待表诊断"谁堵住了谁"用）。
+        row: RowId,
+    },
+    /// **死锁牺牲者**（§5.4.2 ④）：本事务在环上且修改量最少——驱动器已做
+    /// **语句级回滚**（到语句回滚点；**不释锁、不回滚此前语句**）并取消等待，
+    /// 环即解开。会话层据此重启该语句（或把错误上抛给应用重试）。
+    DeadlockVictim {
+        /// 环上事务（诊断/日志；从环的顺序给出）。
+        cycle: Vec<bicdb_storage::undo::TxnId>,
+    },
+    /// **等待次数超限**（会话级参数；默认不设限 = 等到底，死锁检测兜底）。
+    LockTimeout {
+        /// 持锁者。
+        holder: bicdb_storage::undo::TxnId,
+        /// 被等的那一行。
+        row: RowId,
     },
 }
 
@@ -106,8 +123,17 @@ impl std::fmt::Display for TxnError {
             TxnError::NoMigrationTarget { need } => {
                 write!(f, "行迁移需要 {need} 字节的可用页，分配口给不出")
             }
-            TxnError::RowLocked { holder } => {
-                write!(f, "行被事务 {holder:?} 锁住：转入等待（§5.4.2）")
+            TxnError::RowLocked { holder, row } => {
+                write!(f, "行 {row:?} 被事务 {holder:?} 锁住：转入等待（§5.4.2）")
+            }
+            TxnError::DeadlockVictim { cycle } => {
+                write!(
+                    f,
+                    "死锁牺牲者：环 {cycle:?} 中本事务修改量最少，已语句级回滚（§5.4.2 ④）"
+                )
+            }
+            TxnError::LockTimeout { holder, row } => {
+                write!(f, "等行 {row:?} 超过等待次数上限（持锁者 {holder:?}）")
             }
         }
     }
@@ -761,7 +787,10 @@ fn lock_and_occupy(
     row_no: u16,
 ) -> Result<u16, TxnError> {
     match decide_row_lock(local, chain, txn, block, row_no)? {
-        LockOutcome::WouldWait { holder } => Err(TxnError::RowLocked { holder }),
+        LockOutcome::WouldWait { holder } => Err(TxnError::RowLocked {
+            holder,
+            row: RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?,
+        }),
         LockOutcome::Acquired { reentrant: true } => {
             // 同一行的重入：槽已就位，不重复计 `lock_cnt`。
             let row = heap::row(local, row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
@@ -872,6 +901,180 @@ pub fn rollback(
     )?;
     txn.state = TxnState::Free;
     Ok(count)
+}
+
+/// **语句回滚点**（§4.6.6 ②）：语句开始时记录的 `undo_current` 快照——
+/// **纯内存**（真值在事务表槽里；回滚点只是它的一份拷贝，"建立回滚点"本身
+/// 不需要任何持久化动作）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatementMark {
+    at: Option<RowId>,
+}
+
+impl StatementMark {
+    /// 回滚点处的撤销位置（诊断/测试）。
+    #[must_use]
+    pub fn at(&self) -> Option<RowId> {
+        self.at
+    }
+}
+
+/// **取语句回滚点**（读事务表槽的 `undo_current`）。
+pub fn statement_mark(chain: &mut UndoChain<'_, '_>, txn: &Txn) -> Result<StatementMark, TxnError> {
+    let header = chain.segment().read_page(0)?;
+    let slot = read_slot(&header, txn.slot)?;
+    Ok(StatementMark {
+        at: slot.undo_current,
+    })
+}
+
+/// **语句级回滚**（§4.6.6 ②）：沿链从新到旧补偿**到回滚点**（不含回滚点处的
+/// 记录）——**不释放锁**（REQ-TXN-003）、**不回滚此前成功语句**；每条逆操作
+/// 与事务回滚同路径（经池 + redo，§11.1.2：回滚写回也必须可重放）。
+///
+/// 走完后把槽的 `undo_current` **置回回滚点**（一次槽头更新，经池 + redo）：
+/// 被撤销的这段记录从此**不可达**——链上只剩"最终状态里仍然成立的改动"，
+/// 于是后到的事务回滚/恢复重放/CR 重建都不必再对孤链做补偿（那些补偿虽然
+/// 幂等，但"槽已复用"判据在跨事务场景下会拒绝）。崩溃落在两次写之间也安全：
+/// 恢复从旧链头重走整链，补偿幂等（§4.6.6 ③）。
+pub fn rollback_to_mark(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    txn: &mut Txn,
+    mark: StatementMark,
+) -> Result<u64, TxnError> {
+    let mut at = {
+        let header = chain.segment().read_page(0)?;
+        read_slot(&header, txn.slot)?.undo_current
+    };
+    let mut count = 0u64;
+    while let Some(pos) = at {
+        if Some(pos) == mark.at {
+            break;
+        }
+        let record = chain.read(pos)?;
+        at = record.prev;
+        let key = BufferKey::new(
+            workspace_of(chain),
+            Rdba::from_parts(record.rowid.file_id(), record.rowid.block_id())
+                .ok_or(TxnError::StaleCache)?,
+        );
+        let (before, mut local) = {
+            let g = pool.pin(key)?;
+            (*g.as_bytes(), Page::from_bytes(Box::new(*g.as_bytes())))
+        };
+        apply_undo_to_page(&mut local, &record)?;
+        write_page_change(pool, log, txn.raw(), key, &before, local.as_bytes(), false)?;
+        count += 1;
+    }
+    // 槽头置回回滚点（幂等：没变就不写）。
+    let header_before = chain.segment().read_page(0)?;
+    let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
+    let mut slot = read_slot(&header_after, txn.slot)?;
+    if slot.undo_current != mark.at {
+        slot.undo_current = mark.at;
+        write_slot(&mut header_after, txn.slot, &slot)?;
+        let key = undo_page_key(chain, 0)?;
+        write_undo_page_change(
+            pool,
+            log,
+            txn.raw(),
+            key,
+            header_before.as_bytes(),
+            header_after.as_bytes(),
+            false,
+        )?;
+    }
+    Ok(count)
+}
+
+/// **语句执行的等待-重试驱动**（§5.4.2 ①/④ 的会话层落点）。
+///
+/// 进入时取**语句回滚点**；把 `op` 反复执行：
+///
+/// ```text
+/// op 成功            ⇒ 返回结果
+/// op 报 `RowLocked`  ⇒ 登记等待（按持锁者）→ 挂起 → 醒来**从头重试** op
+///                       （不假设行还在原地/槽没换人/行还存在，§5.4.2）
+/// 死锁环上我是牺牲者 ⇒ **语句级回滚到回滚点**（不释锁、不动此前语句）
+///                       + 取消等待（牺牲者不再等待 ⇒ 环即解开）→ 返回
+///                       `DeadlockVictim`（会话层重启语句）
+/// 其他错误           ⇒ 原样上抛（语句边界由调用方处置：先 `rollback_to_mark`）
+/// ```
+///
+/// **等待只在 latch 之外发生**（§5.4.2：latch 持有以页访问为界，持有 latch
+/// 时不得等待业务锁）——`op` 每次调用自行把 latch 取放完；本函数在两次调用
+/// 之间挂起。
+///
+/// `now` 是单调毫秒时钟（死锁阈值与等待时长都用它；测试可注入）。
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with_wait<T>(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &mut UndoChain<'_, '_>,
+    txn: &mut Txn,
+    gate: &crate::lock::WaitGate,
+    policy: &WaitPolicy,
+    now: impl Fn() -> u64,
+    mut op: impl FnMut(
+        &BufferPool<'_>,
+        &mut GroupWriter<'_, '_>,
+        &mut UndoChain<'_, '_>,
+        &mut Txn,
+    ) -> Result<T, TxnError>,
+) -> Result<T, TxnError> {
+    let mark = statement_mark(chain, txn)?;
+    let mut waits: u32 = 0;
+    loop {
+        match op(pool, log, chain, txn) {
+            Ok(v) => return Ok(v),
+            Err(TxnError::RowLocked { holder, row }) => {
+                gate.register(txn.txn_id, holder, row, now());
+                let deadlock = gate.with_registry(|r| {
+                    crate::lock::detect_deadlock(r, chain, now(), policy.deadlock_threshold_ms)
+                })?;
+                if let Some(dl) = deadlock {
+                    if dl.victim == txn.txn_id {
+                        let _ = gate.cancel(txn.txn_id);
+                        rollback_to_mark(pool, log, chain, txn, mark)?;
+                        return Err(TxnError::DeadlockVictim { cycle: dl.cycle });
+                    }
+                    // 我不是牺牲者：继续等待（牺牲者回滚后会释放/不再等待）。
+                }
+                waits = waits.saturating_add(1);
+                if let Some(max) = policy.max_waits {
+                    if waits > max {
+                        let _ = gate.cancel(txn.txn_id);
+                        return Err(TxnError::LockTimeout { holder, row });
+                    }
+                }
+                gate.park(txn.txn_id, policy.park_timeout);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+/// 等待-重试驱动的策略（§5.4.2；会话级参数）。
+#[derive(Debug, Clone, Copy)]
+pub struct WaitPolicy {
+    /// 单次挂起的时长（醒来或超时后重试 / 再做死锁检测）。
+    pub park_timeout: std::time::Duration,
+    /// 死锁检测阈值（等待超过它才建图找环；默认口径 [`crate::lock::DEADLOCK_THRESHOLD_MS`]）。
+    pub deadlock_threshold_ms: u64,
+    /// 等待次数上限（`None` = 等到底——死锁检测与持锁者结束兜底）。
+    pub max_waits: Option<u32>,
+}
+
+impl Default for WaitPolicy {
+    fn default() -> Self {
+        Self {
+            park_timeout: std::time::Duration::from_millis(50),
+            deadlock_threshold_ms: crate::lock::DEADLOCK_THRESHOLD_MS,
+            max_waits: None,
+        }
+    }
 }
 
 /// **回收撤销空间**（§4.6.5）：把"已提交 且 `commit_seq < 最老快照`"的事务
@@ -2160,8 +2363,13 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            TxnError::RowLocked { holder } => {
+            TxnError::RowLocked { holder, row } => {
                 assert_eq!(holder, t1.txn_id, "持锁者是 t1");
+                assert_eq!(
+                    row,
+                    RowId::from_parts(3, 1, rid.row_id()).unwrap(),
+                    "等的是那一行"
+                );
                 reg.register(
                     t2.txn_id,
                     holder,
@@ -2970,5 +3178,476 @@ mod tests {
             Some(row.len()),
             "提交后：CR 可见"
         );
+    }
+
+    #[test]
+    fn statement_rollback_keeps_earlier_statements_and_locks() {
+        // §4.6.6 ②：语句失败 ⇒ 沿链补偿到回滚点——**不释放锁**、
+        // **不回滚此前的成功语句**。
+        let io = mem();
+        let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        // 语句 1（成功语句：语句回滚不得动它）。
+        let a = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            &row_bytes(b"stmt-1-a"),
+            &policy,
+        )
+        .unwrap();
+        // 语句 2：取回滚点 → 插入 B → "失败" ⇒ 回滚到回滚点。
+        let mark = statement_mark(&mut chain, &t1).unwrap();
+        let b = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            &row_bytes(b"stmt-2-b"),
+            &policy,
+        )
+        .unwrap();
+        let undone = rollback_to_mark(&pool, &mut log, &mut chain, &mut t1, mark).unwrap();
+        assert_eq!(undone, 1, "语句 2 的这一条插入被补偿");
+        {
+            let g = pool.pin(key).unwrap();
+            assert!(heap::row(&g, a.row_id()).is_some(), "语句 1 的行保留");
+            assert!(heap::row(&g, b.row_id()).is_none(), "语句 2 的行已撤销");
+        }
+        assert_eq!(t1.state, TxnState::Active, "事务仍在（只是语句回滚）");
+
+        // **锁不释放**：另一事务改 A 仍被挡（RowLocked）。
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let err = update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            a.row_id(),
+            &row_bytes(b"x"),
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TxnError::RowLocked { holder, .. } if holder == t1.txn_id),
+            "语句回滚不释锁：{err}"
+        );
+
+        // **孤链不可达**：整事务回滚只走剩下的一节链——A 被撤销、B 不会再被
+        // "补偿出来"（回滚点让被撤销的记录从此不可达）。
+        rollback(&pool, &mut log, &mut chain, &mut t1).unwrap();
+        {
+            let g = pool.pin(key).unwrap();
+            assert!(heap::row(&g, a.row_id()).is_none(), "整事务回滚撤销 A");
+            assert!(heap::row(&g, b.row_id()).is_none(), "B 保持已撤销");
+        }
+    }
+
+    #[test]
+    fn statement_mark_without_changes_is_a_noop_and_idempotent() {
+        let io = mem();
+        let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        let mut t0 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t0,
+            key,
+            &row_bytes(b"row-0"),
+            &policy,
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        let mark = statement_mark(&mut chain, &t1).unwrap();
+        // 无改动的语句：回滚点是当前链头 ⇒ 零补偿、幂等。
+        assert_eq!(
+            rollback_to_mark(&pool, &mut log, &mut chain, &mut t1, mark).unwrap(),
+            0
+        );
+        assert_eq!(
+            rollback_to_mark(&pool, &mut log, &mut chain, &mut t1, mark).unwrap(),
+            0,
+            "重复回滚到同一回滚点 = 无操作"
+        );
+        // 后续语句照常。
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid.row_id(),
+            &row_bytes(b"row-1"),
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        rollback(&pool, &mut log, &mut chain, &mut t1).unwrap();
+        let g = pool.pin(key).unwrap();
+        let got = heap::row(&g, rid.row_id()).expect("行在").to_vec();
+        let want = row_bytes(b"row-0");
+        assert_eq!(got.len(), want.len());
+        assert_eq!(
+            got[2..],
+            want[2..],
+            "负载逐字节相同（行头 itl_slot 由写路径回填）"
+        );
+    }
+
+    #[test]
+    fn driver_rolls_back_the_statement_when_it_is_the_deadlock_victim() {
+        // §5.4.2 ④ + §4.6.6 ②：环上修改量最少者做**语句级回滚**并返回
+        // `DeadlockVictim`——本语句的改动撤销、**此前语句的改动保留**、
+        // 事务仍在（不释锁），等待被取消（牺牲者不再等待 ⇒ 环解开）。
+        let io = mem();
+        let (mut undo_file, _dh, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let mut chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        // 前置行（已提交）。
+        let mut t0 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let r_stmt = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t0,
+            key,
+            &row_bytes(b"AAA"),
+            &policy,
+        )
+        .unwrap();
+        let r_held = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t0,
+            key,
+            &row_bytes(b"BBB"),
+            &policy,
+        )
+        .unwrap();
+        let r_extra = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t0,
+            key,
+            &row_bytes(b"CCC"),
+            &policy,
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+
+        // t1：先前语句改一行（保留）；t2：改两行（修改量更大 ⇒ 它不是牺牲者）。
+        let mut t1 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            r_stmt.row_id(),
+            &row_bytes(b"aaa"),
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        let mut t2 = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            r_held.row_id(),
+            &row_bytes(b"bbb"),
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            r_extra.row_id(),
+            &row_bytes(b"ccc"),
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap();
+        update_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t2,
+            key,
+            r_stmt.row_id(),
+            &row_bytes(b"ccc"),
+            &policy,
+            &mut no_alloc,
+        )
+        .unwrap_err(); // t1 持有 ⇒ t2 等 t1
+
+        // 等待图：t1 → t2（本测试里 t2 的"等 t1"手动登记，模拟另一会话在挂起）。
+        let gate = crate::lock::WaitGate::new();
+        gate.register(
+            t2.txn_id,
+            t1.txn_id,
+            RowId::from_parts(3, 1, r_stmt.row_id()).unwrap(),
+            0,
+        );
+
+        // t1 的语句：先改一行（语句改动，将被回滚），再改 t2 持有的行 ⇒ 转等待。
+        let held_by_t2 = r_held.row_id();
+        let mut first = true;
+        let now = || 10_000u64; // 固定时钟 ⇒ 等待时长恒超阈值
+        let policy_wait = WaitPolicy {
+            park_timeout: std::time::Duration::from_millis(1),
+            deadlock_threshold_ms: 0,
+            max_waits: Some(8),
+        };
+        let result = execute_with_wait(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            &gate,
+            &policy_wait,
+            now,
+            |pool, log, chain, txn| {
+                if first {
+                    first = false;
+                    update_row(
+                        pool,
+                        log,
+                        chain,
+                        txn,
+                        key,
+                        r_stmt.row_id(),
+                        &row_bytes(b"zzz"),
+                        &policy,
+                        &mut no_alloc,
+                    )?;
+                }
+                update_row(
+                    pool,
+                    log,
+                    chain,
+                    txn,
+                    key,
+                    held_by_t2,
+                    &row_bytes(b"yyy"),
+                    &policy,
+                    &mut no_alloc,
+                )
+            },
+        );
+        match result {
+            Err(TxnError::DeadlockVictim { cycle }) => {
+                assert!(
+                    cycle.contains(&t1.txn_id) && cycle.contains(&t2.txn_id),
+                    "环上两方：{cycle:?}"
+                );
+            }
+            other => panic!("应为 DeadlockVictim：{other:?}"),
+        }
+        assert!(
+            gate.waiters_of(t2.txn_id).is_empty(),
+            "牺牲者不再等待（环解开）"
+        );
+        assert_eq!(t1.state, TxnState::Active, "语句回滚 ≠ 事务回滚");
+        {
+            let g = pool.pin(key).unwrap();
+            // 本语句对 r_stmt 的改动已回滚；**此前语句**的改动保留。
+            let got = heap::row(&g, r_stmt.row_id()).expect("行在").to_vec();
+            let want = row_bytes(b"aaa");
+            assert_eq!(got[2..], want[2..], "回滚到语句前（负载 aaa）");
+            assert!(
+                heap::row(&g, held_by_t2).is_some(),
+                "被等的那行未被本事务改动"
+            );
+        }
+    }
+
+    #[test]
+    fn second_session_parks_until_the_holder_commits_then_succeeds() {
+        // 真跨线程的"等待 → 唤醒 → 重试"（§5.4.2 ①/②）：两个会话共享缓冲池
+        // 与**同一个撤销段**（事务表是全段的——持锁者判定要按 `txn_id` 查它，
+        // 跨段查不到会被当成"陈旧字节"而误判可锁）；等待在 latch 之外发生、
+        // **唤醒不做移交**。
+        let io = mem();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let undo_handle = undo_file.handle();
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let data_handle = {
+            let data_file = DataFile::create(&io, Path::new(DATA_F), 3, 3, WS, 512).unwrap();
+            let h = data_file.handle();
+            let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+            pagefile::write_page(&io, h, 1, &mut page).unwrap();
+            h
+        };
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                3 => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::new(ArchiveMode::NoArchive),
+        )
+        .unwrap();
+        let chain = std::sync::Mutex::new(UndoChain::open(segment));
+        let log = std::sync::Mutex::new(
+            GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap(),
+        );
+        let policy = InsertPolicy::in_place(0);
+        let key = BufferKey::new(WS, rdba(3, 1));
+
+        // 前置行（已提交）。
+        let rid = {
+            let mut chain = chain.lock().unwrap();
+            let mut log = log.lock().unwrap();
+            let mut t0 = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+            let rid = insert_row(
+                &pool,
+                &mut log,
+                &mut chain,
+                &mut t0,
+                key,
+                &row_bytes(b"0123"),
+                &policy,
+            )
+            .unwrap();
+            commit(&pool, &mut log, &mut chain, &mut t0, seq(1)).unwrap();
+            rid
+        };
+
+        let gate = std::sync::Arc::new(crate::lock::WaitGate::new());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            // 会话 1：持锁 → 等会话 2 登记 → 提交 → 唤醒。
+            let g1 = std::sync::Arc::clone(&gate);
+            let (pool1, chain1, log1) = (&pool, &chain, &log);
+            let a = scope.spawn(move || {
+                let mut t1;
+                {
+                    let mut chain = chain1.lock().unwrap();
+                    let mut log = log1.lock().unwrap();
+                    t1 = begin(pool1, &mut log, &mut chain, seq(1)).unwrap();
+                    update_row(
+                        pool1,
+                        &mut log,
+                        &mut chain,
+                        &mut t1,
+                        key,
+                        rid.row_id(),
+                        &row_bytes(b"1111"),
+                        &policy,
+                        &mut no_alloc,
+                    )
+                    .unwrap();
+                }
+                locked_tx.send(()).unwrap();
+                // 等会话 2 挂上（登记在册）。
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while g1.waiters_of(t1.txn_id).is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                {
+                    let mut chain = chain1.lock().unwrap();
+                    let mut log = log1.lock().unwrap();
+                    commit(pool1, &mut log, &mut chain, &mut t1, seq(2)).unwrap();
+                }
+                let woken = g1.wake(t1.txn_id);
+                assert!(!woken.is_empty(), "持锁者结束 ⇒ 唤醒其全部等待者");
+            });
+
+            // 会话 2：尝试 → RowLocked ⇒ 登记 + 挂起 → 醒来重试成功。
+            let g2 = std::sync::Arc::clone(&gate);
+            let (pool2, chain2, log2) = (&pool, &chain, &log);
+            let b = scope.spawn(move || {
+                locked_rx.recv().unwrap();
+                let mut t2 = {
+                    let mut chain = chain2.lock().unwrap();
+                    let mut log = log2.lock().unwrap();
+                    begin(pool2, &mut log, &mut chain, seq(1)).unwrap()
+                };
+                loop {
+                    let attempt = {
+                        let mut chain = chain2.lock().unwrap();
+                        let mut log = log2.lock().unwrap();
+                        update_row(
+                            pool2,
+                            &mut log,
+                            &mut chain,
+                            &mut t2,
+                            key,
+                            rid.row_id(),
+                            &row_bytes(b"2222"),
+                            &policy,
+                            &mut no_alloc,
+                        )
+                    };
+                    match attempt {
+                        Ok(_) => break,
+                        Err(TxnError::RowLocked { holder, row }) => {
+                            g2.register(t2.txn_id, holder, row, 0);
+                            assert!(
+                                g2.park(t2.txn_id, std::time::Duration::from_secs(5)),
+                                "被唤醒"
+                            );
+                        }
+                        Err(other) => panic!("非等待错误：{other}"),
+                    }
+                }
+                {
+                    let mut chain = chain2.lock().unwrap();
+                    let mut log = log2.lock().unwrap();
+                    commit(pool2, &mut log, &mut chain, &mut t2, seq(3)).unwrap();
+                }
+                done_tx.send(()).unwrap();
+            });
+            a.join().unwrap();
+            b.join().unwrap();
+        });
+        done_rx.recv().unwrap();
+        let g = pool.pin(key).unwrap();
+        let got = heap::row(&g, rid.row_id()).expect("行在").to_vec();
+        let want = row_bytes(b"2222");
+        assert_eq!(got[2..], want[2..], "会话 2 等到了锁并写成功");
     }
 }
