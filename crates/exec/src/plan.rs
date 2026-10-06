@@ -17,11 +17,13 @@ use crate::sort::{Sort, SortKey, TopN};
 use crate::value::{ColKind, RowShape};
 
 /// **执行环境**：构建算子树时的存储服务口（池 + 撤销链）。
-pub struct ExecEnv<'a, 'b, 'io, 'f> {
+pub struct ExecEnv<'a, 'b, 'io, 'f, 's> {
     /// 缓冲池。
     pub pool: &'a BufferPool<'b>,
     /// 撤销链（CR 读路径）。
     pub chain: &'a UndoChain<'io, 'f>,
+    /// 溢出空间（切片 6b：Sort 等超预算时落 temp 段；`None` = 不支持溢出）。
+    pub spill: Option<&'a crate::spill::SpillSpace<'s>>,
 }
 
 /// 行源标识（切片 1：单表；编号由计划给出，执行期映射到存储服务的表）。
@@ -185,9 +187,9 @@ pub enum PlanNode {
 
 /// **构建算子树**：`open_cursor` 按行源标识开一个**新**行游标
 /// （每次调用返回新游标——树里每个 `SeqScan` 各开一个）；索引扫描经 `env`。
-pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a>(
+pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
     node: &PlanNode,
-    env: &ExecEnv<'a, 'b, 'io, 'f>,
+    env: &ExecEnv<'a, 'b, 'io, 'f, 's>,
     open_cursor: &mut dyn FnMut(SourceId) -> Result<Box<dyn RowCursor + 'a>, ExecError>,
 ) -> Result<Box<dyn Operator + 'a>, ExecError> {
     Ok(match node {
@@ -248,7 +250,11 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a>(
             // 相邻去重要求输入按去重键有序 ⇒ 一律前置 `Sort`
             // （输入已有序时的冗余排序属**优化**，随索引序复用切片再消）。
             let inner = Sort::new(build(input, env, open_cursor)?, keys.clone());
-            Box::new(crate::setops::Unique::new(Box::new(inner), keys))
+            let inner: Box<dyn Operator + 'a> = match env.spill {
+                Some(spill) => Box::new(inner.with_spill(spill)),
+                None => Box::new(inner),
+            };
+            Box::new(crate::setops::Unique::new(inner, keys))
         }
         PlanNode::SetOp {
             left,
@@ -258,9 +264,19 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a>(
             width,
         } => {
             let keys = crate::setops::all_columns_keys(*width);
-            // 两侧必须按**同一总序**排序（相等即相邻）。
-            let l = Sort::new(build(left, env, open_cursor)?, keys.clone());
-            let r = Sort::new(build(right, env, open_cursor)?, keys.clone());
+            // 两侧必须按**同一总序**排序（相等即相邻）；有溢出空间就接上。
+            let l = match env.spill {
+                Some(spill) => {
+                    Sort::new(build(left, env, open_cursor)?, keys.clone()).with_spill(spill)
+                }
+                None => Sort::new(build(left, env, open_cursor)?, keys.clone()),
+            };
+            let r = match env.spill {
+                Some(spill) => {
+                    Sort::new(build(right, env, open_cursor)?, keys.clone()).with_spill(spill)
+                }
+                None => Sort::new(build(right, env, open_cursor)?, keys.clone()),
+            };
             Box::new(crate::setops::SetOp::new(
                 Box::new(l),
                 Box::new(r),
@@ -324,7 +340,11 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a>(
             *inner_width,
         )),
         PlanNode::Sort { input, keys } => {
-            Box::new(Sort::new(build(input, env, open_cursor)?, keys.clone()))
+            let inner = build(input, env, open_cursor)?;
+            Box::new(match env.spill {
+                Some(spill) => Sort::new(inner, keys.clone()).with_spill(spill),
+                None => Sort::new(inner, keys.clone()),
+            })
         }
         PlanNode::TopN { input, keys, keep } => Box::new(TopN::new(
             build(input, env, open_cursor)?,

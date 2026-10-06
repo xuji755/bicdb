@@ -112,9 +112,15 @@ fn sort_items(items: &mut [SortItem], keys: &[SortKey]) -> Result<(), ExecError>
 }
 
 /// **`Sort`**（阻塞：首次 `next` 耗尽输入并排序，其后流式吐出）。
-pub struct Sort<'a> {
+///
+/// **溢出（切片 6b）**：给了 [`crate::spill::SpillSpace`] 且超工作内存预算 ⇒
+/// 分批排序、逐批写**有序 run**（落 temp 段），收尾做 **k 路归并**
+/// （一次只持各 run 一行 + 一页）；未溢出 ⇒ 全内存排序（`optimal`）。
+pub struct Sort<'a, 's, 'io> {
     input: Box<dyn Operator + 'a>,
     keys: Vec<SortKey>,
+    spill: Option<&'s crate::spill::SpillSpace<'io>>,
+    runs: Vec<usize>,
     items: Vec<SortItem>,
     at: usize,
     loaded: bool,
@@ -122,13 +128,15 @@ pub struct Sort<'a> {
     opened: bool,
 }
 
-impl<'a> Sort<'a> {
-    /// 构造。
+impl<'a, 's, 'io> Sort<'a, 's, 'io> {
+    /// 构造（无溢出空间——超预算即报错）。
     #[must_use]
     pub fn new(input: Box<dyn Operator + 'a>, keys: Vec<SortKey>) -> Self {
         Self {
             input,
             keys,
+            spill: None,
+            runs: Vec::new(),
             items: Vec::new(),
             at: 0,
             loaded: false,
@@ -136,9 +144,32 @@ impl<'a> Sort<'a> {
             opened: false,
         }
     }
+
+    /// 带溢出空间（超预算 ⇒ 外部归并）。
+    #[must_use]
+    pub fn with_spill(mut self, spill: &'s crate::spill::SpillSpace<'io>) -> Self {
+        self.spill = Some(spill);
+        self
+    }
+
+    /// 把当前批排好序后写成一个 **有序 run**（溢出行 = 键 ++ 原行）。
+    fn spill_batch(&mut self, cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
+        let space = self.spill.expect("调用方保证有溢出空间");
+        sort_items(&mut self.items, &self.keys)?;
+        let mut rows = Vec::with_capacity(self.items.len());
+        for item in self.items.drain(..) {
+            let mut values = item.keys;
+            values.extend(item.row.values);
+            rows.push(Row::new(values));
+        }
+        let run = space.write_run(&rows)?;
+        self.runs.push(run);
+        let _ = cx;
+        Ok(())
+    }
 }
 
-impl Operator for Sort<'_> {
+impl Operator for Sort<'_, '_, '_> {
     fn open(&mut self, cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
         if !self.opened {
             self.slot = cx.register_op("Sort");
@@ -149,17 +180,48 @@ impl Operator for Sort<'_> {
 
     fn next(&mut self, cx: &mut ExecContext<'_>) -> Result<Option<Row>, ExecError> {
         if !self.loaded {
-            // 阻塞段：耗尽输入、随增长记账（超预算早失败）、排序。
+            // 阻塞段：耗尽输入；超预算 ⇒ 分批落 run（有溢出空间时）。
             let mut used: u64 = 0;
             while let Some(row) = self.input.next(cx)? {
                 let keys = keys_of(&self.keys, &row, cx.params())?;
                 let item = SortItem { keys, row };
                 used += item.bytes();
-                check_budget(cx, used)?;
                 self.items.push(item);
+                if let Some(budget) = cx.work_memory_budget() {
+                    if used > budget {
+                        if self.spill.is_some() {
+                            self.spill_batch(cx)?;
+                            used = 0;
+                        } else {
+                            return Err(ExecError::WorkMemoryExceeded { used, budget });
+                        }
+                    }
+                }
             }
-            sort_items(&mut self.items, &self.keys)?;
-            cx.note_work_area(WorkAreaOutcome::Optimal); // WMM 最小面（切片 6 扩三态）
+            if self.runs.is_empty() {
+                sort_items(&mut self.items, &self.keys)?;
+                cx.note_work_area(WorkAreaOutcome::Optimal);
+            } else {
+                // 收尾：剩余批落 run ⇒ k 路归并（键在行前缀——比较无需再求值）。
+                if !self.items.is_empty() {
+                    self.spill_batch(cx)?;
+                }
+                let nkeys = self.keys.len();
+                let keys = &self.keys;
+                let runs = self.runs.clone();
+                let space = self.spill.expect("有 run 必有溢出空间");
+                let merged = space.merge_runs(&runs, |a, b| {
+                    compare_keys(keys, &a.values[..nkeys], &b.values[..nkeys])
+                })?;
+                self.items = merged
+                    .into_iter()
+                    .map(|row| SortItem {
+                        keys: Vec::new(),
+                        row: Row::new(row.values[nkeys..].to_vec()),
+                    })
+                    .collect();
+                cx.note_work_area(WorkAreaOutcome::OnePass);
+            }
             self.loaded = true;
         }
         match self.items.get(self.at) {
@@ -175,9 +237,10 @@ impl Operator for Sort<'_> {
     fn rescan(&mut self, cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
         self.at = 0;
         if self.loaded {
-            return Ok(()); // 已装载 ⇒ 直接重放
+            return Ok(()); // 已装载（含已归并结果）⇒ 直接重放
         }
         self.items.clear();
+        self.runs.clear();
         self.input.rescan(cx)
     }
 

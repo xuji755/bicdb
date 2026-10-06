@@ -72,6 +72,7 @@ fn run(fx: &Fixture, plan: &PlanNode) -> Vec<Row> {
     let env = ExecEnv {
         pool: fx.pool,
         chain: &fx.chain,
+        spill: None,
     };
     let mut op = build(plan, &env, &mut open).unwrap();
     let mut cx = ExecContext::new(fx.snapshot);

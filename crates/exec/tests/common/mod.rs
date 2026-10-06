@@ -121,6 +121,9 @@ pub fn fixture(io: &'static MemFileIo, rows: &[Row]) -> Fixture {
     let mut blocks = Vec::new();
     for _ in 0..pages {
         let logical = segment.allocate_append_page().unwrap();
+        if segment.logical_block(logical).is_none() {
+            segment.extend().expect("跨区自动扩展"); // 页数跨出首个区（>8 页）时
+        }
         let block = segment.logical_block(logical).unwrap();
         let mut page = Page::new(PageType::HeapTable, WS, DATA_FID, block);
         segment.write_page(logical, &mut page).unwrap();
@@ -226,6 +229,7 @@ pub fn run_plan(
     let env = ExecEnv {
         pool: fx.pool,
         chain: &fx.chain,
+        spill: None,
     };
     let mut op = match build(&plan, &env, &mut open) {
         Ok(op) => op,
@@ -260,6 +264,7 @@ pub fn run_both(fx: &Fixture, query: &SelectQuery) -> RunBoth {
     let env = ExecEnv {
         pool: fx.pool,
         chain: &fx.chain,
+        spill: None,
     };
     let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx2 = ExecContext::new(fx.snapshot);
@@ -339,6 +344,9 @@ pub fn create_table(env: &mut Env, io: &'static MemFileIo, rows: &[Row]) -> Tabl
     let mut blocks = Vec::new();
     for _ in 0..pages {
         let logical = segment.allocate_append_page().unwrap();
+        if segment.logical_block(logical).is_none() {
+            segment.extend().expect("跨区自动扩展"); // 页数跨出首个区（>8 页）时
+        }
         let block = segment.logical_block(logical).unwrap();
         let mut page = Page::new(PageType::HeapTable, WS, DATA_FID, block);
         segment.write_page(logical, &mut page).unwrap();
