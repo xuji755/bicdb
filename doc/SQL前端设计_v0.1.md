@@ -361,7 +361,7 @@ cancel(执行句柄) -> 释放锁/页引用/临时空间（走 `ExecContext` 的
 
 | 片 | 内容 | 验收 |
 | --- | --- | --- |
-| **S1** | 词法 + 语法 + Raw AST + L1 缓存 | 1000 条手写语句解析往返（AST 结构化比对）；清单外构造零接受；**AST 模块不 import 目录**（依赖检查） |
+| **S1** ✅ **已落地（2026-10-06）** | 词法 + 语法 + Raw AST（L1 缓存随 S6——归一化规则是评审点，先不做） | ✅ `crates/sql` v0.1：`lexer`（token + 字节区间；关键字闭集；字面量只记原文本）+ `ast`（Raw AST，源码自检不 import 目录——REQ-SQL-002 验收原文）+ `parser`（手写递归下降 + 显式优先级；`parse`/`parse_many`）。**用例 18**：闭集语料 58 条全解析（DDL/DML/事务/表达式/集合运算链/参数/向量操作符）、**清单外 22 条零接受**（WITH/EXISTS/子查询/窗口/RIGHT-FULL-NATURAL-USING/INSERT…SELECT/RETURNING/列约束/LIKE/SAVEPOINT/TRUNCATE/ALTER TABLE/`FOR UPDATE`）、优先级与左结合逐点断言、字面量原文本与字节区间、错误带位置、`GRAPH_TABLE` 响亮拒绝、关键字同名标识符折叠一致 |
 | **S2** | Catalog 只读面 + 名字解析三格 + 版本捕获 | 跨区名不可区分；保留名拒绝；`(obj#, mtime)` 被记入 Bound（断点查验） |
 | **S3** | Binder：类型推导 / 参数定型 / 写目标 / 登记点 | 类型错误全在绑定期；参数推导失败拒绝；写固定表/public 拒绝 |
 | **S4** | 逻辑表示 + 白名单变换 | 与**直译执行器**两路差分（无优化 vs 优化，逐行一致）；四条不变量各有用例 |
