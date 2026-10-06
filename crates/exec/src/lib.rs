@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod agg;
 pub mod context;
 pub mod direct;
 pub mod error;
@@ -33,6 +34,7 @@ pub mod plan;
 pub mod sort;
 pub mod value;
 
+pub use agg::{AggKind, AggSpec, HashAgg, ScalarAgg, SortedAgg};
 pub use context::{ExecContext, OpStat, WorkAreaOutcome, WorkAreaStats};
 pub use direct::{execute_direct, SelectQuery};
 pub use error::ExecError;

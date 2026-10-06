@@ -97,6 +97,31 @@ pub enum PlanNode {
         /// 回表批量大小（§9.4；`None` = 默认 256）。
         batch: Option<usize>,
     },
+    /// **单组聚合**（无 `GROUP BY`；空输入恒出一行）。
+    ScalarAgg {
+        /// 输入子树。
+        input: Box<PlanNode>,
+        /// 聚合项（按序）。
+        aggs: Vec<crate::agg::AggSpec>,
+    },
+    /// **哈希聚合**（有 `GROUP BY`；输出键出现序、组内稳定）。
+    HashAgg {
+        /// 输入子树。
+        input: Box<PlanNode>,
+        /// 分组键表达式。
+        groups: Vec<Expr>,
+        /// 聚合项（按序）。
+        aggs: Vec<crate::agg::AggSpec>,
+    },
+    /// **有序聚合**（输入按分组键有序；换组即出——流式首组）。
+    SortedAgg {
+        /// 输入子树。
+        input: Box<PlanNode>,
+        /// 分组键表达式。
+        groups: Vec<Expr>,
+        /// 聚合项（按序）。
+        aggs: Vec<crate::agg::AggSpec>,
+    },
     /// **嵌套循环连接**（内表参数化重扫）。
     NestedLoop {
         /// 外层子树。
@@ -165,6 +190,28 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a>(
                 None => scan,
             })
         }
+        PlanNode::ScalarAgg { input, aggs } => Box::new(crate::agg::ScalarAgg::new(
+            build(input, env, open_cursor)?,
+            aggs.clone(),
+        )),
+        PlanNode::HashAgg {
+            input,
+            groups,
+            aggs,
+        } => Box::new(crate::agg::HashAgg::new(
+            build(input, env, open_cursor)?,
+            groups.clone(),
+            aggs.clone(),
+        )),
+        PlanNode::SortedAgg {
+            input,
+            groups,
+            aggs,
+        } => Box::new(crate::agg::SortedAgg::new(
+            build(input, env, open_cursor)?,
+            groups.clone(),
+            aggs.clone(),
+        )),
         PlanNode::NestedLoop {
             outer,
             inner,

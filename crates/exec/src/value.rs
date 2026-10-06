@@ -25,7 +25,9 @@ pub enum ColKind {
 }
 
 /// **值**（三值逻辑：NULL 是一等值，不是"缺省"）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Hash` 供聚合分组键与 `DISTINCT` 已见值集用（`NULL` **同类即同键**——
+/// 分组与去重的相等比 `WHERE` 的三值比较更宽，见设计 §2.7 的等价类口径）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     /// SQL NULL。
     Null,

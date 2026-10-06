@@ -26,7 +26,13 @@ pub struct SelectQuery {
     pub shape: RowShape,
     /// 谓词（`WHERE`；`None` = 全放行）。
     pub predicate: Option<Expr>,
-    /// 投影（顺序 = 输出列序）。
+    /// 分组键（空 + 空聚合 = 非聚合查询）。
+    pub groups: Vec<Expr>,
+    /// 聚合项（非空 ⇒ 聚合查询；输出行 = 分组键 ++ 聚合结果）。
+    pub aggs: Vec<crate::agg::AggSpec>,
+    /// `HAVING`（在**聚合输出行**上求值：列序 = 分组键 ++ 聚合结果）。
+    pub having: Option<Expr>,
+    /// 投影（顺序 = 输出列序；聚合查询时列序 = 分组键 ++ 聚合结果）。
     pub projection: Vec<Expr>,
     /// `ORDER BY`（空 = 无排序；语义与算子路径共用 [`crate::sort::compare_keys`]）。
     pub order_by: Vec<crate::sort::SortKey>,
@@ -49,6 +55,26 @@ impl SelectQuery {
                 input: Box::new(node),
                 predicate: pred.clone(),
             };
+        }
+        if !self.aggs.is_empty() {
+            node = if self.groups.is_empty() {
+                PlanNode::ScalarAgg {
+                    input: Box::new(node),
+                    aggs: self.aggs.clone(),
+                }
+            } else {
+                PlanNode::HashAgg {
+                    input: Box::new(node),
+                    groups: self.groups.clone(),
+                    aggs: self.aggs.clone(),
+                }
+            };
+            if let Some(h) = &self.having {
+                node = PlanNode::Filter {
+                    input: Box::new(node),
+                    predicate: h.clone(),
+                };
+            }
         }
         if !self.order_by.is_empty() {
             // **排序在投影之下**（`ORDER BY` 可引用未投影的列）；`ORDER BY` +
@@ -110,6 +136,20 @@ pub fn execute_direct(
             }
         }
     }
+    // ①′ 聚合（若声明）——参考模型用**朴素分组**（线性查找、键出现序）。
+    if !query.aggs.is_empty() {
+        rows = crate::agg::direct_aggregate(&query.groups, &query.aggs, &rows, cx.params())?;
+        if let Some(h) = &query.having {
+            let mut kept = Vec::new();
+            for r in rows {
+                if expr::eval_where(h, &r, cx.params())? {
+                    kept.push(r);
+                }
+            }
+            rows = kept;
+        }
+    }
+
     // ② 排序（稳定；键在输入行上求值——`ORDER BY` 可引用未投影列）。
     if !query.order_by.is_empty() {
         let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
