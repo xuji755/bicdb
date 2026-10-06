@@ -32,6 +32,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
   in SQL*Plus layout, `HOST`/`PROMPT`/`REM`/`TIMING`/`HELP`/`EXIT [code]`,
   right-aligned numeric columns, page breaks at `PAGESIZE`, `N rows selected.`
   and `Elapsed: 00:00:00.01`.
+- **On-disk layout aligned with the frozen storage design**: the root area now
+  holds `control/control01.ctl`, `control/control02.ctl`, `data/<ws>_meta`
+  (file 0), `data/<ws>_undo` (file 1) and `wal/redo_g<g>_m<m>`, alongside
+  `bicdb.ini` — instead of the flat `file0.dat`/`undo.dat`/`cf_a`/`cf_b` the
+  CLI used before.
+- **User manual** ([docs/使用手册.md](docs/使用手册.md), Chinese): five-minute
+  quick start, instance addressing, the parameter-file reference, command
+  reference for `bicdb`/`bicdbcli`, the supported SQL surface with its named
+  refusals, operations (locking, crash recovery, backup) and troubleshooting.
 - **Connection routing** — a running service means clients (and `bicdb sql`)
   go over the control socket, **one connection = one session**, so
   `BEGIN … COMMIT` spans statements; otherwise the client opens the instance

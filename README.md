@@ -45,6 +45,7 @@ It unifies five kinds of data under one transactional store:
 | [Design](docs/design.md) | Overall architecture: isolation, storage, transactions, retrieval, graph, phases |
 | [Storage design](docs/storage.md) | Storage layer: file layout, page format, ROWID, recovery. **Design frozen (2026-10) — all pending items closed** |
 | [Platform support](docs/platform-support.md) | Supported architectures and compatibility baseline |
+| [Manual](docs/使用手册.md) | **User manual** (Chinese): quick start, parameter file, command reference, SQL surface, operations |
 | [Changelog](CHANGELOG.md) | Release notes, starting with v0.1.0 |
 
 ### Core constraints
@@ -224,6 +225,7 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | [总体设计](docs/design.md) | 隔离、存储、事务、检索、图，以及研发阶段 |
 | [存储结构设计](docs/storage.md) | 文件布局、页格式、ROWID、恢复。**设计冻结（2026-10）**——全部待冻结项已关闭 |
 | [平台支持](docs/platform-support.md) | 支持的架构与兼容基线 |
+| [使用手册](docs/使用手册.md) | **使用手册**：五分钟上手、参数文件、命令参考、SQL 面清单、运维与排错 |
 | [更新日志](CHANGELOG.md) | 版本说明，自 v0.1.0 起 |
 
 ### 核心约束

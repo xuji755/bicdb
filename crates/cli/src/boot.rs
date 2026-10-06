@@ -51,13 +51,33 @@ const FILE0_ID: u16 = 0;
 const UNDO_ID: u16 = 1;
 
 /// 字典文件名（也是"这是个 bicdb 实例"的判据）。
-pub const FILE0: &str = "file0.dat";
-/// 撤销文件名。
-pub const UNDO: &str = "undo.dat";
+/// **文件面**（`docs/storage/02-工作区存储布局.md` §2.1 的布局，V1.0 单工作区）：
+///
+/// ```text
+/// <db_root>/                      根区目录（参数文件注册它）
+/// ├── bicdb.ini                   实例参数文件
+/// ├── control/                    控制文件双副本（control01.ctl / control02.ctl）
+/// ├── wal/                        日志组（redo_g<组>_m<成员>）
+/// └── data/                       数据文件：<ws>_meta（file 0）/ <ws>_undo（file 1）
+/// ```
+///
+/// **为什么按 `<ws>_` 前缀**：设计里数据文件按工作区命名（`<ws>_meta`/`<ws>_undo`/
+/// `<ws>_data_NN`）——单工作区 CLI 也照这个名字，多工作区/数据文件扩展时命名规则不变。
+pub const CONTROL_DIR: &str = "control";
+/// 数据文件目录。
+pub const DATA_DIR: &str = "data";
+/// 控制文件副本名（设计与 `ControlFile::format` 的取法：01/02）。
+pub const CF_A: &str = "control/control01.ctl";
+/// 控制文件副本名（第二份）。
+pub const CF_B: &str = "control/control02.ctl";
+
+/// 实例的文件面：数据文件名（`<ws>_meta`）。
+#[must_use]
+pub fn data_file_name(ws: [u8; 8], kind: &str) -> String {
+    format!("{}_{kind}", String::from_utf8_lossy(&ws))
+}
 /// 日志组目录名。
 pub const WAL_DIR: &str = "wal";
-const CF_A: &str = "cf_a";
-const CF_B: &str = "cf_b";
 
 /// 建区时 file 0 初始块数的**默认值**（参数文件 `[init] file0_initial_blocks` 可改）。
 pub const DEFAULT_FILE0_BLOCKS: u64 = 4096;
@@ -138,6 +158,17 @@ from_io!(
 
 fn p(dir: &Path, name: &str) -> PathBuf {
     dir.join(name)
+}
+
+/// 数据文件路径（`<db_root>/data/<ws>_<kind>`）。
+pub fn data_path(dir: &Path, ws: [u8; 8], kind: &str) -> PathBuf {
+    dir.join(DATA_DIR).join(data_file_name(ws, kind))
+}
+
+/// 实例的"身份文件"：`data/<ws>_meta`（file 0）——判"这是不是 bicdb 实例"用它。
+#[must_use]
+pub fn data_meta_path(dir: &Path, ws: [u8; 8]) -> PathBuf {
+    data_path(dir, ws, "meta")
 }
 
 fn seq(v: u64) -> CommitSeq {
@@ -297,10 +328,10 @@ pub fn create_instance(params: &InstanceParams) -> Result<Instance, BootError> {
     let dir = params.db_root.clone();
     let dir = dir.as_path();
     std::fs::create_dir_all(dir)?;
-    if p(dir, FILE0).exists() {
+    if data_path(dir, WS, "meta").exists() {
         return Err(BootError::Catalog(format!(
             "{} 已存在（不是空目录）",
-            p(dir, FILE0).display()
+            data_path(dir, WS, "meta").display()
         )));
     }
     let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
@@ -314,7 +345,9 @@ pub fn create_instance(params: &InstanceParams) -> Result<Instance, BootError> {
 
     // ① file 0：自举集 + 种子（**建区期直写**，不经池——见 `catalog::create`）。
     let layout = FileLayout::meta();
-    let file0_path = p(dir, FILE0);
+    std::fs::create_dir_all(dir.join(DATA_DIR))?;
+    std::fs::create_dir_all(dir.join(CONTROL_DIR))?;
+    let file0_path = data_path(dir, WS, "meta");
     let mut file0 = DataFile::create(
         io_dyn,
         &file0_path,
@@ -335,7 +368,7 @@ pub fn create_instance(params: &InstanceParams) -> Result<Instance, BootError> {
     DataFile::open(io_dyn, &file0_path)?.sync()?;
 
     // ② 撤销段（V1.0 单段）。
-    let undo_path = p(dir, UNDO);
+    let undo_path = data_path(dir, WS, "undo");
     let undo_file: &'static mut DataFile<'static> = Box::leak(Box::new(DataFile::create(
         io_dyn,
         &undo_path,
@@ -420,14 +453,14 @@ pub fn open_unlocked_with(
     apply_process_params(params);
     let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
     let io_dyn: &'static dyn FileIo = io;
-    let file0_path = p(dir, FILE0);
+    let file0_path = data_path(dir, WS, "meta");
     if !file0_path.exists() {
         return Err(BootError::Catalog(format!(
             "{} 不存在（先 `bicdb init`）",
             file0_path.display()
         )));
     }
-    let undo_path = p(dir, UNDO);
+    let undo_path = data_path(dir, WS, "undo");
     let wal_path = p(dir, WAL_DIR);
     let (cf_path_a, cf_path_b) = (p(dir, CF_A), p(dir, CF_B));
 

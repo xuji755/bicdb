@@ -150,8 +150,11 @@ impl Conn {
                     .map_err(|e| ConnError::Sql(e.to_string()))
             }
             Conn::Remote { client, .. } => {
+                // 载荷 = **参数序列 + SQL 文本**（`bicdb_cli::wire` 的请求编码；
+                // 这里没有参数，序列为空——但格式必须一致，否则服务端解不出来）。
+                let payload = wire::encode_sql_request(sql, &[]);
                 let body = client
-                    .call("SQL", sql)
+                    .call("SQL", &payload)
                     .map_err(|e| ConnError::Sql(e.to_string()))?;
                 Ok(wire::decode_results(&body))
             }

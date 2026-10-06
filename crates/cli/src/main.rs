@@ -243,7 +243,11 @@ fn run(args: &[String]) -> Result<(), Exit> {
             // **服务在跑 ⇒ 走套接字**（同一条 SQL 路径，事务语义一致）。
             if let service::ServiceState::Serving(info) = service::state_of(&inst_params.db_root) {
                 let text = sql_text(&sql_args, params.is_empty())?;
-                return run_over_socket(&info.socket, &text);
+                let named: Vec<(&str, Value)> = params
+                    .iter()
+                    .map(|(n, v)| (n.as_str(), v.clone()))
+                    .collect();
+                return run_over_socket(&info.socket, &text, &named);
             }
             let mut inst = boot::open_instance(&inst_params)?;
             banner_brief(&inst);
@@ -367,9 +371,14 @@ fn service_opts(args: &[String]) -> Result<StartOptions, Exit> {
 }
 
 /// **经服务执行**（服务在跑时的 `sql`/`shell` 走这条）：打印与直连同形。
-fn run_over_socket(socket: &std::path::Path, sql: &str) -> Result<(), Exit> {
-    let body =
-        wire::call(socket, "SQL", sql).map_err(|e| Exit::Failed(format!("经服务执行失败：{e}")))?;
+fn run_over_socket(
+    socket: &std::path::Path,
+    sql: &str,
+    params: &[(&str, Value)],
+) -> Result<(), Exit> {
+    let payload = wire::encode_sql_request(sql, params);
+    let body = wire::call(socket, "SQL", &payload)
+        .map_err(|e| Exit::Failed(format!("经服务执行失败：{e}")))?;
     let results = wire::decode_results(&body);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

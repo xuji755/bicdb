@@ -253,7 +253,10 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                 }
                 "SQL" => {
                     served += 1;
-                    match session.execute(&payload) {
+                    let (sql, named) = wire::decode_sql_request(&payload);
+                    let named_ref: Vec<(&str, bicdb_exec::Value)> =
+                        named.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
+                    match session.execute_with_params(&sql, &named_ref) {
                         Ok(results) => {
                             let body = wire::encode_results(&results);
                             let _ = wire::write_frame(&mut s, "OK", &body);
@@ -387,11 +390,13 @@ impl LogFile {
 
 /// **`bicdb start`**：分离起服务并等它就绪（`-w` 语义）。
 pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
-    if !opts.dir.join(crate::boot::FILE0).exists() {
+    // 是不是实例：看**数据文件**在不在（`data/<ws>_meta`，见 `boot` 的文件面）。
+    let meta = crate::boot::data_meta_path(&opts.dir, crate::boot::WS);
+    if !meta.exists() {
         return Err(ServiceError::State(format!(
             "{} 不是 bicdb 实例（缺 {}）——先 `bicdb init`",
             opts.dir.display(),
-            crate::boot::FILE0
+            meta.display()
         )));
     }
     if let Some(info) = lock::read_lock(&opts.dir) {

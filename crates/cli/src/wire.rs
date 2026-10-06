@@ -13,7 +13,8 @@
 //! 动词（闭集）：
 //! - `HELLO`：握手（返回协议版本 + 实例路径），客户端据此判断"这是本工具的服务"；
 //! - `STATUS`：服务与实例的自述（`key=value` 若干行）；
-//! - `SQL`：执行 SQL（载荷 = SQL 文本；应答载荷 = 结果集编码）；
+//! - `SQL`：执行 SQL（载荷 = **SQL 文本 + 参数值**，见 [`encode_sql_request`]；
+//!   应答载荷 = 结果集编码）；
 //! - `DESCRIBE`：列定义（载荷 = 对象名；应答载荷 = 列清单编码——`DESC` 命令用）；
 //! - `SHUTDOWN <fast|immediate>`：请服务收尾退出。
 //!
@@ -131,6 +132,83 @@ impl Client {
             other => Err(WireError::BadFrame(format!("未知应答首行 `{other}`"))),
         }
     }
+}
+
+/// **SQL 请求的载荷编码**：`参数序列` + `SQL 文本`。
+///
+/// ```text
+/// <参数数> \n
+/// 每参数： <名>\n<类型码>\n<值长度>\n<值>\n              （类型码 n/b/o/-）
+/// <SQL 字节长度> \n <SQL 文本>
+/// ```
+///
+/// **为什么参数要随请求走**：直连形态下 `--param` 由会话层摆位；经服务时若只送
+/// SQL 文本，参数就丢在客户端了——同一句 SQL 在"服务在跑/不在跑"两种形态下
+/// 行为不同，是绝不能有的静默分歧（实测踩到）。
+#[must_use]
+pub fn encode_sql_request(sql: &str, params: &[(&str, bicdb_exec::Value)]) -> String {
+    use bicdb_exec::Value;
+    let mut out = format!("{}\n", params.len());
+    for (name, v) in params {
+        let (kind, text) = match v {
+            Value::Null => ('-', String::new()),
+            Value::Number(n) => ('n', n.to_string()),
+            Value::Bytes(b) => ('b', String::from_utf8_lossy(b).into_owned()),
+            Value::Bool(b) => ('o', if *b { "1" } else { "0" }.to_owned()),
+        };
+        out.push_str(&format!("{name}\n{kind}\n{}\n{text}\n", text.len()));
+    }
+    out.push_str(&format!("{}\n{sql}", sql.len()));
+    out
+}
+
+/// 解 SQL 请求载荷 → `(SQL 文本, 参数序列)`。
+#[must_use]
+pub fn decode_sql_request(payload: &str) -> (String, Vec<(String, bicdb_exec::Value)>) {
+    use bicdb_exec::Value;
+    let mut it = payload.split_inclusive('\n');
+    let Some(n_line) = it.next() else {
+        return (String::new(), Vec::new());
+    };
+    let n: usize = n_line.trim().parse().unwrap_or(0);
+    let mut params = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (Some(name), Some(kind), Some(vlen), Some(val)) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
+            break;
+        };
+        let _ = name; // 名字用于诊断；摆位由会话层按清单做
+        let name = name.trim_end_matches('\n').to_owned();
+        let kind = kind.trim();
+        let len: usize = vlen.trim().parse().unwrap_or(0);
+        let raw = val.trim_end_matches('\n');
+        let text: String = raw.as_bytes().get(..len).map_or_else(
+            || raw.to_owned(),
+            |b| String::from_utf8_lossy(b).into_owned(),
+        );
+        let v = match kind {
+            "-" => Value::Null,
+            "o" => Value::Bool(text == "1"),
+            "b" => Value::Bytes(text.into_bytes()),
+            _ => match bicdb_types::Number::parse(&text) {
+                Ok(num) => Value::Number(num),
+                Err(_) => Value::Bytes(text.into_bytes()),
+            },
+        };
+        params.push((name, v));
+    }
+    let sql = match it.next() {
+        Some(len_line) => {
+            let len: usize = len_line.trim().parse().unwrap_or(0);
+            let rest: String = it.collect();
+            rest.as_bytes()
+                .get(..len)
+                .map_or(rest.clone(), |b| String::from_utf8_lossy(b).into_owned())
+        }
+        None => String::new(),
+    };
+    (sql, params)
 }
 
 /// **列清单编码**（`DESCRIBE` 的应答；`bicdbcli` 侧解码）。
