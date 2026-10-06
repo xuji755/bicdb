@@ -14,7 +14,7 @@
 //! **`DESCRIBE` 只在直连可用**（要走目录的列定义）——经服务时先用直连打开
 //! 会被锁挡住，所以经服务形态下 `DESC` 明确报"需直连"（不静默给空）。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bicdb_catalog::dict::{namespace, ColTypeCode};
 use bicdb_cli::boot::{self, Instance};
@@ -77,7 +77,12 @@ pub enum Conn {
 
 impl Conn {
     /// **按实例状态选路**：服务在跑 ⇒ 经服务；否则直连（被占用则报错）。
-    pub fn open(dir: &Path, force_direct: bool) -> Result<Self, ConnError> {
+    pub fn open(
+        params: &bicdb_cli::config::InstanceParams,
+        force_direct: bool,
+    ) -> Result<Self, ConnError> {
+        let dir = params.db_root.clone();
+        let dir = dir.as_path();
         if !force_direct {
             match service::state_of(dir) {
                 ServiceState::Serving(info) => {
@@ -99,7 +104,7 @@ impl Conn {
                 ServiceState::NotRunning | ServiceState::Stale(_) => {}
             }
         }
-        let inst = boot::open_instance(dir).map_err(|e| ConnError::Boot(e.to_string()))?;
+        let inst = boot::open_instance(params).map_err(|e| ConnError::Boot(e.to_string()))?;
         Ok(Conn::Local(Box::new(inst)))
     }
 

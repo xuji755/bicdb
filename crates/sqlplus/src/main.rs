@@ -67,7 +67,6 @@ fn main() -> ExitCode {
 
 /// 命令行解析结果。
 struct Options {
-    dir: PathBuf,
     script: Option<PathBuf>,
     silent: bool,
     direct: bool,
@@ -81,7 +80,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         print!("{USAGE}");
         return Ok(0);
     }
-    let mut dir: Option<PathBuf> = None;
+    let mut ini: Option<PathBuf> = None;
     let mut script: Option<PathBuf> = None;
     let mut silent = false;
     let mut direct = false;
@@ -90,26 +89,28 @@ fn run(args: &[String]) -> Result<i32, String> {
         match a.as_str() {
             "-S" => silent = true,
             "--direct" => direct = true,
-            "-s" | "--socket" => {
-                let _ = it.next().ok_or("-s 缺套接字路径")?; // 套接字由实例状态给出；显式覆盖留白
-                return Err("-s 覆盖套接字暂不支持（套接字由实例目录决定）".to_owned());
+            "-p" | "--ini" | "--params-file" => {
+                ini = Some(PathBuf::from(it.next().ok_or("-p 缺参数文件路径")?));
             }
             other if other.starts_with('@') => script = Some(PathBuf::from(&other[1..])),
             other if other.starts_with('-') => {
                 return Err(format!("不认识的选项 `{other}`（`--help` 看用法）"));
             }
-            other => dir = Some(PathBuf::from(other)),
+            other => return Err(format!("不认识的参数 `{other}`（`--help` 看用法）")),
         }
     }
+    // **实例寻址**：`-p` > `$BICDB_INI` > `./bicdb.ini`（照 Oracle 的口径，
+    // 不指向目录——根区目录注册在参数文件里）。
+    let (params, _) =
+        bicdb_cli::config::InstanceParams::locate(ini.as_deref()).map_err(|e| e.to_string())?;
     let opts = Options {
-        dir: dir.ok_or("缺实例目录（`bicdbcli <实例目录>`）")?,
         script,
         silent,
         direct,
     };
 
     // 连接（服务在跑 ⇒ 套接字；否则直连）。
-    let conn = conn::Conn::open(&opts.dir, opts.direct).map_err(|e| e.to_string())?;
+    let conn = conn::Conn::open(&params, opts.direct).map_err(|e| e.to_string())?;
     if !opts.silent {
         println!("bicdbcli —— bicdb {}", env!("CARGO_PKG_VERSION"));
         println!("连接：{}", conn.kind());

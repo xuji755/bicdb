@@ -28,23 +28,29 @@ const USAGE: &str = "\
 bicdb —— 带撤销/日志的页式数据库（V1.0 单工作区）
 
 用法：
-  bicdb init    <dir>              建区
-  bicdb start   <dir> [-w 秒]      后台起服务（分离进程 + 实例锁 + 控制套接字）
-  bicdb stop    <dir> [-m fast|immediate]   停服务（fast = 完全检查点）
-  bicdb status  <dir>              服务/实例状态
-  bicdb params  <dir> [-c 键=值]   有效参数表（默认/文件/命令行三来源）
-  bicdb restart <dir>              重启服务
-  bicdb sql     <dir> <SQL>…       执行 SQL（服务在跑时经套接字；`-` = 读 stdin）
-                [--param 名=值 …]  给语句里的 `:名` 传值（可重复）
-  bicdb shell   <dir>              交互式 shell
-  bicdb version                    版本
-  bicdb help                       本帮助
+  bicdb init    <根区目录> [-p 种子参数文件] [-c 键=值]
+                                建区（**唯一接受目录的命令**）：建库 + 生成
+                                <根区目录>/bicdb.ini（实例参数文件）
+  bicdb start   [-p 参数文件] [-s 套接字] [-l 日志] [-w 秒] [-c 键=值]
+                                后台起服务（分离进程 + 实例锁 + 控制套接字）
+  bicdb stop    [-p 参数文件] [-m fast|immediate]    停服务（fast = 完全检查点）
+  bicdb status  [-p 参数文件]    服务/实例状态
+  bicdb restart [-p 参数文件]    重启服务
+  bicdb params  [-p 参数文件] [-c 键=值]   有效参数表（默认/文件/命令行三来源）
+  bicdb sql     [-p 参数文件] <SQL>…       执行 SQL（服务在跑时经套接字）
+  bicdb shell   [-p 参数文件]              交互式 shell
+  bicdb version | help
+
+**实例寻址（照 Oracle 的口径：不指向某个目录，指向参数文件）**：
+  `-p <参数文件|根区目录>` > 环境变量 BICDB_INI > 当前目录的 bicdb.ini
+  根区目录**注册在参数文件里**（`[instance] db_root`）——本文件即权威。
 
 示例：
-  bicdb init  ./demo
-  bicdb start ./demo               （日志 ./demo/bicdb.log）
-  bicdb sql   ./demo \"SELECT * FROM t\"
-  bicdb stop  ./demo
+  bicdb init  /data/bicdb                      # 建区（并在其下生成 bicdb.ini）
+  bicdb start -p /data/bicdb                   # 起服务（也可 `-p /data/bicdb/bicdb.ini`）
+  bicdb sql   -p /data/bicdb \"SELECT * FROM t\"
+  bicdb params -p /data/bicdb                  # 看有效参数与来源
+  bicdb stop  -p /data/bicdb
 
 SQL*Plus 形态的客户端见 `bicdbcli`（缓冲/斜杠命令/SPOOL/@脚本）。
 ";
@@ -117,15 +123,29 @@ fn run(args: &[String]) -> Result<(), Exit> {
             Ok(())
         }
         "init" => {
-            let dir = args
+            let root = args
                 .get(1)
-                .ok_or_else(|| Exit::Usage("init 缺目录".to_owned()))?;
-            let mut inst = boot::create_instance(std::path::Path::new(dir))?;
+                .filter(|a| !a.starts_with('-'))
+                .ok_or_else(|| Exit::Usage("init 缺根区目录".to_owned()))?;
+            let seed = config::parse_ini_arg(&args[1..]);
+            let overrides =
+                config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
+            let params = config::InstanceParams::for_init(
+                std::path::Path::new(root),
+                seed.as_deref(),
+                &overrides,
+            )
+            .map_err(|e| Exit::Failed(e.to_string()))?;
+            let mut inst = boot::create_instance(&params)?;
             inst.shutdown()?;
-            println!("已建区：{dir}");
+            println!("已建区：{}", params.db_root.display());
+            println!("  参数文件  {}", params.ini_path().display());
             println!("  工作区    {}", String::from_utf8_lossy(&boot::WS));
-            println!("  日志组    {}", boot::group_spec().group_count);
-            println!("  下一步    bicdb sql {dir} \"SELECT * FROM t\"");
+            println!(
+                "  日志组    {} 组 × {} 成员 × {} 页",
+                params.init.wal_groups, params.init.wal_members, params.init.wal_group_pages
+            );
+            println!("  下一步    bicdb start -p {}", params.db_root.display());
             Ok(())
         }
         "start" => {
@@ -145,40 +165,62 @@ fn run(args: &[String]) -> Result<(), Exit> {
             Ok(())
         }
         "params" => {
-            // 有效参数表（默认/文件/命令行三来源）+ 建区期（只读）一节。
-            let dir = args
-                .get(1)
-                .ok_or_else(|| Exit::Usage("params 缺目录".to_owned()))?;
+            // 有效参数表：**全部可调项**（含未显式给出的 ⇒ "默认"）。
+            let ini = config::parse_ini_arg(&args[1..]);
             let overrides =
                 config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
-            let (p, table) = boot::instance_params(std::path::Path::new(dir), &overrides)?;
-            println!("{:<24} {:<28} 来源", "参数", "取值");
-            println!("{:-<24} {:-<28} {:-<8}", "", "", "");
-            for (k, v, src) in &table {
-                println!("{k:<24} {v:<28} {}", src.as_str());
-            }
-            for (k, v) in [
-                ("pool_frames", p.pool_frames.to_string()),
-                ("file_extend_blocks", p.file_extend_blocks.to_string()),
-                ("socket", p.socket.clone()),
-                ("log", p.log.clone()),
-                ("lock_park_ms", p.lock_park_ms.to_string()),
-                ("deadlock_threshold_ms", p.deadlock_threshold_ms.to_string()),
-            ] {
-                if !table.iter().any(|(tk, _, _)| *tk == k) {
-                    println!("{k:<24} {v:<28} 默认");
+            let (p, table) = boot::instance_params(ini.as_deref(), &overrides)?;
+            let value_of = |section: &str, key: &str| -> String {
+                let full = format!("{section}.{key}");
+                match (section, key) {
+                    ("instance", "db_root") => p.db_root.display().to_string(),
+                    ("init", "file0_initial_blocks") => p.init.file0_initial_blocks.to_string(),
+                    ("init", "undo_initial_blocks") => p.init.undo_initial_blocks.to_string(),
+                    ("init", "wal_groups") => p.init.wal_groups.to_string(),
+                    ("init", "wal_members") => p.init.wal_members.to_string(),
+                    ("init", "wal_group_pages") => p.init.wal_group_pages.to_string(),
+                    ("buffer", "pool_frames") => p.run.pool_frames.to_string(),
+                    ("storage", "file_extend_blocks") => p.run.file_extend_blocks.to_string(),
+                    ("service", "socket") => p.run.socket.clone(),
+                    ("service", "log") => p.run.log.clone(),
+                    ("lock", "park_ms") => p.run.park_ms.to_string(),
+                    ("lock", "deadlock_threshold_ms") => p.run.deadlock_threshold_ms.to_string(),
+                    _ => table
+                        .iter()
+                        .find(|(tk, _, _)| *tk == full)
+                        .map_or_else(String::new, |(_, v, _)| v.clone()),
                 }
+            };
+            println!("实例参数（{}）", p.ini_path().display());
+            println!("{:<32} {:<26} {:<8} 类别", "节.键", "取值", "来源");
+            println!("{:-<32} {:-<26} {:-<8} {:-<10}", "", "", "", "");
+            for (section, key) in config::InstanceParams::all_keys() {
+                let full = format!("{section}.{key}");
+                let src = table
+                    .iter()
+                    .find(|(tk, _, _)| *tk == full)
+                    .map_or(config::Source::Default, |(_, _, s)| *s);
+                let kind = if section == "init" {
+                    "建区期"
+                } else {
+                    "运行期"
+                };
+                println!(
+                    "{full:<32} {:<26} {:<8} {kind}",
+                    value_of(section, key),
+                    src.as_str()
+                );
             }
             println!();
-            println!("建区期参数（**控制文件**权威，改需重建；本文件写它们无效）：");
-            println!("  wal_groups / wal_members / wal_group_pages / initial_file0_blocks");
+            println!("说明：");
+            println!("  建区期参数由**控制文件**记录（权威）——`bicdb start` 会逐项核对，");
+            println!("  不符即拒绝启动（改需重建实例）；运行期参数改完 `bicdb restart` 生效。");
             Ok(())
         }
         "status" => {
-            let dir = args
-                .get(1)
-                .ok_or_else(|| Exit::Usage("status 缺目录".to_owned()))?;
-            service::status(std::path::Path::new(dir))?;
+            let ini = config::parse_ini_arg(&args[1..]);
+            let (params, _) = boot::instance_params(ini.as_deref(), &[])?;
+            service::status(&params.db_root)?;
             Ok(())
         }
         "restart" => {
@@ -193,20 +235,19 @@ fn run(args: &[String]) -> Result<(), Exit> {
             Ok(())
         }
         "sql" => {
-            let dir = args
-                .get(1)
-                .ok_or_else(|| Exit::Usage("sql 缺目录".to_owned()))?;
-            let (params, sql_args) = split_params(&args[2..])?;
+            let ini = config::parse_ini_arg(&args[1..]);
+            let overrides =
+                config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
+            let (params, sql_args) = split_params(&args[1..])?;
+            let (inst_params, _) = boot::instance_params(ini.as_deref(), &overrides)?;
             // **服务在跑 ⇒ 走套接字**（同一条 SQL 路径，事务语义一致）。
-            if let service::ServiceState::Serving(info) =
-                service::state_of(std::path::Path::new(dir))
-            {
-                let text = sql_text(&sql_args)?;
+            if let service::ServiceState::Serving(info) = service::state_of(&inst_params.db_root) {
+                let text = sql_text(&sql_args, params.is_empty())?;
                 return run_over_socket(&info.socket, &text);
             }
-            let mut inst = boot::open_instance(std::path::Path::new(dir))?;
+            let mut inst = boot::open_instance(&inst_params)?;
             banner_brief(&inst);
-            let text = sql_text(&sql_args)?;
+            let text = sql_text(&sql_args, params.is_empty())?;
             let named: Vec<(&str, Value)> = params
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.clone()))
@@ -234,10 +275,11 @@ fn run(args: &[String]) -> Result<(), Exit> {
             Ok(())
         }
         "shell" => {
-            let dir = args
-                .get(1)
-                .ok_or_else(|| Exit::Usage("shell 缺目录".to_owned()))?;
-            let mut inst = boot::open_instance(std::path::Path::new(dir))?;
+            let ini = config::parse_ini_arg(&args[1..]);
+            let overrides =
+                config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
+            let (inst_params, _) = boot::instance_params(ini.as_deref(), &overrides)?;
+            let mut inst = boot::open_instance(&inst_params)?;
             banner(&inst);
             let r = repl(&mut inst);
             let closed = inst.shutdown();
@@ -299,13 +341,11 @@ fn flag_present(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-/// **服务类子命令的参数**：`<dir> [-s 套接字] [-l 日志] [-w 秒]`。
+/// **服务类子命令的参数**：`[-p 参数文件] [-s 套接字] [-l 日志] [-w 秒] [-c 键=值]`。
+///
+/// **不指向目录**（除 `init`）：实例在哪儿由参数文件注册（照 Oracle 的口径）。
 fn service_opts(args: &[String]) -> Result<StartOptions, Exit> {
-    // 目录：`--dir <路径>` 或第一个位置参数（守护进程由 `start` 用 `--dir` 拉起）。
-    let dir = flag_value(args, &["-d", "--dir"])
-        .or_else(|| args.iter().find(|a| !a.starts_with('-')).cloned())
-        .ok_or_else(|| Exit::Usage("缺实例目录".to_owned()))?;
-    let dir = std::path::Path::new(&dir);
+    let ini = config::parse_ini_arg(args);
     let socket = flag_value(args, &["-s", "--socket"]).map(std::path::PathBuf::from);
     let log = flag_value(args, &["-l", "--log"]).map(std::path::PathBuf::from);
     let timeout = flag_value(args, &["-w", "--wait"])
@@ -317,7 +357,13 @@ fn service_opts(args: &[String]) -> Result<StartOptions, Exit> {
         .transpose()?
         .unwrap_or(std::time::Duration::from_secs(30));
     let overrides = config::parse_cli_overrides(args).map_err(|e| Exit::Failed(e.to_string()))?;
-    Ok(StartOptions::new(dir, socket, log, timeout, overrides))
+    Ok(StartOptions::load(
+        ini.as_deref(),
+        socket,
+        log,
+        timeout,
+        overrides,
+    )?)
 }
 
 /// **经服务执行**（服务在跑时的 `sql`/`shell` 走这条）：打印与直连同形。
@@ -344,11 +390,16 @@ fn split_params(args: &[String]) -> Result<ParamsAndSql, Exit> {
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--param" || a == "-p" {
+        if a == "--param" || a == "--sql-param" {
             let kv = it
                 .next()
                 .ok_or_else(|| Exit::Usage("--param 缺 `名=值`".to_owned()))?;
             params.push(parse_param(kv)?);
+        } else if matches!(
+            a.as_str(),
+            "-p" | "--ini" | "--params-file" | "-c" | "--set"
+        ) {
+            let _ = it.next(); // 这两个旗标的值不是 SQL 文本
         } else {
             rest.push(a.clone());
         }
@@ -386,7 +437,7 @@ fn parse_param(kv: &str) -> Result<(String, Value), Exit> {
 }
 
 /// `sql` 子命令的文本来源：给了参数就拼接；`-` 或缺参数 ⇒ 读 stdin。
-fn sql_text(rest: &[String]) -> Result<String, Exit> {
+fn sql_text(rest: &[String], _any: bool) -> Result<String, Exit> {
     let joined = rest.join(" ");
     if !joined.trim().is_empty() && joined.trim() != "-" {
         return Ok(joined);

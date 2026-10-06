@@ -39,6 +39,32 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 - Control protocol (length-prefixed text frames: `HELLO`/`STATUS`/`SQL`/
   `DESCRIBE`/`SHUTDOWN`) — explicitly a **transitional** local protocol; the
   versioned client protocol lands with `bicdb-net`.
+- **Instance parameter file and Oracle-style instance addressing.** The
+  instance is addressed by its parameter file, `<db_root>/bicdb.ini`, not by a
+  directory: `bicdb init <db_root>` is the only command that takes a directory
+  (it *points at the filesystem* and **generates the default parameter file**),
+  and every other command (`start`/`stop`/`status`/`restart`/`params`/`sql`/
+  `shell`/`bicdbcli`) locates the instance through the parameter file —
+  `-p <file|db_root>` > `$BICDB_INI` > `./bicdb.ini`. The root directory is
+  **registered inside** the file (`[instance] db_root`) and is authoritative.
+  **Key parameters are no longer hardcoded**: `[init]` carries the creation-time
+  set (file/undo initial blocks, WAL groups, members per group, group pages —
+  `bicdb init -c init.wal_groups=4` builds a 4-group instance) and the other
+  sections carry the runtime set (buffer pool frames, file auto-extend
+  increment, control socket, service log, lock park timeout, deadlock
+  threshold). Creation-time parameters are refused after the fact with a
+  per-item diff ("the control file is authoritative; changing them requires a
+  rebuild"). `bicdb params` prints every knob with its value, source
+  (default / file / command line) and class (creation-time / runtime); unknown
+  sections and keys are rejected by name. When the daemon dies during startup,
+  `start` now reports the **last log lines** instead of just timing out.
+- **Connection routing** — a running service means clients (and `bicdb sql`)
+  go over the control socket, **one connection = one session**, so
+  `BEGIN … COMMIT` spans statements; otherwise the client opens the instance
+  directly.
+- Control protocol (length-prefixed text frames: `HELLO`/`STATUS`/`SQL`/
+  `DESCRIBE`/`SHUTDOWN`) — explicitly a **transitional** local protocol; the
+  versioned client protocol lands with `bicdb-net`.
 - **Instance parameter file** `<dir>/bicdb.conf` (PostgreSQL's `postgresql.conf`
   in the data directory; the text half of Oracle's pfile/spfile split).
   `bicdb init` writes it with all defaults, `bicdb params <dir>` prints the

@@ -1,33 +1,39 @@
-//! **实例参数文件**（`<实例目录>/bicdb.conf`；PG `postgresql.conf` 的对应物）。
+//! **实例参数文件** `bicdb.ini`（Oracle pfile/spfile 分工的**文本那一半**）。
 //!
 //! ```text
-//! # bicdb 实例参数（`bicdb init` 写出；改完重启服务生效）
-//! pool_frames          = 256    # 缓冲池帧数（16 KiB/帧）
-//! file_extend_blocks   = 512    # 段增长撞文件尾时的固定增量（块）
-//! socket               = bicdb.sock
-//! log                  = bicdb.log
-//! lock_park_ms         = 50     # 等锁单次挂起时长
-//! deadlock_threshold_ms = 1000  # 死锁检测阈值
+//! <db_root>/bicdb.ini      ← 根区目录里的这份，是**实例的唯一入口**
+//!
+//! [instance]
+//! db_root = /data/bicdb    ← 根区目录**注册在这里**（实例的全部文件都在它下面）
+//! [init]                   ← 建区期参数（`bicdb init` 读它；建区后只作记录）
+//! [buffer] [storage] [service] [lock]   ← 运行期参数（改完重启生效）
 //! ```
 //!
-//! **三条纪律**：
-//! 1. **闭集**：未知键**拒绝**（与解析期拒绝同一个口径——收下不生效就是空壳，
-//!    本项目 2026-10-06 的审计专门清过这一类）；
-//! 2. **优先级 = 命令行 > 参数文件 > 内置默认**（`bicdb start -c pool_frames=512`
-//!    覆盖文件里的值——PG 的 `postgres -c` 同款）；
-//! 3. **建区期参数只读**：日志组数/成员数/组页数/文件初始块数记录在**控制文件**
-//!    里（权威），参数文件里写它们**无效**——`bicdb params` 单列一节展示。
+//! **寻址模型（照 Oracle，不照"启动指向某个目录"）**：
+//! - `init` 是**唯一**接受根区目录的命令——它就是"指向文件系统"那一步，
+//!   并在根区里**生成默认参数文件**；
+//! - 此后 `start`/`stop`/`status`/`params`/`sql`/`shell`/`bicdbcli` 一律
+//!   **按参数文件寻址**：`-p <路径>` > 环境变量 `BICDB_INI` > `./bicdb.ini`；
+//!   `-p` 给目录时等价于该目录下的 `bicdb.ini`（便利形态）；
+//! - `db_root` 由参数文件**注册**（权威）——参数文件放哪儿都行，实例在哪儿由它说。
 //!
-//! **取法对照**：Oracle 的 `spfile<SID>.ora`（服务端可写、`ALTER SYSTEM SET` 落它）
-//! 与 `pfile`（手工编辑、重启生效）二分；我们 V1.0 只做**文本文件 + 重启生效**这一半，
-//! 在线写回（`ALTER SYSTEM SET`）按 `DCL语句设计` §5 的触发条件延后。
+//! **四条纪律**：
+//! 1. **闭集**：未知节/未知键**具名拒绝**（收下不生效就是空壳）；
+//! 2. **关键参数不硬编码**：建区期（`[init]`）与运行期（其余节）都由文件给，
+//!    程序里只留"没有文件时"的默认值；
+//! 3. **建区期参数建区后不可改**：控制文件是权威，`start` 逐项核对，
+//!    不符即**拒绝启动**并说明"改需重建"；
+//! 4. **三来源**：命令行 `-c 键=值` > 参数文件 > 内置默认（`bicdb params` 显示来源）。
 
 use std::path::{Path, PathBuf};
 
-/// 参数文件名（实例目录下）。
-pub const FILE_NAME: &str = "bicdb.conf";
+/// 参数文件名（**根区目录**下）。
+pub const FILE_NAME: &str = "bicdb.ini";
 
-/// 参数错误的来源（诊断要能指到"哪个文件的哪一行"）。
+/// 环境变量：不给 `-p` 时用它找参数文件（Oracle `ORACLE_SID` / PG `PGDATA` 的位置）。
+pub const ENV_INI: &str = "BICDB_INI";
+
+/// 参数错误的来源（诊断要能指到"哪个文件、哪一行、哪一节"）。
 #[derive(Debug)]
 pub enum ConfigError {
     /// 读文件失败。
@@ -37,28 +43,52 @@ pub enum ConfigError {
         /// 底层错误。
         why: std::io::Error,
     },
-    /// **未知键**（闭集）。
-    Unknown {
+    /// **找不到参数文件**（三个来源都没有）。
+    NotFound {
+        /// 试过哪些位置（诊断）。
+        tried: Vec<PathBuf>,
+    },
+    /// **未知节**。
+    UnknownSection {
+        /// 节名。
+        section: String,
+        /// 行号（1 起）。
+        line: usize,
+    },
+    /// **未知键**。
+    UnknownKey {
+        /// 节名。
+        section: String,
         /// 键名。
         key: String,
-        /// 行号（1 起）。
+        /// 行号。
         line: usize,
     },
     /// 取值非法。
     BadValue {
-        /// 键名。
+        /// 键名（`节.键`）。
         key: String,
         /// 取值文本。
         value: String,
         /// 为什么不行。
         why: String,
     },
-    /// 行形态非法（如缺 `=`）。
+    /// 行形态非法（缺 `=`、键出现在任何节之前…）。
     Malformed {
         /// 行号。
         line: usize,
         /// 原文。
         text: String,
+    },
+    /// **必填项缺失**（`db_root`）。
+    Missing {
+        /// 键名。
+        key: String,
+    },
+    /// **建区期参数与既有的库不符**（控制文件权威；改需重建）。
+    CreationMismatch {
+        /// 逐项不符清单。
+        diffs: Vec<String>,
     },
 }
 
@@ -66,18 +96,44 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::Io { path, why } => write!(f, "读 {}：{why}", path.display()),
-            ConfigError::Unknown { key, line } => write!(
+            ConfigError::NotFound { tried } => {
+                write!(f, "找不到参数文件 {FILE_NAME}——试过：")?;
+                for t in tried {
+                    write!(f, "{}；", t.display())?;
+                }
+                write!(
+                    f,
+                    "（用 `-p <参数文件|根区目录>` 指定，或设环境变量 {ENV_INI}）"
+                )
+            }
+            ConfigError::UnknownSection { section, line } => write!(
                 f,
-                "{} 第 {line} 行：未知参数 `{key}`（闭集；`bicdb params` 看全部可调项）",
-                FILE_NAME
+                "{FILE_NAME} 第 {line} 行：未知节 `[{section}]`（`bicdb params` 看全部可调项）"
+            ),
+            ConfigError::UnknownKey { section, key, line } => write!(
+                f,
+                "{FILE_NAME} 第 {line} 行：`[{section}]` 里没有参数 `{key}`（闭集）"
             ),
             ConfigError::BadValue { key, value, why } => {
                 write!(f, "{FILE_NAME}：`{key} = {value}` 不合法——{why}")
             }
             ConfigError::Malformed { line, text } => write!(
                 f,
-                "{FILE_NAME} 第 {line} 行形态非法（要 `键 = 值`）：`{text}`"
+                "{FILE_NAME} 第 {line} 行形态非法（要 `[节]` 或 `键 = 值`）：`{text}`"
             ),
+            ConfigError::Missing { key } => {
+                write!(
+                    f,
+                    "{FILE_NAME} 缺必填项 `{key}`（`[instance] db_root = …`）"
+                )
+            }
+            ConfigError::CreationMismatch { diffs } => {
+                write!(f, "建区期参数与既有的库不符（**改需重建**）：")?;
+                for d in diffs {
+                    write!(f, "\n  {d}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -107,44 +163,154 @@ impl Source {
     }
 }
 
-/// **运行期可调参数**（每一项都必须有真实落点——审计口径）。
+/// **建区期参数**（`[init]`；`bicdb init` 读它造库，之后控制文件是权威）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstanceParams {
+pub struct InitParams {
+    /// file 0（字典/数据）初始块数。
+    pub file0_initial_blocks: u64,
+    /// 撤销文件初始块数。
+    pub undo_initial_blocks: u64,
+    /// 日志组数（2–8）。
+    pub wal_groups: u8,
+    /// 每组成员数（1–8）。
+    pub wal_members: u8,
+    /// 每组成员页数（下限 34 页 = 一条记录的最大 footprint）。
+    pub wal_group_pages: u32,
+}
+
+impl Default for InitParams {
+    fn default() -> Self {
+        Self {
+            file0_initial_blocks: crate::boot::DEFAULT_FILE0_BLOCKS,
+            undo_initial_blocks: crate::boot::DEFAULT_UNDO_BLOCKS,
+            wal_groups: 2,
+            wal_members: 1,
+            wal_group_pages: crate::boot::DEFAULT_WAL_GROUP_PAGES,
+        }
+    }
+}
+
+/// **运行期参数**（改完重启生效）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunParams {
     /// 缓冲池帧数（16 KiB/帧）。
     pub pool_frames: usize,
     /// 段增长撞文件尾时的固定增量（块）。
     pub file_extend_blocks: u64,
-    /// 控制套接字（相对实例目录；也可给绝对路径）。
+    /// 控制套接字（相对根区目录；也接受绝对路径）。
     pub socket: String,
-    /// 服务日志（相对实例目录；也可给绝对路径）。
+    /// 服务日志（相对根区目录；也接受绝对路径）。
     pub log: String,
     /// 等锁单次挂起时长（毫秒）。
-    pub lock_park_ms: u64,
+    pub park_ms: u64,
     /// 死锁检测阈值（毫秒）。
     pub deadlock_threshold_ms: u64,
 }
 
-impl Default for InstanceParams {
+impl Default for RunParams {
     fn default() -> Self {
         Self {
             pool_frames: 256,
-            file_extend_blocks: crate::boot::DEFAULT_FILE_EXTEND_BLOCKS,
+            file_extend_blocks: bicdb_storage::segment::DEFAULT_FILE_EXTEND_BLOCKS,
             socket: crate::lock::SOCKET_FILE.to_owned(),
             log: "bicdb.log".to_owned(),
-            lock_park_ms: 50,
+            park_ms: 50,
             deadlock_threshold_ms: 1000,
         }
     }
 }
 
-/// 参数清单（键 → 取值 → 来源）。
-pub type ParamTable = Vec<(&'static str, String, Source)>;
+/// **一份完整的实例参数**（= 参数文件的全部内容）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceParams {
+    /// 根区目录（**注册在参数文件里**；实例的全部文件都在它下面）。
+    pub db_root: PathBuf,
+    /// 参数文件自身的路径（诊断；`None` = 还没落到某个文件上）。
+    pub ini_path: Option<PathBuf>,
+    /// 建区期参数。
+    pub init: InitParams,
+    /// 运行期参数。
+    pub run: RunParams,
+}
+
+impl Default for InstanceParams {
+    fn default() -> Self {
+        Self {
+            db_root: PathBuf::new(),
+            ini_path: None,
+            init: InitParams::default(),
+            run: RunParams::default(),
+        }
+    }
+}
+
+/// 参数清单（`节.键` → 取值 → 来源）。
+pub type ParamTable = Vec<(String, String, Source)>;
+
+/// 合法的节名（闭集）。
+pub const SECTIONS: [&str; 6] = ["instance", "init", "buffer", "storage", "service", "lock"];
 
 impl InstanceParams {
-    /// **应用一条覆盖**（文件名或命令行同一条路）。
-    fn set(&mut self, key: &str, value: &str, line: usize) -> Result<(), ConfigError> {
+    /// **解析 INI 文本**（`[节]` + `键 = 值`；`#`/`;` 起注释）。
+    pub fn parse(text: &str) -> Result<Vec<(String, String, String, usize)>, ConfigError> {
+        let mut out = Vec::new();
+        let mut section = String::new();
+        for (i, raw) in text.lines().enumerate() {
+            let line = i + 1;
+            let no_hash = raw.split_once('#').map_or(raw, |(c, _)| c);
+            let code = no_hash.split_once(';').map_or(no_hash, |(c, _)| c).trim();
+            if code.is_empty() {
+                continue;
+            }
+            if let Some(rest) = code.strip_prefix('[') {
+                let name = rest.strip_suffix(']').ok_or(ConfigError::Malformed {
+                    line,
+                    text: raw.trim().to_owned(),
+                })?;
+                section = name.trim().to_ascii_lowercase();
+                // **节头那一行就校验**（诊断直接指到 `[nope]`，而不是它下面的键）。
+                if !SECTIONS.contains(&section.as_str()) {
+                    return Err(ConfigError::UnknownSection { section, line });
+                }
+                continue;
+            }
+            let Some((k, v)) = code.split_once('=') else {
+                return Err(ConfigError::Malformed {
+                    line,
+                    text: raw.trim().to_owned(),
+                });
+            };
+            if section.is_empty() {
+                return Err(ConfigError::Malformed {
+                    line,
+                    text: format!("`{}` 出现在任何节之前", raw.trim()),
+                });
+            }
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .unwrap_or(v);
+            out.push((
+                section.clone(),
+                k.trim().to_ascii_lowercase(),
+                v.to_owned(),
+                line,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// 应用一条 `节.键 = 值`。
+    fn set(
+        &mut self,
+        section: &str,
+        key: &str,
+        value: &str,
+        line: usize,
+    ) -> Result<(), ConfigError> {
         let bad = |why: &str| ConfigError::BadValue {
-            key: key.to_owned(),
+            key: format!("{section}.{key}"),
             value: value.to_owned(),
             why: why.to_owned(),
         };
@@ -154,159 +320,359 @@ impl InstanceParams {
                 .filter(|n| (lo..=hi).contains(n))
                 .ok_or_else(|| bad(&format!("要是 {lo}–{hi} 的整数")))
         };
-        match key {
-            "pool_frames" => self.pool_frames = num(value, 16, 1_000_000)? as usize,
-            "file_extend_blocks" => self.file_extend_blocks = num(value, 8, 1_048_576)?,
-            "socket" => {
-                if value.trim().is_empty() {
-                    return Err(bad("不能为空"));
-                }
-                self.socket = value.trim().to_owned();
+        let text = |v: &str| -> Result<String, ConfigError> {
+            if v.trim().is_empty() {
+                Err(bad("不能为空"))
+            } else {
+                Ok(v.trim().to_owned())
             }
-            "log" => {
-                if value.trim().is_empty() {
-                    return Err(bad("不能为空"));
-                }
-                self.log = value.trim().to_owned();
+        };
+        match (section, key) {
+            ("instance", "db_root") => self.db_root = PathBuf::from(text(value)?),
+            ("init", "file0_initial_blocks") => {
+                self.init.file0_initial_blocks = num(value, 1024, 1_048_576)?
             }
-            "lock_park_ms" => self.lock_park_ms = num(value, 1, 60_000)?,
-            "deadlock_threshold_ms" => self.deadlock_threshold_ms = num(value, 10, 600_000)?,
-            other => {
-                return Err(ConfigError::Unknown {
-                    key: other.to_owned(),
+            ("init", "undo_initial_blocks") => {
+                self.init.undo_initial_blocks = num(value, 512, 1_048_576)?
+            }
+            ("init", "wal_groups") => self.init.wal_groups = num(value, 2, 8)? as u8,
+            ("init", "wal_members") => self.init.wal_members = num(value, 1, 8)? as u8,
+            ("init", "wal_group_pages") => {
+                self.init.wal_group_pages = num(value, 34, 1_048_576)? as u32
+            }
+            ("buffer", "pool_frames") => self.run.pool_frames = num(value, 16, 1_000_000)? as usize,
+            ("storage", "file_extend_blocks") => {
+                self.run.file_extend_blocks = num(value, 8, 1_048_576)?
+            }
+            ("service", "socket") => self.run.socket = text(value)?,
+            ("service", "log") => self.run.log = text(value)?,
+            ("lock", "park_ms") => self.run.park_ms = num(value, 1, 60_000)?,
+            ("lock", "deadlock_threshold_ms") => {
+                self.run.deadlock_threshold_ms = num(value, 10, 600_000)?
+            }
+            _ => {
+                if !SECTIONS.contains(&section) {
+                    return Err(ConfigError::UnknownSection {
+                        section: section.to_owned(),
+                        line,
+                    });
+                }
+                return Err(ConfigError::UnknownKey {
+                    section: section.to_owned(),
+                    key: key.to_owned(),
                     line,
-                })
+                });
             }
         }
         Ok(())
     }
 
-    /// 控制套接字的**绝对路径**（相对项按实例目录解）。
-    #[must_use]
-    pub fn socket_path(&self, dir: &Path) -> PathBuf {
-        resolve(dir, &self.socket)
-    }
-
-    /// 服务日志的**绝对路径**。
-    #[must_use]
-    pub fn log_path(&self, dir: &Path) -> PathBuf {
-        resolve(dir, &self.log)
-    }
-
-    /// **解析参数文件文本**（`键 = 值`；`#` 起注释）。带行号（诊断要指得到）。
-    pub fn parse(text: &str) -> Result<Vec<(String, String, usize)>, ConfigError> {
-        let mut out = Vec::new();
-        for (i, raw) in text.lines().enumerate() {
-            let line = i + 1;
-            let code = raw.split_once('#').map_or(raw, |(c, _)| c).trim();
-            if code.is_empty() {
-                continue;
-            }
-            let Some((k, v)) = code.split_once('=') else {
-                return Err(ConfigError::Malformed {
-                    line,
-                    text: raw.trim().to_owned(),
-                });
-            };
-            let v = v.trim();
-            // 去掉可能包裹的引号（路径里有空格时用得上）。
-            let v = v
-                .strip_prefix('"')
-                .and_then(|t| t.strip_suffix('"'))
-                .unwrap_or(v);
-            out.push((k.trim().to_ascii_lowercase(), v.to_owned(), line));
-        }
-        Ok(out)
-    }
-
-    /// **装载**：默认 → 文件（若在）→ 命令行覆盖。返回参数表（含来源）。
-    pub fn load(dir: &Path, cli: &[(String, String)]) -> Result<Self, ConfigError> {
-        let (params, _) = Self::load_with_table(dir, cli)?;
-        Ok(params)
-    }
-
-    /// 同上，另给一份"键 + 取值 + 来源"的表（`bicdb params` 用）。
-    pub fn load_with_table(
-        dir: &Path,
-        cli: &[(String, String)],
+    /// **从文本装载**（`ini_path` 只作记录）。
+    pub fn from_text(
+        text: &str,
+        ini_path: Option<PathBuf>,
     ) -> Result<(Self, ParamTable), ConfigError> {
-        let mut p = Self::default();
-        let mut table: ParamTable = Vec::new();
-        let mark = |table: &mut ParamTable, key: &str, v: &str, src: Source| {
-            table.push((
-                KEYS.iter().find(|k| **k == key).copied().unwrap_or("?"),
-                v.to_owned(),
-                src,
-            ));
+        let mut p = Self {
+            ini_path,
+            ..Self::default()
         };
-        for (k, v) in cli {
-            table.push((
-                KEYS.iter().find(|kk| **kk == k).copied().unwrap_or("?"),
-                v.clone(),
-                Source::Cli,
-            ));
+        let mut table: ParamTable = Vec::new();
+        for (section, key, value, line) in Self::parse(text)? {
+            p.set(&section, &key, &value, line)?;
+            table.push((format!("{section}.{key}"), value, Source::File));
         }
-        let path = dir.join(FILE_NAME);
-        if path.exists() {
-            let text = std::fs::read_to_string(&path).map_err(|why| ConfigError::Io {
-                path: path.clone(),
-                why,
-            })?;
-            for (k, v, line) in Self::parse(&text)? {
-                p.set(&k, &v, line)?;
-                mark(&mut table, &k, &v, Source::File);
-            }
-        }
-        for (k, v) in cli {
-            p.set(k, v, 0)?;
+        if p.db_root.as_os_str().is_empty() {
+            return Err(ConfigError::Missing {
+                key: "instance.db_root".to_owned(),
+            });
         }
         Ok((p, table))
     }
 
-    /// **`bicdb init` 写出的默认参数文件文本**（带注释；改完重启生效）。
+    /// **按路径装载**（文件或"含 `bicdb.ini` 的目录"）。
+    pub fn load_from(ini: &Path) -> Result<(Self, ParamTable), ConfigError> {
+        let path = if ini.is_dir() {
+            ini.join(FILE_NAME)
+        } else {
+            ini.to_path_buf()
+        };
+        let text = std::fs::read_to_string(&path).map_err(|why| ConfigError::Io {
+            path: path.clone(),
+            why,
+        })?;
+        Self::from_text(&text, Some(path))
+    }
+
+    /// **寻址**：`-p` > `$BICDB_INI` > `./bicdb.ini`；都没有 ⇒ [`ConfigError::NotFound`]。
+    pub fn locate(explicit: Option<&Path>) -> Result<(Self, ParamTable), ConfigError> {
+        let mut tried: Vec<PathBuf> = Vec::new();
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(p) = explicit {
+            candidates.push(p.to_path_buf());
+        }
+        if let Ok(env) = std::env::var(ENV_INI) {
+            if !env.trim().is_empty() {
+                candidates.push(PathBuf::from(env));
+            }
+        }
+        candidates.push(PathBuf::from(FILE_NAME));
+        for c in candidates {
+            let path = if c.is_dir() {
+                c.join(FILE_NAME)
+            } else {
+                c.clone()
+            };
+            if path.exists() {
+                return Self::load_from(&path);
+            }
+            tried.push(path);
+        }
+        Err(ConfigError::NotFound { tried })
+    }
+
+    /// **装载 + 命令行覆盖**（`-c 节.键=值`；也接受唯一键名）。
+    pub fn load_with_overrides(
+        ini: Option<&Path>,
+        cli: &[(String, String)],
+    ) -> Result<(Self, ParamTable), ConfigError> {
+        let (mut p, mut table) = Self::locate(ini)?;
+        for (k, v) in cli {
+            let (section, key) = split_override(k)?;
+            p.set(&section, &key, v, 0)?;
+            let full = format!("{section}.{key}");
+            table.retain(|(tk, _, _)| tk != &full);
+            table.push((full, v.clone(), Source::Cli));
+        }
+        Ok((p, table))
+    }
+
+    /// **`bicdb init` 的参数**：`db_root` 由命令行给（init 的唯一入口），
+    /// 建区期/运行期参数可来自**种子参数文件**或 `-c`。
+    pub fn for_init(
+        db_root: &Path,
+        seed: Option<&Path>,
+        cli: &[(String, String)],
+    ) -> Result<Self, ConfigError> {
+        let mut p = Self::default();
+        if let Some(seed) = seed {
+            let (s, _) = Self::load_from(seed)?;
+            p.init = s.init; // 种子文件里的建区期参数生效
+            p.run = s.run; // 运行期参数也随种子（并写进新生成的参数文件）
+        }
+        for (k, v) in cli {
+            let (section, key) = split_override(k)?;
+            p.set(&section, &key, v, 0)?;
+        }
+        p.db_root = db_root.to_path_buf(); // 命令行给的根区目录优先（唯一入口）
+        Ok(p)
+    }
+
+    /// 控制套接字的绝对路径。
     #[must_use]
-    pub fn default_file_text() -> String {
-        let d = Self::default();
+    pub fn socket_path(&self) -> PathBuf {
+        resolve(&self.db_root, &self.run.socket)
+    }
+
+    /// 服务日志的绝对路径。
+    #[must_use]
+    pub fn log_path(&self) -> PathBuf {
+        resolve(&self.db_root, &self.run.log)
+    }
+
+    /// 参数文件自身的路径。
+    #[must_use]
+    pub fn ini_path(&self) -> PathBuf {
+        self.ini_path
+            .clone()
+            .unwrap_or_else(|| self.db_root.join(FILE_NAME))
+    }
+
+    /// **渲染为参数文件文本**（`init` 生成默认参数文件时用）。
+    #[must_use]
+    pub fn render(&self) -> String {
         format!(
             "\
-# bicdb 实例参数文件（`bicdb init` 写出）
+# ============================================================
+# bicdb 实例参数文件（`bicdb init` 生成）
 #
-# 形态：`键 = 值`；`#` 起注释；**未知键拒绝**（闭集纪律）。
+# 形态：`[节]` + `键 = 值`；`#` 或 `;` 起注释；**未知节/未知键拒绝**（闭集）。
 # 优先级：命令行 `-c 键=值` > 本文件 > 内置默认。
-# 生效时机：**改完重启服务**（在线写回 `ALTER SYSTEM SET` 随后续切片）。
+# 寻址：`-p <本文件|根区目录>` > 环境变量 {ENV_INI} > 当前目录的 {FILE_NAME}
 #
-# 建区期参数（日志组数/成员数/组页数/文件初始块数）由**控制文件**记录，
-# 本文件写它们无效——`bicdb params` 会单列一节展示。
+# 两类参数：
+#   [init]    建区期——`bicdb init` 读取；**建区后不可改**（控制文件权威，
+#             改了 `bicdb start` 会逐项核对并拒绝启动，需重建实例）
+#   其余节    运行期——改完**重启**生效（`bicdb restart`）
+# ============================================================
 
-pool_frames           = {}   # 缓冲池帧数（16 KiB/帧）
-file_extend_blocks    = {}   # 段增长撞文件尾时的固定增量（块；512 块 = 8 MiB）
-socket                = {}   # 控制套接字（相对实例目录）
-log                   = {}   # 服务日志（相对实例目录）
-lock_park_ms          = {}   # 等锁单次挂起时长（毫秒）
+[instance]
+# 根区目录：实例的全部文件（字典/撤销/日志/控制文件）都在它下面。
+# 本文件就在 <db_root>/{FILE_NAME}；实例在哪儿由本项**注册**（权威）。
+db_root = {}
+
+[init]
+# 建区期参数（`bicdb init` 读；建区后只作记录，见上）
+file0_initial_blocks = {}   # file 0（字典/数据）初始块数（16 KiB/块）
+undo_initial_blocks  = {}   # 撤销文件初始块数
+wal_groups           = {}   # 日志组数（2–8，至少 2 组轮转）
+wal_members          = {}   # 每组成员数（1–8）
+wal_group_pages      = {}   # 每组成员页数（512 B/页）
+
+[buffer]
+pool_frames = {}   # 缓冲池帧数（16 KiB/帧）
+
+[storage]
+file_extend_blocks = {}   # 段增长撞文件尾时的固定增量（块；512 = 8 MiB）
+
+[service]
+socket = {}   # 控制套接字（相对根区目录；也可给绝对路径）
+log    = {}   # 服务日志（同上）
+
+[lock]
+park_ms               = {}   # 等锁单次挂起时长（毫秒）
 deadlock_threshold_ms = {}   # 死锁检测阈值（毫秒）
 ",
-            d.pool_frames,
-            d.file_extend_blocks,
-            d.socket,
-            d.log,
-            d.lock_park_ms,
-            d.deadlock_threshold_ms
+            self.db_root.display(),
+            self.init.file0_initial_blocks,
+            self.init.undo_initial_blocks,
+            self.init.wal_groups,
+            self.init.wal_members,
+            self.init.wal_group_pages,
+            self.run.pool_frames,
+            self.run.file_extend_blocks,
+            self.run.socket,
+            self.run.log,
+            self.run.park_ms,
+            self.run.deadlock_threshold_ms
         )
     }
 
-    /// 可调键清单（`-c` 的闭集与 `params` 输出共用）。
-    pub const KEYS: [&'static str; 6] = [
-        "pool_frames",
-        "file_extend_blocks",
-        "socket",
-        "log",
-        "lock_park_ms",
-        "deadlock_threshold_ms",
-    ];
+    /// **核对建区期参数**（控制文件/文件事实为权威）：返回逐项不符。
+    ///
+    /// 只核对**库里真有的事实**（组数/成员数/组文件页数）；`*_initial_blocks`
+    /// 是"建区时的输入"，之后由自动扩展接管——不核对（文件里注明）。
+    #[must_use]
+    pub fn check_creation(&self, actual: &ActualCreation) -> Option<ConfigError> {
+        let mut diffs = Vec::new();
+        if self.init.wal_groups != actual.wal_groups {
+            diffs.push(format!(
+                "wal_groups：参数文件 {}，控制文件 {}",
+                self.init.wal_groups, actual.wal_groups
+            ));
+        }
+        if self.init.wal_members != actual.wal_members {
+            diffs.push(format!(
+                "wal_members：参数文件 {}，控制文件 {}",
+                self.init.wal_members, actual.wal_members
+            ));
+        }
+        if let Some(pages) = actual.wal_group_pages {
+            if self.init.wal_group_pages != pages {
+                diffs.push(format!(
+                    "wal_group_pages：参数文件 {}，日志文件 {}",
+                    self.init.wal_group_pages, pages
+                ));
+            }
+        }
+        if diffs.is_empty() {
+            None
+        } else {
+            Some(ConfigError::CreationMismatch { diffs })
+        }
+    }
+
+    /// 全部可调项（`节`, `键`）。
+    #[must_use]
+    pub fn all_keys() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("instance", "db_root"),
+            ("init", "file0_initial_blocks"),
+            ("init", "undo_initial_blocks"),
+            ("init", "wal_groups"),
+            ("init", "wal_members"),
+            ("init", "wal_group_pages"),
+            ("buffer", "pool_frames"),
+            ("storage", "file_extend_blocks"),
+            ("service", "socket"),
+            ("service", "log"),
+            ("lock", "park_ms"),
+            ("lock", "deadlock_threshold_ms"),
+        ]
+    }
 }
 
-/// `KEYS` 的别名（上面的闭集）。
-const KEYS: [&str; 6] = InstanceParams::KEYS;
+/// **库里的建区事实**（核对用；打开路径读出来后填）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActualCreation {
+    /// 控制文件里的组数。
+    pub wal_groups: u8,
+    /// 控制文件里的成员数。
+    pub wal_members: u8,
+    /// 日志成员文件的页数（读不出 ⇒ `None`，该项不核对）。
+    pub wal_group_pages: Option<u32>,
+}
+
+/// `-c` 的键：`节.键`（全名）或**唯一键名**（如 `pool_frames`）。
+fn split_override(k: &str) -> Result<(String, String), ConfigError> {
+    if let Some((s, key)) = k.split_once('.') {
+        return Ok((
+            s.trim().to_ascii_lowercase(),
+            key.trim().to_ascii_lowercase(),
+        ));
+    }
+    let k = k.trim().to_ascii_lowercase();
+    let hits: Vec<(&str, &str)> = InstanceParams::all_keys()
+        .into_iter()
+        .filter(|(_, key)| *key == k)
+        .collect();
+    match hits.as_slice() {
+        [(s, key)] => Ok(((*s).to_owned(), (*key).to_owned())),
+        [] => Err(ConfigError::UnknownKey {
+            section: "?".to_owned(),
+            key: k,
+            line: 0,
+        }),
+        _ => Err(ConfigError::BadValue {
+            key: k,
+            value: String::new(),
+            why: "该键名在多个节里都有——请写成 `节.键`".to_owned(),
+        }),
+    }
+}
+
+/// **命令行 `-c 键=值`**（可重复）。
+pub fn parse_cli_overrides(args: &[String]) -> Result<Vec<(String, String)>, ConfigError> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-c" || a == "--set" {
+            let kv = it.next().ok_or(ConfigError::Malformed {
+                line: 0,
+                text: "-c 缺 `键=值`".to_owned(),
+            })?;
+            let Some((k, v)) = kv.split_once('=') else {
+                return Err(ConfigError::Malformed {
+                    line: 0,
+                    text: format!("-c 要 `键=值`，给的是 `{kv}`"),
+                });
+            };
+            out.push((k.trim().to_owned(), v.trim().to_owned()));
+        }
+    }
+    Ok(out)
+}
+
+/// **命令行 `-p <参数文件|根区目录>`**。
+#[must_use]
+pub fn parse_ini_arg(args: &[String]) -> Option<PathBuf> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-p" || a == "--ini" || a == "--params-file" {
+            return it.next().map(PathBuf::from);
+        }
+    }
+    None
+}
 
 fn resolve(dir: &Path, name: &str) -> PathBuf {
     let p = Path::new(name);
@@ -317,119 +683,166 @@ fn resolve(dir: &Path, name: &str) -> PathBuf {
     }
 }
 
-/// **命令行 `-c 键=值`** 的解析（可重复）。
-pub fn parse_cli_overrides(args: &[String]) -> Result<Vec<(String, String)>, ConfigError> {
-    let mut out = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "-c" || a == "--param" {
-            let kv = it.next().ok_or_else(|| ConfigError::Malformed {
-                line: 0,
-                text: "-c 缺 `键=值`".to_owned(),
-            })?;
-            let Some((k, v)) = kv.split_once('=') else {
-                return Err(ConfigError::Malformed {
-                    line: 0,
-                    text: format!("-c 要 `键=值`，给的是 `{kv}`"),
-                });
-            };
-            out.push((k.trim().to_ascii_lowercase(), v.trim().to_owned()));
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("bicdb-conf-{}-{tag}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("bicdb-ini-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("建目录");
         d
     }
 
+    const MIN: &str = "[instance]\ndb_root = /tmp/x\n";
+
     #[test]
-    fn parse_ignores_comments_and_reports_lines() {
-        let text = "# 注释\n\npool_frames = 64   # 行尾注释\n";
+    fn parse_handles_sections_comments_and_lines() {
+        let text =
+            "# 注释\n[instance]\ndb_root = /data  # 行尾注释\n\n[buffer]\npool_frames = 64\n";
         let got = InstanceParams::parse(text).expect("解析");
-        assert_eq!(got, vec![("pool_frames".to_owned(), "64".to_owned(), 3)]);
-        // 缺 `=` 要指到行号。
-        let err = InstanceParams::parse("pool_frames 64\n").expect_err("应拒绝");
-        assert!(
-            matches!(err, ConfigError::Malformed { line: 1, .. }),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn precedence_is_cli_over_file_over_default() {
-        let d = dir("prec");
-        std::fs::write(d.join(FILE_NAME), "pool_frames = 64\nlock_park_ms = 7\n").expect("写文件");
-        // 文件生效。
-        let p = InstanceParams::load(&d, &[]).expect("装载");
-        assert_eq!(p.pool_frames, 64);
-        assert_eq!(p.lock_park_ms, 7);
-        // 命令行覆盖文件。
-        let p = InstanceParams::load(&d, &[("pool_frames".to_owned(), "128".to_owned())])
-            .expect("装载");
-        assert_eq!(p.pool_frames, 128);
-        assert_eq!(p.lock_park_ms, 7);
-        // 文件里没有的键 = 默认。
-        assert_eq!(p.deadlock_threshold_ms, 1000);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn unknown_key_and_bad_value_are_named() {
-        let d = dir("bad");
-        std::fs::write(d.join(FILE_NAME), "没这个键 = 1\n").expect("写");
-        let err = InstanceParams::load(&d, &[]).expect_err("应拒绝");
-        assert!(matches!(err, ConfigError::Unknown { line: 1, .. }), "{err}");
-        std::fs::write(d.join(FILE_NAME), "pool_frames = 1\n").expect("写");
-        let err = InstanceParams::load(&d, &[]).expect_err("应拒绝");
-        assert!(matches!(err, ConfigError::BadValue { .. }), "{err}");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn default_file_text_is_loadable_and_socket_resolves() {
-        let d = dir("default");
-        std::fs::write(d.join(FILE_NAME), InstanceParams::default_file_text()).expect("写");
-        let p = InstanceParams::load(&d, &[]).expect("默认文件应可装载");
-        assert_eq!(p, InstanceParams::default());
-        assert_eq!(p.socket_path(&d), d.join("bicdb.sock"));
-        assert_eq!(p.log_path(&d), d.join("bicdb.log"));
-        // 绝对路径原样用。
-        let abs = InstanceParams {
-            socket: "/tmp/abs.sock".to_owned(),
-            ..InstanceParams::default()
-        };
-        assert_eq!(abs.socket_path(&d), PathBuf::from("/tmp/abs.sock"));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn cli_overrides_parse() {
-        let args: Vec<String> = [
-            "-d",
-            "/x",
-            "-c",
-            "pool_frames=32",
-            "-c",
-            "socket=/tmp/s.sock",
-        ]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-        let ov = parse_cli_overrides(&args).expect("解析");
         assert_eq!(
-            ov,
+            got,
             vec![
-                ("pool_frames".to_owned(), "32".to_owned()),
-                ("socket".to_owned(), "/tmp/s.sock".to_owned())
+                (
+                    "instance".to_owned(),
+                    "db_root".to_owned(),
+                    "/data".to_owned(),
+                    3
+                ),
+                (
+                    "buffer".to_owned(),
+                    "pool_frames".to_owned(),
+                    "64".to_owned(),
+                    6
+                ),
             ]
         );
+        assert!(matches!(
+            InstanceParams::parse("db_root = /x\n"),
+            Err(ConfigError::Malformed { line: 1, .. })
+        ));
+        assert!(matches!(
+            InstanceParams::parse("[instance]\ndb_root /x\n"),
+            Err(ConfigError::Malformed { line: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_section_and_key_are_named() {
+        let e = InstanceParams::from_text("[nope]\ndb_root = /x\n", None).expect_err("应拒绝");
+        assert!(
+            matches!(e, ConfigError::UnknownSection { line: 1, .. }),
+            "{e}"
+        );
+        let e = InstanceParams::from_text("[instance]\ndb_root = /x\n[buffer]\nnope = 1\n", None)
+            .expect_err("应拒绝");
+        assert!(matches!(e, ConfigError::UnknownKey { line: 4, .. }), "{e}");
+    }
+
+    #[test]
+    fn db_root_is_required_and_registered() {
+        let e =
+            InstanceParams::from_text("[buffer]\npool_frames = 64\n", None).expect_err("应拒绝");
+        assert!(matches!(e, ConfigError::Missing { .. }), "{e}");
+        let (p, table) = InstanceParams::from_text(MIN, None).expect("装载");
+        assert_eq!(p.db_root, PathBuf::from("/tmp/x"));
+        assert!(table
+            .iter()
+            .any(|(k, v, _)| k == "instance.db_root" && v == "/tmp/x"));
+    }
+
+    #[test]
+    fn render_round_trips_and_resolves_relative_paths() {
+        let p = InstanceParams {
+            db_root: PathBuf::from("/data/bicdb"),
+            ..InstanceParams::default()
+        };
+        let text = p.render();
+        let (back, _) = InstanceParams::from_text(&text, None).expect("回读");
+        assert_eq!(back.db_root, p.db_root);
+        assert_eq!(back.init, p.init, "建区期参数应往返一致");
+        assert_eq!(back.run, p.run, "运行期参数应往返一致");
+        assert_eq!(back.socket_path(), PathBuf::from("/data/bicdb/bicdb.sock"));
+        assert_eq!(back.log_path(), PathBuf::from("/data/bicdb/bicdb.log"));
+    }
+
+    #[test]
+    fn cli_overrides_win_and_accept_short_keys() {
+        let d = dir("ovr");
+        std::fs::write(
+            d.join(FILE_NAME),
+            format!("{MIN}[buffer]\npool_frames = 64\n"),
+        )
+        .expect("写");
+        let (p, table) = InstanceParams::load_with_overrides(
+            Some(&d),
+            &[("pool_frames".to_owned(), "128".to_owned())],
+        )
+        .expect("装载");
+        assert_eq!(p.run.pool_frames, 128);
+        assert!(table
+            .iter()
+            .any(|(k, v, s)| k == "buffer.pool_frames" && v == "128" && *s == Source::Cli));
+        let e =
+            InstanceParams::load_with_overrides(Some(&d), &[("nope".to_owned(), "1".to_owned())])
+                .expect_err("应拒绝");
+        assert!(matches!(e, ConfigError::UnknownKey { .. }), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn creation_check_reports_mismatch() {
+        let d = dir("chk");
+        let p = InstanceParams {
+            db_root: d.clone(),
+            ..InstanceParams::default()
+        };
+        let actual = ActualCreation {
+            wal_groups: 4,
+            wal_members: 2,
+            wal_group_pages: None,
+        };
+        let msg = p.check_creation(&actual).expect("应报不符").to_string();
+        assert!(
+            msg.contains("wal_groups") && msg.contains("wal_members"),
+            "{msg}"
+        );
+        let ok = ActualCreation {
+            wal_groups: p.init.wal_groups,
+            wal_members: p.init.wal_members,
+            wal_group_pages: None,
+        };
+        assert!(p.check_creation(&ok).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn for_init_takes_seed_and_cli() {
+        let d = dir("seed");
+        let seed = d.join("seed.ini");
+        std::fs::write(
+            &seed,
+            "[instance]\ndb_root = /ignored\n[init]\nwal_groups = 4\n",
+        )
+        .expect("写种子");
+        let p = InstanceParams::for_init(
+            &d,
+            Some(&seed),
+            &[("init.wal_members".to_owned(), "2".to_owned())],
+        )
+        .expect("装载");
+        assert_eq!(
+            p.db_root, d,
+            "根区目录以命令行为准（种子里的 db_root 忽略）"
+        );
+        assert_eq!(p.init.wal_groups, 4, "种子里的建区期参数生效");
+        assert_eq!(p.init.wal_members, 2, "命令行覆盖种子");
+        // 寻址：`-p` 优先（把参数文件写出来，模拟 `init` 的产物）。
+        std::fs::write(d.join(FILE_NAME), p.render()).expect("写");
+        let (found, _) = InstanceParams::locate(Some(&d)).expect("按目录寻址");
+        assert_eq!(found.db_root, d);
+        assert_eq!(found.ini_path(), d.join(FILE_NAME));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

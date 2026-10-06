@@ -112,7 +112,9 @@ impl StopMode {
 /// 服务的启动参数。
 #[derive(Debug, Clone)]
 pub struct StartOptions {
-    /// 实例目录。
+    /// **实例参数**（按参数文件装载；根区目录由它注册）。
+    pub params: crate::config::InstanceParams,
+    /// 实例目录（= `params.db_root`；保留为便利字段）。
     pub dir: PathBuf,
     /// 控制套接字路径（默认取参数文件 `socket`，再默认 `<dir>/bicdb.sock`）。
     pub socket: PathBuf,
@@ -125,21 +127,35 @@ pub struct StartOptions {
 }
 
 impl StartOptions {
-    /// 由实例目录 + 命令行覆盖组装（套接字/日志**先看参数文件**，再看默认）。
+    /// **按参数文件寻址装载**（`-p` > `$BICDB_INI` > `./bicdb.ini`）+ 命令行覆盖。
+    pub fn load(
+        ini: Option<&Path>,
+        socket: Option<PathBuf>,
+        log: Option<PathBuf>,
+        timeout: Duration,
+        overrides: Vec<(String, String)>,
+    ) -> Result<Self, ServiceError> {
+        let (params, _) = crate::config::InstanceParams::load_with_overrides(ini, &overrides)?;
+        Ok(Self::from_params(params, socket, log, timeout, overrides))
+    }
+
+    /// 由**已装载的参数**组装（`init` 之后的路径与 `start` 共用）。
     #[must_use]
-    pub fn new(
-        dir: &Path,
+    pub fn from_params(
+        params: crate::config::InstanceParams,
         socket: Option<PathBuf>,
         log: Option<PathBuf>,
         timeout: Duration,
         overrides: Vec<(String, String)>,
     ) -> Self {
-        let params = crate::config::InstanceParams::load(dir, &overrides)
-            .unwrap_or_else(|_| crate::config::InstanceParams::default());
+        let dir = params.db_root.clone();
+        let socket = socket.unwrap_or_else(|| params.socket_path());
+        let log = log.unwrap_or_else(|| params.log_path());
         Self {
-            dir: dir.to_path_buf(),
-            socket: socket.unwrap_or_else(|| params.socket_path(dir)),
-            log: log.unwrap_or_else(|| params.log_path(dir)),
+            params,
+            dir,
+            socket,
+            log,
             timeout,
             overrides,
         }
@@ -163,13 +179,13 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
 
     // **参数文件 + 命令行 `-c`**：先装载（未知键/取值非法在此具名拒绝），
     // 再按它打开实例——与直连路径同一份参数语义。
-    let params = crate::config::InstanceParams::load(&opts.dir, &opts.overrides)?;
+    let params = &opts.params;
     log.line(&format!(
         "参数：池 {} 帧，自动扩展 {} 块，等锁 {} ms，死锁阈值 {} ms",
-        params.pool_frames,
-        params.file_extend_blocks,
-        params.lock_park_ms,
-        params.deadlock_threshold_ms
+        params.run.pool_frames,
+        params.run.file_extend_blocks,
+        params.run.park_ms,
+        params.run.deadlock_threshold_ms
     ));
     let lock = InstanceLock::acquire(&opts.dir, LockMode::Service, &opts.socket)?;
     log.line(&format!(
@@ -178,7 +194,7 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
     ));
 
     // **打开实例**（三阶段恢复）：可能耗时（重放），先记日志再开工。
-    let mut inst = open_unlocked_with(&opts.dir, Some(lock), &params)?;
+    let mut inst = open_unlocked_with(params, Some(lock))?;
     match inst.recovery {
         Some(r) => log.line(&format!(
             "实例已打开：恢复起点 LSN {}，重放 {} 块，回滚 {} 个事务，续写位 {}",
@@ -398,8 +414,8 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
     let errlog = log.try_clone()?;
     let mut child = std::process::Command::new(exe)
         .arg("__daemon")
-        .arg("--dir")
-        .arg(&opts.dir)
+        .arg("-p")
+        .arg(opts.params.ini_path())
         .arg("--socket")
         .arg(&opts.socket)
         .arg("--log")

@@ -53,14 +53,19 @@ fn init(dir: &Path) {
     assert_eq!(code, 0, "init：{err}");
 }
 
+/// `-p <根区目录>`：按参数文件寻址（照 Oracle 的口径）。
+fn p_arg(dir: &Path) -> String {
+    dir.display().to_string()
+}
+
 fn start(dir: &Path) -> (i32, String, String) {
-    let d = dir.display().to_string();
-    run(&["start", &d, "-w", "30"])
+    let d = p_arg(dir);
+    run(&["start", "-p", &d, "-w", "30"])
 }
 
 fn stop(dir: &Path, mode: &str) -> (i32, String, String) {
-    let d = dir.display().to_string();
-    run(&["stop", &d, "-m", mode])
+    let d = p_arg(dir);
+    run(&["stop", "-p", &d, "-m", mode])
 }
 
 #[test]
@@ -70,7 +75,7 @@ fn lifecycle_start_status_stop_restart() {
     let d = dir.path().display().to_string();
 
     // 未运行。
-    let (code, out, _) = run(&["status", &d]);
+    let (code, out, _) = run(&["status", "-p", &d]);
     assert_eq!(code, 0);
     assert!(out.contains("未运行"), "{out}");
 
@@ -80,7 +85,7 @@ fn lifecycle_start_status_stop_restart() {
     assert!(out.contains("服务已启动"), "{out}");
 
     // status：在跑 + 服务模式。
-    let (_, out, _) = run(&["status", &d]);
+    let (_, out, _) = run(&["status", "-p", &d]);
     assert!(out.contains("运行中"), "{out}");
     assert!(out.contains("服务模式"), "{out}");
 
@@ -92,30 +97,31 @@ fn lifecycle_start_status_stop_restart() {
     // 经服务执行 SQL（`bicdb sql` 自动选路）。
     let (code, out, err) = run(&[
         "sql",
+        "-p",
         &d,
         "CREATE TABLE t (id NUMBER NOT NULL, v VARCHAR2(8))",
     ]);
     assert_eq!(code, 0, "建表：{out}{err}");
-    let (code, out, _) = run(&["sql", &d, "INSERT INTO t VALUES (1,'a')"]);
+    let (code, out, _) = run(&["sql", "-p", &d, "INSERT INTO t VALUES (1,'a')"]);
     assert_eq!(code, 0, "插入：{out}");
-    let (_, out, _) = run(&["sql", &d, "SELECT id, v FROM t"]);
+    let (_, out, _) = run(&["sql", "-p", &d, "SELECT id, v FROM t"]);
     assert!(out.contains('a'), "经服务查询：{out}");
 
     // restart：停（fast）+ 起。
-    let (code, out, err) = run(&["restart", &d, "-w", "30"]);
+    let (code, out, err) = run(&["restart", "-p", &d, "-w", "30"]);
     assert_eq!(code, 0, "restart：{out}{err}");
-    let (_, out, _) = run(&["status", &d]);
+    let (_, out, _) = run(&["status", "-p", &d]);
     assert!(out.contains("运行中"), "restart 后应在跑：{out}");
 
     // stop（fast）：完全检查点。
     let (code, out, err) = stop(dir.path(), "fast");
     assert_eq!(code, 0, "stop：{out}{err}");
     assert!(out.contains("服务已停止"), "{out}");
-    let (_, out, _) = run(&["status", &d]);
+    let (_, out, _) = run(&["status", "-p", &d]);
     assert!(out.contains("未运行"), "停后状态：{out}");
 
     // 停后直连：数据在（完全检查点 + 重开）。
-    let (code, out, err) = run(&["sql", &d, "SELECT id, v FROM t"]);
+    let (code, out, err) = run(&["sql", "-p", &d, "SELECT id, v FROM t"]);
     assert_eq!(code, 0, "直连：{out}{err}");
     assert!(out.contains('a'), "数据应在：{out}");
 }
@@ -128,12 +134,12 @@ fn immediate_stop_recovers_on_next_open() {
     let (code, out, err) = start(dir.path());
     assert_eq!(code, 0, "start：{out}{err}");
     assert_eq!(
-        run(&["sql", &d, "CREATE TABLE i (id NUMBER NOT NULL)"]).0,
+        run(&["sql", "-p", &d, "CREATE TABLE i (id NUMBER NOT NULL)"]).0,
         0
     );
     for k in 1..=20 {
         assert_eq!(
-            run(&["sql", &d, &format!("INSERT INTO i VALUES ({k})")]).0,
+            run(&["sql", "-p", &d, &format!("INSERT INTO i VALUES ({k})")]).0,
             0
         );
     }
@@ -142,7 +148,7 @@ fn immediate_stop_recovers_on_next_open() {
     assert_eq!(code, 0, "immediate stop：{out}{err}");
 
     // 重开（直连）：三阶段恢复把 20 行重做出来。
-    let (code, out, err) = run(&["sql", &d, "SELECT id FROM i"]);
+    let (code, out, err) = run(&["sql", "-p", &d, "SELECT id FROM i"]);
     assert_eq!(code, 0, "重开：{out}{err}");
     assert!(
         out.contains("20 行") || out.contains("（20"),
@@ -173,24 +179,27 @@ fn parameter_file_drives_the_service() {
     let dir = TempDir::new("conf");
     init(dir.path());
     let d = dir.path().display().to_string();
-    let conf = dir.path().join("bicdb.conf");
-    assert!(conf.exists(), "init 应写出 bicdb.conf");
+    let conf = dir.path().join("bicdb.ini");
+    assert!(conf.exists(), "init 应写出 bicdb.ini（默认参数文件）");
 
     // 改文件：池 64 帧 + 等锁 7 ms。
     let text = std::fs::read_to_string(&conf).expect("读");
     let text = text
-        .replace("pool_frames           = 256", "pool_frames           = 64")
-        .replace("lock_park_ms          = 50", "lock_park_ms          = 7");
+        .replace("pool_frames = 256", "pool_frames = 64")
+        .replace("park_ms               = 50", "park_ms               = 7");
     std::fs::write(&conf, text).expect("写");
 
     // `params` 应报"文件"来源与文件里的值。
-    let (code, out, err) = run(&["params", &d]);
+    let (code, out, err) = run(&["params", "-p", &d]);
     assert_eq!(code, 0, "{out}{err}");
-    assert!(out.contains("pool_frames") && out.contains("64"), "{out}");
+    assert!(
+        out.contains("buffer.pool_frames") && out.contains("64"),
+        "{out}"
+    );
     assert!(out.contains("文件"), "{out}");
 
     // 命令行覆盖优先。
-    let (_, out, _) = run(&["params", &d, "-c", "pool_frames=128"]);
+    let (_, out, _) = run(&["params", "-p", &d, "-c", "pool_frames=128"]);
     assert!(out.contains("128") && out.contains("命令行"), "{out}");
 
     // 按参数起的服务应正常就绪（参数真的被用上，没炸）。
@@ -204,7 +213,10 @@ fn parameter_file_drives_the_service() {
     let (code, _out, err) = start(dir.path());
     assert_ne!(code, 0, "未知键应拒绝启动");
     // 死因随错误带上（日志尾行）——用户不必自己去翻日志。
-    assert!(err.contains("未知参数"), "{err}");
+    assert!(
+        err.contains("没有参数 `nope`") || err.contains("闭集"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -218,6 +230,7 @@ fn direct_holder_blocks_the_service() {
     assert_eq!(code, 0, "start：{out}{err}");
     let out = Command::new(bin())
         .arg("shell")
+        .arg("-p")
         .arg(&d)
         .stdin(std::process::Stdio::null())
         .output()

@@ -139,19 +139,19 @@ mechanical check that no binary requires a symbol above the baseline.
 ```bash
 cargo build --release
 
-./target/release/bicdb init  ./demo
-./target/release/bicdb sql   ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
-./target/release/bicdb sql   ./demo "INSERT INTO t VALUES (1, 'alpha'); INSERT INTO t VALUES (2, 'beta')"
-./target/release/bicdb sql   ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
-./target/release/bicdb sql   ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
-./target/release/bicdb shell ./demo            # interactive; `;` ends a statement
+./target/release/bicdb init  ./demo      # also writes ./demo/bicdb.ini (the instance parameters)
+./target/release/bicdb sql   -p ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
+./target/release/bicdb sql   -p ./demo "INSERT INTO t VALUES (1, 'alpha'); INSERT INTO t VALUES (2, 'beta')"
+./target/release/bicdb sql   -p ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
+./target/release/bicdb sql   -p ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
+./target/release/bicdb shell -p ./demo         # interactive; `;` ends a statement
 
 # background service + SQL*Plus-style client
-./target/release/bicdb start ./demo            # detached service, instance lock, log
-./target/release/bicdb status ./demo
-./target/release/bicdb params ./demo            # effective parameters + source
-./target/release/bicdbcli ./demo               # buffer, `/` re-runs, SPOOL, @script, DESC
-./target/release/bicdb stop  ./demo            # clean shutdown (full checkpoint)
+./target/release/bicdb start -p ./demo         # detached service, instance lock, log
+./target/release/bicdb status -p ./demo
+./target/release/bicdb params -p ./demo        # every knob + source (default/file/cli)
+./target/release/bicdbcli -p ./demo            # buffer, `/` re-runs, SPOOL, @script, DESC
+./target/release/bicdb stop  -p ./demo         # clean shutdown (full checkpoint)
 ```
 
 `init` creates a real on-disk instance (dictionary file, undo segment, WAL group
@@ -312,19 +312,19 @@ CI 在 Debian 12 容器中、对两个架构分别执行门禁，并机械校验
 ```bash
 cargo build --release
 
-./target/release/bicdb init  ./demo
-./target/release/bicdb sql   ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
-./target/release/bicdb sql   ./demo "INSERT INTO t VALUES (1, 'alpha'); INSERT INTO t VALUES (2, 'beta')"
-./target/release/bicdb sql   ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
-./target/release/bicdb sql   ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
-./target/release/bicdb shell ./demo            # 交互式；`;` 结尾执行
+./target/release/bicdb init  ./demo      # 并在其下生成 bicdb.ini（实例参数文件）
+./target/release/bicdb sql   -p ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
+./target/release/bicdb sql   -p ./demo "INSERT INTO t VALUES (1, 'alpha'); INSERT INTO t VALUES (2, 'beta')"
+./target/release/bicdb sql   -p ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
+./target/release/bicdb sql   -p ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
+./target/release/bicdb shell -p ./demo         # 交互式；`;` 结尾执行
 
 # 后台服务 + SQL*Plus 形态客户端
-./target/release/bicdb start ./demo            # 分离进程 + 实例锁 + 日志
-./target/release/bicdb status ./demo
-./target/release/bicdb params ./demo            # 有效参数表（默认/文件/命令行）
-./target/release/bicdbcli ./demo               # 缓冲、`/` 重跑、SPOOL、@脚本、DESC
-./target/release/bicdb stop  ./demo            # 干净关闭（完全检查点）
+./target/release/bicdb start -p ./demo         # 分离进程 + 实例锁 + 日志
+./target/release/bicdb status -p ./demo
+./target/release/bicdb params -p ./demo         # 全部可调项 + 来源（默认/文件/命令行）
+./target/release/bicdbcli -p ./demo            # 缓冲、`/` 重跑、SPOOL、@脚本、DESC
+./target/release/bicdb stop  -p ./demo         # 干净关闭（完全检查点）
 ```
 
 `init` 建出一个**真盘实例**（字典文件、撤销段、日志组目录、控制文件双副本）。

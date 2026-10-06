@@ -30,6 +30,7 @@ impl Drop for TempDir {
         // 服务可能在跑：先请它停。
         let _ = Command::new(bicdb_bin())
             .arg("stop")
+            .arg("-p")
             .arg(&self.0)
             .arg("-m")
             .arg("immediate")
@@ -69,7 +70,8 @@ fn feed(dir: &Path, input: &str, extra: &[&str]) -> (String, String, i32) {
     for e in extra {
         cmd.arg(e);
     }
-    cmd.arg(dir)
+    cmd.arg("-p")
+        .arg(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -219,6 +221,7 @@ fn service_mode_connects_over_socket_and_keeps_transactions() {
     // 起服务。
     let out = Command::new(bicdb_bin())
         .arg("start")
+        .arg("-p")
         .arg(dir.path())
         .arg("-w")
         .arg("30")
@@ -274,6 +277,7 @@ EXIT
     // 停服务（fast）：完全检查点。
     let out = Command::new(bicdb_bin())
         .arg("stop")
+        .arg("-p")
         .arg(dir.path())
         .output()
         .expect("bicdb stop");
