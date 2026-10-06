@@ -17,6 +17,12 @@
 //!
 //! **四条纪律**：执行器不碰页（行经存储服务，可见性由服务负责）；读路径
 //! 不含锁；deadline/取消贯穿每个 `next()`；计划不可变、执行状态单次新造。
+//!
+//! **表访问·写侧的真实现（2026-10-06）**：[`writer::TableAccessWriter`]——
+//! `TableWriter` 的**真件**（`bicdb-access` 的表访问服务 + 事务引擎），
+//! 补上此前空缺的**表增长**（页选址 → 必要时增长一页，经池 + redo + 先落盘
+//! 再进 redo）。目录 DDL 不经本端口，直接调 `bicdb-access` 的同名函数
+//! （一份实现、两个消费者）。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -39,6 +45,7 @@ pub mod sort;
 pub mod spill;
 pub mod value;
 pub mod wmm;
+pub mod writer;
 
 pub use agg::{AggKind, AggSpec, HashAgg, ScalarAgg, SortedAgg};
 pub use context::{ExecContext, OpStat, WorkAreaOutcome, WorkAreaStats};
@@ -59,3 +66,4 @@ pub use value::{
     cast_value, decode_row, encode_row, kind_name, row_bytes, ColKind, Row, RowShape, Value,
 };
 pub use wmm::{AreaClaim, PoolStats, WorkArea, WorkMemoryPool};
+pub use writer::TableAccessWriter;

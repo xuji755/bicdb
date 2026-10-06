@@ -49,6 +49,8 @@ pub enum ExecError {
     DivisionByZero,
     /// **溢出底座错误**（temp 段读写/序列化——切片 6b）。
     Spill(String),
+    /// **表访问服务**（REQ-ENG-003 的写侧——保真外传）。
+    TableAccess(bicdb_access::TableAccessError),
     /// **行游标不可复位**（重扫路径要求可复位来源——`SeqScan` 重扫 /
     /// `HashAgg` 改档重来；缺省的 [`crate::operator::RowCursor::rewind`]）。
     NoRescan,
@@ -80,6 +82,7 @@ impl std::fmt::Display for ExecError {
             ExecError::Scan(e) => write!(f, "存储服务：{e}"),
             ExecError::Index(e) => write!(f, "索引：{e}"),
             ExecError::Spill(why) => write!(f, "溢出（temp 段）：{why}"),
+            ExecError::TableAccess(e) => write!(f, "{e}"),
             ExecError::NoRescan => f.write_str("行游标不可复位（重扫要求可复位来源）"),
             ExecError::NumericOverflow => f.write_str("数值运算越出 NUMBER 域"),
             ExecError::DivisionByZero => f.write_str("除以零"),

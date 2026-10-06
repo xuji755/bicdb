@@ -25,10 +25,9 @@
 
 use std::collections::BTreeSet;
 
-use bicdb_common::seq::Lsn;
 use bicdb_index::{IndexError, IndexIo};
 use bicdb_storage::buffer::{BufferKey, BufferPool};
-use bicdb_storage::page::{Page, PAGE_SIZE};
+use bicdb_storage::page::Page;
 use bicdb_storage::rowid::Rdba;
 use bicdb_storage::segment::{self, Segment};
 use bicdb_wal::group::GroupWriter;
@@ -203,30 +202,23 @@ impl<'a, 'b, 'w, 'wc, 's, 'sf> TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf> {
         let rdba = rdba_of(file_id, block)?;
         let is_fresh = self.fresh.remove(&block) || self.current(block).is_none();
         if is_fresh {
-            // ① 物理格式化：`page_lsn` 前置到"当前追加位的前一字节"（纪律 3）。
-            let stamp = Lsn::from_raw(self.log.appended_lsn().as_raw().saturating_sub(1))
-                .ok_or_else(|| io_err("追加位越出 48 位域"))?;
-            let mut stamped = Page::from_bytes(Box::new(*after.as_bytes()));
-            let mut header = stamped
-                .header()
-                .ok_or_else(|| io_err("新页页头不可解（页类型非法）"))?;
-            header.page_lsn = stamp;
-            stamped.write_header(&header);
-            self.seg
-                .write_physical_page(block, &mut stamped)
-                .map_err(io_err)?;
-            self.seg.sync().map_err(io_err)?;
-            // ② 全页 redo（前像 = 零页；池经 `insert_new` 装入）。
-            let zero = Page::from_bytes(Box::new([0u8; PAGE_SIZE]));
+            // **全新页三件套**（先格式化落盘 + fsync、再进 redo）——与撤销页/
+            // 堆表页共用 `txn::write::fresh_page_with_redo` 一个实现。
+            let mut physical = |page: &Page| -> Result<(), IndexError> {
+                let mut p = Page::from_bytes(Box::new(*page.as_bytes()));
+                self.seg
+                    .write_physical_page(block, &mut p)
+                    .map_err(|e| IndexError::Io(e.to_string()))?;
+                self.seg.sync().map_err(|e| IndexError::Io(e.to_string()))
+            };
             let key = BufferKey::new(self.ws, rdba);
-            write::write_page_change(
+            write::fresh_page_with_redo(
                 self.pool,
                 self.log,
                 self.txn_raw,
                 key,
-                zero.as_bytes(),
-                after.as_bytes(),
-                true,
+                after,
+                &mut physical,
             )
             .map_err(io_err)?;
         } else {
@@ -268,6 +260,7 @@ impl IndexIo for TxnIndexIo<'_, '_, '_, '_, '_, '_> {
 mod tests {
     use std::path::Path;
 
+    use bicdb_common::seq::Lsn;
     use bicdb_index::Tree;
     use bicdb_storage::buffer::{BufferPool, CacheConfig, SystemClock, WalGuard};
     use bicdb_storage::controlfile::{

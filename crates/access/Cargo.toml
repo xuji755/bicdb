@@ -1,6 +1,6 @@
 [package]
-name = "bicdb-exec"
-description = "执行算子：火山拉取、行式、扫描/回表内部批量"
+name = "bicdb-access"
+description = "表访问服务（REQ-ENG-003）：页选址/分配、行写、索引维护"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-bicdb-access = { path = "../access" }
 bicdb-common = { path = "../common" }
 bicdb-index = { path = "../index" }
 bicdb-storage = { path = "../storage" }
 bicdb-txn = { path = "../txn" }
 bicdb-types = { path = "../types" }
 bicdb-wal = { path = "../wal" }
-
-[dev-dependencies]
 bicdb-workspace = { path = "../workspace" }

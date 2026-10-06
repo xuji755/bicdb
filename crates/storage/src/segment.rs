@@ -714,6 +714,38 @@ impl<'io, 'f> Segment<'io, 'f> {
         })
     }
 
+    /// **打开既有段（池优先的段头读）**——活系统形态。
+    ///
+    /// **为什么需要它**：段头页是 no-force 的（与撤销页/元数据页同规）——写路径
+    /// 改过 `append_pos`/区间映射后，**文件里的段头页会落后**；直读文件开段会拿到
+    /// 旧 hwm/旧映射。池未命中 ⇒ 退化为直读（恢复/无池形态）。
+    ///
+    /// 单文件多段的口径：`Segment` 独占 `&mut DataFile` ⇒ 同文件的多个段**按次开、
+    /// 用完即弃**（开段 = 一次池内页读，廉价）；这也是表访问服务的调用形状。
+    pub fn open_pooled(
+        pool: &crate::buffer::BufferPool<'_>,
+        file: &'f mut crate::datafile::DataFile<'io>,
+        page0: u32,
+        ws: [u8; 8],
+    ) -> Result<Self, SegmentSpaceError> {
+        let rdba = crate::rowid::Rdba::from_parts(file.file_id(), page0)
+            .ok_or(SegmentSpaceError::BitmapCoverage)?;
+        let key = crate::buffer::BufferKey::new(ws, rdba);
+        let page = match pool.pin(key) {
+            Ok(g) => Page::from_bytes(Box::new(*g.as_bytes())),
+            Err(_) => file.read_page(page0)?,
+        };
+        let header = read_header(&page)?;
+        let map = read_extents(&page)?;
+        Ok(Self {
+            file,
+            header,
+            page0,
+            map,
+            coverage: BITMAP_PAGE_COVERAGE,
+        })
+    }
+
     /// 缩小段内位图页的覆盖（**仅供测试/诊断**：让"append_pos 走到位图页"
     /// 的路径在几页之内可达）。
     ///

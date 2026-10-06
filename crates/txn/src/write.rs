@@ -1322,6 +1322,53 @@ pub fn reclaim(
 /// 由 WAL 规则 2 保护）——前台 pwrite 从"稳态 2 次/条 DML"降到 **0**（探针
 /// `probe_frontend_pwrites_per_record`）。恢复/诊断形态不绑池，仍直读段文件，
 /// 撤销页由 redo 重放重建（`AppendUndo` 的"新页先格式化落盘再进 redo"规则不变）。
+/// **全新页的落地三件套**（先格式化落盘 + fsync、再让它进 redo）——
+/// 索引页/堆表页/位图页共用一条纪律（模块文档与 §11.5.4 实现注记）：
+///
+/// ```text
+/// ① page_lsn 前置到"当前追加位的前一字节"（块可能被复用：上一轮生命周期的
+///    redo 记录 LSN 更小，不前置会把旧记录"复活"到新页上；`-1` 的理由见
+///    `append_undo_via_pool` 的同款注记）；
+/// ② 物理写（调用方的 `physical_write`：**定址写 + fsync**）——物理增量重放
+///    无法重建一个不存在的页；
+/// ③ 全页 redo（前像 = 零页）→ 池经 `insert_new` 装入 + 标脏。
+/// ```
+///
+/// 返回新页的 redo LSN（页无变化时为 `None`——全零页）。
+pub fn fresh_page_with_redo<E>(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    txn_raw: u64,
+    key: BufferKey,
+    after: &bicdb_storage::page::Page,
+    physical_write: &mut dyn FnMut(&bicdb_storage::page::Page) -> Result<(), E>,
+) -> Result<Option<Lsn>, TxnError>
+where
+    E: std::fmt::Display,
+{
+    let stamp =
+        Lsn::from_raw(log.appended_lsn().as_raw().saturating_sub(1)).ok_or(TxnError::StaleCache)?;
+    let mut stamped = Page::from_bytes(Box::new(*after.as_bytes()));
+    let mut header = stamped.header().ok_or(TxnError::StaleCache)?;
+    header.page_lsn = stamp;
+    stamped.write_header(&header);
+    physical_write(&stamped).map_err(|e| {
+        TxnError::Segment(bicdb_storage::segment::SegmentSpaceError::Io(
+            std::io::Error::other(e.to_string()),
+        ))
+    })?;
+    let zero = Page::from_bytes(Box::new([0u8; bicdb_storage::page::PAGE_SIZE]));
+    write_page_change(
+        pool,
+        log,
+        txn_raw,
+        key,
+        zero.as_bytes(),
+        after.as_bytes(),
+        true,
+    )
+}
+
 fn write_undo_page_change(
     pool: &BufferPool<'_>,
     log: &mut GroupWriter<'_, '_>,
@@ -1486,7 +1533,11 @@ fn append_undo_via_pool(
 ///
 /// `is_new` = 该页尚未落盘（新分配的页）：经 [`BufferPool::insert_new`] 装入，
 /// 且"前像"必须全零（重放把它重建出来）。
-pub(crate) fn write_page_change(
+///
+/// **公开口**（2026-10-06）：表访问服务/索引写口等**非本模块**的写路径也走它
+/// ——"页差异 → redo → 池 → 标脏"只有这一个实现。调用方负责页内容的正确性
+/// （前像必须是该块**当前**镜像；新页的前像 = 零页）。
+pub fn write_page_change(
     pool: &BufferPool<'_>,
     log: &mut GroupWriter<'_, '_>,
     txn_raw: u64,
