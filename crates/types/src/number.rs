@@ -23,6 +23,14 @@
 //! （§6.5 的"为什么 +1 和 101−值"；负数指数取补是同一目的的另一半——
 //! 知识库口径："负数的实际指数 = 62 − 第一字节"）。
 //!
+//! # 算术
+//!
+//! [`Number::add`] / [`Number::sub`] / [`Number::mul`] / [`Number::div`] 全部
+//! **在 base-100 十进制上做**（REQ-TYP-002：不得经二进制浮点）：加减乘精确，
+//! 超 20 组按**半进位、远离零**舍入；除法取 20 组有效数字后同法舍入
+//! （除零 = [`NumberError::DivisionByZero`]）。**Oracle 除法舍入细则未核验**
+//! （知识库未收录）——见 `doc/evidence/exec-ops-20261006` 的未核验项。
+//!
 //! # 规范形式（同一数值只有一种编码）
 //!
 //! 数值 = `D1.D2D3… × 100^e`：`D1 ∈ 1..=99`（首位非零）、其余 `0..=99`、
@@ -54,6 +62,8 @@ pub enum NumberError {
     ExponentOutOfRange,
     /// 编码字节流非法（数字位越界 / 首位零组 / 负数缺标记字节 / 尾零组未剥离）。
     InvalidEncoding,
+    /// 除以零。
+    DivisionByZero,
 }
 
 impl fmt::Display for NumberError {
@@ -63,6 +73,7 @@ impl fmt::Display for NumberError {
             NumberError::TooManyDigits => "NUMBER 有效数字超过上限（20 个数字字节）",
             NumberError::ExponentOutOfRange => "NUMBER 指数越界（−65..=62）",
             NumberError::InvalidEncoding => "NUMBER 编码非法",
+            NumberError::DivisionByZero => "NUMBER 除以零",
         })
     }
 }
@@ -345,6 +356,148 @@ impl Number {
         s
     }
 
+    // -- 算术（十进制精确；不经浮点——REQ-TYP-002） -------------------------
+
+    /// 取负（零不带符号）。
+    #[must_use]
+    pub fn neg(&self) -> Self {
+        if self.is_zero() {
+            return Self::zero();
+        }
+        Self {
+            negative: !self.negative,
+            groups: self.groups.clone(),
+            exp: self.exp,
+        }
+    }
+
+    /// **绝对值**。
+    #[must_use]
+    pub fn abs(&self) -> Self {
+        if self.is_zero() {
+            return Self::zero();
+        }
+        Self {
+            negative: false,
+            groups: self.groups.clone(),
+            exp: self.exp,
+        }
+    }
+
+    /// **加法**（精确；结果超 20 组按**半进位、远离零**舍入）。
+    pub fn add(&self, other: &Self) -> Result<Self, NumberError> {
+        if self.is_zero() {
+            return Ok(other.clone());
+        }
+        if other.is_zero() {
+            return Ok(self.clone());
+        }
+        if self.negative == other.negative {
+            let (digits, exp) = add_magnitudes(self, other);
+            Self::canonical(self.negative, digits, exp)
+        } else {
+            // 异号：**按幅值**取大减小，符号随幅值较大者（用 self.cmp 会因符号
+            // 翻转把"大减小"的方向搞反——实测：-3 + 1 曾算出乱码）。
+            match self.abs().cmp(&other.abs()) {
+                Ordering::Equal => Ok(Self::zero()),
+                Ordering::Greater => {
+                    let (digits, exp) = sub_magnitudes(self, other);
+                    Self::canonical(self.negative, digits, exp)
+                }
+                Ordering::Less => {
+                    let (digits, exp) = sub_magnitudes(other, self);
+                    Self::canonical(other.negative, digits, exp)
+                }
+            }
+        }
+    }
+
+    /// **减法**（`self - other`）。
+    pub fn sub(&self, other: &Self) -> Result<Self, NumberError> {
+        self.add(&other.neg())
+    }
+
+    /// **乘法**（精确；结果超 20 组按半进位舍入）。
+    pub fn mul(&self, other: &Self) -> Result<Self, NumberError> {
+        if self.is_zero() || other.is_zero() {
+            return Ok(Self::zero());
+        }
+        let prod = mul_digits(&self.groups, &other.groups);
+        let exp = self.point_exp() + other.point_exp() + prod.len() as i32 - 1;
+        Self::canonical(self.negative != other.negative, prod, exp)
+    }
+
+    /// **除法**（商取 20 组有效数字 + 半进位舍入；除零 ⇒
+    /// [`NumberError::DivisionByZero`]）。
+    ///
+    /// 舍入口径：**20 个 base-100 组（40 位十进制）处、半进位、远离零**
+    /// ——与编码上限（[`MAX_DIGIT_BYTES`]）一致。**注**：Oracle 的除法
+    /// 舍入细则（38 位有效数字的确切落点）知识库未收录，记为**未核验**
+    /// （证据包 `exec-ops-20261006` §未核验），待参考环境实测后校正。
+    pub fn div(&self, other: &Self) -> Result<Self, NumberError> {
+        if other.is_zero() {
+            return Err(NumberError::DivisionByZero);
+        }
+        if self.is_zero() {
+            return Ok(Self::zero());
+        }
+        // q = floor(|a|·100^k / |b|)，k 取到商有 ≥ 22 组（20 组 + 2 组余量）。
+        let k = 22 + (other.groups.len() as i32 - self.groups.len() as i32).max(0);
+        let scaled = scale_digits(&self.groups, k as usize);
+        let (q, _) = div_digits(&scaled, &other.groups);
+        let exp = self.point_exp() - other.point_exp() - k + q.len() as i32 - 1;
+        Self::canonical(self.negative != other.negative, q, exp)
+    }
+
+    /// `value = int(groups) × 100^point_exp` 里的 `point_exp`。
+    fn point_exp(&self) -> i32 {
+        self.exp - self.groups.len() as i32 + 1
+    }
+
+    /// **规范形式收口**：去前导零 → 超限舍入（半进位、远离零）→ 去尾零 →
+    /// 指数域检查。空数字 = 零（不带符号）。
+    fn canonical(negative: bool, mut digits: Vec<u8>, mut exp: i32) -> Result<Self, NumberError> {
+        while digits.first() == Some(&0) {
+            digits.remove(0);
+            exp -= 1;
+        }
+        if digits.is_empty() {
+            return Ok(Self::zero());
+        }
+        if digits.len() > MAX_DIGIT_BYTES {
+            let guard = digits[MAX_DIGIT_BYTES];
+            digits.truncate(MAX_DIGIT_BYTES);
+            if guard >= 50 {
+                let mut i = digits.len();
+                loop {
+                    if i == 0 {
+                        digits.insert(0, 1);
+                        exp += 1;
+                        break;
+                    }
+                    if digits[i - 1] == 99 {
+                        digits[i - 1] = 0;
+                        i -= 1;
+                    } else {
+                        digits[i - 1] += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+        if !(EXP_MIN..=EXP_MAX).contains(&exp) {
+            return Err(NumberError::ExponentOutOfRange);
+        }
+        Ok(Self {
+            negative,
+            groups: digits,
+            exp,
+        })
+    }
+
     /// 数值比较（规范形式下与字节序一致——由属性测试保证）。
     fn cmp_numeric(&self, other: &Self) -> Ordering {
         match (self.is_zero(), other.is_zero()) {
@@ -399,6 +552,192 @@ impl Number {
             mag
         }
     }
+}
+
+// -- 算术的 digit 数组助手（全部 base-100、大端：索引 0 = 最高位） ----------
+
+/// 最低非零位次（`value = Σ groups[i] × 100^(exp − i)` 的 `exp − len + 1`）。
+fn low_place(n: &Number) -> i32 {
+    n.exp - n.groups.len() as i32 + 1
+}
+
+/// 同号**幅值相加**：返回（数字数组，首组的位次）。末位带进位余量。
+fn add_magnitudes(a: &Number, b: &Number) -> (Vec<u8>, i32) {
+    let low = low_place(a).min(low_place(b));
+    let high = a.exp.max(b.exp) + 1;
+    let span = (high - low + 1) as usize;
+    let mut acc = vec![0u8; span];
+    for n in [a, b] {
+        for (i, &g) in n.groups.iter().enumerate() {
+            let place = n.exp - i as i32;
+            acc[(high - place) as usize] += g; // 同一位次至多两组 ≤ 198 < 256
+        }
+    }
+    for i in (1..span).rev() {
+        let v = u32::from(acc[i]);
+        acc[i] = (v % 100) as u8;
+        acc[i - 1] += (v / 100) as u8;
+    }
+    (acc, high)
+}
+
+/// **幅值相减**（要求 `|a| ≥ |b|`）：返回（数字数组，首组的位次）。
+fn sub_magnitudes(a: &Number, b: &Number) -> (Vec<u8>, i32) {
+    let low = low_place(a).min(low_place(b));
+    let high = a.exp; // |a| ≥ |b| ⇒ a.exp ≥ b.exp
+    let span = (high - low + 1) as usize;
+    let mut acc = vec![0i32; span];
+    for (i, &g) in a.groups.iter().enumerate() {
+        let place = a.exp - i as i32;
+        acc[(high - place) as usize] += i32::from(g);
+    }
+    for (i, &g) in b.groups.iter().enumerate() {
+        let place = b.exp - i as i32;
+        acc[(high - place) as usize] -= i32::from(g);
+    }
+    for i in (1..span).rev() {
+        if acc[i] < 0 {
+            acc[i] += 100;
+            acc[i - 1] -= 1;
+        }
+    }
+    let digits = acc.into_iter().map(|v| v as u8).collect();
+    (digits, high)
+}
+
+/// **数字数组乘法**（schoolbook，base-100）。
+fn mul_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u32; a.len() + b.len()];
+    for i in (0..a.len()).rev() {
+        let mut carry = 0u32;
+        for j in (0..b.len()).rev() {
+            let cur = out[i + j + 1] + u32::from(a[i]) * u32::from(b[j]) + carry;
+            out[i + j + 1] = cur % 100;
+            carry = cur / 100;
+        }
+        out[i] += carry;
+    }
+    out.into_iter().map(|v| v as u8).collect()
+}
+
+/// 数字数组 × `100^k`（追加 `k` 个零组）。
+fn scale_digits(d: &[u8], k: usize) -> Vec<u8> {
+    let mut out = d.to_vec();
+    out.extend(std::iter::repeat(0).take(k));
+    out
+}
+
+/// 规范数字数组比较（无前导零；空 = 零）。
+fn cmp_digits(a: &[u8], b: &[u8]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// 数字数组加法（整数语义、右对齐）。
+fn add_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let (mut i, mut j, mut carry) = (a.len(), b.len(), 0u8);
+    while i > 0 || j > 0 || carry > 0 {
+        let mut v = u16::from(carry);
+        if i > 0 {
+            i -= 1;
+            v += u16::from(a[i]);
+        }
+        if j > 0 {
+            j -= 1;
+            v += u16::from(b[j]);
+        }
+        out.push((v % 100) as u8);
+        carry = (v / 100) as u8;
+    }
+    out.reverse();
+    out
+}
+
+/// 数字数组 × 小整数（0..=99）。
+fn mul_small(d: &[u8], q: u8) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(d.len() + 1);
+    let mut carry = 0u16;
+    for &g in d.iter().rev() {
+        let v = u16::from(g) * u16::from(q) + carry;
+        out.push((v % 100) as u8);
+        carry = v / 100;
+    }
+    if carry > 0 {
+        out.push(carry as u8);
+    }
+    out.reverse();
+    out
+}
+
+/// 数字数组减法（整数语义；要求 `a ≥ b`）；结果可带前导零（调用方剥）。
+fn sub_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; a.len()];
+    let mut borrow = 0i32;
+    let (mut i, mut j) = (a.len(), b.len());
+    while i > 0 {
+        i -= 1;
+        let mut v = i32::from(a[i]) - borrow;
+        if j > 0 {
+            j -= 1;
+            v -= i32::from(b[j]);
+        }
+        if v < 0 {
+            v += 100;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out[i] = v as u8;
+    }
+    out
+}
+
+/// `rem` 里能容纳的最大倍数 `q ∈ 0..=99`（`den × q ≤ rem`）。
+fn largest_multiple(den: &[u8], rem: &[u8]) -> u8 {
+    if cmp_digits(den, rem) == Ordering::Greater {
+        return 0;
+    }
+    let mut acc = den.to_vec();
+    let mut q = 1u8;
+    loop {
+        let next = add_digits(&acc, den);
+        if cmp_digits(&next, rem) == Ordering::Greater || q == 99 {
+            break;
+        }
+        acc = next;
+        q += 1;
+    }
+    q
+}
+
+/// **长除法**（base-100）：返回（商、余数）；两者都剥前导零、空 = 零。
+fn div_digits(num: &[u8], den: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    debug_assert!(!den.is_empty());
+    let mut quot: Vec<u8> = Vec::with_capacity(num.len());
+    let mut rem: Vec<u8> = Vec::new();
+    for &d in num {
+        rem.push(d);
+        while rem.first() == Some(&0) {
+            rem.remove(0);
+        }
+        let q = if rem.is_empty() {
+            0
+        } else {
+            largest_multiple(den, &rem)
+        };
+        quot.push(q);
+        if q != 0 {
+            let sub = mul_small(den, q);
+            rem = sub_digits(&rem, &sub);
+            while rem.first() == Some(&0) {
+                rem.remove(0);
+            }
+        }
+    }
+    while quot.first() == Some(&0) {
+        quot.remove(0);
+    }
+    (quot, rem)
 }
 
 /// 数字位切片 → 数值（0..=99）。
@@ -570,5 +909,149 @@ mod tests {
             assert_eq!(decoded, n, "{text} 往返");
             assert_eq!(decoded.to_decimal_string(), n.to_decimal_string());
         }
+    }
+
+    // -- 算术（十进制精确；REQ-TYP-002） ------------------------------------
+
+    fn num(t: &str) -> Number {
+        Number::parse(t).expect("可解析")
+    }
+
+    fn sum(a: &str, b: &str) -> String {
+        num(a).add(&num(b)).expect("相加").to_decimal_string()
+    }
+
+    fn diff(a: &str, b: &str) -> String {
+        num(a).sub(&num(b)).expect("相减").to_decimal_string()
+    }
+
+    fn prod(a: &str, b: &str) -> String {
+        num(a).mul(&num(b)).expect("相乘").to_decimal_string()
+    }
+
+    fn quot(a: &str, b: &str) -> String {
+        num(a).div(&num(b)).expect("相除").to_decimal_string()
+    }
+
+    #[test]
+    fn decimal_arithmetic_is_exact_not_binary_float() {
+        // 0.1 + 0.2 = 0.3 精确（双精度会得到 0.30000000000000004）。
+        assert_eq!(sum("0.1", "0.2"), "0.3");
+        assert_eq!(sum("1.1", "2.2"), "3.3");
+        assert_eq!(diff("0.3", "0.1"), "0.2");
+        assert_eq!(
+            diff("1", "0.99999999999999999999999999999999999999"),
+            "0.00000000000000000000000000000000000001"
+        );
+        assert_eq!(prod("0.1", "0.2"), "0.02");
+        assert_eq!(prod("1.5", "2"), "3");
+        assert_eq!(quot("1", "8"), "0.125");
+        assert_eq!(quot("10", "4"), "2.5");
+    }
+
+    #[test]
+    fn signs_and_zero_are_canonical() {
+        assert_eq!(sum("1", "-1"), "0");
+        assert_eq!(diff("5", "5"), "0");
+        assert_eq!(sum("-3", "1"), "-2");
+        assert_eq!(prod("-3", "2"), "-6");
+        assert_eq!(prod("-3", "-2"), "6");
+        assert_eq!(quot("-6", "4"), "-1.5");
+        assert_eq!(Number::zero().neg().to_decimal_string(), "0");
+        let z = num("7").sub(&num("7")).unwrap();
+        assert_eq!(z.encode(), vec![0x80], "算术零 = 规范零字节");
+    }
+
+    #[test]
+    fn thirty_eight_digit_integers_stay_exact() {
+        // 38 位 9 + 1 = 10^38（进位跨组、尾零组剥离后只剩 [1]）。
+        let nines = "9".repeat(38);
+        let one = "1".to_owned() + &"0".repeat(38);
+        assert_eq!(sum(&nines, "1"), one);
+        // 38 位 × 小整数：精确。
+        let big = "12345678901234567890123456789012345678"; // 38 位
+        assert_eq!(prod(big, "1"), big);
+        // 38 位相加超限 ⇒ 半进位舍入（此处末位为 0，剥离尾零）。
+        let a = "1".to_owned() + &"0".repeat(37); // 10^37
+        assert_eq!(sum(&a, &a), "2".to_owned() + &"0".repeat(37));
+    }
+
+    #[test]
+    fn division_keeps_twenty_groups_and_rounds_half_up_away_from_zero() {
+        // 1/3 = 0.333…3（40 位 3：第 21 组 = 33 < 50，不进位）。
+        let one_third = quot("1", "3");
+        assert_eq!(one_third, "0.".to_owned() + &"3".repeat(40));
+        // 2/3 = 0.666…7（第 21 组 = 66 ≥ 50 ⇒ 末组进位 66→67）。
+        let two_thirds = quot("2", "3");
+        assert_eq!(two_thirds, "0.".to_owned() + &"6".repeat(39) + "7");
+        // 负数同幅值（远离零舍入）。
+        assert_eq!(quot("-2", "3"), "-".to_owned() + &two_thirds);
+        // 乘回：1/3 × 3 = 0.999…9（40 位 9——不是 1；除法有舍入，符合"不静默
+        // 变成 1"的十进制语义）。
+        assert_eq!(prod(&one_third, "3"), "0.".to_owned() + &"9".repeat(40));
+    }
+
+    #[test]
+    fn division_by_zero_is_a_named_error() {
+        assert_eq!(
+            num("1").div(&Number::zero()),
+            Err(NumberError::DivisionByZero)
+        );
+        // 零/非零 = 零；非零/自身 = 1。
+        assert!(num("0").div(&num("7")).unwrap().is_zero());
+        assert_eq!(quot("7", "7"), "1");
+        assert_eq!(quot("-7", "-7"), "1");
+    }
+
+    #[test]
+    fn additive_inverse_property_holds_for_exact_operands() {
+        let vals = [
+            "0.1",
+            "-0.2",
+            "1",
+            "-3.5",
+            "123456789.987654321",
+            "-0.000000001",
+            "100000000000000000000000",
+            "99999999999999999999.5",
+        ];
+        for a in vals {
+            for b in vals {
+                let s = num(a).add(&num(b)).expect("相加");
+                assert_eq!(
+                    s.sub(&num(b)).expect("相减"),
+                    num(a),
+                    "({a}) + ({b}) - ({b})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exponent_domain_is_enforced() {
+        // 上界：10^124（exp = 62）可表示；×100 ⇒ exp = 63 ⇒ 具名错误、不回绕。
+        let top = num(&("1".to_owned() + &"0".repeat(124)));
+        assert!(top.mul(&num("99")).is_ok(), "exp = 62 仍在域内");
+        assert_eq!(
+            top.mul(&num("100")).unwrap_err(),
+            NumberError::ExponentOutOfRange
+        );
+        // 下界：10^-124（exp = −62）逐次 ÷100 到 10^-130（exp = −65，域内，
+        // 注意 10^130 本身超出可表示域——不能直接构造除数）；再 ÷100 ⇒ −66 ⇒ 错。
+        let mut bottom = num("1")
+            .div(&num(&("1".to_owned() + &"0".repeat(124))))
+            .unwrap();
+        for _ in 0..3 {
+            bottom = bottom.div(&num("100")).unwrap();
+        }
+        assert_eq!(
+            bottom.to_decimal_string(),
+            "0.".to_owned() + &"0".repeat(129) + "1",
+            "10^-130 可表示（域下界）"
+        );
+        assert_eq!(
+            bottom.div(&num("100")).unwrap_err(),
+            NumberError::ExponentOutOfRange
+        );
     }
 }

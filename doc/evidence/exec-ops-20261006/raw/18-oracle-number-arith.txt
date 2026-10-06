@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] NUMBER 除法 精度 38 位 有效数字 舍入 规则
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 41，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 48，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Oracle 8/8i 扩展 rowid 采用 64 进制编码系统，字符集定义顺序为 A-Z(0-25)、a-z(26-51)、0-9(52-61)、+(62)、/(63)。rowid 字符串包含 object_id、relative file number、block number 和 row slot 四部分，分别占用 6、3、6、3 个字符，可通过 substr 提取各。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:150407.1 Oracle 8/8i Rowid and 64 base number system  (排序分: 15.0)
+     └ 摘要：Oracle 8/8i 扩展 rowid 采用 64 进制编码系统，字符集定义顺序为 A-Z(0-25)、a-z(26-51)、0-9(52-61)、+(62)、/(63)。rowid 字符串包含 object_id、relative file number、block number 和 row slot 四部分，分别占用 6、3、6、3 个字符，可通过 substr 提取各。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1993923
+
+     [KnowledgeEntry] L1：Bug 5006576 USING A NUMBER COLUMNS WITH CACHEDROWSET GIVES '' INVALID SCALE SIZE'' ERROR  (排序分: 15.0)
+     └ 摘要：Bug 5006576：使用JDBC CachedRowSet处理含有NUMBER列的子查询（WITH factoring）时，会抛出“java.sql.SQLException: Invalid scale size. Cannot be less than zero”。该错误在javax.sql.rowset.RowSetMetaDataImpl.setScale()触发，源于NUMBER(12,1)等列返回的scale值为非。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047383
+
+     [KnowledgeEntry] NUMBER小数位数定义  (排序分: 10.0)
+     └ 详情：小数位数指从十进制的小数点到最小有效数字的位数。正小数位数从小数点向右计数直至最小有效位。负小数位数从小数点向左计数直至（但不包括）最小有效数字。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1068817
+
+     [KnowledgeEntry] NUMBER类型存储空间计算  (排序分: 10.0)
+     └ 摘要：Oracle的NUMBER类型存储空间不固定，其大小取决于数字的有效位数。存储字节数计算公式为：1个符号/指数字节加上有效数字位数除以2后向上取整的数字字节数。例如，数字12345有5位有效数字，需要3个数字字节，加上1个符号/指数字节共4字节。负数的存储空间与正数相同，0则使用特殊字节表示。这一特性允许在数值精度差异较大时节省存储空间，但会导致行长度可变。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1548295
+
+     [CaseStudy] FLOAT与NUMBER存储一致性案例  (排序分: 10.0)
+     └ 详情：创建表COE(id number, discount float)，插入相同值1000.7865。DUMP输出：Typ=2 Len=5: 194,11,1,79,66，两列完全相同。证明FLOAT(126)和NUMBER共享相同的内部存储实现，使用相同的base-100表示法。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531806
+
+     [FaultModel] NUMBER值超出21字节导致溢出错误  (排序分: 9.5)
+     └ 摘要：当NUMBER数据类型表示需要22字节或以上时，Oracle返回溢出错误。根因是NUMBER内部格式限制最大21字节（包括长度字节），超限则报错。影响是数据插入或计算失败。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:323458
+
