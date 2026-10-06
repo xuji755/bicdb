@@ -16,6 +16,12 @@
 //!   **优先级表照抄 PG**（`gram.y`）；语句闭集（REQ-SQL-005 正面清单），
 //!   清单外构造**没有产生式**（REQ-SQL-006 闭集纪律）。
 //!
+//! **S2 已落地**（2026-10-06）：[`bind`]——**名字解析三格**（① 对象命名空间
+//! （自举对象 `obj# ≤ 99` 出局）→ ② 固定表清单 → ③ 其余一律"不存在"）+
+//! **保留名清单**（`$` 结尾 + 预置对象名）+ **版本捕获**（`(obj#, mtime)` /
+//! `(obj#, mtime, status)` 进 [`bind::BoundRefs`]——计划缓存键的成分）；
+//! 目录只读面经 [`bind::CatalogView`] 端口接入（真件 = [`bind::CatalogViewImpl`]）。
+//!
 //! **D1 已落地**（2026-10-06；`doc/DCL语句设计_v0.1.md` §5——**纯解析，先于 S2**）：
 //! DCL 语句面——[`ast::Stmt::VariableSet`]（`ALTER SESSION SET/CLEAR`）、
 //! [`ast::Stmt::AlterSystem`]（F 组：文件系统池三动作）、
@@ -30,6 +36,7 @@
 #![deny(missing_docs)]
 
 pub mod ast;
+pub mod bind;
 pub mod lexer;
 pub mod parser;
 
@@ -42,6 +49,11 @@ pub use ast::{
     Location, NullTest, NullTestType, ObjectType, ParamRef, RangeVar, ResTarget, SelectStmt,
     SetOperation, SortBy, SortByDir, SortByNulls, Stmt, TransactionStmt, TransactionStmtKind,
     TypeCast, TypeName, UpdateStmt, VariableSetKind, VariableSetStmt, WorkRef, WorkspaceSource,
+};
+pub use bind::{
+    check_new_object_name, is_reserved_name, BindError, BoundRefs, CatalogColumn, CatalogIndex,
+    CatalogObject, CatalogView, CatalogViewImpl, NameResolver, NameSpace, ResolvePolicy,
+    ResolvedName, FIXED_TABLES, PRESET_OBJECTS,
 };
 pub use lexer::{tokenize, Keyword, LexError, Punct, Span, Token, TokenKind};
 pub use parser::{parse, parse_many, ParseError};

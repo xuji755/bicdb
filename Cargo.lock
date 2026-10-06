@@ -88,6 +88,14 @@ version = "0.0.0"
 [[package]]
 name = "bicdb-sql"
 version = "0.0.0"
+dependencies = [
+ "bicdb-catalog",
+ "bicdb-common",
+ "bicdb-storage",
+ "bicdb-txn",
+ "bicdb-wal",
+ "bicdb-workspace",
+]
 
 [[package]]
 name = "bicdb-storage"

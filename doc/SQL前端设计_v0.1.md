@@ -216,6 +216,19 @@ object_version(obj#) -> mtime（最后修改的提交序号；计划缓存键的
 索引枚举(表 obj#) -> [(索引 obj#, 键列, 唯一性, status)]
 ```
 
+#### 落地记档（S2，2026-10-06）
+
+- **端口与真件**：`bind::CatalogView`（Binder 的取数口）+ `CatalogViewImpl`
+  （`bicdb-catalog::Catalog` + 语句快照的适配器）；**三格规则在 `bind` 模块、
+  不在实现里**——假件与真件走同一套规则。
+- **`public` 的 `file$`**：普通会话 ⇒ `NotFound`（管理元数据）；admin ⇒ 可见
+  （`ResolvePolicy { is_admin }`；角色模型随会话层落地）。
+- **`user$`/`ws$`/`fs$` 的过滤**：由"**自举对象出局**"天然覆盖（它们 `obj# ≤ 23`）
+  ——不需要另立清单。
+- **预置对象清单**（9 名，`spec/SQL` §0.4）：`memory`/`memory_version`/
+  `task_checkpoint`/`source_record`/`derived_link`/`session`/`asset$`/`ref$`/`audit`
+  ——`CREATE` 一律拒绝（名字保留，将来预置对象建立时不撞名）。
+
 ### 4.2 版本捕获（动作 2）
 
 每个解析到的对象记 `(obj#, mtime)`；每个用到的索引记 `(obj#, mtime, status)`
@@ -422,7 +435,7 @@ cancel(执行句柄) -> 释放锁/页引用/临时空间（走 `ExecContext` 的
 | --- | --- | --- |
 | **S1** ✅ **已落地（2026-10-06；含 PG 对齐返工）** | 词法 + 语法 + Raw AST（L1 缓存随 S6） | ✅ `crates/sql` **v0.2**：`lexer`（token + 字节区间；关键字闭集；**引号标识符**；未引号名照 PG 折叠小写；数字含 `.5`/`1e3` 形态）+ `ast`（**同名同形于 PG 解析节点**的 Raw AST——`SelectStmt`/`InsertStmt`/`AExpr`/`BoolExpr`/`NullTest`/`FuncCall`/`TypeCast`/`CaseExpr`/`ColumnRef`/`AConst`/`RangeVar`/`JoinExpr`/`ResTarget`/`SortBy`/`IndexStmt`/`DropStmt`…，映射表 §3.1）+ `parser`（**照 PG 的产生式删减**、优先级表照抄 gram.y、集合运算 `op/all/larg/rarg` 左深嵌套）。**用例 21**：闭集语料 62 条全解析、**清单外 24 条零接受**（新增 `INSERT…SELECT`/`NULLS FIRST`/`DROP…IF EXISTS`；**D1 后扩到 72/35**）、**PG 形状逐点断言**（`*` 是 `ColumnRef[AStar]`、`IN`/`BETWEEN`/`NULLIF` 走 `A_Expr`、`::` 与 `CAST` 同节点、`VALUES` 走 `values_lists`）、优先级三例（含 `a = 1 BETWEEN 2 AND 3` ⇒ `a = (1 BETWEEN …)` 与 `INTERSECT` 更紧）、折叠两例（未引号小写/引号保留） |
 | **D1** ✅ **已落地（2026-10-06；先于 S2，纯解析）** | 《DCL语句设计》§5 的 D1：DCL 语法与 AST | ✅ `crates/sql`：`Stmt::VariableSet`（`ALTER SESSION SET/CLEAR`——**只开后者拼写**）/`AlterSystem`（F 组三动作）/`AlterDatabase`（W2 克隆 + T 组四动作）+ `WorkRef`/`FsRef` 双形态（**解析只认形态**，名字查找在 ②）；`CreateWorkspaceStmt` **删 `CLONE OF`**（错误文案指向 W2 替代句）；`DropStmt.workspaces`（工作区目标走 `WorkRef`）；**配额键闭集**（data/undo/temp/asset——解析期拒绝）；`ALTER SYSTEM`/`ALTER DATABASE` 未知动作**解析期拒绝**。**用例 +4**：语料扩到 72 条（DCL 19 条）+ 清单外 35 条（含 `CLONE OF`/`ALTER SYSTEM SWITCH LOGFILE`/`ALTER DATABASE RENAME`/非法配额键/`ALLOCATE = MAYBE`/裸 `SET`）+ DCL 形状逐点断言 + 闭集文案两例 |
-| **S2** | Catalog 只读面 + 名字解析三格 + 版本捕获 | 跨区名不可区分；保留名拒绝；`(obj#, mtime)` 被记入 Bound（断点查验） |
+| **S2** ✅ **已落地（2026-10-06）** | Catalog 只读面 + 名字解析三格 + 版本捕获 | ✅ `crates/sql::bind`——[`bind::CatalogView`] 端口（真件 `CatalogViewImpl` 接 `bicdb-catalog::Catalog` + 语句快照）+ `NameResolver`（**三格**：① 对象命名空间（**自举对象 `obj# ≤ 99` 出局**）→ ② 固定表清单（`file$`/`session$`/`lock$`；**写目标无此格**——只读 = 没有入口）→ ③ 其余一律 `NotFound`）+ **保留名清单**（`$` 结尾 + 预置对象九名）+ `BoundRefs` 版本捕获（`(obj#, mtime)` / `(obj#, mtime, status)`）。**验收（真件）**：跨区名与"从未存在"**同一错误种类**（文案不含暗示）；保留名拒绝；解析即捕获版本，`Move` 失效后 `(obj#, mtime, status)` 变化 ⇒ **键失配可观测**（断点查验）。用例：单元 7（假件测全三格/不可区分/固定表/公开区 `file$`）+ 真件 1（A/B 两区 + DDL + Move 失效）。**两处记档**：`(obj#, mtime, status)` 里 `mtime` 对索引暂标 0（由 `object_version` 单取——索引版本随其对象行）；`CatalogViewImpl` 构造时固定语句快照（`NameResolver` 随语句走） |
 | **S3** | Binder：类型推导 / 参数定型 / 写目标 / 登记点 | 类型错误全在绑定期；参数推导失败拒绝；写固定表/public 拒绝 |
 | **S4** | 逻辑表示 + 白名单变换 | 与**直译执行器**两路差分（无优化 vs 优化，逐行一致）；四条不变量各有用例 |
 | **S5** | 物理计划 + 接入 `bicdb-exec` | 全算子闭集覆盖；同一语义计划的开/关优化结果一致；真表端到端（含 DML 与快照） |
