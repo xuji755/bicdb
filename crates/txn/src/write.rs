@@ -98,6 +98,12 @@ pub enum TxnError {
         /// 环上事务（诊断/日志；从环的顺序给出）。
         cycle: Vec<bicdb_storage::undo::TxnId>,
     },
+    /// **本事务已预约过提交序号**（重复预约）；
+    /// 预约要么用掉（提交）要么作废（回滚），不能在途叠加。
+    AlreadyReserved {
+        /// 已预约的序号。
+        reserved: CommitSeq,
+    },
     /// **等待次数超限**（会话级参数；默认不设限 = 等到底，死锁检测兜底）。
     LockTimeout {
         /// 持锁者。
@@ -142,6 +148,9 @@ impl std::fmt::Display for TxnError {
             TxnError::LockTimeout { holder, row } => {
                 write!(f, "等行 {row:?} 超过等待次数上限（持锁者 {holder:?}）")
             }
+            TxnError::AlreadyReserved { reserved } => {
+                write!(f, "本事务已预约提交序号 {reserved}（预约不能用两次）")
+            }
         }
     }
 }
@@ -180,6 +189,12 @@ pub struct Txn {
     pub snapshot: CommitSeq,
     /// 状态（内存镜像；真值在事务表槽）。
     pub state: TxnState,
+    /// **预约的提交序号**（`reserve_commit_seq`；`None` = 提交时现取）。
+    ///
+    /// 预约的用途：`mtime` 必须在提交**前**写进字典行（`目录详设` §5.2 ⑧）——
+    /// 提交序号在那里就要知道。**提交必须用预约号**；回滚则预约号作废
+    /// （**跳号无害**——序号空间的既有口径）。
+    pub reserved_seq: Option<CommitSeq>,
 }
 
 impl Txn {
@@ -208,6 +223,7 @@ pub fn begin(
         slot,
         snapshot,
         state: TxnState::Active,
+        reserved_seq: None,
     };
     let key = undo_page_key(chain, 0)?;
     write_undo_page_change(

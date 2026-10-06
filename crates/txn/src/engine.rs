@@ -81,8 +81,11 @@ pub struct Engine<'a, 'b, 'io, 'f> {
     snapshots: Mutex<SnapshotRegistry>,
     /// 行锁的等待门（§5.4.2）。
     gate: WaitGate,
-    /// 当前提交序号（已发布的最大值；`begin` 的语句快照取它）。
+    /// 当前提交序号（**已发布**的最大值；`begin` 的语句快照取它）。
     current_seq: Mutex<CommitSeq>,
+    /// **下一个可用提交序号**（预约与提交共用这一个号源——
+    /// 预约取走的号，提交时不再另取）。
+    next_seq: Mutex<CommitSeq>,
     /// 等锁策略（挂起时长 / 死锁阈值 / 等待上限）。
     policy: WaitPolicy,
 }
@@ -121,6 +124,7 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
             snapshots: Mutex::new(SnapshotRegistry::new()),
             gate: WaitGate::new(),
             current_seq: Mutex::new(initial_seq),
+            next_seq: Mutex::new(initial_seq),
             policy: WaitPolicy::default(),
         }
     }
@@ -187,19 +191,56 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         write::rollback_to_mark(self.pool, &mut wal, &mut chain, &mut txn.txn, handle.mark)
     }
 
+    /// **取号**（内部）：预约与提交共用——号只发一次。
+    fn take_seq(&self) -> Result<CommitSeq, TxnError> {
+        let mut next = self.next_seq.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = CommitSeq::from_raw(next.as_raw() + 1).ok_or(TxnError::StaleCache)?;
+        *next = seq;
+        Ok(seq)
+    }
+
+    /// **预约提交序号**（`目录详设` §5.2 ⑧ 的引擎侧增量）。
+    ///
+    /// 用途：`mtime` 必须在提交**前**写进字典行——提交序号在那里就要知道。
+    /// 语义三条：
+    /// - **原子取号**：从与提交同一个号源取，取走即占用（别的提交/预约**顺延**）；
+    /// - **保证**：本事务此后 `commit` **一定**用这个号（回滚则作废，**跳号无害**）；
+    /// - **一次一发**：重复预约 ⇒ [`TxnError::AlreadyReserved`]（不静默换号）。
+    ///
+    /// **使用约束（记档）**：预约号按序使用效果最好——预约与提交的**出现序**
+    /// 应一致；倒序（先预约的晚提交）不会让已发布水位回退（发布取 `max`），
+    /// 但那段时间内"序号已发布而事务未提交"的窗口里，新快照看见的是
+    /// **已提交的那部分**（提交可见性以提交记录为准，与水位无关）。
+    /// 单写者语义（DDL 路径）下这一条自然成立。
+    pub fn reserve_commit_seq(&self, txn: &mut TxnHandle) -> Result<CommitSeq, TxnError> {
+        if let Some(reserved) = txn.txn.reserved_seq {
+            return Err(TxnError::AlreadyReserved { reserved });
+        }
+        let seq = self.take_seq()?;
+        txn.txn.reserved_seq = Some(seq);
+        Ok(seq)
+    }
+
     /// **提交**：提交记录入流 + 等它耐久（提交点）→ 发布新提交序号 →
     /// **唤醒等待者**（§5.4.2 ③ 的后半步）。返回提交序号。
+    ///
+    /// 序号来源：**预约过就用预约号**（§5.2 ⑧），否则现取（号源同一）。
     pub fn commit(&self, txn: &mut TxnHandle) -> Result<CommitSeq, TxnError> {
-        let seq = {
-            let cur = *self.current_seq.lock().unwrap_or_else(|e| e.into_inner());
-            CommitSeq::from_raw(cur.as_raw() + 1).ok_or(TxnError::StaleCache)?
+        let seq = match txn.txn.reserved_seq.take() {
+            Some(reserved) => reserved,
+            None => self.take_seq()?,
         };
         {
             let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
             let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             write::commit(self.pool, &mut wal, &mut chain, &mut txn.txn, seq)?;
         }
-        *self.current_seq.lock().unwrap_or_else(|e| e.into_inner()) = seq;
+        // **发布取 max**：倒序提交不让水位回退（使用约束见 `reserve_commit_seq`）。
+        let mut cur = self.current_seq.lock().unwrap_or_else(|e| e.into_inner());
+        if seq > *cur {
+            *cur = seq;
+        }
+        drop(cur);
         self.gate.wake(txn.txn.txn_id);
         Ok(seq)
     }
@@ -211,6 +252,8 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
             let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             write::rollback(self.pool, &mut wal, &mut chain, &mut txn.txn)?
         };
+        // 预约号**随回滚作废**（§5.2 ⑧：跳号无害；不留给死句柄复用）。
+        txn.txn.reserved_seq = None;
         let _ = self.gate.cancel(txn.txn.txn_id);
         self.gate.wake(txn.txn.txn_id);
         Ok(count)
@@ -434,6 +477,49 @@ mod tests {
     }
 
     use bicdb_storage::heap::InsertPolicy;
+
+    #[test]
+    fn reserved_commit_seq_is_honored_and_blocks_later_commits() {
+        let (engine, key) = engine();
+        // A 预约 1；B（未预约）提交 ⇒ 必须**顺延**到 2（号源同一个）。
+        let mut a = engine.begin().unwrap();
+        let ra = engine.reserve_commit_seq(&mut a).unwrap();
+        assert_eq!(ra, seq(1), "首次预约取 1");
+        assert!(
+            matches!(
+                engine.reserve_commit_seq(&mut a),
+                Err(TxnError::AlreadyReserved { reserved }) if reserved == seq(1)
+            ),
+            "重复预约具名拒绝"
+        );
+        let mut b = engine.begin().unwrap();
+        engine
+            .insert_row(&mut b, key, &row_bytes(b"b"), &InsertPolicy::in_place(0))
+            .unwrap();
+        assert_eq!(engine.commit(&mut b).unwrap(), seq(2), "未预约者顺延");
+        // A 用预约号提交（即便晚于 B）。
+        engine
+            .insert_row(&mut a, key, &row_bytes(b"a"), &InsertPolicy::in_place(0))
+            .unwrap();
+        assert_eq!(engine.commit(&mut a).unwrap(), seq(1), "预约号被履行");
+        // 之后的新事务继续在号源之后取号。
+        let mut c = engine.begin().unwrap();
+        assert_eq!(engine.commit(&mut c).unwrap(), seq(3));
+    }
+
+    #[test]
+    fn a_rolled_back_reservation_burns_its_number() {
+        let (engine, _key) = engine();
+        let mut a = engine.begin().unwrap();
+        assert_eq!(engine.reserve_commit_seq(&mut a).unwrap(), seq(1));
+        engine.rollback(&mut a).unwrap();
+        // 跳号：下一个提交拿 2（**跳号无害**——序号空间的既有口径）。
+        let mut b = engine.begin().unwrap();
+        assert_eq!(engine.commit(&mut b).unwrap(), seq(2));
+        // 回滚后句柄的预约已作废：同号不复用、也不再被 AlreadyReserved 拦。
+        let mut c = engine.begin().unwrap();
+        assert_eq!(engine.reserve_commit_seq(&mut c).unwrap(), seq(3));
+    }
 
     #[test]
     fn begin_commit_rollback_and_snapshots_through_the_engine() {
