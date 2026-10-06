@@ -1,0 +1,42 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] Memoize 参数化 缓存 嵌套循环 内表
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 34，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 23，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     参数化嵌套循环缓存：外表重复连接键时，内表索引扫描通过Result Cache缓存结果，后续相同键直接返回，演示中缓存命中99000次，大幅提升性能。 分类：概念
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 参数化嵌套循环缓存  (排序分: 9.4)
+     └ 详情：参数化嵌套循环缓存：外表重复连接键时，内表索引扫描通过Result Cache缓存结果，后续相同键直接返回，演示中缓存命中99000次，大幅提升性能。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1215590
+
+     [KnowledgeEntry] 嵌套循环连接内表结果缓存（enable_memorize）  (排序分: 9.4)
+     └ 详情：PostgreSQL 14为参数化嵌套循环连接引入了结果缓存机制，通过enable_memorize参数控制。对于inner侧重复扫描相同参数值的情况，缓存结果可避免重复计算，尤其在不同值少、每个值查找次数多时效果明显。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1476450
+
+     [KnowledgeEntry] 嵌套循环连接  (排序分: 9.4)
+     └ 详情：嵌套循环连接：嵌套循环连接适合小表驱动大表的场景，简单但性能较差。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1258586
+
+     [KnowledgeEntry] Memoize缓存嵌套循环重复键的机制（PG14+）  (排序分: 9.4)
+     └ 摘要：PG14+的Memoize在参数化嵌套循环内层建缓存，缓存预算使用get_hash_memory_limit()（nodeMemoize.c:1039），超限走LRU驱逐而非落盘（nodeMemoize.c:577-615），缓存命中可避免重复扫描内层。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:988815
+
+     [CaseStudy] 嵌套循环缓存示例  (排序分: 9.1)
+     └ 摘要：诊断：嵌套循环缓存示例，外表hundredk有100000行，thousand列仅1000个不同值。不加缓存时选Merge Join，加缓存后Nested Loop更优，内表仅扫描1000次，缓存命中99000次。处理：合理使用Result Cache优化重复扫描。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1488068
+
+     [FaultModel] 嵌套循环耗时  (排序分: 8.6)
+     └ 摘要：嵌套循环耗时
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1292224
+

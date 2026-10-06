@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed
+  名称: Memoize缓存嵌套循环重复键的机制（PG14+）
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:988815
+
+  ── 描述 ──
+  Memoize适用于内层参数化的嵌套循环。它在参数键与内层结果之间建立缓存，同一参数键第二次出现时直接命中缓存，避免重复扫描内层。缓存容量由est_entries决定，执行期按此建哈希表（nodeMe
+  moize.c:1171-1176）。容量不足时不像Hash落盘，而是LRU驱逐最久未用的条目，溢出表现为命中率下降而非IO增加。EXPLAIN中Memoize节点有Hits/Misses/Evict
+  ions/Overflows四个计数（explain.c:3647），Hits占比低说明缓存没价值或est_entries估错。典型受益场景是低基数小维度表join大事实表。
+
+  ── 摘要 ──
+  PG14+的Memoize在参数化嵌套循环内层建缓存，缓存预算使用get_hash_memory_limit()（nodeMemoize.c:1039），超限走LRU驱逐而非落盘（nodeMemoize.c:577-615），缓存命中可避免重复扫描内层。

@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: ROWNUM分页使用COUNT STOPKEY和SORT ORDER BY STOPKEY
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2065263
+
+  ── 描述 ──
+  执行计划步骤1 COUNT STOPKEY过滤ROWNUM<=20，步骤3 SORT ORDER BY
+  STOPKEY也过滤ROWNUM<=20。Oracle将外层ROWNUM条件下推到排序步骤，使排序只需保留前20行，但仍需扫描所有匹配的950K行。
+
+  ── 摘要 ──
+  外层ROWNUM<=20由COUNT STOPKEY过滤，内层排序通过SORT ORDER BY STOPKEY在保留前20行后停止，两个步骤的Predicate Information均显示filter(ROWNUM<=20)。

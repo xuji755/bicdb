@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] HashAggregate 溢出 磁盘 分区 spill
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 16，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 27，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 6，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     该案例关注 PG18 的 AIO 特性对磁盘读取的加速效果，说明通过异步执行多个 I/O 请求来提高读取效率。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] PG18 AIO 加速磁盘读取  (排序分: 9.4)
+     └ 详情：该案例关注 PG18 的 AIO 特性对磁盘读取的加速效果，说明通过异步执行多个 I/O 请求来提高读取效率。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1454609
+
+     [KnowledgeEntry] PostgreSQL 18 异步 I/O 加速磁盘读取  (排序分: 9.4)
+     └ 摘要：pganalyze 文章介绍 PostgreSQL 18 引入异步 I/O，通过 io_method=io_uring/worker 等方式加速磁盘读取，减少 IO 等待。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1467477
+
+     [KnowledgeEntry] BUFFERS 的 shared hit 是缓冲区访问量而非磁盘读取量  (排序分: 9.4)
+     └ 摘要：EXPLAIN (ANALYZE, BUFFERS) 输出的 shared hit=11 表示共享缓冲区命中 11 次、约 88 KiB 的缓冲区访问量（11 块 × 8 KiB），不应直接理解为实际磁盘读取量。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3267404
+
+     [KnowledgeEntry] 多后端并发读单次磁盘IO机制  (排序分: 9.4)
+     └ 摘要：当多个后端并发读同一未缓存页时，只有第一个StartBufferIO返回true并执行磁盘读取，其余后端在WaitIO中等待BM_VALID，确保磁盘只读一次。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2070169
+
+     [CaseStudy] Hash Match Spill  (排序分: 8.8)
+     └ 摘要：Hash Match Spill 现象，根因是哈希操作所需内存超出可用内存（即便统计信息已完整更新），导致溢出到磁盘，影响查询性能下降，典型场景为海量数据关联或内存资源不足。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1227069
+
+     [FaultModel] HashAggregate内存溢出和spill  (排序分: 8.6)
+     └ 摘要：HashAggregate因分组数或哈希表内存超过work_mem（受hash_mem_multiplier影响）导致batch和spill。EXPLAIN ANALYZE中HashAggregate显示Batches非1，或有spill信息。可增大work_mem或减少分组数。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1289875
+

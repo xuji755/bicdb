@@ -1,0 +1,45 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] Incremental Sort 增量排序 前缀 有序 LIMIT
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 55，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 61，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 45，摘要筛选通过 44，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     增量排序启动延迟收益：普通Sort需读完所有输入才能输出；Incremental Sort第一组排完即可输出，对LIMIT查询尤为有利。但若LIMIT很大或每组规模巨大，收益递减。建议在查询带LIMIT且前缀有序时使用，并测试实际性能。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 增量排序启动延迟收益  (排序分: 10.0)
+     └ 详情：增量排序启动延迟收益：普通Sort需读完所有输入才能输出；Incremental Sort第一组排完即可输出，对LIMIT查询尤为有利。但若LIMIT很大或每组规模巨大，收益递减。建议在查询带LIMIT且前缀有序时使用，并测试实际性能。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1235140
+
+     [KnowledgeEntry] 增量排序对LIMIT的收益原理  (排序分: 10.0)
+     └ 详情：增量排序对LIMIT的收益原理：普通Sort必须先排序全部数据才能输出前N行；Incremental Sort逐步输出，LIMIT越小收益越明显。官方回归测试明确此目标。若LIMIT接近全量数据，收益有限，甚至因分组开销变差。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1235143
+
+     [KnowledgeEntry] EXPLAIN Incremental Sort  (排序分: 10.0)
+     └ 详情：EXPLAIN Incremental Sort：增量排序在部分排序键上使用索引保证前缀有序，减少内存和溢出可能，尤其适用于LIMIT。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:24137
+
+     [KnowledgeEntry] PostgreSQL_18_mergejoin_增量排序_执行计划示例  (排序分: 10.0)
+     └ 详情：PostgreSQL_18_mergejoin_增量排序_执行计划示例：查询示例：select * from (select * from tenk1 order by four) t1 join tenk1 t2 on ... order by t1.four, t1.two limit 1; 执行计划显示 Limit -> Merge Join -> Incremental Sort 等步骤。
+分类：案例
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:559308
+
+     [CaseStudy] t3表GIN索引LIMIT实验  (排序分: 10.0)
+     └ 详情：案例：t3表GIN索引LIMIT实验
+摘要：EXPLAIN显示Bitmap Index Scan扫描10000行，即使LIMIT 1也扫描全部。GIN索引必须走Bitmap Scan无法提前终止，导致LIMIT慢。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1487707
+
+     [FaultModel] Advisory lock not released due to inappropriate LIMIT usage  (排序分: 9.5)
+     └ 摘要：Advisory lock not released due to inappropriate LIMIT usage：使用pg_advisory_lock()与LIMIT而未用子查询，可能导致锁被错误行获取而无法释放。锁保持到会话结束，在pg_locks中可见。建议在子查询中使用LIMIT。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1289507
+

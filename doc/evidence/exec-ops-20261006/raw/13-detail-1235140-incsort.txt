@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 增量排序启动延迟收益
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1235140
+
+  ── 描述 ──
+  增量排序启动延迟收益：普通Sort需读完所有输入才能输出；Incremental
+  Sort第一组排完即可输出，对LIMIT查询尤为有利。但若LIMIT很大或每组规模巨大，收益递减。建议在查询带LIMIT且前缀有序时使用，并测试实际性能。 分类：原理
+
+  ── 摘要 ──
+  增量排序启动延迟收益：普通Sort需读完所有输入才能输出；Incremental Sort第一组排完即可输出，对LIMIT查询尤为有利。但若LIMIT很大或每组规模巨大，收益递减。建议在查询带LIMIT且前缀有序时使用，并测试实际性能。

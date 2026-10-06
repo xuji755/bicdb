@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed
+  名称: PG18 hash join批次回退walk-back机制
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:988820
+
+  ── 描述 ──
+  传统批次计算忽略每批次两个BufFile的BLCKSZ缓冲，旧逻辑对大内表可能无解。PG18 commit aa151022e（Tomas
+  Vondra）在nodeHash.c:851-939实现walk-back循环，每次减半nbbatch同时将nbuckets×2、num_skew_mcvs×2、space_allowed×2，并检查
+  溢出（MaxAllocSize/SIZE_MAX）。注释明确只减批次，不主动加批次。执行期函数ExecHashIncreaseBatchSize（nodeHash.c:998）遵循同一逻辑：space
+  Allowed<=2*nbatch*BLCKSZ时翻倍哈希表预算而非批次。
+
+  ── 摘要 ──
+  PG18修复hash join内存选择：总内存公式(inner_rel_bytes/nbatch)+(2*nbatch*BLCKSZ)呈U形，walk-back循环减半批次并翻倍nbuckets/num_skew_mcvs/space_allowed，带MaxAllocSize溢出防护，只减批次绝不主动加批次。

@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: PG18 新增 Index Searches 索引扫描次数统计
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2288804
+
+  ── 描述 ──
+  EXPLAIN 新增索引扫描次数统计，用于让开发者精确了解索引使用效率。示例输出为：Index Scan using orders_pkey on orders / Index Searches: 1
+  / Buffers: shared hit=2 read=2。原文洞察指出：执行了 1 次 orders_pkey 索引扫描，并从缓存中访问了 2
+  个共享缓冲区，清晰显示了索引的使用效率。该指标可与索引条件（Index Cond: (order_id > 49900)）联合判断索引是否被有效使用及一次扫描的缓冲区成本。
+
+  ── 摘要 ──
+  PG18 EXPLAIN 新增索引扫描次数统计：Index Scan using orders_pkey on orders 节点下显示 Index Searches: 1，明确索引查找次数，配合 Buffers: shared hit=2 read=2 可精确了解索引使用效率。

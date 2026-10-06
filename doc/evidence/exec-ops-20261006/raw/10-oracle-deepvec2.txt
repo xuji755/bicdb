@@ -1,0 +1,39 @@
+
+============================================================
+  [问题诊断] In-Memory 深度向量化 21c 哈希连接 批量 SIMD
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 12，摘要筛选通过 11，批次 1；本路已取尽
+  CaseStudy：已取 1，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     SIMD是一种处理器能力，允许单个指令对多个数据作为一个向量进行处理。例如，一次加法运算可处理四组数字，避免四次循环。SIMD处理常被称为向量化。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] SIMD（单指令多数据）向量处理  (排序分: 10.0)
+     └ 详情：SIMD单元使CPU能以向量为单位处理数据。Oracle数据库利用SIMD提高In-Memory列存储的扫描性能，通过加载多个列条目到向量寄存器并用一条指令评估，实现每秒数十亿行的扫描能力。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:519184
+
+     [KnowledgeEntry] Oracle Database In-Memory的SIMD向量扫描加速  (排序分: 10.0)
+     └ 详情：在Oracle In-Memory列存储中，数据填充后，数据库采用SIMD向量处理。CPU将一组列值加载到向量寄存器，对整组数据执行单条指令，从而大幅提高扫描吞吐量。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:519183
+
+     [KnowledgeEntry] Oracle 列式存储与 In-Memory  (排序分: 10.0)
+     └ 详情：Oracle列式存储与In-Memory：在内存中以列格式存储，支持压缩和SIMD向量处理，加速分析查询。适合聚合和扫描操作。开启In-Memory需额外许可。监控内存分配。概念 arch perf In-Memory Column Store Columnar SIMD
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1532695
+
+     [KnowledgeEntry] Exadata Smart Flash Cache的纯列格式与SIMD谓词  (排序分: 10.0)
+     └ 详情：Exadata Smart Scan利用SIMD谓词进行加速。数据以纯列格式存储于闪存缓存中，使得扫描操作能够借助向量处理，达到类似DRAM的高吞吐，将内存级性能延伸至闪存存储。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:519193
+
+     [KnowledgeEntry] SIMD矢量指令的优势  (排序分: 10.0)
+     └ 摘要：SIMD矢量指令存在于所有现有CPU中，在现有硬件之上不需要进一步增加成本、复杂性或功耗。它受益于CPU插槽中的超大缓存和内存带宽的完全访问权限。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2229137
+
+     [KnowledgeEntry] 3.2 21c 关键性能特性总结  (排序分: 9.7)
+     └ 摘要：Oracle 21c 引入多项关键性能特性，旨在自动化管理和优化数据库性能。自动索引功能可自动创建、监控并维护索引，并支持存储分层 ADO 策略；自动 In-Memory 无需手动配置即可管理 IM 列存储，配合 In-Memory 混合扫描同时利用列式和行式存储执行查询。内存向量化连接通过 SIMD 技术加速连接操作；自动 Zone Maps 自动创建和维护数据修剪结构；自动物化视图和自动 SQL 调优集分别实现物化视图的自动创建与 SQL 的持续调优收集。此外，持久内存数据库利用 PMEM 加速数据库操作。这些特性减少了手动干预，提升了查询与分析效率。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:364538
+
