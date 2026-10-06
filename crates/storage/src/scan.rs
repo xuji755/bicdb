@@ -21,8 +21,12 @@ use bicdb_common::seq::CommitSeq;
 use crate::buffer::{BufferError, BufferPool};
 use crate::cr::{self, CrError};
 use crate::heap;
+use crate::page::Page;
 use crate::rowid::{Rdba, RowId};
 use crate::undo::UndoChain;
+
+/// 顺序扫描的**区读上限**（§5.12：一次 `pread` ≤ 8 页 = 128 KiB）。
+pub const SCAN_RUN_PAGES: u32 = 8;
 
 /// 扫描原语错误。
 #[derive(Debug)]
@@ -41,6 +45,18 @@ pub enum ScanError {
         /// 请求的块地址。
         rdba: Rdba,
     },
+    /// 区读返回的页数与请求不符（**响亮失败**——绝不静默少读）。
+    ShortRun {
+        /// 请求的页数。
+        expected: u32,
+        /// 实际拿到的页数。
+        got: usize,
+    },
+    /// 扫描块号编不出 ROWID（越域；段页表给错）。
+    BadBlock {
+        /// 块号。
+        block: u32,
+    },
 }
 
 impl std::fmt::Display for ScanError {
@@ -55,6 +71,10 @@ impl std::fmt::Display for ScanError {
                 rdba.file_id(),
                 rdba.block_id()
             ),
+            ScanError::ShortRun { expected, got } => {
+                write!(f, "扫描：区读请求 {expected} 页、只拿到 {got} 页")
+            }
+            ScanError::BadBlock { block } => write!(f, "扫描：块号 {block} 编不出 ROWID"),
         }
     }
 }
@@ -136,6 +156,146 @@ pub fn fetch_block_rows(
         .iter()
         .map(|n| heap::row(&cr_page, *n).map(<[u8]>::to_vec))
         .collect())
+}
+
+/// **顺序扫描游标**（全表扫描的存储服务口；执行器不碰页）。
+///
+/// - 按**区**读（连续块成组，≤ [`SCAN_RUN_PAGES`] 页一次 `pread`，§5.12）；
+/// - 每块**一次 CR 块重建**（§12.3：整块还原到快照版本），逐槽提取行；
+/// - **可见性由本服务负责**（执行器不得推测）：返回的每一行都是"快照下
+///   存在"的行——已删 / 未提交 / 槽已复用 ⇒ 不返回（与 [`fetch_rows`]
+///   同语义）；行内片段链的重装在行提取之后（`fetch` 语义）。
+///
+/// 块列表由调用方给（段侧 [`crate::segment::Segment::data_blocks`]，`bound`
+/// 按表类型选，§4.3.1）；扫描范围的**上界语义**因此留在调用方。
+pub struct HeapScanner<'a, 'b, 'io, 'f> {
+    pool: &'a BufferPool<'b>,
+    chain: &'a UndoChain<'io, 'f>,
+    snapshot: CommitSeq,
+    workspace: [u8; 8],
+    file_id: u16,
+    /// 待扫物理块（升序）。
+    blocks: Vec<u32>,
+    /// 下一个待发起的区读下标。
+    at: usize,
+    /// 当前区读的剩余页（与 `run_blocks` 同序）。
+    run: std::collections::VecDeque<Page>,
+    /// 当前区读各页对应的块号。
+    run_blocks: std::collections::VecDeque<u32>,
+    /// 当前页的待发行。
+    pending: std::collections::VecDeque<(RowId, Vec<u8>)>,
+    /// 诊断：区读次数。
+    pub runs: u64,
+    /// 诊断：读入页数。
+    pub pages_read: u64,
+    /// 诊断：CR 重建次数（每块一次）。
+    pub cr_rebuilds: u64,
+}
+
+impl std::fmt::Debug for HeapScanner<'_, '_, '_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeapScanner")
+            .field("remaining_blocks", &(self.blocks.len() - self.at))
+            .field("runs", &self.runs)
+            .field("cr_rebuilds", &self.cr_rebuilds)
+            .finish()
+    }
+}
+
+impl<'a, 'b, 'io, 'f> HeapScanner<'a, 'b, 'io, 'f> {
+    /// 打开游标（块列表 = 待扫数据页，升序；空列表 ⇒ 立即扫完）。
+    #[must_use]
+    pub fn new(
+        pool: &'a BufferPool<'b>,
+        chain: &'a UndoChain<'io, 'f>,
+        snapshot: CommitSeq,
+        file_id: u16,
+        blocks: Vec<u32>,
+    ) -> Self {
+        let workspace = chain.segment().workspace_ref();
+        Self {
+            pool,
+            chain,
+            snapshot,
+            workspace,
+            file_id,
+            blocks,
+            at: 0,
+            run: std::collections::VecDeque::new(),
+            run_blocks: std::collections::VecDeque::new(),
+            pending: std::collections::VecDeque::new(),
+            runs: 0,
+            pages_read: 0,
+            cr_rebuilds: 0,
+        }
+    }
+
+    /// 取下一行（ROWID + 行字节）。`None` = 扫完。
+    pub fn next_row(&mut self) -> Result<Option<(RowId, Vec<u8>)>, ScanError> {
+        loop {
+            if let Some(item) = self.pending.pop_front() {
+                return Ok(Some(item));
+            }
+            let page = match self.run.pop_front() {
+                Some(p) => p,
+                None => {
+                    if !self.start_run()? {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+            };
+            let block = self.run_blocks.pop_front().expect("页与块同序");
+            // 块引用自证（串页防线）：页头必须与请求一致。
+            match page.header() {
+                Some(h) if h.block_id == block && h.file_id == self.file_id => {}
+                _ => return Err(ScanError::BadBlock { block }),
+            }
+            // **一次 CR 块重建**服务本块全部行（§12.3）。
+            let cr_page = cr::reconstruct(&page, self.snapshot, self.chain)?;
+            self.cr_rebuilds += 1;
+            let slots = cr_page.slot_count();
+            for row_no in 1..=slots {
+                if let Some(bytes) = heap::row(&cr_page, row_no) {
+                    let rid = RowId::from_parts(self.file_id, block, row_no)
+                        .map_err(|_| ScanError::BadBlock { block })?;
+                    self.pending.push_back((rid, bytes.to_vec()));
+                }
+            }
+        }
+    }
+
+    /// 发起下一个区读（连续块成组）。返回是否还有块。
+    fn start_run(&mut self) -> Result<bool, ScanError> {
+        if self.at >= self.blocks.len() {
+            return Ok(false);
+        }
+        let first = self.blocks[self.at];
+        let mut count = 1u32;
+        while self.at + (count as usize) < self.blocks.len()
+            && self.blocks[self.at + count as usize] == first + count
+            && count < SCAN_RUN_PAGES
+        {
+            count += 1;
+        }
+        let rdba =
+            Rdba::from_parts(self.file_id, first).ok_or(ScanError::BadBlock { block: first })?;
+        let pages = self.pool.read_run(self.workspace, rdba, count)?;
+        if pages.len() != count as usize {
+            return Err(ScanError::ShortRun {
+                expected: count,
+                got: pages.len(),
+            });
+        }
+        for i in 0..count {
+            self.run_blocks.push_back(first + i);
+        }
+        self.at += count as usize;
+        self.runs += 1;
+        self.pages_read += u64::from(count);
+        self.run = pages.into();
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

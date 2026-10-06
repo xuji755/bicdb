@@ -984,6 +984,26 @@ impl<'io, 'f> Segment<'io, 'f> {
     // `append_only` 取 [`Segment::append_position`]——表类型在目录/表选项里，
     // 段层不重复存；扫描方在 `[0, bound)` 上做区读（§5.12）。
 
+    /// **数据页的物理块列表**（升序；`[1, bound)` 的逻辑页，排除段头页与段内
+    /// 位图页）——全表扫描 / FFS 的枚举口（§9.1.6、§5.12）。
+    ///
+    /// `bound` 由调用方按表类型选（§4.3.1：`in_place` 取 [`Segment::hwm`]、
+    /// `append_only` 取 [`Segment::append_position`]）——段层不替调用方选。
+    #[must_use]
+    pub fn data_blocks(&self, bound: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for logical in 1..bound {
+            if self.is_bitmap_page(logical) {
+                continue;
+            }
+            if let Some(block) = self.logical_block(logical) {
+                out.push(block);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// **计划推进高水位**（**只增**；§4.3.1）：返回段头页的（前像、后像）——
     /// 调用方经池写 redo（系统操作，§11.5.3）。**降低 HWM 直接拒绝**（只有
     /// TRUNCATE/重组类独占操作可以降，走独立入口）。

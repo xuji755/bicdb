@@ -24,6 +24,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bicdb-exec"
+version = "0.0.0"
+dependencies = [
+ "bicdb-common",
+ "bicdb-storage",
+ "bicdb-txn",
+ "bicdb-types",
+ "bicdb-wal",
+ "bicdb-workspace",
+]
+
+[[package]]
 name = "bicdb-graph"
 version = "0.0.0"
 
