@@ -383,15 +383,21 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
             kind,
             qual,
             build_width,
-        } => Box::new(crate::hash_join::HashJoin::new(
-            build(build_side, env, open_cursor)?,
-            build(probe_side, env, open_cursor)?,
-            build_keys.clone(),
-            probe_keys.clone(),
-            *kind,
-            qual.clone(),
-            *build_width,
-        )),
+        } => {
+            let op = crate::hash_join::HashJoin::new(
+                build(build_side, env, open_cursor)?,
+                build(probe_side, env, open_cursor)?,
+                build_keys.clone(),
+                probe_keys.clone(),
+                *kind,
+                qual.clone(),
+                *build_width,
+            );
+            match env.spill {
+                Some(space) => Box::new(op.with_spill(space)),
+                None => Box::new(op),
+            }
+        }
         PlanNode::NestedLoop {
             outer,
             inner,
