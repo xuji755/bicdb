@@ -87,6 +87,7 @@ pub mod dbwr;
 pub mod fragment;
 pub mod heap;
 pub mod itl;
+pub mod key;
 pub mod page;
 pub mod pagefile;
 pub mod row;
