@@ -7,8 +7,8 @@
 mod common;
 
 use bicdb_exec::{
-    build, collect, ColKind, ExecContext, ExecError, Expr, OpStat, Row, RowCursor, SelectQuery,
-    SortKey, Value, WorkAreaOutcome, WorkAreaStats,
+    build, collect, ColKind, ExecContext, ExecEnv, ExecError, Expr, OpStat, Row, RowCursor,
+    SelectQuery, SortKey, Value, WorkAreaOutcome, WorkAreaStats,
 };
 use bicdb_storage::scan::HeapScanner;
 
@@ -204,7 +204,11 @@ fn work_memory_budget_is_enforced_and_counted() {
         fx.blocks.clone(),
     ));
     let mut open = |_src| Ok(Box::new(cursor.take().expect("单次扫描")) as Box<dyn RowCursor>);
-    let mut op = build(&plan, &mut open).unwrap();
+    let env = ExecEnv {
+        pool: fx.pool,
+        chain: &fx.chain,
+    };
+    let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx = ExecContext::new(fx.snapshot).with_work_memory_budget(Some(1 << 20));
     let rows_out = collect(op.as_mut(), &mut cx).unwrap();
     assert_eq!(rows_out.len(), 20);

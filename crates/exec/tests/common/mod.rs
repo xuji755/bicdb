@@ -7,15 +7,15 @@ use std::path::Path;
 
 use bicdb_common::seq::{CommitSeq, Lsn};
 use bicdb_exec::{
-    build, collect, encode_row, execute_direct, ColKind, ExecContext, ExecError, OpStat, Row,
-    RowCursor, RowShape, SelectQuery, Value, WorkAreaStats,
+    build, collect, encode_row, execute_direct, ColKind, ExecContext, ExecEnv, ExecError, OpStat,
+    Row, RowCursor, RowShape, SelectQuery, Value, WorkAreaStats,
 };
 use bicdb_storage::buffer::{BufferKey, BufferPool, WalGuard};
 use bicdb_storage::controlfile::{ArchiveRecord, ControlFile, RedoEntries, WorkspaceEntry};
 use bicdb_storage::datafile::DataFile;
 use bicdb_storage::heap::InsertPolicy;
 use bicdb_storage::page::{Page, PageType};
-use bicdb_storage::rowid::Rdba;
+use bicdb_storage::rowid::{Rdba, RowId};
 use bicdb_storage::scan::HeapScanner;
 use bicdb_storage::segment::{SegType, Segment};
 use bicdb_storage::undo::{create_undo_segment, UndoChain};
@@ -223,7 +223,11 @@ pub fn run_plan(
     ));
     let mut open =
         |_src| Ok(Box::new(cursor.take().expect("单次扫描：游标恰好开一次")) as Box<dyn RowCursor>);
-    let mut op = match build(&plan, &mut open) {
+    let env = ExecEnv {
+        pool: fx.pool,
+        chain: &fx.chain,
+    };
+    let mut op = match build(&plan, &env, &mut open) {
         Ok(op) => op,
         Err(e) => return Err((e, WorkAreaStats::default())),
     };
@@ -253,7 +257,11 @@ pub fn run_both(fx: &Fixture, query: &SelectQuery) -> RunBoth {
     let mut open = |_src| {
         Ok(Box::new(cursor2.take().expect("单次扫描：游标恰好开一次")) as Box<dyn RowCursor>)
     };
-    let mut op = build(&plan, &mut open).unwrap();
+    let env = ExecEnv {
+        pool: fx.pool,
+        chain: &fx.chain,
+    };
+    let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx2 = ExecContext::new(fx.snapshot);
     let plan_rows = collect(op.as_mut(), &mut cx2).unwrap();
     RunBoth {
@@ -263,4 +271,184 @@ pub fn run_both(fx: &Fixture, query: &SelectQuery) -> RunBoth {
         op_stats: cx2.stats().to_vec(),
         work_areas: cx2.work_area_stats(),
     }
+}
+
+/// **多表 + 索引夹具**（切片 3）：一个数据文件、多张表段、可选 B+Tree 索引。
+pub struct Env {
+    /// 池。
+    pub pool: &'static BufferPool<'static>,
+    /// 链。
+    pub chain: UndoChain<'static, 'static>,
+    /// 快照。
+    pub snapshot: CommitSeq,
+    /// 数据文件（建索引段用）。
+    pub data_file: &'static mut DataFile<'static>,
+}
+
+/// 一张表（数据块 + 各行 ROWID——建索引/回表用）。
+pub struct Table {
+    /// 数据块（升序）。
+    pub blocks: Vec<u32>,
+    /// 插入顺序的各行 ROWID。
+    pub rowids: Vec<RowId>,
+}
+
+/// 建环境（池/链/控制文件/日志——真件；`Box::leak` 保 `'static`）。
+#[allow(clippy::too_many_lines)]
+pub fn build_env(io: &'static MemFileIo) -> Env {
+    let undo_file = Box::leak(Box::new(
+        DataFile::create(io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap(),
+    ));
+    let undo_handle = undo_file.handle();
+    let undo_segment = create_undo_segment(undo_file, 2, 3, 4).unwrap();
+
+    let data_file: &'static mut DataFile<'static> = Box::leak(Box::new(
+        DataFile::create(io, Path::new(DATA_F), DATA_FID, 3, WS, 512).unwrap(),
+    ));
+    let data_handle = data_file.handle();
+
+    let pool: &'static BufferPool<'static> = Box::leak(Box::new(
+        BufferPool::new(
+            io,
+            64,
+            move |_ws, r| match r.file_id() {
+                1 => Some((undo_handle, r.block_id())),
+                DATA_FID => Some((data_handle, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+        )
+        .unwrap(),
+    ));
+    let chain = UndoChain::open(undo_segment).with_pool(pool);
+
+    // 控制文件与日志由 `create_table` 在插入事务时创建（一次一表）——
+    // 这里不预建（同路径重复创建会撞 AlreadyExists）。
+    Env {
+        pool,
+        chain,
+        snapshot: seq(1),
+        data_file,
+    }
+}
+
+/// 建一张表并插入 `rows`（独立事务；返回块表与各行 ROWID）。
+pub fn create_table(env: &mut Env, io: &'static MemFileIo, rows: &[Row]) -> Table {
+    let mut segment = Segment::create(env.data_file, SegType::Heap, 1, 1, 8, 0, 0).unwrap();
+    let pages = rows.len().div_ceil(8).max(3) as u32;
+    let mut blocks = Vec::new();
+    for _ in 0..pages {
+        let logical = segment.allocate_append_page().unwrap();
+        let block = segment.logical_block(logical).unwrap();
+        let mut page = Page::new(PageType::HeapTable, WS, DATA_FID, block);
+        segment.write_page(logical, &mut page).unwrap();
+        blocks.push(block);
+    }
+    let blocks = segment.data_blocks(segment.hwm());
+    drop(segment);
+
+    let mut rowids = Vec::new();
+    if !rows.is_empty() {
+        let mut cf = ControlFile::format(
+            io,
+            Path::new(A),
+            Path::new(B),
+            &WorkspaceEntry {
+                workspace_id: WorkspaceId::from_raw(1).unwrap(),
+                created_at: 0,
+                derived_from: None,
+                derived_at_seq: seq(0),
+            },
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut log = GroupWriter::create(
+            io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 1, 64).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        let mut txn = begin(env.pool, &mut log, &mut env.chain, seq(1)).unwrap();
+        for (i, r) in rows.iter().enumerate() {
+            let block = blocks[(i / 8).min(blocks.len() - 1)];
+            let bytes = encode_row(r, &shape()).unwrap();
+            let rid = insert_row(
+                env.pool,
+                &mut log,
+                &mut env.chain,
+                &mut txn,
+                BufferKey::new(WS, rdba(block)),
+                &bytes,
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+            rowids.push(rid);
+        }
+        commit(env.pool, &mut log, &mut env.chain, &mut txn, seq(1)).unwrap();
+    }
+    Table { blocks, rowids }
+}
+
+/// 索引写口（建索引用；与 `bicdb-index` 测试同法）。
+struct IndexTestIo<'a, 'b, 'f, 'io> {
+    pool: &'a BufferPool<'b>,
+    segment: &'a mut Segment<'f, 'io>,
+}
+
+impl bicdb_index::IndexIo for IndexTestIo<'_, '_, '_, '_> {
+    fn allocate_page(&mut self) -> Result<u32, bicdb_index::IndexError> {
+        let logical = self
+            .segment
+            .allocate_append_page()
+            .map_err(|e| bicdb_index::IndexError::Io(e.to_string()))?;
+        self.segment
+            .logical_block(logical)
+            .ok_or(bicdb_index::IndexError::Malformed("逻辑页无物理块"))
+    }
+
+    fn apply_page(
+        &mut self,
+        block: u32,
+        after: &bicdb_storage::page::Page,
+    ) -> Result<(), bicdb_index::IndexError> {
+        let key = BufferKey::new(WS, Rdba::from_parts(DATA_FID, block).unwrap());
+        let mut guard = match self.pool.pin(key) {
+            Ok(g) => g,
+            Err(_) => self
+                .pool
+                .insert_new(
+                    key,
+                    bicdb_storage::page::Page::from_bytes(Box::new(*after.as_bytes())),
+                )
+                .map_err(|e| bicdb_index::IndexError::Io(e.to_string()))?,
+        };
+        guard.as_bytes_mut().copy_from_slice(after.as_bytes());
+        Ok(())
+    }
+
+    fn allocated_blocks(&mut self) -> Result<Vec<u32>, bicdb_index::IndexError> {
+        Ok(Vec::new())
+    }
+}
+
+/// 在数据文件里建一个 B+Tree 索引段并填入 `(键字节, ROWID)`；返回根页 ROWID。
+pub fn build_index(env: &mut Env, entries: &[(Vec<u8>, RowId)]) -> RowId {
+    let mut segment = Segment::create(env.data_file, SegType::BTree, 1, 1, 8, 0, 0).unwrap();
+    let mut io = IndexTestIo {
+        pool: env.pool,
+        segment: &mut segment,
+    };
+    let ws = env.chain.segment().workspace_ref();
+    let root = {
+        let mut store = bicdb_index::PoolStore::new(env.pool, &mut io, DATA_FID, ws);
+        let mut tree = bicdb_index::Tree::create(&mut store, DATA_FID, ws).unwrap();
+        for (key, rid) in entries {
+            tree.insert(key, *rid).unwrap();
+        }
+        tree.root()
+    };
+    root
 }

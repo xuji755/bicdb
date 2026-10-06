@@ -149,6 +149,72 @@ impl<I: IndexIo> PageStore for PoolStore<'_, '_, '_, I> {
     }
 }
 
+/// **只读池存取口**（执行器的**扫描侧**：索引定位只需要读页，不分配、不改页）。
+///
+/// 与 [`PoolStore`] 同形（读经缓冲池、区读走池的读法），但**写动作一律
+/// 响亮失败**——扫描路径不该有写入口（ENG 不变量："读路径不含锁"的姊妹条：
+/// 读路径不含写）。
+pub struct ReadOnlyStore<'a, 'b> {
+    pool: &'a BufferPool<'b>,
+    file_id: u16,
+    ws: [u8; 8],
+}
+
+impl<'a, 'b> ReadOnlyStore<'a, 'b> {
+    /// 打开只读存取口（`ws` = 工作区标识；页键 =（工作区, `file_id` + 块号））。
+    #[must_use]
+    pub fn new(pool: &'a BufferPool<'b>, file_id: u16, ws: [u8; 8]) -> Self {
+        Self { pool, file_id, ws }
+    }
+
+    fn key_of(&self, block: u32) -> Result<BufferKey, IndexError> {
+        let rdba = Rdba::from_parts(self.file_id, block)
+            .ok_or(IndexError::Malformed("块号越出 ROWID 域"))?;
+        Ok(BufferKey::new(self.ws, rdba))
+    }
+}
+
+impl PageStore for ReadOnlyStore<'_, '_> {
+    fn read(&mut self, block: u32) -> Result<Page, IndexError> {
+        let key = self.key_of(block)?;
+        match self.pool.pin(key) {
+            Ok(guard) => Ok(Page::from_bytes(Box::new(*guard.as_bytes()))),
+            Err(BufferError::Unresolved { .. }) => Err(IndexError::BlockNotFound { block }),
+            Err(e) => Err(IndexError::Io(e.to_string())),
+        }
+    }
+
+    fn write(&mut self, _block: u32, _page: &mut Page) -> Result<(), IndexError> {
+        Err(IndexError::Io("只读存取口：写动作不可用".to_owned()))
+    }
+
+    fn allocate(&mut self) -> Result<u32, IndexError> {
+        Err(IndexError::Io("只读存取口：分配不可用".to_owned()))
+    }
+
+    fn block_count(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn blocks(&mut self) -> Result<Vec<u32>, IndexError> {
+        // 只读扫描不做 FFS（枚举口属执行器的段侧；见 `Segment::data_blocks`）。
+        Err(IndexError::Io("只读存取口：块枚举不可用".to_owned()))
+    }
+
+    fn read_run(&mut self, first: u32, count: u32) -> Result<Vec<Page>, IndexError> {
+        let rdba = Rdba::from_parts(self.file_id, first)
+            .ok_or(IndexError::Malformed("块号越出 ROWID 域"))?;
+        self.pool
+            .read_run(self.ws, rdba, count)
+            .map_err(|e| match e {
+                BufferError::Unresolved { rdba } => IndexError::BlockNotFound {
+                    block: rdba.block_id(),
+                },
+                e => IndexError::Io(e.to_string()),
+            })
+    }
+}
+
 /// **内存页仓**（测试用）：固定上限的页数组，`allocate` 递增分配。
 #[derive(Debug)]
 pub struct MemStore {

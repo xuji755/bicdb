@@ -1,6 +1,7 @@
 //! 执行期错误（**明确判定**，不静默；错误分类归 `CONV` §4，本模块只负责
 //! 执行器内部的具名判定）。
 
+use bicdb_index::IndexError;
 use bicdb_storage::scan::ScanError;
 
 /// 执行期错误。
@@ -38,6 +39,8 @@ pub enum ExecError {
     },
     /// 存储服务错误（保真外传——`scan` 模块的判定）。
     Scan(ScanError),
+    /// 索引层错误（保真外传——`bicdb-index` 的判定）。
+    Index(IndexError),
     /// 数值运算越出 `NUMBER` 域（溢出/下溢——`TYP` 的明确判定，不回绕）。
     NumericOverflow,
     /// 除以零（SQL 层的确定错误）。
@@ -67,6 +70,7 @@ impl std::fmt::Display for ExecError {
             }
             ExecError::NoSuchSource { id } => write!(f, "计划引用的行源 {id} 不存在"),
             ExecError::Scan(e) => write!(f, "存储服务：{e}"),
+            ExecError::Index(e) => write!(f, "索引：{e}"),
             ExecError::NumericOverflow => f.write_str("数值运算越出 NUMBER 域"),
             ExecError::DivisionByZero => f.write_str("除以零"),
             ExecError::WorkMemoryExceeded { used, budget } => write!(
@@ -82,5 +86,11 @@ impl std::error::Error for ExecError {}
 impl From<ScanError> for ExecError {
     fn from(e: ScanError) -> Self {
         ExecError::Scan(e)
+    }
+}
+
+impl From<IndexError> for ExecError {
+    fn from(e: IndexError) -> Self {
+        ExecError::Index(e)
     }
 }

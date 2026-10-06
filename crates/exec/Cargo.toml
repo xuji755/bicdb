@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bicdb-common = { path = "../common" }
+bicdb-index = { path = "../index" }
 bicdb-storage = { path = "../storage" }
 bicdb-types = { path = "../types" }
 

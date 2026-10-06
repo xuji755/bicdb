@@ -48,7 +48,7 @@ pub struct WorkAreaStats {
 #[derive(Debug)]
 pub struct ExecContext<'a> {
     snapshot: CommitSeq,
-    params: &'a [Value],
+    params: Vec<Value>,
     deadline: Option<Instant>,
     cancel: Option<&'a AtomicBool>,
     stats: Vec<OpStat>,
@@ -64,7 +64,7 @@ impl<'a> ExecContext<'a> {
     pub fn new(snapshot: CommitSeq) -> Self {
         Self {
             snapshot,
-            params: &[],
+            params: Vec::new(),
             deadline: None,
             cancel: None,
             stats: Vec::new(),
@@ -73,11 +73,16 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    /// 带参数。
+    /// 带参数（会话级类型化参数——绑定期已定型）。
     #[must_use]
-    pub fn with_params(mut self, params: &'a [Value]) -> Self {
-        self.params = params;
+    pub fn with_params(mut self, params: &[Value]) -> Self {
+        self.params = params.to_vec();
         self
+    }
+
+    /// **换参数表**（`NestedLoop` 的参数化重扫：装内表参数 / 还原语句参数）。
+    pub fn set_params(&mut self, params: Vec<Value>) {
+        self.params = params;
     }
 
     /// 带截止时间（到点即 [`ExecError::Deadline`]）。
@@ -103,7 +108,7 @@ impl<'a> ExecContext<'a> {
     /// 参数值。
     #[must_use]
     pub fn params(&self) -> &[Value] {
-        self.params
+        &self.params
     }
 
     /// **取消/截止检查**（每个 `next()` 的开头；长循环另设检查点）。

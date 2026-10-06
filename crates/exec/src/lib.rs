@@ -25,6 +25,8 @@ pub mod context;
 pub mod direct;
 pub mod error;
 pub mod expr;
+pub mod index_scan;
+pub mod join;
 pub mod nodes;
 pub mod operator;
 pub mod plan;
@@ -35,9 +37,11 @@ pub use context::{ExecContext, OpStat, WorkAreaOutcome, WorkAreaStats};
 pub use direct::{execute_direct, SelectQuery};
 pub use error::ExecError;
 pub use expr::{ArithOp, CmpOp, Expr, Truth};
+pub use index_scan::{IndexScan, DEFAULT_FETCH_BATCH};
+pub use join::{JoinKind, NestedLoop};
 pub use nodes::{Filter, Limit, Project, SeqScan};
 pub use operator::{collect, Operator, RowCursor};
-pub use plan::{build, PlanNode, SourceId};
+pub use plan::{build, ExecEnv, PlanNode, SourceId};
 pub use sort::{Sort, SortKey, TopN};
 pub use value::{
     cast_value, decode_row, encode_row, kind_name, row_bytes, ColKind, Row, RowShape, Value,

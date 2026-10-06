@@ -11,8 +11,8 @@ mod common;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bicdb_exec::{
-    build, collect, execute_direct, ArithOp, CmpOp, ColKind, ExecContext, ExecError, Expr, Row,
-    RowCursor, SelectQuery, SortKey, Value,
+    build, collect, execute_direct, ArithOp, CmpOp, ColKind, ExecContext, ExecEnv, ExecError, Expr,
+    Row, RowCursor, SelectQuery, SortKey, Value,
 };
 use bicdb_storage::scan::HeapScanner;
 
@@ -161,7 +161,11 @@ fn cancel_and_deadline_are_honoured_on_both_paths() {
         fx.blocks.clone(),
     ));
     let mut open = |_src| Ok(Box::new(cursor2.take().expect("单次扫描")) as Box<dyn RowCursor>);
-    let mut op = build(&plan, &mut open).unwrap();
+    let env = ExecEnv {
+        pool: fx.pool,
+        chain: &fx.chain,
+    };
+    let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx2 = ExecContext::new(fx.snapshot).with_cancel(&cancel);
     let err = collect(op.as_mut(), &mut cx2).unwrap_err();
     assert!(matches!(err, ExecError::Cancelled), "{err}");
