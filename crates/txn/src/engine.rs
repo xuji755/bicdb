@@ -162,6 +162,37 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         reg.release(handle)
     }
 
+    /// **当前提交序号**（已发布的水位；会话的快照起点/诊断）。
+    #[must_use]
+    pub fn current_seq(&self) -> u64 {
+        self.current_seq
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_raw()
+    }
+
+    /// **完全检查点**（§11.7 的"关闭工作区前"形态）：脏页按序全部写回 →
+    /// 低水位一次推到当前日志位置 → 发布（控制文件 + 检查点记录）。
+    ///
+    /// **单进程关闭路径**：调用后实例即可干净退出（下次打开的重做范围为 0）。
+    /// 与运行期增量检查点的区别只在"先刷页"这一步——发布次序两者相同。
+    pub fn checkpoint_full(
+        &self,
+        workspace: [u8; 8],
+    ) -> Result<bicdb_wal::checkpoint::CheckpointReport, bicdb_wal::checkpoint::CheckpointError>
+    {
+        let current = *self.current_seq.lock().unwrap_or_else(|e| e.into_inner());
+        let oldest = self.oldest_snapshot().unwrap_or(current);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
+        bicdb_wal::checkpoint::full_checkpoint(
+            &mut wal, self.pool, workspace, current, current, oldest, timestamp,
+        )
+    }
+
     /// **最老活跃快照**（undo 回收的唯一输入；`None` = 无活跃快照）。
     pub fn oldest_snapshot(&self) -> Option<CommitSeq> {
         let reg = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
@@ -243,6 +274,18 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
         let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         f(self.pool, &mut wal, &mut chain, &mut handle.txn)
+    }
+
+    /// **借出读上下文**（扫描/CR 用）：池 + 撤销链（只读借用）。
+    ///
+    /// `f` 期间持有撤销链的锁（与写路径同一把）——**读路径不做长事务**：
+    /// 扫描应当在 `f` 内完成（会话层的语句执行即此形态）。
+    pub fn with_read_context<R>(
+        &self,
+        f: impl FnOnce(&BufferPool<'b>, &bicdb_storage::undo::UndoChain<'io, 'f>) -> R,
+    ) -> R {
+        let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
+        f(self.pool, &chain)
     }
 
     /// **提交**：提交记录入流 + 等它耐久（提交点）→ 发布新提交序号 →

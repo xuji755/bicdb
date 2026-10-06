@@ -1,0 +1,44 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 唯一索引 唯一约束 插入 检查 并发 MVCC 死元组 索引项
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 11，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 17，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 3，批次 1；相关证据已满足，仍有未取候选
+  正文核实 3 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     并发插入竞争导致唯一约束违反：MVCC机制下子查询可见性判断与INSERT非原子，高并发时简单CTE方法会触发duplicate key错误。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 并发插入竞争导致唯一约束违反  (排序分: 10.0)
+     └ 详情：并发插入竞争导致唯一约束违反：MVCC机制下子查询可见性判断与INSERT非原子，高并发时简单CTE方法会触发duplicate key错误。
+分类：原理
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1259185
+
+     [KnowledgeEntry] MVCC 死元组与表膨胀机制  (排序分: 10.0)
+     └ 详情：PostgreSQL 的 MVCC 机制下 UPDATE/DELETE 产生旧版本死元组，VACUUM 负责回收。如果长事务阻止清理或 autovacuum 跟不上写流量，死元组堆积导致表和索引物理膨胀。索引不随行版本回收，其膨胀独立于表，需单独 REINDEX。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:987183
+
+     [KnowledgeEntry] MVCC 与死元组  (排序分: 10.0)
+     └ 详情：MVCC 与死元组：MVCC更新和删除操作会留下死元组（旧版本），导致表膨胀和索引失效。需要定期执行VACUUM或依赖autovacuum回收空间。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:548206
+
+     [KnowledgeEntry] MVCC与死元组  (排序分: 10.0)
+     └ 详情：MVCC与死元组：PostgreSQL使用MVCC实现隔离性，修改元组时创建多个版本，包括可见和不可见的死元组，导致磁盘空间增加。通过VACUUM或autovacuum清理不可见元组回收空间。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:548226
+
+     [CaseStudy] 表膨胀与VACUUM死元组堆积  (排序分: 9.8)
+     └ 摘要：诊断摘要：
+根因：PG的MVCC机制导致UPDATE/DELETE生成死元组，需依赖autovacuum回收空间，大表清理时因索引扫描和WAL写入产生严重性能瓶颈。典型影响：vacuum耗时数小时，WAL大量产生，阻塞业务写入并占用磁盘I/O，高并发下可能触发failsafe保护。关键指标：n_dead_tup超过阈值（autovacuum_vacuum_scale_factor * reltuples + autovacuum_vacuum_threshold），WAL产生速率持续高位，vacuum进度缓慢；PG13起的并行worker、bypass_threshold_pages及TidStore等改进可缓解但未根治。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:261699
+
+     [FaultModel] pg_mvcc_bloat_io_amplification  (排序分: 9.3)
+     └ 摘要：根因为MVCC并发控制导致表膨胀，大量死元组占据页面，全表扫描时产生IO放大。典型影响包括查询响应时间随IO放大线性增长，以及VACUUM FREEZE全表扫描引发IO风暴。关键指标是死元组比例升高和页面扫描量显著增加。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:112191
+

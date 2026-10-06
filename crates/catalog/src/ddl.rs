@@ -484,6 +484,15 @@ fn create_table_segment(
     Ok(block)
 }
 
+/// 键的前 32 字节十六进制（诊断用）。
+fn hex_key(key: &[u8]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in key.iter().take(32) {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 // ───────────────────────────── 名字与对象号 ─────────────────────────────
 
 /// **用户对象名检查**（`$` 结尾 = 保留名；预置名随需求清单扩展）。
@@ -833,7 +842,7 @@ pub fn create_table(
 ///
 /// **统一路径**：自举表（引导页权威）、`stat$`/`seq$`（DDL 建）、用户表/索引
 /// 都经 `seg$` 取段头——同一份字典事实，不搞第二套映射。
-pub(crate) fn live_segment_block(cat: &mut Catalog<'_>, obj: u32) -> Result<u32, DdlError> {
+pub fn live_segment_block(cat: &mut Catalog<'_>, obj: u32) -> Result<u32, DdlError> {
     let key = crate::open::comp_num(u64::from(obj));
     let obj_row = cat
         .lookup("i_obj_pk", &[Some(&key)])?
@@ -924,6 +933,7 @@ pub fn init_dictionary_tables(
                 w,
                 "stat$",
                 stat_obj_number(is_public),
+                &[stat_index_obj_number(is_public)],
                 kernel_stat_columns(),
                 &stat_options(),
             )?;
@@ -933,6 +943,7 @@ pub fn init_dictionary_tables(
                 w,
                 "seq$",
                 seq_obj_number(is_public),
+                &[seq_index_obj_number(is_public)],
                 kernel_seq_columns(),
                 &TableOptions::default(),
             )?;
@@ -1000,6 +1011,9 @@ fn create_kernel_table(
     w: &mut DictWriter<'_, '_, '_, '_, '_>,
     name: &str,
     reserved_obj: u32,
+    // 各键的**保留对象号**（逐一给出——内核表的号是常量，**不得**按
+    // `reserved_obj + i` 现推：那会与相邻的保留号撞车，v0.1 前的实测缺陷）。
+    key_objs: &[u32],
     columns: Vec<ColumnSpec>,
     options: &TableOptions,
 ) -> Result<(), DdlError> {
@@ -1024,8 +1038,15 @@ fn create_kernel_table(
         .iter()
         .find(|t| t.name == name)
         .ok_or_else(|| DdlError::NotFound(name.to_owned()))?;
-    for (i, key) in def.keys.iter().enumerate() {
-        let idx_obj = allocate_obj_number(w, Some(reserved_obj + 1 + i as u32))?;
+    if key_objs.len() != def.keys.len() {
+        return Err(DdlError::BadTableDef(format!(
+            "{name} 的保留键号个数 {} 与键数 {} 不符",
+            key_objs.len(),
+            def.keys.len()
+        )));
+    }
+    for (key, idx_obj) in def.keys.iter().zip(key_objs) {
+        let idx_obj = allocate_obj_number(w, Some(*idx_obj))?;
         let cols: Vec<u32> = key.cols.iter().map(|c| u32::from(*c)).collect();
         create_index_object(w, idx_obj, obj, key.name, &cols, key.unique)?;
     }
@@ -1204,19 +1225,35 @@ fn create_index_inner(
                     .map_err(|_| DdlError::BadTableDef("行号越域".to_owned()))?;
                 let values = row::decode(bytes, &scan_cols)?;
                 let mut comps: Vec<Option<Vec<u8>>> = Vec::with_capacity(col_numbers.len());
+                let mut has_null = false;
                 for cn in col_numbers {
                     let idx = usize::from(*cn as u16) - 1;
                     let col_def = &scan_cols[idx];
-                    comps.push(row::component_bytes(&values[idx], col_def)?);
+                    let c = row::component_bytes(&values[idx], col_def)?;
+                    has_null |= c.is_none();
+                    comps.push(c);
                 }
                 let refs: Vec<Option<&[u8]>> = comps.iter().map(|c| c.as_deref()).collect();
-                entries.push((bicdb_storage::key::encode(&refs), rid));
+                entries.push((bicdb_storage::key::encode(&refs), rid, has_null));
             }
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.to_bytes().cmp(&b.1.to_bytes())));
     }
-    // ③ 批量灌树（唯一索引在此检出重复键 ⇒ 回滚）。
+    // ③a **唯一性（SQL 口径：含 NULL 的键不参与）**——相邻等键在排序后即可判定；
+    //     违反 ⇒ 整条 DDL 回滚（`目录详设` §5.3 的唯一性口径）。
+    if spec.unique {
+        for w2 in entries.windows(2) {
+            let (a, b) = (&w2[0], &w2[1]);
+            if !a.2 && !b.2 && a.0 == b.0 {
+                return Err(DdlError::Index(bicdb_index::IndexError::DuplicateKey {
+                    key: format!("{} {}", spec.name, hex_key(&a.0)),
+                }));
+            }
+        }
+    }
+    // ③b 批量灌树（结构层面；唯一性已在上一步按口径判过 ⇒ `unique = false`）。
     let ws = w.cat.ws();
+    let flat: Vec<(Vec<u8>, RowId)> = entries.iter().map(|(k, r, _)| (k.clone(), *r)).collect();
     let report = acc_index::build_index(
         w.pool,
         w.log,
@@ -1224,8 +1261,8 @@ fn create_index_inner(
         ws,
         seg_block,
         w.txn,
-        &entries,
-        spec.unique,
+        &flat,
+        false,
     )?;
     // 索引统计：条目数（= 索引项数）作行数估计（选路的 `entries` 口径）。
     w.insert_stat(obj, report.entries as u64)?;

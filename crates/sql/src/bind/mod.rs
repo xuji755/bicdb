@@ -27,8 +27,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod catalog;
+pub mod expr;
+pub mod statement;
 
 pub use catalog::CatalogViewImpl;
+pub use expr::{bind_expr, kind_name, BindScope, BoundColumn, BoundParams};
+pub use statement::{bind_statement, BoundDdl, BoundInsert, BoundSelect, BoundStatement};
 
 /// 命名空间（三格里的第 ① 格的两个子空间）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +101,39 @@ pub enum BindError {
     ReservedName(String),
     /// 目录/存储层失败（**基础设施错误**——与"不存在"分开，响亮）。
     Catalog(String),
+    /// 列名不在作用域里（**只针对已解析到的表**；"表不存在"是 `NotFound`）。
+    UnknownColumn(String),
+    /// **参数无类型上下文**（如 `SELECT :p`）——推导不出即拒绝（§4.3）。
+    ParamWithoutContext(String),
+    /// 同一参数多处使用推出**不同类型**（§4.3）。
+    ParamTypeConflict {
+        /// 参数名。
+        name: String,
+        /// 首次推出的形态。
+        first: &'static str,
+        /// 再次推出的形态。
+        again: &'static str,
+    },
+    /// 字面量非法（TYP 内核拒绝——如越出 `NUMBER` 域）。
+    BadLiteral {
+        /// 原文本。
+        text: String,
+        /// 内核给的原因。
+        why: String,
+    },
+    /// 形态不匹配（MVP：不做隐式提升；显式 `CAST` 是唯一转换入口）。
+    TypeMismatch {
+        /// 出错的位置（"比较两侧"/"IN 列表"…）。
+        what: String,
+        /// 期望形态。
+        want: &'static str,
+        /// 实际形态。
+        got: &'static str,
+    },
+    /// **写目标不可写**（固定表/`asset$`/`ref$`/`audit`/自举/`public`）。
+    NotWritable(String),
+    /// 清单外的构造（绑定期兜底）；附原因。
+    Unsupported(String),
 }
 
 impl std::fmt::Display for BindError {
@@ -105,6 +142,20 @@ impl std::fmt::Display for BindError {
             BindError::NotFound { name, .. } => write!(f, "对象 `{name}` 不存在"),
             BindError::ReservedName(n) => write!(f, "名字 `{n}` 是保留名（`$` 结尾或预置名）"),
             BindError::Catalog(why) => write!(f, "目录读取失败：{why}"),
+            BindError::UnknownColumn(n) => write!(f, "列 `{n}` 不存在"),
+            BindError::ParamWithoutContext(n) => {
+                write!(f, "参数 `:{n}` 无类型上下文（推导不出类型）")
+            }
+            BindError::ParamTypeConflict { name, first, again } => write!(
+                f,
+                "参数 `:{name}` 多处使用推出不同类型（{first} / {again}）"
+            ),
+            BindError::BadLiteral { text, why } => write!(f, "字面量 `{text}` 非法：{why}"),
+            BindError::TypeMismatch { what, want, got } => {
+                write!(f, "{what} 的形态不匹配：需要 {want}、得到 {got}")
+            }
+            BindError::NotWritable(n) => write!(f, "`{n}` 不可写（固定表/预置只读对象/自举对象）"),
+            BindError::Unsupported(why) => write!(f, "绑定期不支持：{why}"),
         }
     }
 }
@@ -186,6 +237,8 @@ pub trait CatalogView {
     fn fixed_table(&mut self, name: &str) -> Result<bool, BindError>;
     /// 是不是 `public` 工作区（`file$` 的可见性规则之一）。
     fn is_public(&self) -> bool;
+    /// **段头块**（`seg$.block_id`）——物理计划开扫描用（活路径：`obj$` → `seg$`）。
+    fn segment_block(&mut self, obj: u32) -> Result<u32, BindError>;
 }
 
 /// **版本捕获集**（`SQL前端设计` §4.2）：Bound 的组成之一、计划缓存键的成分。

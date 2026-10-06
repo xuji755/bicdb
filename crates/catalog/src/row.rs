@@ -132,7 +132,10 @@ pub fn component_bytes(v: &DictValue, c: &ColDef) -> Result<Option<Vec<u8>>, Row
     };
     Ok(match (c.type_code, v) {
         (_, DictValue::Null) => None,
-        (ColTypeCode::Number, DictValue::Num(n)) => {
+        (
+            ColTypeCode::Number | ColTypeCode::Timestamp | ColTypeCode::TimestampTz,
+            DictValue::Num(n),
+        ) => {
             let num = bicdb_types::Number::parse(&n.to_string()).map_err(|_| bad())?;
             Some(num.encode())
         }
@@ -141,6 +144,61 @@ pub fn component_bytes(v: &DictValue, c: &ColDef) -> Result<Option<Vec<u8>>, Row
         (ColTypeCode::Varchar2, DictValue::Bytes(b)) => Some(b.clone()),
         (ColTypeCode::Bytes, DictValue::Bytes(b)) => Some(b.clone()),
         _ => return Err(bad()),
+    })
+}
+
+/// **从行字节直接取索引键**（`cols` = 键列在行内的 **0 基序号**）。
+///
+/// **为什么走原始字节而不是解码成值**：索引键的分量**就是行内该列的字节**
+/// （`arch/06` §6.0："索引比较即字节比较"）——本模块的 `push_value` 与
+/// `component_bytes` 两侧都刻意用同一份保序编码。解码成 [`DictValue`] 再编
+/// 回去不但多两次转换，还会被字典值模型的**整数域**卡住（非整数 NUMBER 会
+/// 在这里被冤枉地判非法）。
+pub fn key_from_row(bytes: &[u8], cols: &[usize]) -> Result<Vec<u8>, RowCodecError> {
+    Ok(row_key(bytes, cols)?.bytes)
+}
+
+/// 行内键的完整形态：编码字节 + **是否含 NULL 分量**。
+///
+/// `has_null` 供**唯一性口径**用：含 NULL 的键不参与唯一性判定（MySQL
+/// "NULL 与 NULL 不相等"、PostgreSQL 唯一索引默认把 NULL 视为互异）——
+/// 与"键里有 NULL"的索引项照常入树（`IS NULL` 的查找要用）并不矛盾。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowKey {
+    /// 键编码字节（`bicdb_storage::key::encode`）。
+    pub bytes: Vec<u8>,
+    /// 键里有任一 NULL 分量。
+    pub has_null: bool,
+}
+
+/// **从行字节取键（带 NULL 标记）**。
+pub fn row_key(bytes: &[u8], cols: &[usize]) -> Result<RowKey, RowCodecError> {
+    let view = RowView::new(bytes).map_err(|e| RowCodecError::Format(e.to_string()))?;
+    view.validate_var_offsets(0)
+        .map_err(|e| RowCodecError::Format(e.to_string()))?;
+    let mut comps: Vec<Option<&[u8]>> = Vec::with_capacity(cols.len());
+    let width = usize::from(view.header().col_count);
+    let mut has_null = false;
+    for at in cols {
+        if *at >= width {
+            return Err(RowCodecError::ColumnCount {
+                expected: at + 1,
+                got: width,
+            });
+        }
+        if view.is_null(*at as u16) {
+            has_null = true;
+            comps.push(None);
+            continue;
+        }
+        let raw = view
+            .var_column(*at, 0)
+            .ok_or_else(|| RowCodecError::Format(format!("键列 {at} 越出行形状")))?;
+        comps.push(Some(raw));
+    }
+    Ok(RowKey {
+        bytes: bicdb_storage::key::encode(&comps),
+        has_null,
     })
 }
 

@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use bicdb_common::seq::CommitSeq;
 use bicdb_index::{IndexError, SegmentStore, Tree};
 use bicdb_storage::bootstrap::{self, BootstrapEntry};
 use bicdb_storage::buffer::BufferPool;
@@ -30,8 +31,9 @@ use bicdb_storage::rowid::RowId;
 use bicdb_storage::segment::{self, Segment, SegmentError, SegmentSpaceError};
 use bicdb_workspace::io::FileIo;
 
+use crate::api::DmlIndex;
 use crate::create::BuiltDictionary;
-use crate::dict::{self, DictTable, KeyDef};
+use crate::dict::{self, ColTypeCode, DictTable, KeyDef};
 use crate::row::{self, DictValue, RowCodecError};
 
 /// 打开/种子错误。
@@ -335,6 +337,60 @@ impl<'io> Catalog<'io> {
             return Ok(*block);
         }
         self.index_target_live(index)
+    }
+
+    /// **DML 路径的索引维护清单**：`(行类型码, 索引清单)`。
+    ///
+    /// ```text
+    /// columns(表)          → 行形状（col$ 序；类型码给行解码与键分量）
+    /// usable_indexes_of(表) → 活索引（Move 后失效的不在内）
+    /// 键列号 → 行内 0 基序号（键列序 = 索引的列序）
+    /// ```
+    ///
+    /// 段头块**现取**（`seg$.block_id`）——不用工厂里的陈旧副本。
+    pub fn dml_indexes(
+        &mut self,
+        snapshot: CommitSeq,
+        table_obj: u32,
+    ) -> Result<(Vec<ColTypeCode>, Vec<DmlIndex>), OpenError> {
+        let cols = self
+            .columns(snapshot, table_obj)
+            .map_err(|e| mismatch(e.to_string()))?;
+        let types: Vec<ColTypeCode> = cols
+            .iter()
+            .map(|c| {
+                ColTypeCode::from_u8(c.type_code as u8)
+                    .ok_or_else(|| mismatch("col$ 出现未知类型码"))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::new();
+        for idx in self
+            .usable_indexes_of(snapshot, table_obj)
+            .map_err(|e| mismatch(e.to_string()))?
+        {
+            let mut ordinals = Vec::with_capacity(idx.cols.len());
+            for ic in &idx.cols {
+                let at = cols
+                    .iter()
+                    .position(|c| c.col == ic.col)
+                    .ok_or_else(|| mismatch("索引键列不在基表列里"))?;
+                ordinals.push(at);
+            }
+            let seg_page0 = crate::ddl::live_segment_block(self, idx.obj)
+                .map_err(|e| mismatch(e.to_string()))?;
+            let name = self
+                .resolve_by_obj(snapshot, idx.obj)
+                .map(|o| o.name)
+                .unwrap_or_else(|_| format!("obj#{}", idx.obj));
+            out.push(DmlIndex {
+                obj: idx.obj,
+                name,
+                seg_page0,
+                cols: ordinals,
+                unique: idx.is_unique,
+            });
+        }
+        Ok((types, out))
     }
 
     /// **接上缓冲池**（活系统形态）：此后段/页读取经池（no-force 纪律）。

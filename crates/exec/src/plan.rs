@@ -273,29 +273,33 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
         )),
         PlanNode::Insert { shape, rows } => {
             let writer = env.writer.ok_or(ExecError::NoWriter)?;
+            // 事务归属问写侧（会话层持有时为 false——语句不再各自提交）。
+            let owns_txn = writer.borrow().owns_txn();
             Box::new(crate::dml::Insert::new(
                 writer,
-                true,
+                owns_txn,
                 shape.clone(),
                 rows.clone(),
             ))
         }
         PlanNode::Update { input, sets, shape } => {
             let writer = env.writer.ok_or(ExecError::NoWriter)?;
+            let owns_txn = writer.borrow().owns_txn();
             Box::new(crate::dml::Update::new(
                 build(input, env, open_cursor)?,
                 writer,
-                true,
+                owns_txn,
                 sets.clone(),
                 shape.clone(),
             ))
         }
         PlanNode::Delete { input } => {
             let writer = env.writer.ok_or(ExecError::NoWriter)?;
+            let owns_txn = writer.borrow().owns_txn();
             Box::new(crate::dml::Delete::new(
                 build(input, env, open_cursor)?,
                 writer,
-                true,
+                owns_txn,
             ))
         }
         PlanNode::Append { inputs } => {

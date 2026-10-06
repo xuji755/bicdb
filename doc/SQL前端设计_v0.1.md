@@ -64,6 +64,7 @@ crates/sql/                      （bicdb-sql；本设计的实现落点）
   src/plan.rs         物理计划：选路 + 映射到 bicdb-exec::PlanNode
   src/cache.rs        两层缓存（实例级 AST / 工作区级计划）+ 键与失效
   src/session.rs      compile/execute/cancel 的会话侧装配（ENG REQ-ENG-005）
+  src/dml_index.rs    DML 的索引维护 + 唯一性预检（写前；含 NULL 口径）
 crates/catalog/                  （bicdb-catalog；只读接口在本设计定契约，写侧另详设）
    resolve / type_descriptor / object_version（ENG REQ-ENG-006）
 ```
@@ -74,6 +75,7 @@ crates/catalog/                  （bicdb-catalog；只读接口在本设计定�
 sql ──读──▶ catalog ──读──▶ storage(表访问服务)
 sql ──▶ types（TYP 内核：类型规则/比较/转换）
 sql ──▶ exec（只构建 PlanNode；**不反向依赖**）
+sql ──▶ access（DML 索引维护的写口：插条目 + 树头 redo）
 ast ──✗──▶ catalog（REQ-SQL-002：AST 模块不得 import 目录接口）
 ```
 
@@ -437,6 +439,9 @@ cancel(执行句柄) -> 释放锁/页引用/临时空间（走 `ExecContext` 的
 | **D1** ✅ **已落地（2026-10-06；先于 S2，纯解析）** | 《DCL语句设计》§5 的 D1：DCL 语法与 AST | ✅ `crates/sql`：`Stmt::VariableSet`（`ALTER SESSION SET/CLEAR`——**只开后者拼写**）/`AlterSystem`（F 组三动作）/`AlterDatabase`（W2 克隆 + T 组四动作）+ `WorkRef`/`FsRef` 双形态（**解析只认形态**，名字查找在 ②）；`CreateWorkspaceStmt` **删 `CLONE OF`**（错误文案指向 W2 替代句）；`DropStmt.workspaces`（工作区目标走 `WorkRef`）；**配额键闭集**（data/undo/temp/asset——解析期拒绝）；`ALTER SYSTEM`/`ALTER DATABASE` 未知动作**解析期拒绝**。**用例 +4**：语料扩到 72 条（DCL 19 条）+ 清单外 35 条（含 `CLONE OF`/`ALTER SYSTEM SWITCH LOGFILE`/`ALTER DATABASE RENAME`/非法配额键/`ALLOCATE = MAYBE`/裸 `SET`）+ DCL 形状逐点断言 + 闭集文案两例 |
 | **S2** ✅ **已落地（2026-10-06）** | Catalog 只读面 + 名字解析三格 + 版本捕获 | ✅ `crates/sql::bind`——[`bind::CatalogView`] 端口（真件 `CatalogViewImpl` 接 `bicdb-catalog::Catalog` + 语句快照）+ `NameResolver`（**三格**：① 对象命名空间（**自举对象 `obj# ≤ 99` 出局**）→ ② 固定表清单（`file$`/`session$`/`lock$`；**写目标无此格**——只读 = 没有入口）→ ③ 其余一律 `NotFound`）+ **保留名清单**（`$` 结尾 + 预置对象九名）+ `BoundRefs` 版本捕获（`(obj#, mtime)` / `(obj#, mtime, status)`）。**验收（真件）**：跨区名与"从未存在"**同一错误种类**（文案不含暗示）；保留名拒绝；解析即捕获版本，`Move` 失效后 `(obj#, mtime, status)` 变化 ⇒ **键失配可观测**（断点查验）。用例：单元 7（假件测全三格/不可区分/固定表/公开区 `file$`）+ 真件 1（A/B 两区 + DDL + Move 失效）。**两处记档**：`(obj#, mtime, status)` 里 `mtime` 对索引暂标 0（由 `object_version` 单取——索引版本随其对象行）；`CatalogViewImpl` 构造时固定语句快照（`NameResolver` 随语句走） |
 | **S3** | Binder：类型推导 / 参数定型 / 写目标 / 登记点 | 类型错误全在绑定期；参数推导失败拒绝；写固定表/public 拒绝 |
+| **S3** ✅ **已落地（2026-10-06）** | Binder：类型推导 / 参数定型 / 写目标 / 登记点 | ✅ `crates/sql::bind::{expr,statement}`——**类型推导**（表达式绑定即定型：`Number` 算术、比较、`IN`/`BETWEEN`（脱糖为 `>= AND <=`）、`IS [NOT] NULL`、`CASE`、`CAST`；比较两侧类型不许混）；**参数定型**（`:name` 按**用处**定型；无上下文 ⇒ 拒绝；同参数两处类型冲突 ⇒ 具名错误）；**写目标检查**（`check_writable`：`READ_ONLY_PRESETS = ["asset$","ref$","audit"]` + `status` 检查）；**登记点**（`BoundRefs` 由 `NameResolver` 累积）；DCL/集合运算/`DISTINCT`/`GROUP BY`/多表/表别名/无 FROM/`INSERT…SELECT`/`UPDATE`/`DELETE` **绑定期具名拒绝**（`BindError::Unsupported`，绝不静默）。**用例**：`bind/tests.rs` 扩（未知列、类型不匹配、参数无上下文/类型冲突、只读表写目标、清单外语句各一例） |
+| **S5-lite** ✅ **已落地（2026-10-06）** | 物理计划 + 接入 `bicdb-exec`（**首版直映射**） | ✅ `src/plan.rs`——`BoundStatement → bicdb_exec::PlanNode` 直映射（`SeqScan→Filter→Project→TopN/Sort→Limit`；`INSERT` 行补齐到全列宽）；**逻辑 IR 与白名单变换（S4）延后**（触发条件 = REQ-SQL-007 首条规则启用——现在引入只会多一层同构的树）；行源清单 `SourcePlan`（表对象号 + 段头块 + 行形状） |
+| **会话层** ✅ **已落地（2026-10-06）** | `src/session.rs` + `src/dml_index.rs`（ENG REQ-ENG-005） | ✅ `Session::execute`（`parse_many → bind → plan → execute`；语句 = 一个事务（自动提交）或显式 `BEGIN`/`COMMIT`/`ROLLBACK`；DDL 在活动中拒绝 REQ-TXN-016）；`QueryResult::{Rows,Affected,Ddl,Txn}`；**写路径**：会话持事务（写侧 `owns_txn = false`——修掉"显式事务里语句各自提交"）、池/日志/链一次借出、**DML 索引维护**（`dml_index.rs`：清单来自 `Catalog::dml_indexes`，键 = 行内列字节直取）+ **写前唯一性预检**（回表重算键逐字节比；含 NULL 不判唯一）；读路径经 `with_read_context` + `HeapScanner`。**端到端验收**：`crates/cli/tests/e2e.rs`（建区→DDL→DML→索引→事务→重开；崩溃恢复；NULL 口径）；证据包 `dml-index-unique-20261006` |
 | **S4** | 逻辑表示 + 白名单变换 | 与**直译执行器**两路差分（无优化 vs 优化，逐行一致）；四条不变量各有用例 |
 | **S5** | 物理计划 + 接入 `bicdb-exec` | 全算子闭集覆盖；同一语义计划的开/关优化结果一致；真表端到端（含 DML 与快照） |
 | **S6** | 计划缓存 + 失效 | DROP INDEX / 改表选项 / Move ⇒ 键失配重编译；跨工作区不共享；并发执行同计划互不干扰 |

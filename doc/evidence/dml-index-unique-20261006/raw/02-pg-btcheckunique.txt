@@ -1,0 +1,17 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+  [bic_agent_KnowledgeEntry,SyncEntity] _bt_check_unique 检查右兄弟页的优化  (排序分: 10.0)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2070229
+  [bic_agent_KnowledgeEntry,SyncEntity] 插入链调用全图（唯一索引）  (排序分: 10.0)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2069171
+  [bic_agent_KnowledgeEntry,SyncEntity] 并发索引构建中唯一性检查用 SnapshotSelf 复查新元组是否存活  (排序分: 10.0)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2071197
+  [bic_agent_KnowledgeEntry,SyncEntity] btree插入算法完整调用链  (排序分: 10.0)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2066850
+  [bic_agent_KnowledgeEntry,SyncEntity] _bt_doinsert 唯一性检查时 scantid 的延迟设置  (排序分: 10.0)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2067635
+  [bic_agent_KnowledgeEntry,SyncEntity] 唯一性检查中全死链标记索引项为 killed  (排序分: 10.0)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2070131
+  [bic_agent_KnowledgeEntry,SyncEntity] B-tree 唯一性检查并发等待与可见性判定机制  (排序分: 10.0)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2055840
+  [bic_agent_FaultModel,SyncEntity] 唯一约束冲突错误  (排序分: 8.5)
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2073141

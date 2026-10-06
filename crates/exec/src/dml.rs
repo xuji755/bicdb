@@ -28,6 +28,14 @@ use crate::value::{encode_row, Row, RowShape, Value};
 /// 实现方 = 事务引擎 + 段（页选址、行锁、等待-重试、undo/redo 全在其内）；
 /// 算子只递"行字节"。
 pub trait TableWriter {
+    /// **事务归属**：`true` = 写侧自己开关（算子调 `begin`/`commit`/`rollback`）；
+    /// `false` = **调用方（会话层）持有**——算子**不得**调用这三个方法
+    /// （显式事务 `BEGIN … COMMIT` 的形态：语句不再各自提交）。
+    ///
+    /// 默认 `true`（自持——测试与独立执行形态）；会话层显式设为 `false`。
+    fn owns_txn(&self) -> bool {
+        true
+    }
     /// 开语句事务（默认自动提交形态）。
     fn begin(&mut self) -> Result<(), ExecError>;
     /// 插入一行；返回 ROWID。
@@ -40,6 +48,66 @@ pub trait TableWriter {
     fn commit(&mut self) -> Result<(), ExecError>;
     /// 回滚语句事务（出错路径）。
     fn rollback(&mut self) -> Result<(), ExecError>;
+}
+
+/// **索引维护口**（表访问写侧的可选增量）。
+///
+/// ```text
+/// 算子 insert_row ──▶ 写侧（堆写 + 行锁 + undo/redo）──▶ 本口（每个可用索引一项）
+/// ```
+///
+/// **为什么在 exec 侧开口**：索引清单与"行字节 → 键字节"的规则是**目录/会话**
+/// 的知识（`col$`/`ind$` + 行编解码），执行器不碰；写侧只负责"什么时候调"。
+/// **顺序**：先堆写、后索引（键里的 ROWID 来自堆写的返回值）。
+pub trait IndexMaintenance {
+    /// 行插入后：为表的每个**可用**索引插条目（唯一性由表访问服务把守）。
+    ///
+    /// 参数 = 写上下文的四件套（池/日志/数据文件/事务）——实现方按需转发给
+    /// `bicdb-access`；`row` = 刚写进去的**行字节**（全列宽）。
+    #[allow(clippy::too_many_arguments)]
+    fn after_insert(
+        &mut self,
+        pool: &bicdb_storage::buffer::BufferPool<'_>,
+        log: &mut bicdb_wal::group::GroupWriter<'_, '_>,
+        file: &mut bicdb_storage::datafile::DataFile<'_>,
+        ws: [u8; 8],
+        txn: &bicdb_txn::write::Txn,
+        rid: RowId,
+        row: &[u8],
+    ) -> Result<(), ExecError>;
+
+    /// 行更新后（**旧键删、新键插**）。
+    ///
+    /// **首版未接**（UPDATE 的 SQL 面随 S4 之后，见 `bind` 的明确拒绝）——
+    /// 装了口却走到这里 ⇒ 明确报错，不静默漏维护。
+    #[allow(clippy::too_many_arguments)]
+    fn after_update(
+        &mut self,
+        _pool: &bicdb_storage::buffer::BufferPool<'_>,
+        _log: &mut bicdb_wal::group::GroupWriter<'_, '_>,
+        _file: &mut bicdb_storage::datafile::DataFile<'_>,
+        _ws: [u8; 8],
+        _txn: &bicdb_txn::write::Txn,
+        _rid: RowId,
+        _old: &[u8],
+        _new: &[u8],
+    ) -> Result<(), ExecError> {
+        Err(ExecError::NoIndexMaintenance("UPDATE"))
+    }
+
+    /// 行删除后（**删键**）。首版未接，同 [`IndexMaintenance::after_update`]。
+    #[allow(clippy::too_many_arguments)]
+    fn after_delete(
+        &mut self,
+        _pool: &bicdb_storage::buffer::BufferPool<'_>,
+        _log: &mut bicdb_wal::group::GroupWriter<'_, '_>,
+        _file: &mut bicdb_storage::datafile::DataFile<'_>,
+        _ws: [u8; 8],
+        _txn: &bicdb_txn::write::Txn,
+        _rid: RowId,
+    ) -> Result<(), ExecError> {
+        Err(ExecError::NoIndexMaintenance("DELETE"))
+    }
 }
 
 /// **带 ROWID 的扫描**：把存储行游标变成 `[ROWID 6B 字节] ++ 各列`（DML 源用）。

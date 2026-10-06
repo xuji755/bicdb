@@ -52,7 +52,7 @@ pub mod fixed;
 pub mod open;
 pub mod row;
 
-pub use api::{CatalogError, ColumnDesc, IndexCol, IndexRef, ObjectRef, ObjectVersion};
+pub use api::{CatalogError, ColumnDesc, DmlIndex, IndexCol, IndexRef, ObjectRef, ObjectVersion};
 pub use cache::{
     CacheCaps, CacheError, CacheKind, CacheStats, ColRow, IcolRow, IndRow, ObjRow, RowCache,
     SegRow, TabRow, UndoRow,

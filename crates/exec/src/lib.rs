@@ -50,7 +50,7 @@ pub mod writer;
 pub use agg::{AggKind, AggSpec, HashAgg, ScalarAgg, SortedAgg};
 pub use context::{ExecContext, OpStat, WorkAreaOutcome, WorkAreaStats};
 pub use direct::{execute_direct, SelectQuery};
-pub use dml::{Delete, Insert, TableWriter, Update, WithRowId};
+pub use dml::{Delete, IndexMaintenance, Insert, TableWriter, Update, WithRowId};
 pub use error::ExecError;
 pub use expr::{ArithOp, CmpOp, Expr, Truth};
 pub use hash_join::HashJoin;

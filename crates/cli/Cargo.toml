@@ -1,21 +1,25 @@
 [package]
-name = "bicdb-sql"
-description = "Raw AST、Binder、逻辑/物理计划、执行器"
+name = "bicdb-cli"
+description = "bicdb 命令行（建区 / 执行 SQL / REPL）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "bicdb_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bicdb"
+path = "src/main.rs"
+
 [dependencies]
-bicdb-access = { path = "../access" }
 bicdb-catalog = { path = "../catalog" }
 bicdb-common = { path = "../common" }
-bicdb-exec = { path = "../exec" }
-bicdb-index = { path = "../index" }
+bicdb-sql = { path = "../sql" }
 bicdb-storage = { path = "../storage" }
 bicdb-txn = { path = "../txn" }
-bicdb-types = { path = "../types" }
 bicdb-wal = { path = "../wal" }
 bicdb-workspace = { path = "../workspace" }
-

@@ -54,14 +54,17 @@ fn writer<'a>(
         )
         .unwrap(),
     ));
-    let log = GroupWriter::create(
-        io,
-        cf,
-        Path::new(walfile),
-        GroupSpec::new(2, 1, 8192).unwrap(),
-        Lsn::from_raw(0).unwrap(),
-    )
-    .unwrap();
+    // 日志写口常驻（`TableAccessWriter` 借它——与真件的 `&'a mut` 口径一致）。
+    let log: &'static mut GroupWriter<'static, 'static> = Box::leak(Box::new(
+        GroupWriter::create(
+            io,
+            cf,
+            Path::new(walfile),
+            GroupSpec::new(2, 1, 8192).unwrap(),
+            Lsn::from_raw(0).unwrap(),
+        )
+        .unwrap(),
+    ));
     TableAccessWriter::new(
         env.pool,
         &mut env.chain,

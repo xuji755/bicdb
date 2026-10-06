@@ -1,0 +1,44 @@
+❌ 未知命令: 'knowledge'
+
+支持的命令格式（<db> 为数据库名称、别名或四位 db_type）:
+  kb_graph.py <db> stats
+      数据库知识图谱统计；仅写 <db> 是该命令的兼容简写。
+  kb_graph.py <db> analyze "<自然语言描述>"
+      综合分析实体、诊断链、影响面、跨库等价和潜在关联。
+  kb_graph.py <db> diagnose "<问题描述>"
+      按 problem→fault→entity→知识条目→文档的多层策略统一诊断。
+  kb_graph.py <db> problem "<关键词或日志片段>" ["<独立关键词2>" ...]
+      问题、日志和报错检索；多个参数会分别检索后合并。
+  kb_graph.py <db> batch "<查询1>" "<查询2>" [...]
+      批量执行多个独立查询并去重、精排。
+  kb_graph.py <db> entity <type> "<ID、名称或关键词>"
+      查询指定类型实体；type 可取:
+      metric | param/parameter | fault/fault_model | wait/wait_event |
+      view/system_view | table | column | function/funcion | opsql | opsqllist | knowledge/ke/knowledge_entry |
+      module | casestudy/case_study | operator | bug |
+      error/errorcode/error_code/sqlstate
+      使用 all 等非上述 type 值时，执行不限实体类型的全文搜索。
+  kb_graph.py <db> entity --help
+      查看实体类型专项帮助。
+  kb_graph.py <db> detail <elementId>
+  kb_graph.py <db> ke_detail <elementId>
+      按 Neo4j elementId 查看实体完整内容；ke_detail 是兼容别名。
+  kb_graph.py <db> csdetail <elementId>
+      按 elementId 查看案例（CaseStudy）详情。
+  kb_graph.py <db> diagnostic "<故障别名[,故障别名2,...]>"
+      展开一个或多个故障模型的诊断传导链。
+  kb_graph.py <db> fault "<关键词>"
+      独立检索 FM、日志模式和 Bug；支持故障现象、日志片段或 Bug ID。
+  kb_graph.py <db> impact <entity_type> "<ID或名称>"
+      分析实体影响的知识条目和故障；常用 entity_type 为 metric。
+  kb_graph.py <db> discover [最小共现次数]
+      发现尚未建边的高频共现实体；默认阈值为 3。
+  kb_graph.py <target-db> equivalent "<视图名>" [source-db]
+      查询跨数据库等价视图；source-db 省略时默认为 Oracle。
+
+示例:
+  kb_graph.py oracle problem "连接数过多"
+  kb_graph.py oracle analyze "CPU使用率过高"
+  kb_graph.py oracle entity knowledge "内存"
+  kb_graph.py oracle detail "<上一条结果中的elementId>"
+

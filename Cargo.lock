@@ -34,6 +34,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bicdb-cli"
+version = "0.0.0"
+dependencies = [
+ "bicdb-catalog",
+ "bicdb-common",
+ "bicdb-sql",
+ "bicdb-storage",
+ "bicdb-txn",
+ "bicdb-wal",
+ "bicdb-workspace",
+]
+
+[[package]]
 name = "bicdb-common"
 version = "0.0.0"
 
@@ -89,10 +102,14 @@ version = "0.0.0"
 name = "bicdb-sql"
 version = "0.0.0"
 dependencies = [
+ "bicdb-access",
  "bicdb-catalog",
  "bicdb-common",
+ "bicdb-exec",
+ "bicdb-index",
  "bicdb-storage",
  "bicdb-txn",
+ "bicdb-types",
  "bicdb-wal",
  "bicdb-workspace",
 ]

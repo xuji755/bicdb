@@ -64,6 +64,9 @@ impl CatalogView for FakeView {
     fn is_public(&self) -> bool {
         self.public
     }
+    fn segment_block(&mut self, _obj: u32) -> Result<u32, BindError> {
+        Ok(832)
+    }
 }
 
 #[test]

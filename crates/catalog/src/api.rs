@@ -177,6 +177,24 @@ pub struct IndexRef {
     pub expr_src: Option<Vec<u8>>,
 }
 
+/// **DML 索引维护清单**的一条（表的每个**可用**索引 = 一条）。
+///
+/// 用途：DML 路径（INSERT 的表访问写侧）按它维护索引项——目录把"索引清单 +
+/// 键列构成 + 段头块"一次给全，写侧不必再查字典（写侧在事务里，不宜回查）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmlIndex {
+    /// 索引对象号。
+    pub obj: u32,
+    /// 索引名（诊断/错误消息）。
+    pub name: String,
+    /// 索引段头块（`seg$.block_id` 现取）。
+    pub seg_page0: u32,
+    /// 键列在**行内**的 0 基序号（与外层 `types` 同序）。
+    pub cols: Vec<usize>,
+    /// 唯一索引。
+    pub unique: bool,
+}
+
 /// **对象版本**（计划缓存的比对依据，REQ-SQL-009）。
 ///
 /// 三元组 `(obj#, mtime, status)`（`目录详设` §5.5）：`Move` 引起的索引失效

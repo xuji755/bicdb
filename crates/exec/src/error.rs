@@ -34,6 +34,9 @@ pub enum ExecError {
     },
     /// 计划含写算子但执行环境没给写通道（构建期缺陷）。
     NoWriter,
+    /// **语句带了索引维护口，却走到尚未接上的 DML 形态**（UPDATE/DELETE 的
+    /// 索引维护随其 SQL 面落地——明确拒绝，不静默漏维护）。
+    NoIndexMaintenance(&'static str),
     /// 计划引用了不存在的行源（构建期缺陷）。
     NoSuchSource {
         /// 行源标识。
@@ -78,6 +81,12 @@ impl std::fmt::Display for ExecError {
                 write!(f, "参数下标 {index} 越界（共 {count} 个参数）")
             }
             ExecError::NoWriter => f.write_str("计划含写算子，但执行环境未提供写通道"),
+            ExecError::NoIndexMaintenance(op) => {
+                write!(
+                    f,
+                    "{op} 的索引维护尚未接上（随 UPDATE/DELETE 的 SQL 面落地）"
+                )
+            }
             ExecError::NoSuchSource { id } => write!(f, "计划引用的行源 {id} 不存在"),
             ExecError::Scan(e) => write!(f, "存储服务：{e}"),
             ExecError::Index(e) => write!(f, "索引：{e}"),

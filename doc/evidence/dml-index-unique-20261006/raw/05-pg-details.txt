@@ -1,0 +1,55 @@
+########## detail 2071197 ##########
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 并发索引构建中唯一性检查用 SnapshotSelf 复查新元组是否存活
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2071197
+
+  ── 描述 ──
+  代码：htid = itup->t_tid; 如果 table_index_fetch_tuple_check(heapRel, &htid, SnapshotSelf, NULL) 返回
+  false（表示元组已死），则 break，不报错。同时需要跟随 HOT 链，因为并发建索引时插入的是根 TID，实际元组可能在 HOT
+  链中。如果链中任一元组存活，则仍有唯一键冲突。该机制为避免在并发索引构建期间因元组被并发删除而产生误报。
+
+  ── 摘要 ──
+  在明确冲突前，_bt_check_unique 使用 SnapshotSelf 检查待插入元组自身是否已提交死亡。若已死则不报错直接 break，以支持 CREATE INDEX CONCURRENTLY。
+########## detail 2070131 ##########
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 唯一性检查中全死链标记索引项为 killed
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2070131
+
+  ── 描述 ──
+  代码：else if (all_dead && (!inposting || (prevalldead && curposti == BTreeTupleGetNPosting(curitup) -
+  1))) { ItemIdMarkDead(curitemid); opaque->btpo_flags |= BTP_HAS_GARBAGE; if (nbuf != InvalidBuffer)
+  MarkBufferDirtyHint(nbuf, true); else MarkBufferDirtyHint(insertstate->buf, true); } 这适用于冲突元组（或所有
+  posting list TID 指向的 HOT 链）对所有人都已死的情况。标记为 dead 后，后续唯一性检查可跳过这些项。
+
+  ── 摘要 ──
+  当 table_index_fetch_tuple_check 返回 all_dead 且（对 posting list）整链全死时，_bt_check_unique 将索引项标记为 ItemIdMarkDead，设置 BTP_HAS_GARBAGE 标志，并用 MarkBufferDirtyHint 标记缓冲区 dirty hint。
+########## detail 2055840 ##########
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: B-tree 唯一性检查并发等待与可见性判定机制
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2055840
+
+  ── 描述 ──
+  唯一性检查不依赖表锁，而是通过索引扫描加行可见性判定处理并发。发现可能存在同键元组时，若并发事务未提交，则等待其事务结束再重新判断；若对方回滚则无冲突，若提交且键可见则报
+  23505。同事务内先删除再插入同键不冲突，死元组不计入。报告前先释放缓冲锁再调用 BuildIndexValueDescription 防目录访问死锁（:643-653）。
+
+  ── 摘要 ──
+  _bt_check_unique 在 nbtinsert.c:570-640 对疑似冲突调用 HeapTupleSatisfiesDirty 判可见性，并用 XactLockTableWait 等待并发未提交事务结束后重判；同事务先删后插不冲突；死元组不计（nbtinsert.c:676-689）。
+########## detail 2070229 ##########
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: _bt_check_unique 检查右兄弟页的优化
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2070229
+
+  ── 描述 ──
+  源码注释 nbtinsert.c:159-169。由于 _bt_findsplitloc
+  对重复元组的行为，一组重复项只在没有其他分裂点时才会跨页边界，因此第一个页几乎总是唯一可能包含匹配元组的页。_bt_check_unique 可以使用叶页高键确定右兄弟没有重复。
+
+  ── 摘要 ──
+  _bt_check_unique 通常只在第一个可能包含该键的页上检查冲突；可能需要检查右页但非常罕见。可利用叶页高键判断右兄弟无重复，无需实际访问

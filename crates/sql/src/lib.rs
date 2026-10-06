@@ -37,8 +37,11 @@
 
 pub mod ast;
 pub mod bind;
+pub mod dml_index;
 pub mod lexer;
 pub mod parser;
+pub mod plan;
+pub mod session;
 
 pub use ast::{
     AConst, AExpr, AExprKind, Alias, AlterDatabaseAction, AlterDatabaseStmt, AlterSystemAction,
@@ -57,3 +60,5 @@ pub use bind::{
 };
 pub use lexer::{tokenize, Keyword, LexError, Punct, Span, Token, TokenKind};
 pub use parser::{parse, parse_many, ParseError};
+pub use plan::{ddl_summary, plan_statement, PhysicalPlan, PlanKind, SourcePlan};
+pub use session::{format_value, QueryResult, Session, SessionError};

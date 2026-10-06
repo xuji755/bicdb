@@ -119,4 +119,9 @@ impl CatalogView for CatalogViewImpl<'_, '_> {
     fn is_public(&self) -> bool {
         self.catalog.is_public()
     }
+
+    fn segment_block(&mut self, obj: u32) -> Result<u32, BindError> {
+        bicdb_catalog::ddl::live_segment_block(self.catalog, obj)
+            .map_err(|e| BindError::Catalog(e.to_string()))
+    }
 }
