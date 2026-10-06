@@ -166,8 +166,9 @@ fn cancel_and_deadline_are_honoured_on_both_paths() {
     let mut open = |_src| Ok(Box::new(cursor2.take().expect("单次扫描")) as Box<dyn RowCursor>);
     let env = ExecEnv {
         pool: fx.pool,
-        chain: &fx.chain,
+        chain: Some(&fx.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx2 = ExecContext::new(fx.snapshot).with_cancel(&cancel);

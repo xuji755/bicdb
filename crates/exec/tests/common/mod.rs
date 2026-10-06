@@ -228,8 +228,9 @@ pub fn run_plan(
         |_src| Ok(Box::new(cursor.take().expect("单次扫描：游标恰好开一次")) as Box<dyn RowCursor>);
     let env = ExecEnv {
         pool: fx.pool,
-        chain: &fx.chain,
+        chain: Some(&fx.chain),
         spill: None,
+        writer: None,
     };
     let mut op = match build(&plan, &env, &mut open) {
         Ok(op) => op,
@@ -263,8 +264,9 @@ pub fn run_both(fx: &Fixture, query: &SelectQuery) -> RunBoth {
     };
     let env = ExecEnv {
         pool: fx.pool,
-        chain: &fx.chain,
+        chain: Some(&fx.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx2 = ExecContext::new(fx.snapshot);

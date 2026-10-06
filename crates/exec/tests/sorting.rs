@@ -209,8 +209,9 @@ fn work_memory_budget_is_enforced_and_counted() {
     let mut open = |_src| Ok(Box::new(cursor.take().expect("单次扫描")) as Box<dyn RowCursor>);
     let env = ExecEnv {
         pool: fx.pool,
-        chain: &fx.chain,
+        chain: Some(&fx.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx = ExecContext::new(fx.snapshot).with_work_memory_budget(Some(1 << 20));

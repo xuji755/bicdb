@@ -66,8 +66,9 @@ fn run(fx: &Fixture, plan: &PlanNode) -> Vec<Row> {
     };
     let env = ExecEnv {
         pool: fx.pool,
-        chain: &fx.chain,
+        chain: Some(&fx.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(plan, &env, &mut open).unwrap();
     let mut cx = ExecContext::new(fx.snapshot);
@@ -257,8 +258,9 @@ fn hash_join_respects_work_memory_budget() {
     };
     let env = ExecEnv {
         pool: fx.pool,
-        chain: &fx.chain,
+        chain: Some(&fx.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(&plan, &env, &mut open).unwrap();
     let mut cx = ExecContext::new(fx.snapshot).with_work_memory_budget(Some(64));

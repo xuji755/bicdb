@@ -19,6 +19,8 @@ pub struct OpStat {
     pub name: &'static str,
     /// 向上产出的行数。
     pub rows_out: u64,
+    /// **影响的写行数**（DML 口径：插入/更新/删除的行数——与"产出"分开）。
+    pub rows_affected: u64,
 }
 
 /// **算子内存区的执行结果**（WMM 三态；Oracle `V$SYSSTAT` 口径，
@@ -128,7 +130,11 @@ impl<'a> ExecContext<'a> {
 
     /// 登记一个算子（open 时调用），返回统计槽下标。
     pub fn register_op(&mut self, name: &'static str) -> usize {
-        self.stats.push(OpStat { name, rows_out: 0 });
+        self.stats.push(OpStat {
+            name,
+            rows_out: 0,
+            rows_affected: 0,
+        });
         self.stats.len() - 1
     }
 
@@ -166,6 +172,23 @@ impl<'a> ExecContext<'a> {
     #[must_use]
     pub fn work_area_stats(&self) -> WorkAreaStats {
         self.work_areas
+    }
+
+    /// **记账：某 DML 算子影响了 n 行**（`INSERT`/`UPDATE`/`DELETE` 口径）。
+    pub fn note_affected(&mut self, slot: usize, n: u64) {
+        if let Some(s) = self.stats.get_mut(slot) {
+            s.rows_affected += n;
+        }
+    }
+
+    /// 某算子的影响行数（按名——DML 断言便利口）。
+    #[must_use]
+    pub fn rows_affected_of(&self, name: &str) -> u64 {
+        self.stats
+            .iter()
+            .filter(|s| s.name == name)
+            .map(|s| s.rows_affected)
+            .sum()
     }
 
     /// 统计快照（诊断 / 用例断言）。

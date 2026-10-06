@@ -20,10 +20,12 @@ use crate::value::{ColKind, RowShape};
 pub struct ExecEnv<'a, 'b, 'io, 'f, 's> {
     /// 缓冲池。
     pub pool: &'a BufferPool<'b>,
-    /// 撤销链（CR 读路径）。
-    pub chain: &'a UndoChain<'io, 'f>,
+    /// 撤销链（CR 读路径）；`None` = 本次执行无读通道（纯写计划/测试）。
+    pub chain: Option<&'a UndoChain<'io, 'f>>,
     /// 溢出空间（切片 6b：Sort 等超预算时落 temp 段；`None` = 不支持溢出）。
     pub spill: Option<&'a crate::spill::SpillSpace<'s>>,
+    /// 表访问·写侧（切片 7：DML 算子用；`None` = 无写通道）。
+    pub writer: Option<&'a std::cell::RefCell<&'a mut dyn crate::dml::TableWriter>>,
 }
 
 /// 行源标识（切片 1：单表；编号由计划给出，执行期映射到存储服务的表）。
@@ -98,6 +100,34 @@ pub enum PlanNode {
         limit: Option<u64>,
         /// 回表批量大小（§9.4；`None` = 默认 256）。
         batch: Option<usize>,
+    },
+    /// **带 ROWID 的扫描**（DML 源；行 = `[ROWID 6B] ++ 各列`）。
+    WithRowId {
+        /// 行源标识。
+        source: SourceId,
+        /// 表的行形状。
+        shape: RowShape,
+    },
+    /// **插入**（`INSERT INTO t VALUES …`；不产出结果行）。
+    Insert {
+        /// 表的行形状。
+        shape: RowShape,
+        /// VALUES 行（每行 = 一列一个表达式）。
+        rows: Vec<Vec<Expr>>,
+    },
+    /// **更新**（源行带 ROWID；SET 表达式按原行求值）。
+    Update {
+        /// 源子树（必须经 `WithRowId`）。
+        input: Box<PlanNode>,
+        /// `(列号, 新值表达式)`。
+        sets: Vec<(usize, Expr)>,
+        /// 表的行形状。
+        shape: RowShape,
+    },
+    /// **删除**（源行带 ROWID）。
+    Delete {
+        /// 源子树（必须经 `WithRowId`）。
+        input: Box<PlanNode>,
     },
     /// **合并追加**（`UNION ALL`；流水）。
     Append {
@@ -219,9 +249,10 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
             limit,
             batch,
         } => {
+            let chain = env.chain.ok_or(ExecError::NoWriter)?;
             let scan = IndexScan::new(
                 env.pool,
-                env.chain,
+                chain,
                 *file_id,
                 *root,
                 *key_kind,
@@ -235,6 +266,37 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
                 Some(n) => scan.with_batch(*n),
                 None => scan,
             })
+        }
+        PlanNode::WithRowId { source, shape } => Box::new(crate::dml::WithRowId::new(
+            open_cursor(*source)?,
+            shape.clone(),
+        )),
+        PlanNode::Insert { shape, rows } => {
+            let writer = env.writer.ok_or(ExecError::NoWriter)?;
+            Box::new(crate::dml::Insert::new(
+                writer,
+                true,
+                shape.clone(),
+                rows.clone(),
+            ))
+        }
+        PlanNode::Update { input, sets, shape } => {
+            let writer = env.writer.ok_or(ExecError::NoWriter)?;
+            Box::new(crate::dml::Update::new(
+                build(input, env, open_cursor)?,
+                writer,
+                true,
+                sets.clone(),
+                shape.clone(),
+            ))
+        }
+        PlanNode::Delete { input } => {
+            let writer = env.writer.ok_or(ExecError::NoWriter)?;
+            Box::new(crate::dml::Delete::new(
+                build(input, env, open_cursor)?,
+                writer,
+                true,
+            ))
         }
         PlanNode::Append { inputs } => {
             let mut ops = Vec::with_capacity(inputs.len());

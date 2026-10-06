@@ -32,6 +32,8 @@ pub enum ExecError {
         /// 参数个数。
         count: usize,
     },
+    /// 计划含写算子但执行环境没给写通道（构建期缺陷）。
+    NoWriter,
     /// 计划引用了不存在的行源（构建期缺陷）。
     NoSuchSource {
         /// 行源标识。
@@ -70,6 +72,7 @@ impl std::fmt::Display for ExecError {
             ExecError::ParamOutOfRange { index, count } => {
                 write!(f, "参数下标 {index} 越界（共 {count} 个参数）")
             }
+            ExecError::NoWriter => f.write_str("计划含写算子，但执行环境未提供写通道"),
             ExecError::NoSuchSource { id } => write!(f, "计划引用的行源 {id} 不存在"),
             ExecError::Scan(e) => write!(f, "存储服务：{e}"),
             ExecError::Index(e) => write!(f, "索引：{e}"),

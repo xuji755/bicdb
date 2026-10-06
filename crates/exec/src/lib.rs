@@ -24,6 +24,7 @@
 pub mod agg;
 pub mod context;
 pub mod direct;
+pub mod dml;
 pub mod error;
 pub mod expr;
 pub mod hash_join;
@@ -40,6 +41,7 @@ pub mod value;
 pub use agg::{AggKind, AggSpec, HashAgg, ScalarAgg, SortedAgg};
 pub use context::{ExecContext, OpStat, WorkAreaOutcome, WorkAreaStats};
 pub use direct::{execute_direct, SelectQuery};
+pub use dml::{Delete, Insert, TableWriter, Update, WithRowId};
 pub use error::ExecError;
 pub use expr::{ArithOp, CmpOp, Expr, Truth};
 pub use hash_join::HashJoin;

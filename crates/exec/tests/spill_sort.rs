@@ -57,8 +57,9 @@ fn run_sort(
     };
     let env = ExecEnv {
         pool: fx.pool,
-        chain: &fx.chain,
+        chain: Some(&fx.chain),
         spill,
+        writer: None,
     };
     let mut op = build(plan, &env, &mut open)?;
     let mut cx = ExecContext::new(fx.snapshot).with_work_memory_budget(budget);

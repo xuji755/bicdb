@@ -81,8 +81,9 @@ fn run_plan_only(env: &Env, plan: &PlanNode) -> Result<(Vec<Row>, usize), ExecEr
     let mut open = |_src| Err::<Box<dyn RowCursor>, ExecError>(ExecError::NoSuchSource { id: 0 });
     let envx = ExecEnv {
         pool: env.pool,
-        chain: &env.chain,
+        chain: Some(&env.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(plan, &envx, &mut open)?;
     let mut cx = ExecContext::new(env.snapshot);
@@ -227,8 +228,9 @@ fn nested_loop_with_index_inner_matches_naive_reference() {
     };
     let envx = ExecEnv {
         pool: env.pool,
-        chain: &env.chain,
+        chain: Some(&env.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(&plan, &envx, &mut open).unwrap();
     let mut cx = ExecContext::new(env.snapshot);
@@ -301,8 +303,9 @@ fn left_join_pads_unmatched_outer_rows() {
     };
     let envx = ExecEnv {
         pool: env.pool,
-        chain: &env.chain,
+        chain: Some(&env.chain),
         spill: None,
+        writer: None,
     };
     let mut op = build(&plan, &envx, &mut open).unwrap();
     let mut cx = ExecContext::new(env.snapshot);
