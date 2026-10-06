@@ -5,12 +5,14 @@
 //! （行数——LIMIT 短路等行为由此可观测）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use bicdb_common::seq::CommitSeq;
 
 use crate::error::ExecError;
 use crate::value::Value;
+use crate::wmm::{AreaClaim, WorkArea, WorkMemoryPool};
 
 /// 一个算子的统计槽。
 #[derive(Debug, Clone, Default)]
@@ -35,7 +37,8 @@ pub enum WorkAreaOutcome {
     MultiPass,
 }
 
-/// 三态计数（诊断口径；切片 2c 只记 `optimal`——溢出随切片 6）。
+/// 三态计数 + 额外字节（诊断口径；设计 §4.2 监测四件套：三态计数与
+/// extra bytes 都是设计的一部分，不是可选的观测）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WorkAreaStats {
     /// `optimal` 次数。
@@ -44,6 +47,10 @@ pub struct WorkAreaStats {
     pub one_pass: u64,
     /// `multi-pass` 次数。
     pub multi_pass: u64,
+    /// 溢出写出的额外字节（temp 写）。
+    pub extra_bytes_written: u64,
+    /// 溢出读回的额外字节（temp 读）。
+    pub extra_bytes_read: u64,
 }
 
 /// **执行上下文**（单次执行一造；不属于计划——REQ-SQL-004）。
@@ -54,9 +61,11 @@ pub struct ExecContext<'a> {
     deadline: Option<Instant>,
     cancel: Option<&'a AtomicBool>,
     stats: Vec<OpStat>,
-    /// 工作内存预算（**WMM 最小面**：切片 2c 由计划侧给；`None` = 不限——
-    /// 完整 WMM 随切片 6 接入，照 `work_memory_target` / 会话设置的语境填）。
+    /// 工作内存预算（**固定值形态**＝会话 MANUAL 模式：`work_area_size` 或
+    /// 测试直给；`None` = 不限。AUTO 模式由 [`Self::claim_area`] 从共享池取）。
     work_memory_budget: Option<u64>,
+    /// **实例共享池**（AUTO 模式；会话层注入——执行器不持有实例状态）。
+    pool: Option<Arc<WorkMemoryPool>>,
     work_areas: WorkAreaStats,
 }
 
@@ -71,6 +80,7 @@ impl<'a> ExecContext<'a> {
             cancel: None,
             stats: Vec::new(),
             work_memory_budget: None,
+            pool: None,
             work_areas: WorkAreaStats::default(),
         }
     }
@@ -145,26 +155,74 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    /// **设工作内存预算**（字节；`None` = 不限）。切片 2c 的入口——
-    /// 完整 WMM（共享池/租户/会话三层 + 分配算法）随切片 6。
+    /// **设固定工作内存预算**（字节；`None` = 不限）——会话 MANUAL 模式
+    /// （`work_area_size`）与测试的直给口。
     #[must_use]
     pub fn with_work_memory_budget(mut self, budget: Option<u64>) -> Self {
         self.work_memory_budget = budget;
         self
     }
 
-    /// 工作内存预算（排序/哈希工作区在装载时检查；超限在切片 6 前报错）。
+    /// 固定工作内存预算（未声明内存区时生效；见 [`Self::budget_for`]）。
     #[must_use]
     pub fn work_memory_budget(&self) -> Option<u64> {
         self.work_memory_budget
     }
 
-    /// **记一次算子内存区的执行结果**（WMM 三态计数）。
+    /// **接实例共享池**（AUTO 模式；会话层注入——设计 §4.2 三层关系）。
+    #[must_use]
+    pub fn with_work_memory_pool(mut self, pool: Arc<WorkMemoryPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// 实例共享池（若有）。
+    #[must_use]
+    pub fn work_memory_pool(&self) -> Option<&Arc<WorkMemoryPool>> {
+        self.pool.as_ref()
+    }
+
+    /// **登记一个算子内存区**（算子 open 时：申报 = 未申报，边读边量再
+    /// [`WorkArea::regrade`]；无池 = `None`——算子退回固定预算/不限形态）。
+    #[must_use]
+    pub fn claim_area(&self, name: &'static str) -> Option<WorkArea> {
+        self.pool.as_ref().map(|p| p.claim(name))
+    }
+
+    /// 登记并带初始申报（代价模型到位后由计划侧给申报的入口）。
+    #[must_use]
+    pub fn claim_area_with(&self, name: &'static str, claim: AreaClaim) -> Option<WorkArea> {
+        self.pool.as_ref().map(|p| p.claim_with(name, claim))
+    }
+
+    /// **本算子的工作内存额度**：声明了内存区 ⇒ 池配额（每次重读——
+    /// 池内重平衡可下调）；否则退固定预算（`None` = 不限）。
+    #[must_use]
+    pub fn budget_for(&self, area: Option<&WorkArea>) -> Option<u64> {
+        match area {
+            Some(a) => Some(a.budget()),
+            None => self.work_memory_budget,
+        }
+    }
+
+    /// **记额外字节**（temp 读/写；`V$PGASTAT` 同名口径）。
+    pub fn note_extra_bytes(&mut self, written: u64, read: u64) {
+        self.work_areas.extra_bytes_written += written;
+        self.work_areas.extra_bytes_read += read;
+        if let Some(p) = &self.pool {
+            p.note_extra_bytes(written, read);
+        }
+    }
+
+    /// **记一次算子内存区的执行结果**（WMM 三态计数；池级累计同步）。
     pub fn note_work_area(&mut self, outcome: WorkAreaOutcome) {
         match outcome {
             WorkAreaOutcome::Optimal => self.work_areas.optimal += 1,
             WorkAreaOutcome::OnePass => self.work_areas.one_pass += 1,
             WorkAreaOutcome::MultiPass => self.work_areas.multi_pass += 1,
+        }
+        if let Some(p) = &self.pool {
+            p.note_outcome(outcome);
         }
     }
 

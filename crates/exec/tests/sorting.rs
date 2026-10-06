@@ -222,7 +222,9 @@ fn work_memory_budget_is_enforced_and_counted() {
         WorkAreaStats {
             optimal: 1,
             one_pass: 0,
-            multi_pass: 0
+            multi_pass: 0,
+            extra_bytes_written: 0,
+            extra_bytes_read: 0,
         },
         "预算内完成 ⇒ optimal 计数 1（WMM 最小面）"
     );

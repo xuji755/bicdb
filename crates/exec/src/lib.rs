@@ -37,6 +37,7 @@ pub mod setops;
 pub mod sort;
 pub mod spill;
 pub mod value;
+pub mod wmm;
 
 pub use agg::{AggKind, AggSpec, HashAgg, ScalarAgg, SortedAgg};
 pub use context::{ExecContext, OpStat, WorkAreaOutcome, WorkAreaStats};
@@ -56,3 +57,4 @@ pub use spill::SpillSpace;
 pub use value::{
     cast_value, decode_row, encode_row, kind_name, row_bytes, ColKind, Row, RowShape, Value,
 };
+pub use wmm::{AreaClaim, PoolStats, WorkArea, WorkMemoryPool};

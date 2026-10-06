@@ -80,7 +80,9 @@ fn external_merge_matches_in_memory_sort_row_by_row() {
         WorkAreaStats {
             optimal: 1,
             one_pass: 0,
-            multi_pass: 0
+            multi_pass: 0,
+            extra_bytes_written: 0,
+            extra_bytes_read: 0,
         }
     );
     assert_eq!(in_memory.len(), 200);
