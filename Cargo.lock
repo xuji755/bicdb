@@ -9,6 +9,12 @@ version = "0.0.0"
 [[package]]
 name = "bicdb-catalog"
 version = "0.0.0"
+dependencies = [
+ "bicdb-common",
+ "bicdb-index",
+ "bicdb-storage",
+ "bicdb-workspace",
+]
 
 [[package]]
 name = "bicdb-common"

@@ -11,6 +11,7 @@
 use bicdb_storage::buffer::{BufferError, BufferKey, BufferPool};
 use bicdb_storage::page::{Page, PageType};
 use bicdb_storage::rowid::{Rdba, RowId, ROWID_LEN};
+use bicdb_storage::segment::Segment;
 
 use crate::IndexError;
 
@@ -309,5 +310,155 @@ impl PageStore for MemStore {
             out.push(self.read(first + i)?);
         }
         Ok(out)
+    }
+}
+
+/// **段直存取口**（**无池、无 redo**）：把一段当作 B+Tree 的页仓——
+/// **建区期**（引导页/自举集：引导页本身不产生 redo，段也是首次创建）与
+/// 离线工具的存取口。
+///
+/// **生产 DDL 不走这里**（建表/建索引经缓冲池 + redo，见执行器的 `IndexIo`
+/// 适配）；本存取口的存在理由 = 自举阶段**还没有池与日志可用**。
+///
+/// 页号语义：对外是**物理块号**（与树里的 `rdba` 一致），对内映射到段的
+/// **逻辑页号**（`Segment` 的口径）；映射表在分配时建立。
+pub struct SegmentStore<'a, 'io, 'f> {
+    segment: &'a mut Segment<'io, 'f>,
+    file_id: u16,
+    ws: [u8; 8],
+    /// 物理块 → 逻辑页（分配时记录）。
+    map: std::collections::HashMap<u32, u32>,
+}
+
+impl<'a, 'io, 'f> SegmentStore<'a, 'io, 'f> {
+    /// 打开（`ws` = 工作区标识；文件号取自段）。
+    ///
+    /// **建映射**：扫 `逻辑页 0..hwm` 建立 `物理块 → 逻辑页`（既有段因此可
+    /// 直接读回；新建段则随分配增量补记）。O(hwm) 一次——本存取口面向
+    /// **建区期与离线工具**，不做池化。
+    #[must_use]
+    pub fn new(segment: &'a mut Segment<'io, 'f>, ws: [u8; 8]) -> Self {
+        let file_id = segment.file_id();
+        let mut map = std::collections::HashMap::new();
+        // 快照先取（避免与 `&mut segment` 的借用冲突）。
+        let hwm = segment.hwm();
+        for logical in 0..hwm {
+            if let Some(block) = segment.logical_block(logical) {
+                map.insert(block, logical);
+            }
+        }
+        Self {
+            segment,
+            file_id,
+            ws,
+            map,
+        }
+    }
+
+    fn logical_of(&self, block: u32) -> Result<u32, IndexError> {
+        self.map
+            .get(&block)
+            .copied()
+            .ok_or(IndexError::BlockNotFound { block })
+    }
+}
+
+impl PageStore for SegmentStore<'_, '_, '_> {
+    fn read(&mut self, block: u32) -> Result<Page, IndexError> {
+        let logical = self.logical_of(block)?;
+        self.segment
+            .read_page(logical)
+            .map_err(|e| IndexError::Io(e.to_string()))
+    }
+
+    fn write(&mut self, block: u32, page: &mut Page) -> Result<(), IndexError> {
+        let logical = self.logical_of(block)?;
+        self.segment
+            .write_page(logical, page)
+            .map_err(|e| IndexError::Io(e.to_string()))
+    }
+
+    fn allocate(&mut self) -> Result<u32, IndexError> {
+        IndexIo::allocate_page(self)
+    }
+
+    fn block_count(&self) -> u32 {
+        self.map.len() as u32
+    }
+
+    fn blocks(&mut self) -> Result<Vec<u32>, IndexError> {
+        // **只列索引页**（页类型 2/3/4）：段头（逻辑 0）与段内位图页不属于树
+        // （`PageStore::blocks` 的口径）。页类型从页头取——顺带做了自证。
+        let mut out = Vec::new();
+        let mut pairs: Vec<(u32, u32)> = self.map.iter().map(|(&b, &l)| (b, l)).collect();
+        pairs.sort_unstable();
+        for (block, logical) in pairs {
+            let Ok(page) = self.segment.read_page(logical) else {
+                continue;
+            };
+            if matches!(
+                page.header().map(|h| h.page_type),
+                Some(PageType::IndexLeaf | PageType::IndexBranch | PageType::IndexRoot)
+            ) {
+                out.push(block);
+            }
+        }
+        Ok(out)
+    }
+
+    fn read_run(&mut self, first: u32, count: u32) -> Result<Vec<Page>, IndexError> {
+        // 段的区读口（一次读 ≤ N 页）在 `Segment` 层；此处逐页读语义等价
+        // （建区期数据量小，不值得另设口）。
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            out.push(self.read(first + i)?);
+        }
+        Ok(out)
+    }
+}
+
+impl IndexIo for SegmentStore<'_, '_, '_> {
+    fn allocate_page(&mut self) -> Result<u32, IndexError> {
+        let logical = self
+            .segment
+            .allocate_append_page()
+            .map_err(|e| IndexError::Io(e.to_string()))?;
+        if self.segment.logical_block(logical).is_none() {
+            self.segment
+                .extend()
+                .map_err(|e| IndexError::Io(e.to_string()))?;
+        }
+        let block = self
+            .segment
+            .logical_block(logical)
+            .ok_or(IndexError::Malformed("逻辑页无物理块"))?;
+        self.map.insert(block, logical);
+        Ok(block)
+    }
+
+    fn apply_page(&mut self, block: u32, after: &Page) -> Result<(), IndexError> {
+        let logical = self.logical_of(block)?;
+        let mut page = Page::from_bytes(Box::new(*after.as_bytes()));
+        self.segment
+            .write_page(logical, &mut page)
+            .map_err(|e| IndexError::Io(e.to_string()))
+    }
+
+    fn allocated_blocks(&mut self) -> Result<Vec<u32>, IndexError> {
+        self.blocks()
+    }
+}
+
+impl SegmentStore<'_, '_, '_> {
+    /// 文件号（诊断）。
+    #[must_use]
+    pub fn file_id(&self) -> u16 {
+        self.file_id
+    }
+
+    /// 工作区标识（诊断）。
+    #[must_use]
+    pub fn workspace(&self) -> [u8; 8] {
+        self.ws
     }
 }

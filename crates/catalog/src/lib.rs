@@ -22,8 +22,10 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod create;
 pub mod dict;
 
+pub use create::{create_dictionary, BootstrapObject, BuiltDictionary, CreateError};
 pub use dict::{
     bootstrap_entries_normal, bootstrap_entries_public, index_kind, is_public_only, namespace,
     obj_kind, self_check, table_opt, ColDef, ColTypeCode, DictTable, KeyDef, DICT_TABLES,
