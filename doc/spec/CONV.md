@@ -213,7 +213,7 @@
 
 各域引用资源额度时使用统一名称，实际数值 P0 冻结（REQ-PERF-001、REQ-RES-001）：
 
-`max_buffers`、`max_query_memory`、`max_connections`、`max_task_queue`、`cpu_budget`、`io_bandwidth`、`max_files`、`max_asset_bytes`、`max_vectors`、`max_graph_expansion`、`max_temp_bytes`、**`work_memory_target`**（实例侧工作内存目标——2026-10-06 追加冻结，P0 冻结决议的评审记录）
+`max_buffers`、`max_query_memory`、`max_connections`、`max_task_queue`、`cpu_budget`、`io_bandwidth`、`max_files`、`max_asset_bytes`、`max_vectors`、`max_graph_expansion`、`max_temp_bytes`、**`work_memory_target`**（实例侧工作内存目标——2026-10-06 追加冻结，P0 冻结决议的评审记录）、**`work_area_size`**（会话级；设置即切 MANUAL 手工模式、每算子内存区固定上限——PG `work_mem` 对应物，2026-10-06 用户口径）
 
 **分层**：每个额度同时存在**工作区上限**与**实例总上限**。任一超限均返回**资源拒绝类**错误（码自 `BIC-10000` 起，见 §4.1、§4.3）。
 
