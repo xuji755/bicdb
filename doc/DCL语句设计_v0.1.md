@@ -32,33 +32,63 @@
 
 ## 1 语句闭集（V1.0）
 
-### 1.1 工作区生命周期
+### 1.1 工作区引用：**id 或名字**（用户口径 2026-10-06）
+
+**id 不好记** ⇒ 所有工作区语句的引用位**同时接受 id 与名字**：
+
+```text
+<work_ref> := 整数                        -- workspace_id（全局唯一）
+            | Str [ FOR USER <主体> ]     -- 名字（可选属主限定——名字只在属主内唯一）
+```
+
+**解析规则（三条，明确不猜）**：
+
+| 情形 | 行为 |
+| --- | --- |
+| 给 `FOR USER` | 在该属主的范围内按 `(user_id, name)` **唯一索引**点查；找不到 ⇒ "不存在" |
+| 裸名（无 `FOR USER`） | 全实例按名查：**命中恰好一个 ⇒ 解析**；**命中多个 ⇒ 明确拒绝**（"名字不唯一——请用 `FOR USER` 限定或改用 id"）；**零命中 ⇒ "不存在"** |
+| `ws$.name` 为 NULL（**缺省名 = 跟随属主用户名**） | 引用时按**有效名**（= 属主名）解析——`NAME` 缺省的工作区**同样可按名操作** |
+
+**有效名唯一性的收口（评审点⑦）**：`ws$` 的 `(user_id, name)` 唯一索引**对 NULL 不生效**⇒
+可能出现"一个 NULL 名（有效名 = `alice`）+ 一个显式名 `alice`"的歧义。
+**建议**：DDL 侧显式检查**有效名**唯一（写入时把 NULL 展开为属主名比较），
+违反即拒绝（"与跟随属主名的默认命名冲突"）；`ws$` 仍存 NULL（保住"跟随"语义）。
+**admin 面**：DCL 仅 admin ⇒ 报"不唯一"不构成信息泄露（管理面本就跨区）。
+
+### 1.2 工作区生命周期
 
 | # | 语句 | 语义落点 |
 | --- | --- | --- |
 | W1 | `CREATE WORKSPACE FOR USER <主体> [NAME '<名>']` | 三步协议（`目录详设` §5.1）：建文件 + 引导页 → 建字典（DDL 事务）→ **登记 `public.ws$`（唯一可见性分界）**；`NAME` 缺省 = 跟随属主名 |
-| W2 | `ALTER DATABASE CLONE WORKSPACE '<新名>' FROM WORKSPACE <源 id>` <br> `ALTER DATABASE CLONE WORKSPACE '<新名>' FROM TEMPLATE '<模板名>'` | **克隆独立成句**（用户形状）；**两种源**（工作区 / 模板）同一实现：校验**同一 owner**（REQ-ISO-012）/模板可见性 → **暂停写访问窗内 reflink 复制**（`arch/02` §3.4 的窗口协议同形）→ 新工作区登记 `ws$`；`seq$` **原样延续**（§2.12） |
-| W3 | `ALTER WORKSPACE <id> SET NAME = '<名>' \| NULL` | 改名；`NULL` = 回到"跟随用户名"（§2.11）；同属主内名字唯一 |
-| W4 | `ALTER WORKSPACE <id> SET QUOTA (data=…, undo=…, temp=…, asset=…)` | 四配额按角色分设；**只允许不小于当前占用**（向下越界 ⇒ 具名拒绝，不静默截断） |
-| W5 | `DROP WORKSPACE <id>` | 反向三步：**先从 `ws$` 摘除（可见性先断）** → 释放资源 → 删目录；`public` 与模板**不可此路删除** |
+| W2 | `ALTER DATABASE CLONE WORKSPACE '<新名>' FROM WORKSPACE <work_ref>` <br> `ALTER DATABASE CLONE WORKSPACE '<新名>' FROM TEMPLATE '<模板名>'` | **克隆独立成句**（用户形状）；**两种源**（工作区 / 模板）同一实现：校验**同一 owner**（REQ-ISO-012）/模板可见性 → **暂停写访问窗内 reflink 复制**（`arch/02` §3.4 的窗口协议同形）→ 新工作区登记 `ws$`；`seq$` **原样延续**（§2.12） |
+| W3 | `ALTER WORKSPACE <work_ref> SET NAME = '<名>' \| NULL` | 改名；`NULL` = 回到"跟随用户名"（§2.11）；同属主内名字唯一 |
+| W4 | `ALTER WORKSPACE <work_ref> SET QUOTA (data=…, undo=…, temp=…, asset=…)` | 四配额按角色分设；**只允许不小于当前占用**（向下越界 ⇒ 具名拒绝，不静默截断） |
+| W5 | `DROP WORKSPACE <work_ref>` | 反向三步：**先从 `ws$` 摘除（可见性先断）** → 释放资源 → 删目录；`public` 与模板**不可此路删除** |
 
 > **与现规格的一处替换（评审点①）**：REQ-SQL-005 现写 `CREATE WORKSPACE … [CLONE OF <id>]`。
 > 克隆**独立成句**（W2）——一件事不设两个入口，建议删掉 `CLONE OF` 从句，
 > 需求文字随评审同步。
 
-### 1.2 实例资源：文件系统池
+### 1.3 实例资源：文件系统池
 
 **池语义以 `arch/02` §2.8 为准**（实例级；加入无前置；**移出前该文件系统上不得有
 任何数据文件**——硬条件，先 `Move` 走再移出）；池定义存**全局控制文件**（权威、可重建），
 `public.fs$` 供查询/审计。
 
+**文件系统引用同样接受两种形态**（槽位号不好记，用户口径同 §1.1）：
+
+```text
+<fs_ref> := 整数          -- 槽位号
+          | Str           -- 挂载点路径（`fs$` 按 mount_path 解析；注册即唯一）
+```
+
 | # | 语句 | 语义落点 |
 | --- | --- | --- |
 | F1 | `ALTER SYSTEM ADD FILESYSTEM '<挂载点>'` | 校验：存在、可写、**非符号链接**（`FileIo` 既有纪律）；写**全局控制文件**（双副本·慢路径）+ 插 `public.fs$`（`status = 在池`）；新加入者立即参与后续分配 |
-| F2 | `ALTER SYSTEM ALTER FILESYSTEM <槽位> SET ALLOCATE = ON \| OFF` | **退役前的排水阀**：`OFF` = 不再分配新文件、已有文件不动（配合 `Move`） |
-| F3 | `ALTER SYSTEM DROP FILESYSTEM <槽位>` | **硬前置**：该盘无任何数据文件（判据 = 全局控制文件的工作区清单 × 各工作区控制文件的完整路径前缀）；通过 ⇒ 全局控制文件更新 + `fs$` 行置 `已移出`（**不删行**——审计友好） |
+| F2 | `ALTER SYSTEM ALTER FILESYSTEM <fs_ref> SET ALLOCATE = ON \| OFF` | **退役前的排水阀**：`OFF` = 不再分配新文件、已有文件不动（配合 `Move`） |
+| F3 | `ALTER SYSTEM DROP FILESYSTEM <fs_ref>` | **硬前置**：该盘无任何数据文件（判据 = 全局控制文件的工作区清单 × 各工作区控制文件的完整路径前缀）；通过 ⇒ 全局控制文件更新 + `fs$` 行置 `已移出`（**不删行**——审计友好） |
 
-### 1.3 会话参数（闭合面）
+### 1.4 会话参数（闭合面）
 
 | # | 语句 | 语义落点 |
 | --- | --- | --- |
@@ -71,7 +101,7 @@
 > WMM 的会话设置（已冻结）需要 `ALTER SESSION SET/CLEAR` 这一**闭合面**——建议改为
 > "不提供**通用**会话变量；仅白名单参数"；`SHOW` 维持不提供。
 
-### 1.4 **工作区模板**（用户口径 2026-10-06）
+### 1.5 **工作区模板**（用户口径 2026-10-06）
 
 **是什么**：一份**可克隆的工作区快照**——含**数据结构**（字典）与**初始化数据**
 （用户表内容）；克隆即得"某种特定类型的工作区"（例：记忆库骨架、项目起始区）。
@@ -80,8 +110,8 @@
 
 | # | 语句 | 语义 |
 | --- | --- | --- |
-| T1 | `ALTER DATABASE ADD TEMPLATE '<模板名>' FROM <源 workspace_id>` | **由源区制作模板**：暂停写窗内 reflink 快照 → 模板区；**源区保持可写、不受影响**（"从生产库抽模板"） |
-| T2 | `ALTER DATABASE ALTER WORKSPACE <id> TO TEMPLATE '<模板名>'` | **原地转换**：该区 `status → template`；此后**不可作为普通区打开**（"把已建好的区固化为模板"） |
+| T1 | `ALTER DATABASE ADD TEMPLATE '<模板名>' FROM <work_ref>` | **由源区制作模板**：暂停写窗内 reflink 快照 → 模板区；**源区保持可写、不受影响**（"从生产库抽模板"） |
+| T2 | `ALTER DATABASE ALTER WORKSPACE <work_ref> TO TEMPLATE '<模板名>'` | **原地转换**：该区 `status → template`；此后**不可作为普通区打开**（"把已建好的区固化为模板"） |
 | T3 | `ALTER DATABASE DROP TEMPLATE '<模板名>'` | 删模板（**硬前置**：无任何工作区自它克隆？——**否**：克隆是复制，不建立依赖；直接删，审计留痕） |
 
 **模板的内容与快照纪律**：
@@ -113,36 +143,40 @@
 ### 2.1 产生式（BNF；照 PG 的形状，本库扩展标记 ★）
 
 ```text
+-- ── 公共引用位（id 或名字；§1.1/§1.3）────────────────────────
+WorkRef:  整数 | Str [ FOR USER 主体名 ]
+FsRef:    整数 | Str                       -- 槽位号或挂载点
+
 -- ── 工作区生命周期 ──────────────────────────────────────────
 CreateWorkspaceStmt:
-      CREATE WORKSPACE FOR USER 主体名 [ NAME Str ]
+      CREATE WORKSPACE FOR USER 主体名 [ NAME Str ]      -- NAME 缺省 = 跟随属主名
 
 ★ CloneWorkspaceStmt:
-      ALTER DATABASE CLONE WORKSPACE Str FROM WORKSPACE 整数
+      ALTER DATABASE CLONE WORKSPACE Str FROM WORKSPACE WorkRef
     | ALTER DATABASE CLONE WORKSPACE Str FROM TEMPLATE  Str
 
 ★ AddTemplateStmt:
-      ALTER DATABASE ADD TEMPLATE Str FROM 整数
+      ALTER DATABASE ADD TEMPLATE Str FROM WorkRef
 
 ★ WorkspaceToTemplateStmt:
-      ALTER DATABASE ALTER WORKSPACE 整数 TO TEMPLATE Str
+      ALTER DATABASE ALTER WORKSPACE WorkRef TO TEMPLATE Str
 
 ★ DropTemplateStmt:
       ALTER DATABASE DROP TEMPLATE Str
 
 AlterWorkspaceStmt:
-      ALTER WORKSPACE 整数 SET NAME Eq ( Str | NULL )
-    | ALTER WORKSPACE 整数 SET QUOTA '(' QuotaItem ( ',' QuotaItem )* ')'
+      ALTER WORKSPACE WorkRef SET NAME Eq ( Str | NULL )
+    | ALTER WORKSPACE WorkRef SET QUOTA '(' QuotaItem ( ',' QuotaItem )* ')'
 QuotaItem:  ( data | undo | temp | asset ) Eq 整数
 
 DropWorkspaceStmt:
-      DROP WORKSPACE 整数
+      DROP WORKSPACE WorkRef
 
 -- ── 文件系统池（★ 全部为本库扩展）──────────────────────────
 ★ AlterSystemStmt:
       ALTER SYSTEM ADD   FILESYSTEM Str
-    | ALTER SYSTEM ALTER FILESYSTEM 整数 SET ALLOCATE Eq （ ON | OFF ）
-    | ALTER SYSTEM DROP  FILESYSTEM 整数
+    | ALTER SYSTEM ALTER FILESYSTEM FsRef SET ALLOCATE Eq （ ON | OFF ）
+    | ALTER SYSTEM DROP  FILESYSTEM FsRef
 
 -- ── 会话参数（闭合白名单；照 PG 的 SET/ALTER SESSION 同节点）──
 VariableSetStmt:
@@ -162,7 +196,8 @@ SetValue:  整数 | 浮点 | Str                          -- 内存量照 PG：'
 | --- | --- | --- |
 | `VariableSetStmt` | `VariableSetStmt { kind: Set\|Clear, name, args: Vec<AConst>, location }` | `ALTER SESSION SET/CLEAR`（PG 的 `SET` 与 `ALTER SESSION SET` 同节点）；`is_local`/CURRENT 面在清单外 |
 | `AlterSystemStmt` | `AlterSystemStmt { action: AddFilesystem{mount} \| AlterFilesystem{slot, allocate} \| DropFilesystem{slot}, location }` | 本库扩展（记档） |
-| `AlterDatabaseStmt`（PG 带库名） | `AlterDatabaseStmt { action: AlterDatabaseAction, location }`；`AlterDatabaseAction = CloneWorkspace{name, source: WorkspaceSource} \| AddTemplate{name, from} \| WorkspaceToTemplate{ws, name} \| DropTemplate{name}`；`WorkspaceSource = Workspace(u64) \| Template(String)` | **本库实例即一个"库"** ⇒ 不带库名（记档） |
+| `AlterDatabaseStmt`（PG 带库名） | `AlterDatabaseStmt { action: AlterDatabaseAction, location }`；`AlterDatabaseAction = CloneWorkspace{name, source: WorkspaceSource} \| AddTemplate{name, from} \| WorkspaceToTemplate{ws, name} \| DropTemplate{name}`；`WorkspaceSource = Workspace(WorkRef) \| Template(String)` | **本库实例即一个"库"** ⇒ 不带库名（记档） |
+| —（公共引用位） | `WorkRef { id: Option<u64>, name: Option<String>, user: Option<String>, location }`（§1.1 的三条解析规则在 **② 绑定期**执行）；`FsRef { slot: Option<u32>, mount: Option<String>, location }` | 两种形态的**语义等价**由绑定层承担（解析结果统一为 id/槽位） |
 
 ### 2.3 语法要点
 
@@ -170,7 +205,9 @@ SetValue:  整数 | 浮点 | Str                          -- 内存量照 PG：'
   没有产生式）；
 - 白名单外的会话参数 ⇒ **绑定期拒绝**（"参数不存在"，**不静默忽略**）；
 - 配额项之外的键（`ALTER WORKSPACE … SET QUOTA (foo=1)`）⇒ 解析期拒绝
-  （`QuotaItem` 的产生式只有四个键）。
+  （`QuotaItem` 的产生式只有四个键）；
+- **`WorkRef`/`FsRef` 的歧义在绑定期拒绝**（裸名不唯一 ⇒ 要求 `FOR USER` 或改 id）——
+  解析器只认形态，**不做名字查找**（REQ-SQL-002 同一条纪律）。
 
 ---
 
@@ -200,6 +237,7 @@ SetValue:  整数 | 浮点 | Str                          -- 内存量照 PG：'
 | ④ | 模板/工作区的**快照窗口协议**（不复制 redo/undo、`file_scn` 起点、`seq$` 延续） | 与 `arch/02` §2.12 的既有克隆细则对齐后，写入 §2.12 |
 | ⑤ | `spec/ENG.md` REQ-ENG-005 的 `execute` 面 | 补一句：DCL 走同一通道，**不产出算子树** |
 | ⑥ | `spec/API.md` 的管理面（会话内省/cancel/terminate） | 与本设计**正交**（协议面命令 ≠ SQL 语句）——不改 |
+| ⑦ | `ws$.name` 的 NULL 展开与**有效名唯一性**（§1.1） | DDL 侧显式检查有效名唯一（NULL 展开为属主名比较）；`ws$` 仍存 NULL 保住"跟随"语义——`(user_id, name)` 唯一索引对 NULL 不生效，故需应用层收口；`arch/03` §2.11、§3.1.3 随评审补一句 |
 
 ---
 
