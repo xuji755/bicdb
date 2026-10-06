@@ -1486,7 +1486,7 @@ fn append_undo_via_pool(
 ///
 /// `is_new` = 该页尚未落盘（新分配的页）：经 [`BufferPool::insert_new`] 装入，
 /// 且"前像"必须全零（重放把它重建出来）。
-fn write_page_change(
+pub(crate) fn write_page_change(
     pool: &BufferPool<'_>,
     log: &mut GroupWriter<'_, '_>,
     txn_raw: u64,

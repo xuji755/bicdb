@@ -55,6 +55,15 @@
 //!   §5.12）、`Segment::{hwm, plan_advance_hwm}`（§4.3.1）、
 //!   `pagefile::read_run`。
 //!   （续，v0.26，P3 审核修复）`itl::cleanout`（延迟块清除的落点——已提交条目 → `Committed` + 准确序号、锁清零）；`ITL 覆盖` 载荷加 `txn_id` + **归属守卫**（幽灵/换人记录不得覆盖他人条目）；`Segment::sync`（新页"先落盘后进 redo"次序用）；CR 终止符按 `itl_slot` 匹配；（续）`plan_materialize_bitmap_page`（**计划形态的位图页物化**：全新页先格式化 fsync、扩展页经池 + redo、段头以后像为基）、`plan_extend` 支持"窗口首位落在新增区内"、`rollback_chain` 环检测、`ExtentNo` 域校验、页访问器对损坏页降级。**P4 多写者随后。**
+//!   （续，v0.30，2026-10-06 缺陷修复）**计划器的"在飞覆盖层"**——
+//!   `plan_materialize_bitmap_page` 内的连续 `plan_extend` 曾基于**过期段头页**
+//!   重算（第二次扩展丢掉前一步的区映射）⇒ 一旦需要"多次扩展才够到窗口首位"
+//!   就死循环（实测：`coverage=4` 时第 4 个窗口；默认 coverage 下需要 8000+ 次
+//!   扩展，同样永不终止）。修复 = 函数内维护**在飞后像覆盖层**，连续计划步骤
+//!   一律以覆盖层为读-改-写基准（提供者只反映已落地内容）。回归用例
+//!   `materializes_bitmap_windows_across_repeated_extensions`（连物化 10 个窗口）。
+//!   `Segment::plan_advance_append`（推进 `append_pos` + 抬 `hwm`，池视角基准）、
+//!   `Segment::read_physical_page`（物理块不校验读；池路径判断"是否已格式化"）。
 //!   （续，v0.28）**多工作集分区**（`BufferPool::with_partitions`：每分区自带
 //!   链/桶/写列表与具名闩锁，`H(工作区) mod N` 稳定哈希——§5.10 的 P4 形态）；
 //!   **NUMA 重绑定原语**——帧的页缓冲**惰性分配**（装页线程 = 首次触碰者，

@@ -26,7 +26,9 @@
 //!   **新撤销页先 fsync 落盘、后进 redo**（物理增量无法重建不存在的页）。
 //!
 //! 配套：[`snapshot`]（最老快照集合，§12.7——undo 回收的唯一输入）、
-//! [`lock`]（行锁的等待结构与死锁检测，§5.4.2）。
+//! [`lock`]（行锁的等待结构与死锁检测，§5.4.2）、[`index_io`]
+//! （**带 redo 的索引写口**——`bicdb_index::IndexIo` 的生产实现：段空间分配
+//! 走计划形态 + 经池 + redo，全新页先格式化落盘 + fsync，`page_lsn` 前置）。
 //!
 //! 三条纪律（§11.1）：
 //! 1. **写先入缓存**——DML 只改缓冲池里的页，脏页由 DBWR（Make Free/检查点）写回；
@@ -37,6 +39,7 @@
 #![deny(missing_docs)]
 
 pub mod engine;
+pub mod index_io;
 pub mod lock;
 pub mod snapshot;
 pub mod write;

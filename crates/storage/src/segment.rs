@@ -929,8 +929,28 @@ impl<'io, 'f> Segment<'io, 'f> {
     ) -> Result<PlannedAdvance, SegmentSpaceError> {
         let (_, _, bmp_logical) = self.bitmap_slot(i * self.coverage);
         let mut images: Vec<(Rdba, Page, Page)> = Vec::new();
+        // **在飞覆盖层**（2026-10-06 修复）：本函数内的连续计划步骤必须看到
+        // **上一步的后像**——提供者（池/文件）只反映**已落地**的内容，而本函数
+        // 的中间态是"待调用方落地的镜像"。缺了这层，第二次 `plan_extend` 会基于
+        // 过期段头页重新计算（前一步的区映射被静默丢弃）⇒ `while` 永不终止
+        // （实测：coverage=4 时第 4 个窗口物化即死循环）。
+        let file_id = self.file.file_id();
+        let mut overlay: Vec<(Rdba, Page)> = Vec::new();
         while self.logical_block(bmp_logical).is_none() {
-            let planned = self.plan_extend(&mut *current)?;
+            let planned = {
+                let mut layered = |block: u32| -> Option<Page> {
+                    overlay
+                        .iter()
+                        .rev()
+                        .find(|(r, _)| r.file_id() == file_id && r.block_id() == block)
+                        .map(|(_, p)| Page::from_bytes(Box::new(*p.as_bytes())))
+                        .or_else(|| (*current)(block))
+                };
+                self.plan_extend(&mut layered)?
+            };
+            for (rdba, _before, after) in &planned.images {
+                overlay.push((*rdba, Page::from_bytes(Box::new(*after.as_bytes()))));
+            }
             images.extend(planned.images);
         }
         let block = self
@@ -956,8 +976,19 @@ impl<'io, 'f> Segment<'io, 'f> {
             crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::High)?;
         }
 
-        // 段头页：append_pos 跳过位图页、bitmap_pages +1。
-        let header_before = current_page(self, self.page0, &mut *current)?;
+        // 段头页：append_pos 跳过位图页、bitmap_pages +1——
+        // 基准同样取**覆盖层**（上一步扩展后的段头页，尚未落地）。
+        let header_before = {
+            let mut layered = |block: u32| -> Option<Page> {
+                overlay
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| r.file_id() == file_id && r.block_id() == block)
+                    .map(|(_, p)| Page::from_bytes(Box::new(*p.as_bytes())))
+                    .or_else(|| (*current)(block))
+            };
+            current_page(self, self.page0, &mut layered)?
+        };
         let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
         let mut h = read_header(&header_after)?;
         h.append_pos = bmp_logical + 1;
@@ -978,6 +1009,32 @@ impl<'io, 'f> Segment<'io, 'f> {
             fresh: vec![(rdba, bmp)],
             header_after: header_after_copy,
         })
+    }
+
+    /// **计划推进追加位置**（**只增**）：`append_pos → new_append_pos`、
+    /// `hwm = max(hwm, new_append_pos)`；返回段头页的（前像、后像）。
+    ///
+    /// 与 [`Segment::plan_advance_hwm`] 同规（调用方经池写 redo），两处差异：
+    /// - 读-改-写基准取**当前镜像**（[`CurrentPages`]；元数据页 no-force 后
+    ///   文件像会落后于池像）；
+    /// - **同时推进 `append_pos`**——池路径"分配一个可写页"的落点
+    ///   （[`Segment::allocate_append_page`] 的 redo 形态）。
+    pub fn plan_advance_append(
+        &mut self,
+        new_append_pos: u32,
+        current: CurrentPages<'_>,
+    ) -> Result<(Page, Page), SegmentSpaceError> {
+        if new_append_pos < self.header.append_pos {
+            return Err(SegmentSpaceError::Format(SegmentError::Malformed));
+        }
+        let header_before = current_page(self, self.page0, current)?;
+        let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
+        let mut h = read_header(&header_after)?;
+        h.append_pos = new_append_pos;
+        h.hwm = h.hwm.max(new_append_pos);
+        write_header(&mut header_after, &h)?;
+        self.header = read_header(&header_after)?;
+        Ok((header_before, header_after))
     }
 
     /// **高水位**（内存镜像；§4.3.1）。
@@ -1043,6 +1100,16 @@ impl<'io, 'f> Segment<'io, 'f> {
             .logical_block(logical)
             .ok_or(SegmentSpaceError::BitmapCoverage)?;
         Ok(self.file.read_page_unverified(block)?)
+    }
+
+    /// **按物理块号读一页**（不校验 ⇒ 未初始化/零页返回 `None`）。
+    ///
+    /// 池路径的兜底读：池未命中时判断"盘上是否已有这张格式化过的页"——
+    /// 已格式化 ⇒ 走"既有页差异"分支，未格式化 ⇒ 走"全新页全像"分支。
+    #[must_use]
+    pub fn read_physical_page(&self, block: u32) -> Option<Page> {
+        let page = self.file.read_page_unverified(block).ok()?;
+        (page.verify() == crate::page::PageCheck::Ok).then_some(page)
     }
 
     /// **按物理块号直写一页**（不经区映射/逻辑页——"先格式化落盘"用）。
@@ -1601,5 +1668,70 @@ mod space_tests {
         seg.write_page(0, &mut page).unwrap();
         assert_eq!(seg.prepare_append_page().unwrap(), 9, "跳过位图页后落到 9");
         assert_eq!(seg.header().append_pos, 9);
+    }
+
+    /// **回归（2026-10-06）**：coverage 压到 4 ⇒ 每 4 个逻辑页撞一次窗口首位；
+    /// 连做 40 步（含 **10 次窗口物化、跨多次段扩展**）。钉住"计划器在飞覆盖层"
+    /// 这条修复——缺它时第二次 `plan_extend` 基于**过期段头页**重算（前一步的
+    /// 区映射被静默丢弃）⇒ `while` 永不终止（实测第 4 个窗口即死循环）。
+    #[test]
+    fn materializes_bitmap_windows_across_repeated_extensions() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut f =
+            DataFile::create(&io, Path::new("/mem/probe.dat"), 3, 3, [7u8; 8], 2048).unwrap();
+        let mut seg = Segment::create(&mut f, SegType::Heap, 1, 1, 8, 0, 0)
+            .unwrap()
+            .with_coverage(4);
+        let page0 = seg.page0_block();
+        let mut direct = |_: u32| None;
+        let mut last_append = 0u32;
+        for _ in 0..40 {
+            let logical = seg.append_position().unwrap();
+            assert!(logical > last_append, "append_pos 单调：{logical}");
+            last_append = logical;
+            if seg.is_bitmap_page(logical) {
+                let (i, _, _) = seg.bitmap_slot(logical);
+                let adv = seg.plan_materialize_bitmap_page(i, &mut direct).unwrap();
+                assert_eq!(adv.fresh.len(), 1, "物化恒产出一张全新位图页");
+                assert_eq!(
+                    adv.fresh[0].0.block_id(),
+                    seg.logical_block(logical).unwrap(),
+                    "全新页落在该窗口首位"
+                );
+                for (rdba, page) in &adv.fresh {
+                    let mut p = Page::from_bytes(Box::new(*page.as_bytes()));
+                    seg.write_physical_page(rdba.block_id(), &mut p).unwrap();
+                }
+                for (rdba, _b, a) in &adv.images {
+                    let mut p = Page::from_bytes(Box::new(*a.as_bytes()));
+                    seg.write_physical_page(rdba.block_id(), &mut p).unwrap();
+                }
+                continue;
+            }
+            if seg.logical_block(logical).is_none() {
+                let planned = seg.plan_extend(&mut direct).unwrap();
+                for (rdba, _b, a) in &planned.images {
+                    let mut p = Page::from_bytes(Box::new(*a.as_bytes()));
+                    seg.write_physical_page(rdba.block_id(), &mut p).unwrap();
+                }
+                continue;
+            }
+            let (before, after) = seg.plan_advance_append(logical + 1, &mut direct).unwrap();
+            assert_eq!(
+                read_header(&before).unwrap().append_pos + 1,
+                read_header(&after).unwrap().append_pos,
+                "推进恒 +1"
+            );
+            let mut p = Page::from_bytes(Box::new(*after.as_bytes()));
+            seg.write_physical_page(page0, &mut p).unwrap();
+        }
+        // 40 步后：逻辑页 0..=40 全部映射到位（含 10 个位图页窗口）。
+        for logical in 0..=40 {
+            assert!(
+                seg.logical_block(logical).is_some(),
+                "逻辑页 {logical} 应已映射"
+            );
+        }
     }
 }
