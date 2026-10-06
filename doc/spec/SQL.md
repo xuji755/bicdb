@@ -268,7 +268,8 @@ Binder 解析**对象与参数**，形成**带类型的 Bound Query**。
 #### 语义
 
 首版 SQL 包含**建删表索引、CRUD、事务控制、表达式、参数绑定、INNER 与 LEFT JOIN、
-聚合、排序、LIMIT 及 JSON 路径与向量距离接口**。
+聚合（含 `DISTINCT` 变体）、排序、LIMIT、**`SELECT DISTINCT` 与集合运算
+（`UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]`）**及 JSON 路径与向量距离接口**。
 
 #### 规格
 
@@ -290,8 +291,9 @@ ALTER WORKSPACE <workspace_id> SET NAME = '<名>' | NULL
 ALTER WORKSPACE <workspace_id> SET QUOTA (data=…, undo=…, temp=…, asset=…)
 DROP WORKSPACE <workspace_id>
 ── DML ─────────────────────────────────────────────────────
-SELECT … FROM <表 | 固定表 | GRAPH_TABLE(…)> [JOIN …] [WHERE …]
+SELECT [DISTINCT] … FROM <表 | 固定表 | GRAPH_TABLE(…)> [JOIN …] [WHERE …]
        [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT n [OFFSET m]]
+       [UNION [ALL] | INTERSECT [ALL] | EXCEPT [ALL] <同形 SELECT>]…
 INSERT INTO <表> [(<列>, …)] VALUES (…)[, (…)]
 UPDATE <表> SET <列> = <表达式>, … [WHERE …]
 DELETE FROM <表> [WHERE …]
@@ -309,7 +311,8 @@ CREATE / MATCH-WHERE-RETURN / SET / DELETE / DETACH DELETE（子集见 GRP REQ-G
 | **表选项** | `WITH (table_type = normal │ config │ session │ memory)`——**类型决定 §8.1 选项全组**（§8.2 的五种）；另可附 `retention = <时长>`、`version_keep = <个数>` 两个有合法默认的覆盖项。**非法组合不可能出现**（类型之外没有自由组合）✓。图数据表**只经 `CREATE GRAPH`** |
 | **事务控制** | **默认自动提交**——每条语句自成事务；`BEGIN` 进入多语句事务，`COMMIT`/`ROLLBACK` 结束。**DDL 在活动事务中拒绝**（TXN REQ-TXN-016）。隔离级别固定 RC，**无 `SET TRANSACTION`** |
 | **JOIN** | `INNER JOIN`、`LEFT [OUTER] JOIN`（`ON` 条件）；逗号 = 普通连接 ✓。**无 RIGHT / FULL / NATURAL / USING** |
-| **聚合** | `COUNT(*)` / `COUNT(x)` / `SUM` / `AVG` / `MIN` / `MAX` + `GROUP BY` + `HAVING`。**无 DISTINCT 聚合**（去重经 `GROUP BY`，见 006） |
+| **聚合** | `COUNT(*)` / `COUNT(x)` / `SUM` / `AVG` / `MIN` / `MAX` + `GROUP BY` + `HAVING`；**`DISTINCT` 变体**（`COUNT(DISTINCT x)` 等——去重键 = 该聚合的参数表达式） |
+| **去重与集合运算** | `SELECT DISTINCT`；`UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]`——两侧列数一致、逐列类型可隐式统一（`TYP` 内核判定）；结果列名取第一个 `SELECT`；**未写 `ALL` = 去重**（SQL 标准默认）；链式出现（`A UNION B UNION C`）自左向右 |
 | **排序 / 限行** | `ORDER BY <表达式> [ASC│DESC] [, …]`——**NULL 位置**：升序在最后、降序在最前（Oracle 默认）✓；`LIMIT n [OFFSET m]` |
 | **表达式构件** | 字面量、列引用、算术（`+ - * /`）、比较（`= <> < <= > >=`）、`IS [NOT] NULL`、`AND / OR / NOT`、`IN (<字面量列表>)`、`BETWEEN`、`COALESCE` / `NULLIF`、`CASE WHEN … THEN … ELSE … END`、`CAST(e AS 类型)`——求值语义全部由 `TYP` 内核定义（REQ-SQL-010） |
 | **参数绑定** | `:name`；**类型绑定期推导**；**不做字符串插值**——参数只经参数通道 ✓ |
@@ -350,7 +353,7 @@ CREATE / MATCH-WHERE-RETURN / SET / DELETE / DETACH DELETE（子集见 GRP REQ-G
 
 #### 语义
 
-**复杂重写、窗口函数、JIT 与单查询并行延后**。
+**复杂重写、窗口函数、子查询/CTE/递归、JIT、单查询并行与列存所需算子延后**——**延后 ≠ 永久不做**：这些是后续切片/版本的目标，本期不实现、语法上不存在入口；简单常用构造（`DISTINCT`、集合运算等）在 `REQ-SQL-005` 的正面清单内。
 
 #### 规格
 
@@ -358,9 +361,9 @@ CREATE / MATCH-WHERE-RETURN / SET / DELETE / DETACH DELETE（子集见 GRP REQ-G
 
 | 类别 | 不提供 |
 | --- | --- |
-| 查询构造 | 子查询（标量 / `IN` / `EXISTS`）、`WITH` / CTE / 递归、`SELECT DISTINCT`（去重经 `GROUP BY`）、`UNION / INTERSECT / EXCEPT`、`RIGHT / FULL / NATURAL / USING` 连接、`INSERT…SELECT`、`UPDATE…FROM`、`RETURNING`、窗口函数 |
+| 查询构造 | 子查询（标量 / `IN` / `EXISTS`）、`WITH` / CTE / 递归、`RIGHT / FULL / NATURAL / USING` 连接、`INSERT…SELECT`、`UPDATE…FROM`、`RETURNING`、窗口函数 |
 | DDL 面 | 视图与物化视图（待冻结项 25）、`ALTER TABLE`（含加列 / 改名）、列默认值与约束（PK / FK / CHECK）、`TRUNCATE`、序列 / 自增、`MERGE` / UPSERT、触发器 / 存储过程（V1.0 无 PL/SQL） |
-| 执行与优化 | **JIT**、**单查询并行**（一条语句内的并行算子）、复杂重写（子查询解嵌套 / 外连接消除等——本就没有子查询）、跨语句的计划共享以外的自适应计划 |
+| 执行与优化 | **JIT**、**单查询并行**（一条语句内的并行算子）、**列存所需算子**（向量化/批量 SIMD 执行——本系统未引入列存）、复杂重写（子查询解嵌套 / 外连接消除等——本就没有子查询）、跨语句的计划共享以外的自适应计划 |
 | 会话与诊断 | `SAVEPOINT`、`SET TRANSACTION`（隔离级别固定）、`LOCK TABLE`、会话变量（`SET` / `SHOW`）、`EXPLAIN`、显式游标语句 |
 | 其他 | 跨工作区的一切（含 `public` 写）、`SELECT` 的 `FOR UPDATE`（锁的获取是写路径的事） |
 
