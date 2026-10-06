@@ -78,6 +78,7 @@
 #![deny(missing_docs)]
 
 pub mod bitmap;
+pub mod bootstrap;
 pub mod buffer;
 pub mod controlfile;
 pub mod cr;
