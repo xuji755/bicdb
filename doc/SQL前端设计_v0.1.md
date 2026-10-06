@@ -131,6 +131,9 @@ ast ──✗──▶ catalog（REQ-SQL-002：AST 模块不得 import 目录接
 | `TypeName` | `TypeName` | `names`（列表）⇒ `name: String`（无模式限定）；`typmods` ⇒ 原文本列表；+location |
 | `DefElem` | `DefElem` | `defname`/`arg: DefElemArg`（`Const(AConst)` 或 `Ident(String)`——PG 的 `arg` 是任意 Node，我们收窄；理由：`table_type = memory` 的裸标识符值是本库写法，PG 的 reloptions 只收字面量） |
 | `TransactionStmt` | `TransactionStmt` | `kind`（BEGIN/COMMIT/ROLLBACK） |
+| `VariableSetStmt` | `VariableSetStmt` | `ALTER SESSION SET/CLEAR`（PG 的 `SET` 与 `ALTER SESSION SET` 同节点）；参数白名单在 ② 判（《DCL语句设计》§1.3） |
+| `AlterSystemStmt` | `AlterSystemStmt` | `ADD/DROP/ALTER FILESYSTEM`（**本库扩展**，形状仿 PG 同类 DDL 节点）——《DCL语句设计》§1.2 |
+| `AlterDatabaseStmt` | `AlterDatabaseStmt` | 只含 `CLONE WORKSPACE`；**本库实例即一个库** ⇒ 不带库名（记档）——《DCL语句设计》§1.1 W2 |
 | `ParamRef` | `ParamRef` | **`:name`（本库规格），非 PG 的 `$n`**——**唯一的刻意偏离**，理由 = REQ-SQL-005 明定":name，类型绑定期推导" |
 | —（无 PG 对应） | `CreateGraphStmt` / `CreateWorkspaceStmt` / `AlterWorkspaceStmt` / `DropWorkspaceStmt` | 本库扩展（图/工作区 DDL）；**记档**：形状仿 PG 同类 DDL 节点（`RangeVar` + 选项列表） |
 
@@ -170,7 +173,9 @@ BETWEEN / IN / NOT（nonassoc）  <
 - **手写递归下降**：每个优先级一层函数；表达式按上表；每个 PG 产生式
   一一对应一个解析函数（便于对照 gram.y 复核）。
 - **语句闭集**（REQ-SQL-005 正面清单，逐条有产生式）：DDL（表/索引/图/工作区）、
-  DML（SELECT 家族/INSERT/UPDATE/DELETE）、事务控制；图语言独立入口（GRP 域）。
+  DML（SELECT 家族/INSERT/UPDATE/DELETE）、事务控制、**DCL 管理语句**
+  （工作区生命周期 / 文件系统池 / 会话参数——详设见
+  `doc/DCL语句设计_v0.1.md`）；图语言独立入口（GRP 域）。
 - **清单外即语法错误**（REQ-SQL-006）：`WITH`/`EXISTS`/窗口/`RETURNING`/`RIGHT JOIN`/
   列约束…在词法/语法层没有产生式——报错文案指向"不支持该构造"。
 
@@ -420,7 +425,7 @@ cancel(执行句柄) -> 释放锁/页引用/临时空间（走 `ExecContext` 的
 | **S4** | 逻辑表示 + 白名单变换 | 与**直译执行器**两路差分（无优化 vs 优化，逐行一致）；四条不变量各有用例 |
 | **S5** | 物理计划 + 接入 `bicdb-exec` | 全算子闭集覆盖；同一语义计划的开/关优化结果一致；真表端到端（含 DML 与快照） |
 | **S6** | 计划缓存 + 失效 | DROP INDEX / 改表选项 / Move ⇒ 键失配重编译；跨工作区不共享；并发执行同计划互不干扰 |
-| **S7** | 语句面收尾：DDL/DML/事务控制 + 工作区 DDL | 资格先于对象查找；DDL 在活动中拒绝；`BEGIN/COMMIT/ROLLBACK` 语义 |
+| **S7** | 语句面收尾：DDL/DML/事务控制 + 工作区 DDL + **DCL**（工作区生命周期/文件系统池/会话参数——`doc/DCL语句设计_v0.1.md`） | 资格先于对象查找；DDL 在活动中拒绝；`BEGIN/COMMIT/ROLLBACK` 语义；DCL 的闭集拒绝（未知动作/未知参数各一例） |
 | **S8** | 语料与验收：≥1000 手写 + 1 万生成查询的两路差分 | REQ-SQL-005/007 的验收原文 |
 
 **依赖**：S2 需要 `bicdb-catalog` 的只读面（其写侧/DDL 与 S7 并行推进，

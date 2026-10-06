@@ -8,10 +8,17 @@
 //! 块 321 起                数据区（段的区；块 = 321 + 区号 × 8）
 //!
 //! 文件头页页体：偏移 68  file_id 2B │ role 1B │ format_version 1B │ flags 2B │
-//!                        当前大小 6B（块数）│ workspace_ref 8B
-//!                偏移 88  位图空间头：run_count 1B │ 保留 3B │
+//!                        当前大小 6B（块数）│ workspace_ref 8B（止于 88）
+//!                偏移 88  保留 8B
+//!                偏移 96  **file_scn 8B**——本文件最新持久化位点（LSN）
+//!                偏移 104 位图空间头：run_count 1B │ 保留 3B │
 //!                        runs[] 4B×40（各位图区的起始块号）│ 保留
 //! ```
+//!
+//! **`file_scn`（2026-10-06 用户口径；`目录详设` §2.4/§2.5）**：文件级恢复位点，
+//! 与**控制文件检查点**比对判一致性（落后=需重放/介质恢复、超前=不配对拒绝）。
+//! **只前移**；推进协议（先数据 fsync、后写头）随刷盘路径落地——本文件只提供
+//! 字段的读写与**单调校验**（[`DataFile::set_file_scn`]）。
 //!
 //! **预留式增长**（2026-10-05 定案）：位图区按**该文件能长到的最大规模**
 //! 一次预留够（40 区覆盖 ≈ 5 TB > 4 TiB 的文件上限），于是——
@@ -33,11 +40,13 @@ use crate::pagefile;
 
 /// 文件头页页体内的字段起点。
 pub const FILE_HEADER_BODY_OFFSET: usize = 68;
-/// 位图空间头在页体内的偏移（file_id 2 + role 1 + version 1 + flags 2 +
-/// 当前大小 6 + workspace_ref 8 = 68..88）。
-pub const BITMAP_SPACE_HEAD_OFFSET: usize = 88;
+/// `file_scn` 在页体内的偏移（… 当前大小 6 + workspace_ref 8 = 68..88，
+/// 保留 8B = 88..96）。
+pub const FILE_SCN_OFFSET: usize = 96;
+/// 位图空间头在页体内的偏移（68..88 头部字段 + 88..96 保留 + 96..104 `file_scn`）。
+pub const BITMAP_SPACE_HEAD_OFFSET: usize = 104;
 /// 位图区起始块号数组的偏移（run_count 1B + 保留 3B）。
-pub const BITMAP_RUNS_OFFSET: usize = 92;
+pub const BITMAP_RUNS_OFFSET: usize = 108;
 /// 位图区上限（§5.11：4 TiB 上限下 ≤ 33，留余量到 40）。
 pub const MAX_BITMAP_RUNS: usize = 40;
 /// 建文件的最小块数：块 0 文件头 + **全量预留的位图区**（320 页）+ 至少一个数据区。
@@ -84,6 +93,13 @@ pub enum DataFileError {
         /// 请求的块数。
         requested: u64,
     },
+    /// `file_scn` 倒退——**只前移**（文件级恢复位点，倒退会让"落后/超前"判定失真）。
+    ScnWentBackwards {
+        /// 当前位点。
+        current: u64,
+        /// 请求的位点。
+        requested: u64,
+    },
     /// 越过预留位图区的覆盖上限（文件能长到的最大规模）。
     BeyondCoverage {
         /// 请求的块数。
@@ -113,6 +129,9 @@ impl std::fmt::Display for DataFileError {
                 f,
                 "文件增长要求更大的尺寸：当前 {blocks} 块，请求 {requested} 块"
             ),
+            DataFileError::ScnWentBackwards { current, requested } => {
+                write!(f, "file_scn 只前移：当前 {current}，请求 {requested}")
+            }
             DataFileError::BeyondCoverage { requested, limit } => write!(
                 f,
                 "文件尺寸越过预留位图区覆盖上限：请求 {requested} 块，上限 {limit} 块"
@@ -151,6 +170,10 @@ pub struct FileHead {
     pub blocks: u64,
     /// 工作区受校验标识（与页头同源；"打开错了文件"的快速否决）。
     pub workspace_ref: [u8; 8],
+    /// **本文件最新持久化位点**（LSN 原值；0 = 尚未推进）。
+    ///
+    /// 与**控制文件检查点**比对判一致性（`目录详设` §2.5）；**只前移**。
+    pub file_scn: u64,
 }
 
 /// 读文件头。
@@ -163,6 +186,8 @@ pub fn read_file_head(page: &Page) -> Result<FileHead, DataFileError> {
     blocks[..6].copy_from_slice(&b[FILE_HEADER_BODY_OFFSET + 6..FILE_HEADER_BODY_OFFSET + 12]);
     let mut workspace_ref = [0u8; 8];
     workspace_ref.copy_from_slice(&b[FILE_HEADER_BODY_OFFSET + 12..FILE_HEADER_BODY_OFFSET + 20]);
+    let mut scn = [0u8; 8];
+    scn.copy_from_slice(&b[FILE_SCN_OFFSET..FILE_SCN_OFFSET + 8]);
     Ok(FileHead {
         file_id: u16::from_le_bytes([b[FILE_HEADER_BODY_OFFSET], b[FILE_HEADER_BODY_OFFSET + 1]]),
         role: b[FILE_HEADER_BODY_OFFSET + 2],
@@ -173,6 +198,7 @@ pub fn read_file_head(page: &Page) -> Result<FileHead, DataFileError> {
         ]),
         blocks: u64::from_le_bytes(blocks),
         workspace_ref,
+        file_scn: u64::from_le_bytes(scn),
     })
 }
 
@@ -191,6 +217,7 @@ pub fn write_file_head(page: &mut Page, h: &FileHead) -> Result<(), DataFileErro
     b[FILE_HEADER_BODY_OFFSET + 6..FILE_HEADER_BODY_OFFSET + 12]
         .copy_from_slice(&h.blocks.to_le_bytes()[..6]);
     b[FILE_HEADER_BODY_OFFSET + 12..FILE_HEADER_BODY_OFFSET + 20].copy_from_slice(&h.workspace_ref);
+    b[FILE_SCN_OFFSET..FILE_SCN_OFFSET + 8].copy_from_slice(&h.file_scn.to_le_bytes());
     Ok(())
 }
 
@@ -306,6 +333,8 @@ impl<'a> DataFile<'a> {
                 flags: 0,
                 blocks,
                 workspace_ref,
+                // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
+                file_scn: 0,
             },
             runs: Vec::new(),
         };
@@ -379,6 +408,8 @@ impl<'a> DataFile<'a> {
                 flags: 0,
                 blocks,
                 workspace_ref,
+                // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
+                file_scn: 0,
             },
             runs: Vec::new(),
         };
@@ -552,6 +583,40 @@ impl<'a> DataFile<'a> {
         let mut header = self.read_page(0)?;
         let mut head = self.head;
         head.blocks = new_blocks;
+        write_file_head(&mut header, &head)?;
+        self.write_page(0, &mut header)?;
+        self.head = head;
+        Ok(())
+    }
+
+    /// **本文件最新持久化位点**（`file_scn`；0 = 尚未推进）。
+    #[must_use]
+    pub fn file_scn(&self) -> u64 {
+        self.head.file_scn
+    }
+
+    /// **推进 `file_scn`**（文件级恢复位点；`目录详设` §2.4/§2.5）。
+    ///
+    /// 纪律（**只前移**，倒退即具名拒绝）：
+    /// - **调用方必须已把该位点对应的数据页持久化（fsync）之后**再调本方法——
+    ///   头绝不声称未持久化的位点；
+    /// - 头页写成功之后才提交内存值（与 [`DataFile::extend`] 同一手法）。
+    ///
+    /// 头页**副本**的同步写入属建区/刷盘路径（目录详设 §2.1/§2.4，随 C1 落地）；
+    /// 本文件只保证字段本身的读写与单调校验。
+    pub fn set_file_scn(&mut self, scn: u64) -> Result<(), DataFileError> {
+        if scn < self.head.file_scn {
+            return Err(DataFileError::ScnWentBackwards {
+                current: self.head.file_scn,
+                requested: scn,
+            });
+        }
+        if scn == self.head.file_scn {
+            return Ok(());
+        }
+        let mut header = self.read_page(0)?;
+        let mut head = self.head;
+        head.file_scn = scn;
         write_file_head(&mut header, &head)?;
         self.write_page(0, &mut header)?;
         self.head = head;
@@ -860,5 +925,52 @@ mod tests {
         // 一次正常增长仍然可行、且头页落盘。
         file.extend(600).unwrap();
         assert_eq!(file.blocks(), 600);
+    }
+
+    #[test]
+    fn file_scn_round_trips_and_only_moves_forward() {
+        // `file_scn` = 文件级恢复位点（目录详设 §2.4）——往返 + 只前移。
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let path = Path::new("/mem/scn.dat");
+        {
+            let mut file = DataFile::create(&io, path, 3, 3, WS, MIN_FILE_BLOCKS).unwrap();
+            assert_eq!(file.file_scn(), 0, "创建位点 = 0");
+            file.set_file_scn(0).unwrap(); // 同值：幂等
+            file.set_file_scn(4096).unwrap();
+            file.set_file_scn(8192).unwrap();
+            // 倒退即具名拒绝（头不写、内存值不动）。
+            let err = file.set_file_scn(4096).unwrap_err();
+            assert!(
+                matches!(err, DataFileError::ScnWentBackwards { .. }),
+                "{err}"
+            );
+            assert_eq!(file.file_scn(), 8192);
+        }
+        // 关盘重开：位点随头页落盘而来。
+        let file2 = DataFile::open(&io, path).unwrap();
+        assert_eq!(file2.file_scn(), 8192, "file_scn 随头页持久化");
+    }
+
+    #[test]
+    fn header_layout_offsets_are_the_frozen_ones() {
+        // 布局常量（arch/05 文件头页 + 目录详设 §2.4）：file_scn 96..104、
+        // 位图空间头 104、runs 108——**任何改动必须同步 arch/05 与设计**。
+        assert_eq!(FILE_SCN_OFFSET, 96);
+        assert_eq!(BITMAP_SPACE_HEAD_OFFSET, 104);
+        assert_eq!(BITMAP_RUNS_OFFSET, 108);
+        // 写读一致：位图 runs 与 file_scn 互不覆盖（同一页体各占其位）。
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file = DataFile::create(&io, Path::new("/mem/lay.dat"), 3, 3, WS, 512).unwrap();
+        file.set_file_scn(99).unwrap();
+        let page = file.read_page(0).unwrap();
+        let head = read_file_head(&page).unwrap();
+        assert_eq!(head.file_scn, 99);
+        // 位图区**全量预留**（块 1 起连续 40 段）：runs 非空且首段在块 1——
+        // 与 `file_scn` 各占其位、互不覆盖。
+        let runs = read_bitmap_runs(&page).unwrap();
+        assert_eq!(runs.len(), MAX_BITMAP_RUNS);
+        assert_eq!(runs[0], 1);
     }
 }
