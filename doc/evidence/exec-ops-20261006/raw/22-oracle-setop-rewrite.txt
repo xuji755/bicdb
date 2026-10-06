@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] MINUS 改写 反连接 半连接 执行计划 去重
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 5，摘要筛选通过 2，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 62，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 59，摘要筛选通过 7，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Event 10714 用于启用对 bitmap index minus 操作的跟踪分析，其内部由 kkrbm row source 执行，适用于诊断位图索引扫描中 minus 转换的性能问题或执行计划异常场景。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:76231.1 EVENT:10714 "trace bitmap index minus"  (排序分: 15.0)
+     └ 摘要：Event 10714 用于启用对 bitmap index minus 操作的跟踪分析，其内部由 kkrbm row source 执行，适用于诊断位图索引扫描中 minus 转换的性能问题或执行计划异常场景。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1995491
+
+     [KnowledgeEntry] L1：Note:121817.1 QUERY WITH UNION ALL/CUBE/ROLLUP/MINUS GIVES ORA-600 [STSREADINSLT_1]  (排序分: 15.0)
+     └ 摘要：包含 UNION ALL、CUBE、ROLLUP、MINUS 的查询，当多个分支及汇总后均需要磁盘排序时，可能触发 ORA-600 [stsReadInSlt_1] 或 ORA-600 [15851] 错误。该问题源于多个排序操作同时使用临时盘区，受 Bug 1331849 影响，8.1.6.3 之前版本需通过增大 so。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2048814
+
+     [KnowledgeEntry] L1：Note:102339.1 Temporary Segments: What Happens When a Sort Occurs  (排序分: 14.4)
+     └ 摘要：SORT_AREA_SIZE 和 SORT_AREA_RETAINED_SIZE 是控制排序内存的初始化参数，分别设定单次排序最大内存和排序结束后保留的内存，默认值相等。当执行 CREATE INDEX、ORDER BY、GROUP BY、DISTINCT、UNION、INTERSECT、MINUS、排序合并连接等操作时，若。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043902
+
+     [KnowledgeEntry] 集合操作符的执行计划特征  (排序分: 10.0)
+     └ 详情：通过查看执行计划，可以快速判断SQL是否使用了集合操作符以及是否进行了去重。例如，`HASH UNIQUE` 或 `SORT UNIQUE` 操作的出现，意味着查询使用了UNION、MINUS或INTERSECT。这有助于分析SQL性能瓶颈。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531704
+
+     [CaseStudy] www.eygle.com 技术文章  (排序分: 9.0)
+     └ 摘要：高级复制出现数据不一致冲突，根因是两端数据差异，通过dbms_rectifier_diff包的DIFFERENCES过程执行minus操作检测差异，典型场景为手动解决Oracle高级复制中的冲突。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:392890
+
+     [FaultModel] PDB重启后创建表报ORA-08102（OBJ$表与I_OBJ4索引不一致）  (排序分: 7.5)
+     └ 摘要：PDB1 close/open后，执行create table anbob.t2(id int)报ORA-08102: index key not found, obj# 39, file 9, block 25268 (2)。通过INDEX/FULL HINT配合MINUS对比，发现I_OBJ4索引多出DATAOBJ#=73509、OBJ$表多出DATAOBJ#=73513，确认索引与表不一致，后续尝试bbed修复。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1188833
+

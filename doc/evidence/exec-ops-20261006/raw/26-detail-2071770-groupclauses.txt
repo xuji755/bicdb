@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 集合操作 groupClauses 构造与 hash 支持
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2071770
+
+  ── 描述 ──
+  在统一列类型后，为每列构造 groupClauses（存储于 op->groupClauses），调用 makeSortGroupClauseForSetOp
+  获取等价运算符（eqop）、排序运算符（sortop）和可哈希性（hashable）。这些 groupClauses 用于集合操作的去重（例如 UNION 去重、INTERSECT/EXCEPT
+  去重）。当处理递归 CTE（recursive 为真）时，要求列类型具有哈希支持，否则哈希聚合去重无法实现，可能导致特性不支持错误。
+
+  ── 摘要 ──
+  集合操作内部节点为每列构造 groupClauses，用于去重和排序，使用 makeSortGroupClauseForSetOp 确定 eqop/sortop/hashable；递归 UNION 要求 hash 支持。

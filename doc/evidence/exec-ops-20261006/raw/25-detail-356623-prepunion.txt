@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: prepunion.c集合操作预处理：plan_set_operations处理UNION/INTERSECT/EXCEPT→generate_union_paths生成UNION路径→generate_nonunion_paths处理INTERSECT/EXCEPT。recurse_set_operations递归处理嵌套集合操作。支持UNION ALL(不消除重复)和UNION(需HashAg
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:356623
+
+  ── 描述 ──
+  prepunion.c集合操作预处理：plan_set_operations处理UNION/INTERSECT/EXCEPT→generate_union_paths生成UNION路径→generat
+  e_nonunion_paths处理INTERSECT/EXCEPT。recurse_set_operations递归处理嵌套集合操作。支持UNION
+  ALL(不消除重复)和UNION(需HashAgg或Sort+Unique去重)。
+
+  ── 摘要 ──
+  prepunion.c中的集合操作预处理流程包括：plan_set_operations负责处理UNION、INTERSECT和EXCEPT操作，随后通过generate_union_paths生成UNION的执行路径，而generate_nonunion_paths则处理INTERSECT和EXCEPT。针对嵌套的集合操作，递归函数recurse_set_operations进行递归处理。该模块同时支持UNION ALL（不进行去重）和UNION（需通过HashAgg或Sort+Unique实现去重）。

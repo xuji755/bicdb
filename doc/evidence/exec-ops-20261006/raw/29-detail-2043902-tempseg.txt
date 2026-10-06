@@ -1,0 +1,93 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:102339.1 Temporary Segments: What Happens When a Sort Occurs
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043902
+
+  ── 描述 ──
+  Purpose Scope and Application Temporary Segments: What Happens When a Sort Occurs Introduction.
+  Memory Allocation. User Defined Space Management in Tablespaces. Temporary Segments in a Permanent
+  Tablespace. Temporary Segments in a Temporary Tablespace Guidelines. Information about Temporary
+  Segments. Error Messages. References (AuthWiz 2.5.3) Click here to edit in wizard. Applies to:
+  Oracle Server - Enterprise Edition - Version: 7.3Information in this document applies to any
+  platform. Purpose This article describes what happens when a sort takes place, and how to optimize
+  this process. Scope and Application This document is intended for database administrators who want
+  to review general information about temporary segments and temporary tablespaces. Temporary
+  Segments: What Happens When a Sort Occurs Introduction.Most SQL operations do not require data to be
+  sorted. However, some operations do require sorting. Sorts can have a large impact on performance.-
+  Index creation. The CREATE INDEX statement causes the server process (or processes if the index is
+  being created in parallel) to sort the index values before building the tree. After the sort a final
+  index is built in the INDEX tablespaces by using a temporary segment; once the index has been built
+  completely, the segment type is changed to index.- ORDER BY or GROUP BY clauses of SELECT
+  statements. The server process must sort on the values in the ORDER BY or GROUP BY clauses.-
+  DISTINCT values of SELECT statements. For the DISTINCT keyword, the sort has to eliminate
+  duplicates.- UNION, INTERSECT or MINUS operations. Servers need to sort the tables they are working
+  on to eliminate duplicates.- Sort-Merge joins. If no index is available, an equivalent-join request
+  needs to perform full table scans and sort each row source separately. After that, the sorted
+  sources are merged together, combining each row from one source with each matching row of the other
+  source.- Analyze command execution. The Analyze command sorts the data to provide summarized
+  information.Besides these sort operations, there are other SQL operations, which also require
+  temporary segments to operate correctly. For example: CREATE PRIMARY KEY CONSTRAINT, ENABLE
+  CONSTRAINT, and CREATE TABLE. The creation of a new table can start as a temporary segment if
+  MINEXTENTS is larger than 1 or when using the statement CREATE TABLE AS SELECT. Memory
+  Allocation.Sorting requires space im memory. These memory areas are called sort areas. Every user
+  session has their own sort area size. The "init.ora" SORT_AREA_SIZE parameter defines the maximum
+  size of real memory (in bytes) that will be used by a single sort. Common settings of the
+  SORT_AREA_SIZE parameter range between 64K and 256K for larger systems. The location in memory where
+  this sort area is allocated, depends on the configuration of the Server.- Dedicated Server
+  Configuration. The sort area is allocated in the Program Global Area (PGA). Besides this sort area,
+  the PGA also contains session- information (e.g. user-privileges), cursor-status (of that session)
+  and stack-space (session-variables).- Multi-threaded Server Configuration. The sort area is
+  allocated in the User Global Area (UGA). This UGA lies in the Shared Pool of the System Global Area
+  (SGA).For each session there will be a moment in time when the first sort has to be performed. At
+  that moment, memory is allocated for performing that sort (sort area). The size of the sort area
+  grows incrementallyuntil sufficient memory has been allocated to perform the sort or until it
+  reaches the maximum as specified by SORT_AREA_SIZE. When a sort completes, the memory retained by
+  that process for another sort is reduced to the value specified by SORT_AREA_RETAINED_SIZE. This
+  "init.ora" parameter defines the maximum size of real memory (in bytes) that will be reserved for
+  sorts after a previous sort has finished. The difference between SORT_AREA_SIZE and
+  SORT_AREA_RETAINED_SIZE is the memory, which is freed after the sort. SORT_AREA_RETAINED_SIZE and
+  SORT_AREA_SIZE default to the same value, so all memory needed by previous sorts, will be available
+  for next sort operations. When the process as a wholeis terminated, the memory is returned to the
+  operating system (in case of a dedicated connection) or to the shared pool (in case of a shared
+  connection).Both "init.ora" parameters SORT_AREA_SIZE and SORT_AREA_RETAINED_SIZE can be changed
+  during the session. Example to set the sort memory for the current session to 100k: ALTER SESSION
+  SET SORT_AREA_SIZE=102400 SORT_AREA_RETAINED_SIZE=102400;To change these parameters for all new
+  sessions, you can issue the ALTER SYSTEM statement. Example to set the sort memory for all new
+  sessions to 64k: ALTER SYSTEM SET SORT_AREA_SIZE=65536 DEFERRED SORT_AREA_RETAINED_SIZE=65536
+  DEFERRED; User DefinedIf the sort operation needs additional memory (above the value specified by
+  the SORT_AREA_SIZE parameter), then the sorted rows are written to disk to free up the sort area so
+  that it can be re-used for the remaining sort. This means that temporary segments are created. The
+  sorted rows that are temporarily written to disk, are stored in these temporary segments. The
+  location where temporary segments are created, depends on the settings for each user. To find out
+  which tablespaces can be used by a user for permanent and temporary segments, you could use the
+  following query: SELECT TABLESPACE_NAME, STATUS, CONTENTS FROM dba_tablespaces;TABLESPACE_NAME
+  PERMANENTUSERS ONLINE PERMANENTTEMP ONLINE TEMPORARYINDX ONLINE PERMANENTDRSYS ONLINE
+  PERMANENTPERM01 ONLINE PERMANENTTEMP01 ONLINE TEMPORARY8 rows selected.When a new user is created,
+  the TEMPORARY TABLESPACE clause identifies the tablespace for the user's temporary segments.
+  Example: CREATE USER hugo IDENTIFIED by welcome DEFAULT TABLESPACE users TEMPORARY TABLESPACE perm01
+  QUOTA 10M on users;If you omit the TEMPORARY TABLESPACE clause, the temporary segments default to
+  the SYSTEM tablespace. For existing users, the temporary tablespace can also be changed. Example:
+  ALTER USER hugo TEMPORARY TABLESPACE temp01; Space Management in Tablespaces.Tablespaces allocate
+  space in extents. Tablespaces can use two different methods to keep track of their free and used
+  space.- Dictionary-managed tablespace (extent management by the data dictionary). For a tablespace
+  that uses the data dictionary to manage its extents, Oracle updates the appropriate tables in the
+  data dictionary whenever an extent is allocated or freed for reuse. A tablespace that uses the data
+  dictionary to manage its extents has by default incremental extent sizes, which are determined by
+  the storage parameters INITIAL, NEXT, and PCTINCREASE. When an object is created in the tablespace,
+  its first extent is allocated with the INITIAL size. When additional space is needed, the NEXT and
+  PCTINCREASE parameters determine the sizes of new extents. Because dictionary tables are part of the
+  database, the space that they occupy is subject to the same space management operations as all other
+  data. This is the default method of space management in a tablespace. It was the only method
+  available in Oracle releases 8.0 and earlier.- Locally-managed tablespace (extent management by the
+  tablespace; Oracle8.1+). A tablespace that manages its own extents, maintains a bitmap in each
+  datafile to keep track of the free or used status of blocks in that datafile.Each bit in the bitmap
+  corresponds to a block or a group of blocks. When an extent is allocated or freed for reuse, Oracle
+  changes the bitmap values to show the new status of the blocks. A tablespace that manages its
+  extents locally can have either uniform extent sizes or variable extent sizes that are determined
+  automatically by the system. When you create the tablespace, the UNIFORM or AUTOALLOCATE (system-
+  managed) option specifies the type of allocation. The storage parameters NEXT, PCTINCREASE,
+  MINEXTENTS, MAXEXTENTS, and DEFAULT STORAGE are not valid parameters for extents
+
+  ── 摘要 ──
+  SORT_AREA_SIZE 和 SORT_AREA_RETAINED_SIZE 是控制排序内存的初始化参数，分别设定单次排序最大内存和排序结束后保留的内存，默认值相等。当执行 CREATE INDEX、ORDER BY、GROUP BY、DISTINCT、UNION、INTERSECT、MINUS、排序合并连接等操作时，若。

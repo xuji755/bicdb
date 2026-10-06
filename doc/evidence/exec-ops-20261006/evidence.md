@@ -46,3 +46,37 @@
 3. **自适应/增量项一律"按需启用"**（Memoize、Incremental Sort、Skip Scan）：
    材料给的是机制与收益面，触发条件由我们的实测给（本库一贯纪律：
    先测量后优化）。
+
+---
+
+## 追加（2026-10-06）：集合运算（SetOp）路线核验
+
+**问题**：`INTERSECT` / `EXCEPT` / `UNION` 去重，Oracle 与 PostgreSQL 各走什么
+路线；哪种更适合本库硬件（Neoverse-N1 arm64 单 socket；单查询单线程；16 KiB 页
++ 区读；temp 段已实现）。
+
+| # | 证据 | 要点 |
+| --- | --- | --- |
+| `356623` | **PG `prepunion.c`** | `plan_set_operations` → `generate_union_paths`（UNION）/ `generate_nonunion_paths`（INTERSECT/EXCEPT）；`recurse_set_operations` 递归处理嵌套；**UNION ALL 不去重；UNION 去重 = `HashAgg` 或 `Sort+Unique` 两条路线** |
+| `2071770` | PG 集合操作 groupClauses | 为每列构造 `groupClauses`（去重与排序都用它），`makeSortGroupClauseForSetOp` 定 `eqop/sortop/`**`hashable`**；**递归 UNION 要求 hash 支持**（否则只能排序路线）——即 PG 是**双路线 + 可哈希性/代价选择** |
+| `602781` | PG `SetOp` 节点 | SetOp 节点实现 INTERSECT/EXCEPT（与 UNION 走 HashAgg/Sort+Unique 不同） |
+| `622847` | **NULL 在集合运算中视为相同** | `NULL UNION NULL` = 一行；`NULL INTERSECT NULL` = 一行；`NULL EXCEPT NULL` = 零行——**集合去重是等价类语义，不是三值逻辑** |
+| `1531704` | **Oracle 执行计划特征** | 计划中出现 **`HASH UNIQUE` 或 `SORT UNIQUE`** 即 UNION/MINUS/INTERSECT 的去重——**Oracle 同样双路线**（排序唯一 / 哈希唯一） |
+| `2043902`（Note:102339.1） | Oracle 临时段 | UNION/INTERSECT/MINUS 等触发排序；**排序超 `SORT_AREA_SIZE` 即落临时段**（排序路线天然可落盘） |
+| `3257599` | Oracle 排序触发场景 | UNION/INTERSECT/MINUS 列为"触发排序"的场景（服务进程找重复记录） |
+| `1003770` | Oracle 21c 增强 | 新增 `EXCEPT`/`EXCEPT ALL`，并为 `MINUS`/`INTERSECT` 补 `ALL` 变体（多重集语义） |
+| `1563834` | Oracle 半连接/反连接 | `IN`/`EXISTS`/`NOT IN` 可被改写为半连接/反连接（**MINUS→反连接的专门证据未检出**） |
+
+**结论（供设计引用）**：
+
+1. **两边都是"排序 + 哈希"双路线**：Oracle 看 `SORT UNIQUE`/`HASH UNIQUE`，
+   PG 看 `SetOp(sorted/hashed)` 与 `HashAgg`/`Sort+Unique`——**没有单一路线**。
+2. **排序路线天然可落盘**（Oracle 临时段的证据）——**哈希路线能否落盘，
+   PG 侧未核验**（知识库无条目；不得凭记忆断言）⇒ 我们自研哈希路线时
+   **必须自带容量判据/溢出**，不复制可能的"内存爆了"缺陷。
+3. **集合去重 = NULL 等价类**（`622847`）：与 `WHERE` 的三值比较**不是同一个
+   比较器**——实现要点，写进设计。
+4. `ALL` 变体（21c/PG 同有）按**重数**（多重集）语义。
+
+**未核验**：PG `HashSetOp` 是否支持 spill（内存不足时的行为）；Oracle MINUS 是否
+改写为反连接。两项都不影响本库取法（见设计 §2.7 的路线评估）。

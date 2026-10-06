@@ -1,0 +1,45 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] HashSetOp SetOp 集合运算 哈希 排序 INTERSECT EXCEPT 策略
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 2，摘要筛选通过 1，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 44，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ⚠️ 精确对象未入图/未命中: INTERSECT
+     以下语义检索结果仅供参考；请优先补齐这些对象的 SystemView/Column 数据。
+
+  ✅ 答案要点
+     UNION/INTERSECT/EXCEPT 通过 select_clause 递归定义，左右分支均为 select_clause 可带括号，makeSetOp 函数生成集合操作节点，参数包括操作类型（SETOP_UNION/SETOP_INTERSECT/SETOP_EXCEPT）、是否 ALL 以及左右子查询。ORDER BY 只能挂在 select_no_parens 层，保证作用于整个集合运算结果。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] UNION/INTERSECT/EXCEPT 集合运算的递归文法与 makeSetOp  (排序分: 10.0)
+     └ 摘要：UNION/INTERSECT/EXCEPT 通过 select_clause 递归定义，左右分支均为 select_clause 可带括号，makeSetOp 函数生成集合操作节点，参数包括操作类型（SETOP_UNION/SETOP_INTERSECT/SETOP_EXCEPT）、是否 ALL 以及左右子查询。ORDER BY 只能挂在 select_no_parens 层，保证作用于整个集合运算结果。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2071950
+
+     [KnowledgeEntry] makeSetOp 构造集合运算节点  (排序分: 10.0)
+     └ 摘要：makeSetOp 在 gram.y:19106 定义，用于构造集合运算（UNION/INTERSECT/EXCEPT）上层的 SelectStmt 节点，参数为 op、all、left、right。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2071925
+
+     [KnowledgeEntry] SetOp  (排序分: 10.0)
+     └ 详情：SetOp：SetOp节点用于实现INTERSECT、EXCEPT等集合运算操作。
+分类：概念
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:602781
+
+     [KnowledgeEntry] 条件 UNION/INTERSECT/EXCEPT 语句未实现错误  (排序分: 10.0)
+     └ 详情：在 join 树合并阶段，若 sub_action->setOperations != NULL 且 newjointree 非空，则 ereport(ERROR) 并设置 errcode(ERRCODE_FEATURE_NOT_SUPPORTED)。原因：setop 的 jointree 是 dummy，无法挂接条件和加入连接。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2071113
+
+     [KnowledgeEntry] 7.4. Combining Queries (UNION, INTERSECT, EXCEPT)  (排序分: 10.0)
+     └ 详情：7.4. Combining Queries (UNION, INTERSECT, EXCEPT)：集合操作：UNION、INTERSECT、EXCEPT。
+分类：操作
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:10266
+
+     [FaultModel] NULL值导致JOIN语义与EXCEPT/INTERSECT不一致  (排序分: 9.3)
+     └ 摘要：EXCEPT/INTERSECT将NULL视为相等，而JOIN等值条件不匹配NULL，导致结果不同。需注意两种语义差异。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1290029
+

@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: 集合操作符的执行计划特征
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531704
+
+  ── 描述 ──
+  通过查看执行计划，可以快速判断SQL是否使用了集合操作符以及是否进行了去重。例如，`HASH UNIQUE` 或 `SORT UNIQUE`
+  操作的出现，意味着查询使用了UNION、MINUS或INTERSECT。这有助于分析SQL性能瓶颈。
+
+  ── 摘要 ──
+  通过执行计划可快速判断SQL是否使用了集合操作符（如UNION、MINUS、INTERSECT）及其去重行为。当计划中出现`HASH UNIQUE`或`SORT UNIQUE`操作时，表明查询执行了去重，这往往是性能瓶颈的根源，有助于定位和优化。

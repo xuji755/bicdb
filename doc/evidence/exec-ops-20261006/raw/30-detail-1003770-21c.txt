@@ -1,0 +1,12 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: Oracle 21c SQL集合运算符增强整体介绍
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1003770
+
+  ── 描述 ──
+  在 Oracle Database 21c 中，SQL 集合运算符功能得到增强。新增了 EXCEPT 和 EXCEPT ALL 运算符，并在 MINUS 和 INTERSECT 上支持 ALL
+  关键字，形成了 MINUS ALL 和 INTERSECT ALL。这使得集合操作从原来的去重模式扩展到保留重复行的多重集模式。
+
+  ── 摘要 ──
+  Oracle 21c 引入了 EXCEPT、EXCEPT ALL、MINUS ALL、INTERSECT ALL 运算符，并将 ALL 关键字支持扩展到 MINUS 和 INTERSECT，实现了基于多重集的操作语义。

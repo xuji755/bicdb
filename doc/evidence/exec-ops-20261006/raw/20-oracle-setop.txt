@@ -1,0 +1,48 @@
+
+============================================================
+  [问题诊断] MINUS INTERSECT 集合运算符 执行 排序唯一 哈希唯一 反连接
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 37，摘要筛选通过 27，批次 1；本路已取尽
+  CaseStudy：已取 2，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ⚠️ 精确对象未入图/未命中: INTERSECT
+     以下语义检索结果仅供参考；请优先补齐这些对象的 SystemView/Column 数据。
+
+  ✅ 答案要点
+     SORT_AREA_SIZE 和 SORT_AREA_RETAINED_SIZE 是控制排序内存的初始化参数，分别设定单次排序最大内存和排序结束后保留的内存，默认值相等。当执行 CREATE INDEX、ORDER BY、GROUP BY、DISTINCT、UNION、INTERSECT、MINUS、排序合并连接等操作时，若。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:102339.1 Temporary Segments: What Happens When a Sort Occurs  (排序分: 14.7)
+     └ 摘要：SORT_AREA_SIZE 和 SORT_AREA_RETAINED_SIZE 是控制排序内存的初始化参数，分别设定单次排序最大内存和排序结束后保留的内存，默认值相等。当执行 CREATE INDEX、ORDER BY、GROUP BY、DISTINCT、UNION、INTERSECT、MINUS、排序合并连接等操作时，若。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2043902
+
+     [KnowledgeEntry] INTERSECT 集合运算符  (排序分: 10.0)
+     └ 详情：标准的 INTERSECT 集合运算符从两个查询结果中取交集，且结果集自动去除重复行，只返回互不相同的共有行。例如，查询包含 10,20,20,30,30 与 20,30 的交集返回去重后的 20 和 30。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1003760
+
+     [KnowledgeEntry] **算术运算符:** `+`, `-`, `*`, `/`
+**连接运算符:** `||`
+**集合运算符:** `UNION`, `UNION ALL`, `INTERSECT`, `MINUS`
+**比较运算符:** `=`, `!=` / `<>` / `^=`, `>`, `<`, `>=`, `<=`
+**逻辑运算符:** `AND`, `OR`, `NOT`
+
+**字符串连接示例:**  (排序分: 10.0)
+     └ 摘要：该知识条目介绍了SQL中的几类运算符：算术运算符（+、-、*、/）、连接运算符（||）、集合运算符（UNION、UNION ALL、INTERSECT、MINUS），以及比较运算符（=、!=/<>/^=、>、<、>=、<=）和逻辑运算符（AND、OR、NOT）。其中特别给出了字符串连接的示例：`SELECT 'Hello ' || 'World' FROM dual;` 结果为 `'Hello World'`。摘要概括了这些运算符的基本分类和用法。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:366362
+
+     [KnowledgeEntry] Oracle 21c SQL集合运算符增强整体介绍  (排序分: 10.0)
+     └ 详情：在 Oracle Database 21c 中，SQL 集合运算符功能得到增强。新增了 EXCEPT 和 EXCEPT ALL 运算符，并在 MINUS 和 INTERSECT 上支持 ALL 关键字，形成了 MINUS ALL 和 INTERSECT ALL。这使得集合操作从原来的去重模式扩展到保留重复行的多重集模式。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1003770
+
+     [KnowledgeEntry] UNION/INTERSECT/MINUS集合操作触发排序  (排序分: 10.0)
+     └ 详情：原文将UNION、INTERSECT、MINUS列为排序触发场景，原因是服务进程需要查找重复记录。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257599
+
+     [KnowledgeEntry] INTERSECT后MINUS的复合查询语义  (排序分: 10.0)
+     └ 详情：集合运算按自上而下顺序执行：先INTERSECT得到products和sales共有产品，即已售出产品；再MINUS排除在COSTS中出现的产品，最终为已售出但无成本记录的产品集合。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2412225
+
