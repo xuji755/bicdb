@@ -18,6 +18,8 @@ use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
 
 use bicdb_cli::boot;
+use bicdb_cli::service::{self, ServiceError, StartOptions, StopMode};
+use bicdb_cli::wire;
 use bicdb_exec::Value;
 use bicdb_sql::session::{QueryResult, Session, SessionError};
 
@@ -25,22 +27,34 @@ const USAGE: &str = "\
 bicdb —— 带撤销/日志的页式数据库（V1.0 单工作区）
 
 用法：
-  bicdb init  <dir>               建区
-  bicdb sql   <dir> <SQL>…       执行 SQL（多条用 `;` 分隔；`-` = 读 stdin）
-              [--param 名=值 …]   给语句里的 `:名` 传值（可重复）
-  bicdb shell <dir>               交互式 shell
-  bicdb version                   版本
-  bicdb help                      本帮助
+  bicdb init    <dir>              建区
+  bicdb start   <dir> [-w 秒]      后台起服务（分离进程 + 实例锁 + 控制套接字）
+  bicdb stop    <dir> [-m fast|immediate]   停服务（fast = 完全检查点）
+  bicdb status  <dir>              服务/实例状态
+  bicdb restart <dir>              重启服务
+  bicdb sql     <dir> <SQL>…       执行 SQL（服务在跑时经套接字；`-` = 读 stdin）
+                [--param 名=值 …]  给语句里的 `:名` 传值（可重复）
+  bicdb shell   <dir>              交互式 shell
+  bicdb version                    版本
+  bicdb help                       本帮助
 
 示例：
-  bicdb init ./demo
-  bicdb sql ./demo \"CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))\"
-  bicdb sql ./demo \"INSERT INTO t VALUES (1, 'a')\"
-  bicdb sql ./demo --param id=1 \"SELECT name FROM t WHERE id = :id\"
-  bicdb sql ./demo \"SELECT * FROM t\"
+  bicdb init  ./demo
+  bicdb start ./demo               （日志 ./demo/bicdb.log）
+  bicdb sql   ./demo \"SELECT * FROM t\"
+  bicdb stop  ./demo
+
+SQL*Plus 形态的客户端见 `bicdbcli`（缓冲/斜杠命令/SPOOL/@脚本）。
 ";
 
 fn main() -> ExitCode {
+    // **下游提前关闭**（`… | head`）⇒ 静默收工，别 panic（Broken pipe）。
+    std::panic::set_hook(Box::new(|info| {
+        if info.to_string().contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        eprintln!("{info}");
+    }));
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -81,6 +95,12 @@ impl From<boot::BootError> for Exit {
     }
 }
 
+impl From<ServiceError> for Exit {
+    fn from(e: ServiceError) -> Self {
+        Exit::Failed(e.to_string())
+    }
+}
+
 fn run(args: &[String]) -> Result<(), Exit> {
     let Some(cmd) = args.first().map(String::as_str) else {
         return Err(Exit::Usage("缺少子命令".to_owned()));
@@ -106,11 +126,52 @@ fn run(args: &[String]) -> Result<(), Exit> {
             println!("  下一步    bicdb sql {dir} \"SELECT * FROM t\"");
             Ok(())
         }
+        "start" => {
+            let opts = service_opts(&args[1..])?;
+            service::start(&opts)?;
+            Ok(())
+        }
+        "stop" => {
+            let opts = service_opts(&args[1..])?;
+            let mode = flag_value(&args[1..], &["-m", "--mode"])
+                .map(|v| {
+                    StopMode::parse(&v).ok_or_else(|| Exit::Usage(format!("停止模式 `{v}` 不认识")))
+                })
+                .transpose()?
+                .unwrap_or(StopMode::Fast);
+            service::stop(&opts.dir, mode)?;
+            Ok(())
+        }
+        "status" => {
+            let dir = args
+                .get(1)
+                .ok_or_else(|| Exit::Usage("status 缺目录".to_owned()))?;
+            service::status(std::path::Path::new(dir))?;
+            Ok(())
+        }
+        "restart" => {
+            let opts = service_opts(&args[1..])?;
+            service::restart(&opts)?;
+            Ok(())
+        }
+        // 内部：守护进程入口（由 `start` 拉起；不写进帮助）。
+        "__daemon" => {
+            let opts = service_opts(&args[1..])?;
+            service::run_daemon(&opts, flag_present(&args[1..], "--foreground"))?;
+            Ok(())
+        }
         "sql" => {
             let dir = args
                 .get(1)
                 .ok_or_else(|| Exit::Usage("sql 缺目录".to_owned()))?;
             let (params, sql_args) = split_params(&args[2..])?;
+            // **服务在跑 ⇒ 走套接字**（同一条 SQL 路径，事务语义一致）。
+            if let service::ServiceState::Serving(info) =
+                service::state_of(std::path::Path::new(dir))
+            {
+                let text = sql_text(&sql_args)?;
+                return run_over_socket(&info.socket, &text);
+            }
             let mut inst = boot::open_instance(std::path::Path::new(dir))?;
             banner_brief(&inst);
             let text = sql_text(&sql_args)?;
@@ -188,6 +249,57 @@ fn ends_statement(text: &str) -> bool {
         }
     }
     last_sig.ends_with(';')
+}
+
+/// 从实参里取 `--flag value`（`names` 里的任一写法）。
+fn flag_value(args: &[String], names: &[&str]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if names.contains(&a.as_str()) {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
+/// 实参里有没有 `--flag`。
+fn flag_present(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+/// **服务类子命令的参数**：`<dir> [-s 套接字] [-l 日志] [-w 秒]`。
+fn service_opts(args: &[String]) -> Result<StartOptions, Exit> {
+    // 目录：`--dir <路径>` 或第一个位置参数（守护进程由 `start` 用 `--dir` 拉起）。
+    let dir = flag_value(args, &["-d", "--dir"])
+        .or_else(|| args.iter().find(|a| !a.starts_with('-')).cloned())
+        .ok_or_else(|| Exit::Usage("缺实例目录".to_owned()))?;
+    let dir = std::path::Path::new(&dir);
+    let socket = flag_value(args, &["-s", "--socket"]).map(std::path::PathBuf::from);
+    let log = flag_value(args, &["-l", "--log"]).map(std::path::PathBuf::from);
+    let timeout = flag_value(args, &["-w", "--wait"])
+        .map(|v| {
+            v.parse::<u64>()
+                .map(std::time::Duration::from_secs)
+                .map_err(|_| Exit::Usage(format!("-w 要秒数，给的是 `{v}`")))
+        })
+        .transpose()?
+        .unwrap_or(std::time::Duration::from_secs(30));
+    Ok(StartOptions::new(dir, socket, log, timeout))
+}
+
+/// **经服务执行**（服务在跑时的 `sql`/`shell` 走这条）：打印与直连同形。
+fn run_over_socket(socket: &std::path::Path, sql: &str) -> Result<(), Exit> {
+    let body =
+        wire::call(socket, "SQL", sql).map_err(|e| Exit::Failed(format!("经服务执行失败：{e}")))?;
+    let results = wire::decode_results(&body);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for r in &results {
+        print_result(&mut out, r)?;
+    }
+    out.flush()
+        .map_err(|e| Exit::Failed(format!("写输出失败：{e}")))?;
+    Ok(())
 }
 
 /// `--param` 解析结果：`(参数表, 其余实参 = SQL 文本)`。

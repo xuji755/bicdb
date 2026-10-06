@@ -8,3 +8,6 @@
 #![forbid(unsafe_code)]
 
 pub mod boot;
+pub mod lock;
+pub mod service;
+pub mod wire;

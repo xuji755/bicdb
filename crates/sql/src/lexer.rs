@@ -739,12 +739,19 @@ pub fn tokenize(text: &str) -> Result<Vec<Token>, LexError> {
     Ok(out)
 }
 
+/// 标识符起始字节。
+///
+/// **非 ASCII 字节（≥ 0x80）算字母**——照 PG 的扫描器（`scanner.l` 的
+/// `ident_start` 把高位置 1 的字节当字母）：这让 `名称`/`café` 这类标识符
+/// 可用（未引号名只做 **ASCII** 折叠，非 ASCII 原样保留，与 PG 的
+/// `downcase_identifier` 一致）。
 fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+    b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
 }
 
+/// 标识符续接字节（同 PG 口径 + 我们的 `$`）。
 fn is_ident_cont(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
 }
 
 /// 读一个标点/操作符（**先长后短**：`<->` 必须先于 `<=` 与 `<` 试）。

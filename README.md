@@ -94,7 +94,8 @@ and is not blocked by them.**
 | `bicdb-net` | Versioned request protocol, ACK/reconcile, sessions, SDK/CLI plumbing |
 | `bicdb-daemon` | Worker process entry, bounded execution pool, maintenance threads |
 | `bicdb-tools` | Diagnostics: `page_dump`, `db_check` |
-| `bicdb-cli` | `bicdb` binary: instance bootstrap, SQL execution, interactive shell |
+| `bicdb-cli` | `bicdb` binary: instance bootstrap, service lifecycle, SQL execution, shell |
+| `bicdb-sqlplus` | `bicdbcli`: standalone SQL*Plus-style client (buffer, slash commands, SPOOL, scripts) |
 
 ### Development phases
 
@@ -136,7 +137,7 @@ mechanical check that no binary requires a symbol above the baseline.
 ### Quick start
 
 ```bash
-cargo build --release -p bicdb-cli
+cargo build --release
 
 ./target/release/bicdb init  ./demo
 ./target/release/bicdb sql   ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
@@ -144,6 +145,12 @@ cargo build --release -p bicdb-cli
 ./target/release/bicdb sql   ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
 ./target/release/bicdb sql   ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
 ./target/release/bicdb shell ./demo            # interactive; `;` ends a statement
+
+# background service + SQL*Plus-style client
+./target/release/bicdb start ./demo            # detached service, instance lock, log
+./target/release/bicdb status ./demo
+./target/release/bicdbcli ./demo               # buffer, `/` re-runs, SPOOL, @script, DESC
+./target/release/bicdb stop  ./demo            # clean shutdown (full checkpoint)
 ```
 
 `init` creates a real on-disk instance (dictionary file, undo segment, WAL group
@@ -261,7 +268,8 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | `bicdb-net` | 版本化请求协议、ACK/对账、会话、SDK/CLI 对接 |
 | `bicdb-daemon` | 工作进程入口、有界执行池、维护线程 |
 | `bicdb-tools` | 诊断工具：`page_dump`、`db_check` |
-| `bicdb-cli` | `bicdb` 命令行：建区、执行 SQL、交互式 shell |
+| `bicdb-cli` | `bicdb` 命令行：建区、服务生命周期、执行 SQL、交互式 shell |
+| `bicdb-sqlplus` | `bicdbcli`：SQL*Plus 形态的独立客户端（缓冲、斜杠命令、SPOOL、脚本） |
 
 ### 研发阶段
 
@@ -301,7 +309,7 @@ CI 在 Debian 12 容器中、对两个架构分别执行门禁，并机械校验
 ### 快速上手
 
 ```bash
-cargo build --release -p bicdb-cli
+cargo build --release
 
 ./target/release/bicdb init  ./demo
 ./target/release/bicdb sql   ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
@@ -309,6 +317,12 @@ cargo build --release -p bicdb-cli
 ./target/release/bicdb sql   ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
 ./target/release/bicdb sql   ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
 ./target/release/bicdb shell ./demo            # 交互式；`;` 结尾执行
+
+# 后台服务 + SQL*Plus 形态客户端
+./target/release/bicdb start ./demo            # 分离进程 + 实例锁 + 日志
+./target/release/bicdb status ./demo
+./target/release/bicdbcli ./demo               # 缓冲、`/` 重跑、SPOOL、@脚本、DESC
+./target/release/bicdb stop  ./demo            # 干净关闭（完全检查点）
 ```
 
 `init` 建出一个**真盘实例**（字典文件、撤销段、日志组目录、控制文件双副本）。

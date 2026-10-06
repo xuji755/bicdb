@@ -240,7 +240,10 @@ fn crash_without_shutdown_recovers_committed_rows() {
             ok(&mut inst, &format!("INSERT INTO c VALUES ({i}, 'r{i}')"));
         }
         // **不 `shutdown`**：模拟进程直接消失（日志已耐久、页未回写）。
+        // 真崩溃时进程也没了 ⇒ 实例锁是**陈旧的**（pid 文件在、进程不在）——
+        // `mem::forget` 做不到"进程消失"，这里把 pid 文件删掉补上这一半。
         std::mem::forget(inst);
+        let _ = std::fs::remove_file(dir.path().join("bicdb.pid"));
     }
     let mut inst = open_instance(dir.path()).expect("崩溃后重开");
     let r = inst.recovery.expect("应有一次恢复");

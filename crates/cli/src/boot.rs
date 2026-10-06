@@ -37,6 +37,8 @@ use bicdb_txn::engine::Engine;
 use bicdb_wal::group::{online_groups, GroupSpec, GroupWriter};
 use bicdb_wal::recovery::recover;
 use bicdb_workspace::io::{FileHandle, FileIo, OsFileIo};
+
+use crate::lock::{self, InstanceLock, LockError, LockMode};
 use bicdb_workspace::WorkspaceId;
 
 /// 工作区标识（V1.0 单工作区 CLI：常量；多工作区随 daemon/DCL）。
@@ -47,9 +49,12 @@ const FILE0_ID: u16 = 0;
 /// 撤销段的物理文件号。
 const UNDO_ID: u16 = 1;
 
-const FILE0: &str = "file0.dat";
-const UNDO: &str = "undo.dat";
-const WAL_DIR: &str = "wal";
+/// 字典文件名（也是"这是个 bicdb 实例"的判据）。
+pub const FILE0: &str = "file0.dat";
+/// 撤销文件名。
+pub const UNDO: &str = "undo.dat";
+/// 日志组目录名。
+pub const WAL_DIR: &str = "wal";
 const CF_A: &str = "cf_a";
 const CF_B: &str = "cf_b";
 
@@ -67,6 +72,8 @@ pub enum BootError {
     Io(std::io::Error),
     /// 目录（字典）层。
     Catalog(String),
+    /// **实例被别的进程占着**（单写者纪律；见 `lock.rs`）。
+    Occupied(String),
 }
 
 impl std::fmt::Display for BootError {
@@ -74,6 +81,7 @@ impl std::fmt::Display for BootError {
         match self {
             BootError::Io(e) => write!(f, "I/O：{e}"),
             BootError::Catalog(w) => write!(f, "目录：{w}"),
+            BootError::Occupied(w) => f.write_str(w),
         }
     }
 }
@@ -91,6 +99,21 @@ macro_rules! from_io {
     ($($t:ty),* $(,)?) => { $(impl From<$t> for BootError {
         fn from(e: $t) -> Self { BootError::Io(std::io::Error::other(e.to_string())) }
     })* };
+}
+
+impl From<LockError> for BootError {
+    fn from(e: LockError) -> Self {
+        match e {
+            LockError::Occupied { pid, mode } => BootError::Occupied(format!(
+                "实例被 pid {pid} 占用（{}）——服务在跑时请用 `bicdbcli`/`bicdb stop` 连它",
+                match mode {
+                    LockMode::Service => "服务模式",
+                    LockMode::Direct => "直连模式",
+                }
+            )),
+            other => BootError::Io(std::io::Error::other(other.to_string())),
+        }
+    }
 }
 
 from_io!(
@@ -163,6 +186,10 @@ pub struct Instance {
     pub catalog: Catalog<'static>,
     /// 打开期的恢复回执（诊断；`None` = 建区当次）。
     pub recovery: Option<RecoverySummary>,
+    /// **实例锁**（单写者纪律；Drop 即释放）。服务模式由守护进程持有，
+    /// 直连模式由本进程持有——同一时刻只允许一个写者。
+    /// 读它的地方：`Instance::lock_holder`（诊断）与服务退出前的显式释放。
+    lock: Option<InstanceLock>,
 }
 
 /// 打开期的一份恢复回执（CLI 启动横幅用）。
@@ -199,6 +226,12 @@ impl Instance {
         Ok(())
     }
 
+    /// 本实例的锁事实（谁占着、什么模式；诊断/`status` 用）。
+    #[must_use]
+    pub fn lock_holder(&self) -> Option<&crate::lock::LockInfo> {
+        self.lock.as_ref().map(InstanceLock::info)
+    }
+
     /// 当前提交序号（会话的快照水位起点）。
     #[must_use]
     pub fn seq(&self) -> u64 {
@@ -217,6 +250,8 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
     }
     let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
     let io_dyn: &'static dyn FileIo = io;
+    // 建区也持锁（Direct）：建到一半被别人开起来同样是撕字典。
+    let lock = InstanceLock::acquire(dir, LockMode::Direct, &lock::socket_path(dir))?;
 
     // ① file 0：自举集 + 种子（**建区期直写**，不经池——见 `catalog::create`）。
     let layout = FileLayout::meta();
@@ -297,11 +332,21 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
         engine,
         catalog,
         recovery: None,
+        lock: Some(lock),
     })
 }
 
-/// **打开既有实例**：先恢复（三阶段），再建池/引擎。
+/// **打开既有实例（直连模式）**：先取实例锁（单写者），再打开。
+///
+/// 服务在跑（或别的进程直连着）⇒ [`BootError::Occupied`]——**不**静默并存：
+/// 两个写者各写各的池与日志不是并发，是互相破坏。
 pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
+    let lock = InstanceLock::acquire(dir, LockMode::Direct, &lock::socket_path(dir))?;
+    open_unlocked(dir, Some(lock))
+}
+
+/// **打开既有实例（锁已由调用方持有）**：守护进程走这条（它拿的是 Service 锁）。
+pub fn open_unlocked(dir: &Path, lock: Option<InstanceLock>) -> Result<Instance, BootError> {
     let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
     let io_dyn: &'static dyn FileIo = io;
     let file0_path = p(dir, FILE0);
@@ -421,5 +466,6 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
         engine,
         catalog,
         recovery: Some(summary),
+        lock,
     })
 }
