@@ -31,15 +31,6 @@ impl From<IndexError> for TableAccessError {
     }
 }
 
-/// **一个索引的维护目标**（调用方从目录解析出来）：段头块 + 树头（根页）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexTarget {
-    /// 索引段的段头**物理块**（`seg$.block_id`）。
-    pub seg_block: u32,
-    /// 树头（根页 ROWID；分段头页扩展区）。
-    pub root: RowId,
-}
-
 /// **插入一个索引项**；返回**新树头**（根分裂时变化，否则原值）。
 ///
 /// 调用方负责把返回的树头写回（[`write_tree_head_redo`]）——**同一事务内**。
