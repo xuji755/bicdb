@@ -245,6 +245,24 @@ EXIT
     assert_eq!(code, 0, "stderr={err}");
     // BEGIN 之后、COMMIT 之前也能查到自己的行（同会话可见）。
     assert!(out.contains('2'), "事务里应看到自己的插入：\n{out}");
+    // **`DESC` 走会话**（不丢事务状态）：显式事务里也能 DESC，且事务照旧。
+    let input = "\
+BEGIN;
+INSERT INTO svc VALUES (3, 'c');
+DESC svc
+ROLLBACK;
+SELECT id FROM svc ORDER BY id;
+EXIT
+";
+    let (out, err, code) = feed(dir.path(), input, &[]);
+    assert_eq!(code, 0, "stderr={err}");
+    assert!(out.contains("Null?"), "事务里也能 DESC：\n{out}");
+    assert!(out.contains("ROLLBACK"), "事务照旧收尾：\n{out}");
+    assert!(
+        !out.contains('3') || !out.contains("c "),
+        "回滚后不应有第 3 行：\n{out}"
+    );
+
     // 直连被锁挡住（单写者纪律）。
     let (_, err2, code2) = feed(dir.path(), "SELECT 1 FROM x;\nEXIT\n", &["--direct"]);
     assert_ne!(code2, 0, "服务在跑时 --direct 应被拒");

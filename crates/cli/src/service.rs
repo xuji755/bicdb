@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use bicdb_sql::session::Session;
 
-use crate::boot::{open_unlocked, Instance};
+use crate::boot::open_unlocked;
 use crate::lock::{self, InstanceLock, LockError, LockInfo, LockMode};
 use crate::wire::{self, WireError};
 
@@ -188,36 +188,9 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
         };
         // **一个连接 = 一个会话**：事务（`BEGIN … COMMIT`）跨该连接的语句保持
         // ——SQL*Plus 一句一发，事务语义必须绑在连接上，不能绑在单条语句上。
-        // 先服务「不需要会话」的动词（DESCRIBE 只读目录），再建会话——
-        // 会话借住 `inst.catalog`，一旦建了就没法再用 `inst`。
-        let (verb, payload) = match wire::read_frame(&mut s) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if verb == "DESCRIBE" {
-            match describe_object(&mut inst, payload.trim()) {
-                Ok(cols) => {
-                    let body = wire::encode_columns(&cols);
-                    let _ = wire::write_frame(&mut s, "OK", &body);
-                }
-                Err(e) => {
-                    let _ = wire::write_frame(&mut s, "ERR", &e);
-                }
-            }
-            continue;
-        }
         let seq = inst.seq();
         let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
-        // 第一帧已经读走了：先处理它，再进循环。
-        let mut pending = Some((verb, payload));
-        loop {
-            let (verb, payload) = match pending.take() {
-                Some(v) => v,
-                None => match wire::read_frame(&mut s) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                },
-            };
+        while let Ok((verb, payload)) = wire::read_frame(&mut s) {
             match verb.as_str() {
                 "HELLO" => {
                     let _ = wire::write_frame(
@@ -251,6 +224,23 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                         }
                         Err(e) => {
                             log.line(&format!("语句失败：{e}"));
+                            let _ = wire::write_frame(&mut s, "ERR", &e.to_string());
+                        }
+                    }
+                }
+                "DESCRIBE" => {
+                    // **走会话**（它的目录借用）：不动事务状态——`DESC` 在
+                    // 显式事务里也该能用，不能为此把会话丢了（那会回滚事务）。
+                    match session.describe_columns(payload.trim()) {
+                        Ok(cols) => {
+                            let rows: Vec<(String, bool, String)> = cols
+                                .into_iter()
+                                .map(|(n, nul, code, len)| (n, nul, type_name(code, len)))
+                                .collect();
+                            let body = wire::encode_columns(&rows);
+                            let _ = wire::write_frame(&mut s, "OK", &body);
+                        }
+                        Err(e) => {
                             let _ = wire::write_frame(&mut s, "ERR", &e.to_string());
                         }
                     }
@@ -291,33 +281,6 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
         let _ = std::io::stdout().flush();
     }
     Ok(())
-}
-
-/// **列定义**（服务端的 `DESCRIBE`：只读目录，不建会话）。
-fn describe_object(inst: &mut Instance, name: &str) -> Result<Vec<(String, bool, String)>, String> {
-    use bicdb_catalog::dict::namespace;
-    if name.is_empty() {
-        return Err("DESCRIBE 缺对象名".to_owned());
-    }
-    let snapshot = bicdb_common::seq::CommitSeq::from_raw(inst.seq().max(1)).expect("48 位域内");
-    let obj = inst
-        .catalog
-        .resolve(snapshot, namespace::TABLE, name)
-        .map_err(|e| e.to_string())?;
-    let cols = inst
-        .catalog
-        .columns(snapshot, obj.obj)
-        .map_err(|e| e.to_string())?;
-    Ok(cols
-        .into_iter()
-        .map(|c| {
-            (
-                c.name,
-                c.nullable,
-                crate::service::type_name(c.type_code, c.length),
-            )
-        })
-        .collect())
 }
 
 /// 类型码 → SQL 类型名（与 `bicdbcli` 的 `DESCRIBE` 版面同源）。

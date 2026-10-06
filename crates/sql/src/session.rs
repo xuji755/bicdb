@@ -153,6 +153,28 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         self.seq
     }
 
+    /// **列定义**（`DESCRIBE` 用）：`(列名, 可空, 类型码, 声明长度)`。
+    ///
+    /// 走会话自己的目录借用——**不动事务状态**（`DESCRIBE` 在显式事务里也该能用）。
+    pub fn describe_columns(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<(String, bool, u32, u32)>, SessionError> {
+        let snapshot = self.snapshot();
+        let obj = self
+            .catalog
+            .resolve(snapshot, bicdb_catalog::dict::namespace::TABLE, name)
+            .map_err(|e| SessionError::State(e.to_string()))?;
+        let cols = self
+            .catalog
+            .columns(snapshot, obj.obj)
+            .map_err(|e| SessionError::State(e.to_string()))?;
+        Ok(cols
+            .into_iter()
+            .map(|c| (c.name, c.nullable, c.type_code, c.length))
+            .collect())
+    }
+
     /// 有没有未收尾的显式事务。
     #[must_use]
     pub fn in_transaction(&self) -> bool {
