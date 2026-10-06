@@ -37,6 +37,9 @@ use bicdb_txn::engine::Engine;
 use bicdb_wal::group::{online_groups, GroupSpec, GroupWriter};
 use bicdb_wal::recovery::recover;
 use bicdb_workspace::io::{FileHandle, FileIo, OsFileIo};
+
+use crate::config::{self, InstanceParams};
+use crate::lock::{InstanceLock, LockError, LockMode};
 use bicdb_workspace::WorkspaceId;
 
 /// 工作区标识（V1.0 单工作区 CLI：常量；多工作区随 daemon/DCL）。
@@ -47,18 +50,44 @@ const FILE0_ID: u16 = 0;
 /// 撤销段的物理文件号。
 const UNDO_ID: u16 = 1;
 
-const FILE0: &str = "file0.dat";
-const UNDO: &str = "undo.dat";
-const WAL_DIR: &str = "wal";
-const CF_A: &str = "cf_a";
-const CF_B: &str = "cf_b";
+/// 字典文件名（也是"这是个 bicdb 实例"的判据）。
+/// **文件面**（`docs/storage/02-工作区存储布局.md` §2.1 的布局，V1.0 单工作区）：
+///
+/// ```text
+/// <db_root>/                      根区目录（参数文件注册它）
+/// ├── bicdb.ini                   实例参数文件
+/// ├── control/                    控制文件双副本（control01.ctl / control02.ctl）
+/// ├── wal/                        日志组（redo_g<组>_m<成员>）
+/// └── data/                       数据文件：<ws>_meta（file 0）/ <ws>_undo（file 1）
+/// ```
+///
+/// **为什么按 `<ws>_` 前缀**：设计里数据文件按工作区命名（`<ws>_meta`/`<ws>_undo`/
+/// `<ws>_data_NN`）——单工作区 CLI 也照这个名字，多工作区/数据文件扩展时命名规则不变。
+pub const CONTROL_DIR: &str = "control";
+/// 数据文件目录。
+pub const DATA_DIR: &str = "data";
+/// 控制文件副本名（设计与 `ControlFile::format` 的取法：01/02）。
+pub const CF_A: &str = "control/control01.ctl";
+/// 控制文件副本名（第二份）。
+pub const CF_B: &str = "control/control02.ctl";
 
-/// 建区时 file 0 的初始块数（`FileLayout::meta().min_file_blocks()` + 余量；
-/// 段扩展会按需长大，这个数字只是"免去建区后立刻扩文件"）。
-const FILE0_BLOCKS: u64 = 4096;
+/// 实例的文件面：数据文件名（`<ws>_meta`）。
+#[must_use]
+pub fn data_file_name(ws: [u8; 8], kind: &str) -> String {
+    format!("{}_{kind}", String::from_utf8_lossy(&ws))
+}
+/// 日志组目录名。
+pub const WAL_DIR: &str = "wal";
 
-/// **缓冲区帧数**（16 KiB/帧 ⇒ 4 MiB）。
-const POOL_FRAMES: usize = 256;
+/// 建区时 file 0 初始块数的**默认值**（参数文件 `[init] file0_initial_blocks` 可改）。
+pub const DEFAULT_FILE0_BLOCKS: u64 = 4096;
+/// 撤销文件初始块数的**默认值**（参数文件 `[init] undo_initial_blocks` 可改）。
+pub const DEFAULT_UNDO_BLOCKS: u64 = 512;
+/// 日志每组成员页数的**默认值**（参数文件 `[init] wal_group_pages` 可改）。
+pub const DEFAULT_WAL_GROUP_PAGES: u32 = 8192;
+
+/// **自动扩展增量的默认值**（块；与 `storage::segment` 同源）。
+pub const DEFAULT_FILE_EXTEND_BLOCKS: u64 = bicdb_storage::segment::DEFAULT_FILE_EXTEND_BLOCKS;
 
 /// 建区/打开错误。
 #[derive(Debug)]
@@ -67,6 +96,10 @@ pub enum BootError {
     Io(std::io::Error),
     /// 目录（字典）层。
     Catalog(String),
+    /// **实例被别的进程占着**（单写者纪律；见 `lock.rs`）。
+    Occupied(String),
+    /// **参数文件**（未知键/取值非法；见 `config.rs`）。
+    Config(String),
 }
 
 impl std::fmt::Display for BootError {
@@ -74,6 +107,8 @@ impl std::fmt::Display for BootError {
         match self {
             BootError::Io(e) => write!(f, "I/O：{e}"),
             BootError::Catalog(w) => write!(f, "目录：{w}"),
+            BootError::Occupied(w) => f.write_str(w),
+            BootError::Config(w) => write!(f, "参数：{w}"),
         }
     }
 }
@@ -93,6 +128,21 @@ macro_rules! from_io {
     })* };
 }
 
+impl From<LockError> for BootError {
+    fn from(e: LockError) -> Self {
+        match e {
+            LockError::Occupied { pid, mode } => BootError::Occupied(format!(
+                "实例被 pid {pid} 占用（{}）——服务在跑时请用 `bicdbcli`/`bicdb stop` 连它",
+                match mode {
+                    LockMode::Service => "服务模式",
+                    LockMode::Direct => "直连模式",
+                }
+            )),
+            other => BootError::Io(std::io::Error::other(other.to_string())),
+        }
+    }
+}
+
 from_io!(
     bicdb_storage::datafile::DataFileError,
     bicdb_storage::controlfile::ControlFileError,
@@ -110,6 +160,17 @@ fn p(dir: &Path, name: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// 数据文件路径（`<db_root>/data/<ws>_<kind>`）。
+pub fn data_path(dir: &Path, ws: [u8; 8], kind: &str) -> PathBuf {
+    dir.join(DATA_DIR).join(data_file_name(ws, kind))
+}
+
+/// 实例的"身份文件"：`data/<ws>_meta`（file 0）——判"这是不是 bicdb 实例"用它。
+#[must_use]
+pub fn data_meta_path(dir: &Path, ws: [u8; 8]) -> PathBuf {
+    data_path(dir, ws, "meta")
+}
+
 fn seq(v: u64) -> CommitSeq {
     CommitSeq::from_raw(v).expect("48 位域内")
 }
@@ -123,10 +184,11 @@ fn undo_page0() -> u32 {
     FileLayout::standard().first_block_of(ExtentNo::from_raw(0).expect("域内"))
 }
 
-/// **日志组规格**（V1.0 固定：2 组 × 1 成员；与控制文件条目一致）。
+/// **日志组规格**（来自参数文件 `[init]`；与控制文件条目一致）。
 #[must_use]
-pub fn group_spec() -> GroupSpec {
-    GroupSpec::new(2, 1, 8192).expect("日志组参数为常量")
+pub fn group_spec(init: &crate::config::InitParams) -> GroupSpec {
+    GroupSpec::new(init.wal_groups, init.wal_members, init.wal_group_pages)
+        .expect("参数文件已做闭集校验")
 }
 
 fn workspace_entry() -> WorkspaceEntry {
@@ -135,6 +197,48 @@ fn workspace_entry() -> WorkspaceEntry {
         created_at: 0,
         derived_from: None,
         derived_at_seq: seq(0),
+    }
+}
+
+/// **进程级参数落点**（段层的自动扩展增量：层里没有实例上下文，故设一次）。
+fn apply_process_params(params: &InstanceParams) {
+    let _ = bicdb_storage::segment::set_file_extend_blocks(params.run.file_extend_blocks);
+}
+
+/// 等锁策略（参数文件 → 引擎）。
+fn wait_policy(params: &InstanceParams) -> bicdb_txn::write::WaitPolicy {
+    bicdb_txn::write::WaitPolicy {
+        park_timeout: std::time::Duration::from_millis(params.run.park_ms),
+        deadlock_threshold_ms: params.run.deadlock_threshold_ms,
+        max_waits: None,
+    }
+}
+
+/// 实例参数（`bicdb params` 与诊断用；按参数文件寻址，命令行覆盖可给）。
+pub fn instance_params(
+    ini: Option<&Path>,
+    cli: &[(String, String)],
+) -> Result<(InstanceParams, config::ParamTable), BootError> {
+    InstanceParams::load_with_overrides(ini, cli).map_err(|e| BootError::Config(e.to_string()))
+}
+
+/// **核对建区期参数**（控制文件/日志文件是权威）：不符即拒绝打开。
+fn check_creation_facts(
+    _dir: &Path,
+    params: &InstanceParams,
+    entries: &bicdb_storage::controlfile::RedoEntries,
+) -> Result<(), BootError> {
+    // **只核对控制文件里真有的事实**（组数/成员数）。`wal_group_pages` 不核对：
+    // 日志成员文件是**懒增长**的（用到哪写到哪），文件长度不是组容量——
+    // 拿它推断会误报（实测：新库 g1 只写了 31 页、g2 还是建时的满长度）。
+    let actual = crate::config::ActualCreation {
+        wal_groups: entries.group_count,
+        wal_members: entries.member_count,
+        wal_group_pages: None,
+    };
+    match params.check_creation(&actual) {
+        None => Ok(()),
+        Some(e) => Err(BootError::Config(e.to_string())),
     }
 }
 
@@ -163,6 +267,10 @@ pub struct Instance {
     pub catalog: Catalog<'static>,
     /// 打开期的恢复回执（诊断；`None` = 建区当次）。
     pub recovery: Option<RecoverySummary>,
+    /// **实例锁**（单写者纪律；Drop 即释放）。服务模式由守护进程持有，
+    /// 直连模式由本进程持有——同一时刻只允许一个写者。
+    /// 读它的地方：`Instance::lock_holder`（诊断）与服务退出前的显式释放。
+    lock: Option<InstanceLock>,
 }
 
 /// 打开期的一份恢复回执（CLI 启动横幅用）。
@@ -199,6 +307,12 @@ impl Instance {
         Ok(())
     }
 
+    /// 本实例的锁事实（谁占着、什么模式；诊断/`status` 用）。
+    #[must_use]
+    pub fn lock_holder(&self) -> Option<&crate::lock::LockInfo> {
+        self.lock.as_ref().map(InstanceLock::info)
+    }
+
     /// 当前提交序号（会话的快照水位起点）。
     #[must_use]
     pub fn seq(&self) -> u64 {
@@ -207,27 +321,40 @@ impl Instance {
 }
 
 /// **建区**：字典 + 撤销段 + 控制文件 + 日志组 + 池/引擎（§5.1 的 ①–⑤）。
-pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
+///
+/// `params` 由 `bicdb init <根区目录>` 装载（建区期参数在 `[init]`；见 `config`），
+/// 建区**同时生成参数文件**到 `<db_root>/bicdb.ini`。
+pub fn create_instance(params: &InstanceParams) -> Result<Instance, BootError> {
+    let dir = params.db_root.clone();
+    let dir = dir.as_path();
     std::fs::create_dir_all(dir)?;
-    if p(dir, FILE0).exists() {
+    if data_path(dir, WS, "meta").exists() {
         return Err(BootError::Catalog(format!(
             "{} 已存在（不是空目录）",
-            p(dir, FILE0).display()
+            data_path(dir, WS, "meta").display()
         )));
     }
     let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
     let io_dyn: &'static dyn FileIo = io;
+    // 建区也持锁（Direct）：建到一半被别人开起来同样是撕字典。
+    let lock = InstanceLock::acquire(dir, LockMode::Direct, &params.socket_path())?;
+    // **生成默认参数文件**（`bicdb init` 的产物之一；`db_root` 注册在里面）——
+    // 参数是"跑起来的关键"，写出来才看得见、改得动。
+    std::fs::write(params.ini_path(), params.render())?;
+    apply_process_params(params);
 
     // ① file 0：自举集 + 种子（**建区期直写**，不经池——见 `catalog::create`）。
     let layout = FileLayout::meta();
-    let file0_path = p(dir, FILE0);
+    std::fs::create_dir_all(dir.join(DATA_DIR))?;
+    std::fs::create_dir_all(dir.join(CONTROL_DIR))?;
+    let file0_path = data_path(dir, WS, "meta");
     let mut file0 = DataFile::create(
         io_dyn,
         &file0_path,
         FILE0_ID,
         META_ROLE,
         WS,
-        layout.min_file_blocks() + FILE0_BLOCKS,
+        layout.min_file_blocks() + params.init.file0_initial_blocks,
     )?;
     let built =
         create_dictionary(&mut file0, WS, false).map_err(|e| BootError::Catalog(e.to_string()))?;
@@ -241,9 +368,14 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
     DataFile::open(io_dyn, &file0_path)?.sync()?;
 
     // ② 撤销段（V1.0 单段）。
-    let undo_path = p(dir, UNDO);
+    let undo_path = data_path(dir, WS, "undo");
     let undo_file: &'static mut DataFile<'static> = Box::leak(Box::new(DataFile::create(
-        io_dyn, &undo_path, UNDO_ID, 1, WS, 512,
+        io_dyn,
+        &undo_path,
+        UNDO_ID,
+        1,
+        WS,
+        params.init.undo_initial_blocks,
     )?));
     let undo_handle = undo_file.handle();
     let undo_seg = create_undo_segment(undo_file, 2, 3, 4)?;
@@ -255,31 +387,32 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
         &p(dir, CF_A),
         &p(dir, CF_B),
         &workspace_entry(),
-        &RedoEntries::new(2, 1).expect("常量"),
+        &RedoEntries::new(params.init.wal_groups, params.init.wal_members).expect("已校验"),
         &ArchiveRecord::new(ArchiveMode::NoArchive),
     )?));
     let wal_path = p(dir, WAL_DIR);
     std::fs::create_dir_all(&wal_path)?;
-    let writer = GroupWriter::create(io_dyn, cf, &wal_path, group_spec(), lsn(0))?;
+    let writer = GroupWriter::create(io_dyn, cf, &wal_path, group_spec(&params.init), lsn(0))?;
 
     // ④ 池（WAL 守卫 = 日志的刷盘核心）+ 引擎 + 目录。
     let file0_handle = DataFile::open(io_dyn, &file0_path)?.handle();
     let guard = writer.shared();
     let pool: &'static BufferPool<'static> = Box::leak(Box::new(BufferPool::with_config(
         io_dyn,
-        POOL_FRAMES,
+        params.run.pool_frames,
         move |_ws, r| resolve(file0_handle, undo_handle, r),
         guard,
         SystemClock,
-        CacheConfig::for_capacity(POOL_FRAMES),
+        CacheConfig::for_capacity(params.run.pool_frames),
     )?));
-    let engine: &'static Engine<'static, 'static, 'static, 'static> =
-        Box::leak(Box::new(Engine::new(
-            pool,
-            writer,
-            UndoChain::open(undo_seg).with_pool(pool),
-            seq(0),
-        )));
+    let mut engine = Engine::new(
+        pool,
+        writer,
+        UndoChain::open(undo_seg).with_pool(pool),
+        seq(0),
+    );
+    engine.set_policy(wait_policy(params));
+    let engine: &'static Engine<'static, 'static, 'static, 'static> = Box::leak(Box::new(engine));
     let mut catalog =
         Catalog::open(io_dyn, &file0_path).map_err(|e| BootError::Catalog(e.to_string()))?;
     catalog.attach_pool(pool);
@@ -297,21 +430,37 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
         engine,
         catalog,
         recovery: None,
+        lock: Some(lock),
     })
 }
 
-/// **打开既有实例**：先恢复（三阶段），再建池/引擎。
-pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
+/// **打开既有实例（直连模式）**：先取实例锁（单写者），再打开。
+///
+/// 服务在跑（或别的进程直连着）⇒ [`BootError::Occupied`]——**不**静默并存：
+/// 两个写者各写各的池与日志不是并发，是互相破坏。
+pub fn open_instance(params: &InstanceParams) -> Result<Instance, BootError> {
+    let lock = InstanceLock::acquire(&params.db_root, LockMode::Direct, &params.socket_path())?;
+    open_unlocked_with(params, Some(lock))
+}
+
+/// **打开（参数已装载）**：服务路径用它（命令行 `-c` 覆盖在这里生效）。
+pub fn open_unlocked_with(
+    params: &InstanceParams,
+    lock: Option<InstanceLock>,
+) -> Result<Instance, BootError> {
+    let dir = params.db_root.clone();
+    let dir = dir.as_path();
+    apply_process_params(params);
     let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
     let io_dyn: &'static dyn FileIo = io;
-    let file0_path = p(dir, FILE0);
+    let file0_path = data_path(dir, WS, "meta");
     if !file0_path.exists() {
         return Err(BootError::Catalog(format!(
             "{} 不存在（先 `bicdb init`）",
             file0_path.display()
         )));
     }
-    let undo_path = p(dir, UNDO);
+    let undo_path = data_path(dir, WS, "undo");
     let wal_path = p(dir, WAL_DIR);
     let (cf_path_a, cf_path_b) = (p(dir, CF_A), p(dir, CF_B));
 
@@ -322,9 +471,11 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
     let undo_seg = Segment::open(undo_file, undo_page0())?;
 
     // 起点 = 控制文件的检查点 LSN（低水位）。
-    let spec = group_spec();
+    let spec = group_spec(&params.init);
     let progress = {
         let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
+        // **建区期参数核对**（控制文件权威）：不符 ⇒ 拒绝打开（改需重建）。
+        check_creation_facts(dir, params, &cf_ro.redo_entries()?)?;
         cf_ro.checkpoint_progress()?
     };
 
@@ -399,15 +550,15 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
     let guard = writer.shared();
     let pool: &'static BufferPool<'static> = Box::leak(Box::new(BufferPool::with_config(
         io_dyn,
-        POOL_FRAMES,
+        params.run.pool_frames,
         move |_ws, r| resolve(file0_handle, undo_handle, r),
         guard,
         SystemClock,
-        CacheConfig::for_capacity(POOL_FRAMES),
+        CacheConfig::for_capacity(params.run.pool_frames),
     )?));
-    let engine: &'static Engine<'static, 'static, 'static, 'static> = Box::leak(Box::new(
-        Engine::new(pool, writer, chain.with_pool(pool), seq(recovered_seq)),
-    ));
+    let mut engine = Engine::new(pool, writer, chain.with_pool(pool), seq(recovered_seq));
+    engine.set_policy(wait_policy(params));
+    let engine: &'static Engine<'static, 'static, 'static, 'static> = Box::leak(Box::new(engine));
     let mut catalog =
         Catalog::open(io_dyn, &file0_path).map_err(|e| BootError::Catalog(e.to_string()))?;
     catalog.attach_pool(pool);
@@ -421,5 +572,6 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
         engine,
         catalog,
         recovery: Some(summary),
+        lock,
     })
 }

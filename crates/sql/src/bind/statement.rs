@@ -258,7 +258,10 @@ fn bind_select<V: CatalogView>(
                         .parse()
                         .map_err(|_| BindError::Unsupported("ORDER BY 序号".to_owned()))?;
                     if n == 0 || n > out_columns.len() {
-                        return Err(BindError::UnknownColumn(text.clone()));
+                        return Err(BindError::Unsupported(format!(
+                            "ORDER BY 序号 {n} 越出输出列（共 {} 列）",
+                            out_columns.len()
+                        )));
                     }
                     n - 1
                 }
@@ -269,9 +272,14 @@ fn bind_select<V: CatalogView>(
                     [ast::ColumnRefField::Name(n)] => n.clone(),
                     _ => return Err(BindError::Unsupported("ORDER BY 多段引用".to_owned())),
                 };
-                *output_names
-                    .get(&name)
-                    .ok_or_else(|| BindError::UnknownColumn(name.clone()))?
+                // **口径**：`ORDER BY` 只收**输出列**名或序号（投影后的行序）——
+                // 不投影的列作排序键是本版不支持（不是"列不存在"）。错误文本要说清，
+                // 否则用户看到"列 X 不存在"会去翻表定义（实测被误导过）。
+                *output_names.get(&name).ok_or_else(|| {
+                    BindError::Unsupported(format!(
+                        "ORDER BY 只收输出列名或序号——`{name}` 不在 SELECT 的输出列里（本版不投影的列不能作排序键）"
+                    ))
+                })?
             }
             _ => {
                 return Err(BindError::Unsupported(

@@ -1,0 +1,23 @@
+[package]
+name = "bicdb-sqlplus"
+description = "bicdbcli —— SQL*Plus 形态的独立命令行客户端（缓冲/斜杠命令/SPOOL/脚本）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bicdb_sqlplus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bicdbcli"
+path = "src/main.rs"
+
+[dependencies]
+bicdb-catalog = { path = "../catalog" }
+bicdb-cli = { path = "../cli" }
+bicdb-common = { path = "../common" }
+bicdb-sql = { path = "../sql" }
+bicdb-workspace = { path = "../workspace" }

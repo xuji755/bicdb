@@ -149,9 +149,31 @@ impl std::fmt::Display for SegmentError {
 
 impl std::error::Error for SegmentError {}
 
-/// **自动扩展的固定增量**（块；8 MiB）——区分配越出文件长度时按此追加
+/// **自动扩展固定增量的默认值**（块；8 MiB）——区分配越出文件长度时按此追加
 /// （Oracle `NEXT` / InnoDB autoextend 的固定增量形态，见 `存储架构设计` §3.3）。
-pub const FILE_EXTEND_BLOCKS: u64 = 512;
+pub const DEFAULT_FILE_EXTEND_BLOCKS: u64 = 512;
+
+/// 进程级当前值（**启动时设定一次**；段层没有实例上下文，故用单值：
+/// 见 [`set_file_extend_blocks`]）。默认 = [`DEFAULT_FILE_EXTEND_BLOCKS`]。
+static FILE_EXTEND_BLOCKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_FILE_EXTEND_BLOCKS);
+
+/// **设定自动扩展增量**（实例参数 `file_extend_blocks`；进程级单值）。
+///
+/// 下限 = 一个区（8 块）——比一区还小会让增长退化成逐页扩文件；上限 1 Mi 块。
+pub fn set_file_extend_blocks(blocks: u64) -> Result<(), SegmentError> {
+    if !(EXTENT_BLOCKS as u64..=1_048_576).contains(&blocks) {
+        return Err(SegmentError::Malformed);
+    }
+    FILE_EXTEND_BLOCKS.store(blocks, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// 当前自动扩展增量（块）。
+#[must_use]
+pub fn file_extend_blocks() -> u64 {
+    FILE_EXTEND_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// 段头（公共部分的值形态；§5.11）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -959,7 +981,7 @@ impl<'io, 'f> Segment<'io, 'f> {
     /// **分配一个区；文件满则先增长文件再试**（自动扩展，§3.3）。
     ///
     /// 判据：区分配越出**当前文件长度**（`FileFull`）⇒ `set_len` 尾部追加
-    /// [`FILE_EXTEND_BLOCKS`] 块 + 更新文件头（`DataFile::extend`，零搬移），
+    /// [`file_extend_blocks`] 块 + 更新文件头（`DataFile::extend`，零搬移），
     /// 然后重试。**位图区在文件前部且全量预留**，所以增长不搬任何元数据。
     ///
     /// 上限由覆盖域把关（`extend` 自带 `BeyondCoverage`）；重试有界
@@ -971,7 +993,7 @@ impl<'io, 'f> Segment<'io, 'f> {
         match self.file.plan_allocate_extent(current) {
             Ok(p) => Ok(p),
             Err(crate::datafile::DataFileError::FileFull) => {
-                let want = self.file.blocks() + FILE_EXTEND_BLOCKS;
+                let want = self.file.blocks() + file_extend_blocks();
                 self.file.extend(want)?;
                 Ok(self.file.plan_allocate_extent(current)?)
             }

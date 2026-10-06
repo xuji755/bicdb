@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 
 use bicdb_cli::boot::{create_instance, open_instance, Instance};
+use bicdb_cli::config::InstanceParams;
 use bicdb_sql::session::{QueryResult, Session, SessionError};
 
 /// 一个测试独占的实例目录（进程号 + 名字；跑完删）。
@@ -57,6 +58,12 @@ fn err(inst: &mut Instance, sql: &str) -> String {
     }
 }
 
+/// 建区/打开用的参数（**就是 `bicdb init` 那一步做的事**：默认 + 根区目录；
+/// `create_instance` 会把参数文件写到 `<db_root>/bicdb.ini`）。
+fn params_for(dir: &std::path::Path) -> InstanceParams {
+    InstanceParams::for_init(dir, None, &[]).expect("参数")
+}
+
 /// 结果集的行（`SELECT id, name FROM t ORDER BY id` 形态）。
 fn rows(r: &[QueryResult]) -> Vec<Vec<String>> {
     match r.last() {
@@ -69,7 +76,7 @@ fn rows(r: &[QueryResult]) -> Vec<Vec<String>> {
 fn create_ddl_dml_index_txn_and_reopen() {
     let dir = TempDir::new("main");
     // ① 建区 + DDL（`stat$`/`seq$` 在建区收尾里建）。
-    let mut inst = create_instance(dir.path()).expect("建区");
+    let mut inst = create_instance(&params_for(dir.path())).expect("建区");
     ok(
         &mut inst,
         "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))",
@@ -106,7 +113,7 @@ fn create_ddl_dml_index_txn_and_reopen() {
     // ④ 关（完全检查点）→ 重开（恢复）→ 数据在。
     inst.shutdown().expect("关闭");
     drop(inst);
-    let mut inst = open_instance(dir.path()).expect("重开");
+    let mut inst = open_instance(&params_for(dir.path())).expect("重开");
     let got = rows(&ok(&mut inst, "SELECT id, name FROM t ORDER BY id"));
     assert_eq!(
         got,
@@ -130,7 +137,7 @@ fn create_ddl_dml_index_txn_and_reopen() {
 #[test]
 fn unique_index_treats_nulls_as_distinct() {
     let dir = TempDir::new("nulls");
-    let mut inst = create_instance(dir.path()).expect("建区");
+    let mut inst = create_instance(&params_for(dir.path())).expect("建区");
     ok(
         &mut inst,
         "CREATE TABLE n (id NUMBER NOT NULL, code VARCHAR2(8))",
@@ -151,7 +158,7 @@ fn unique_index_treats_nulls_as_distinct() {
 #[test]
 fn table_options_reach_the_write_path() {
     let dir = TempDir::new("options");
-    let mut inst = create_instance(dir.path()).expect("建区");
+    let mut inst = create_instance(&params_for(dir.path())).expect("建区");
     ok(
         &mut inst,
         "CREATE TABLE tight (id NUMBER NOT NULL, v VARCHAR2(64)) WITH (pctfree = 0)",
@@ -196,23 +203,23 @@ fn table_options_reach_the_write_path() {
 #[test]
 fn a_stale_control_file_is_refused_at_open() {
     let dir = TempDir::new("consistency");
-    let mut inst = create_instance(dir.path()).expect("建区");
+    let mut inst = create_instance(&params_for(dir.path())).expect("建区");
     ok(&mut inst, "CREATE TABLE c (id NUMBER NOT NULL)");
     ok(&mut inst, "INSERT INTO c VALUES (1)");
     inst.shutdown().expect("关闭"); // 推进 file_scn 到检查点位点
     drop(inst);
 
     // 备份"当前"控制文件，再走一次写入/关闭让位点前进，然后换回旧的。
-    let cur_a = std::fs::read(dir.path().join("cf_a")).expect("读 cf_a");
-    let cur_b = std::fs::read(dir.path().join("cf_b")).expect("读 cf_b");
-    let mut inst = open_instance(dir.path()).expect("重开");
+    let cur_a = std::fs::read(dir.path().join("control/control01.ctl")).expect("读 cf_a");
+    let cur_b = std::fs::read(dir.path().join("control/control02.ctl")).expect("读 cf_b");
+    let mut inst = open_instance(&params_for(dir.path())).expect("重开");
     ok(&mut inst, "INSERT INTO c VALUES (2)");
     inst.shutdown().expect("关闭");
     drop(inst);
-    std::fs::write(dir.path().join("cf_a"), &cur_a).expect("写回旧 cf_a");
-    std::fs::write(dir.path().join("cf_b"), &cur_b).expect("写回旧 cf_b");
+    std::fs::write(dir.path().join("control/control01.ctl"), &cur_a).expect("写回旧 cf_a");
+    std::fs::write(dir.path().join("control/control02.ctl"), &cur_b).expect("写回旧 cf_b");
 
-    match open_instance(dir.path()) {
+    match open_instance(&params_for(dir.path())) {
         Ok(_) => panic!("旧控制文件 + 新文件 ⇒ 应拒绝打开"),
         Err(e) => {
             let msg = e.to_string();
@@ -221,8 +228,8 @@ fn a_stale_control_file_is_refused_at_open() {
     }
 
     // 复原（好控制文件 = 刚才那份新的）——把备份放回去，实例仍可打开。
-    std::fs::write(dir.path().join("cf_a"), &cur_a).ok();
-    std::fs::write(dir.path().join("cf_b"), &cur_b).ok();
+    std::fs::write(dir.path().join("control/control01.ctl"), &cur_a).ok();
+    std::fs::write(dir.path().join("control/control02.ctl"), &cur_b).ok();
 }
 
 /// **崩溃语义**：不调 `shutdown`（脏页留在池里、WAL 是唯一耐久源）⇒
@@ -231,7 +238,7 @@ fn a_stale_control_file_is_refused_at_open() {
 fn crash_without_shutdown_recovers_committed_rows() {
     let dir = TempDir::new("crash");
     {
-        let mut inst = create_instance(dir.path()).expect("建区");
+        let mut inst = create_instance(&params_for(dir.path())).expect("建区");
         ok(
             &mut inst,
             "CREATE TABLE c (id NUMBER NOT NULL, tag VARCHAR2(16))",
@@ -240,9 +247,12 @@ fn crash_without_shutdown_recovers_committed_rows() {
             ok(&mut inst, &format!("INSERT INTO c VALUES ({i}, 'r{i}')"));
         }
         // **不 `shutdown`**：模拟进程直接消失（日志已耐久、页未回写）。
+        // 真崩溃时进程也没了 ⇒ 实例锁是**陈旧的**（pid 文件在、进程不在）——
+        // `mem::forget` 做不到"进程消失"，这里把 pid 文件删掉补上这一半。
         std::mem::forget(inst);
+        let _ = std::fs::remove_file(dir.path().join("bicdb.pid"));
     }
-    let mut inst = open_instance(dir.path()).expect("崩溃后重开");
+    let mut inst = open_instance(&params_for(dir.path())).expect("崩溃后重开");
     let r = inst.recovery.expect("应有一次恢复");
     assert_eq!(
         rows(&ok(&mut inst, "SELECT id FROM c")).len(),

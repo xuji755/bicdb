@@ -4,6 +4,97 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-10-06
+
+**Background service and a standalone SQL\*Plus-style client.** Design note:
+`doc/服务与客户端_v0.1.md` (Chinese).
+
+### Added
+
+- **Instance lock** (`<dir>/bicdb.pid`) — one writer per instance, enforced
+  rather than assumed: `bicdb init`/`sql`/`shell`/`bicdbcli --direct` take a
+  *direct* lock, the service takes a *service* lock, and a second opener is
+  refused. Liveness is decided by pid + the process start time read from
+  `/proc/<pid>/stat`, so a stale lock (after `kill -9`) is taken over
+  automatically — PG's `postmaster.pid` dance, with no `unsafe` and no signals.
+- **Service lifecycle** (`pg_ctl`-shaped): `bicdb start <dir> [-s socket]
+  [-l log] [-w seconds]`, `stop [-m fast|immediate]`, `status`, `restart`.
+  `start` spawns a detached daemon (`process_group(0)`, stdio to the log) and
+  **waits until it is ready** (polls the control socket). `stop` asks the
+  service to finish over the socket — `fast` runs a full checkpoint first,
+  `immediate` exits and lets crash recovery do the work on the next open.
+- **`bicdbcli`** (`crates/sqlplus`) — a standalone SQL*Plus-style client:
+  multi-line input with **line-number continuation prompts**, `;` to execute,
+  blank line to end input without executing, **`/` to re-run the current
+  buffer**, buffer editing (`LIST`/`DEL`/`APPEND`/`INPUT`/`CHANGE`/`CLEAR
+  BUFFER`), `SET`/`SHOW` session parameters, `SPOOL`, `@file`/`START`/`@@`
+  scripts with `&name` substitution and `WHENEVER SQLERROR EXIT`, `DESCRIBE`
+  in SQL*Plus layout, `HOST`/`PROMPT`/`REM`/`TIMING`/`HELP`/`EXIT [code]`,
+  right-aligned numeric columns, page breaks at `PAGESIZE`, `N rows selected.`
+  and `Elapsed: 00:00:00.01`.
+- **On-disk layout aligned with the frozen storage design**: the root area now
+  holds `control/control01.ctl`, `control/control02.ctl`, `data/<ws>_meta`
+  (file 0), `data/<ws>_undo` (file 1) and `wal/redo_g<g>_m<m>`, alongside
+  `bicdb.ini` — instead of the flat `file0.dat`/`undo.dat`/`cf_a`/`cf_b` the
+  CLI used before.
+- **User manual** ([docs/使用手册.md](docs/使用手册.md), Chinese): five-minute
+  quick start, instance addressing, the parameter-file reference, command
+  reference for `bicdb`/`bicdbcli`, the supported SQL surface with its named
+  refusals, operations (locking, crash recovery, backup) and troubleshooting.
+- **Connection routing** — a running service means clients (and `bicdb sql`)
+  go over the control socket, **one connection = one session**, so
+  `BEGIN … COMMIT` spans statements; otherwise the client opens the instance
+  directly.
+- Control protocol (length-prefixed text frames: `HELLO`/`STATUS`/`SQL`/
+  `DESCRIBE`/`SHUTDOWN`) — explicitly a **transitional** local protocol; the
+  versioned client protocol lands with `bicdb-net`.
+- **Instance parameter file and Oracle-style instance addressing.** The
+  instance is addressed by its parameter file, `<db_root>/bicdb.ini`, not by a
+  directory: `bicdb init <db_root>` is the only command that takes a directory
+  (it *points at the filesystem* and **generates the default parameter file**),
+  and every other command (`start`/`stop`/`status`/`restart`/`params`/`sql`/
+  `shell`/`bicdbcli`) locates the instance through the parameter file —
+  `-p <file|db_root>` > `$BICDB_INI` > `./bicdb.ini`. The root directory is
+  **registered inside** the file (`[instance] db_root`) and is authoritative.
+  **Key parameters are no longer hardcoded**: `[init]` carries the creation-time
+  set (file/undo initial blocks, WAL groups, members per group, group pages —
+  `bicdb init -c init.wal_groups=4` builds a 4-group instance) and the other
+  sections carry the runtime set (buffer pool frames, file auto-extend
+  increment, control socket, service log, lock park timeout, deadlock
+  threshold). Creation-time parameters are refused after the fact with a
+  per-item diff ("the control file is authoritative; changing them requires a
+  rebuild"). `bicdb params` prints every knob with its value, source
+  (default / file / command line) and class (creation-time / runtime); unknown
+  sections and keys are rejected by name. When the daemon dies during startup,
+  `start` now reports the **last log lines** instead of just timing out.
+- **Connection routing** — a running service means clients (and `bicdb sql`)
+  go over the control socket, **one connection = one session**, so
+  `BEGIN … COMMIT` spans statements; otherwise the client opens the instance
+  directly.
+- Control protocol (length-prefixed text frames: `HELLO`/`STATUS`/`SQL`/
+  `DESCRIBE`/`SHUTDOWN`) — explicitly a **transitional** local protocol; the
+  versioned client protocol lands with `bicdb-net`.
+- **Instance parameter file** `<dir>/bicdb.conf` (PostgreSQL's `postgresql.conf`
+  in the data directory; the text half of Oracle's pfile/spfile split).
+  `bicdb init` writes it with all defaults, `bicdb params <dir>` prints the
+  effective values **with their source** (default / file / command line), and
+  `-c key=value` on `bicdb start` overrides the file. Unknown keys are
+  **rejected by name** (closed set — an accepted-but-ignored parameter is
+  exactly the kind of shell the 0.1.1 audit removed), and every parameter has a
+  real sink: buffer pool frames, file auto-extend increment, control socket,
+  service log, lock park timeout, deadlock threshold. Creation-time parameters
+  (WAL groups/members/group pages, initial file blocks) live in the control
+  file and are shown read-only. When the daemon dies during startup, `start`
+  now reports the **last log lines** instead of just timing out.
+
+### Fixed
+
+- The lexer accepted ASCII identifiers only — `CREATE TABLE t (名称
+  VARCHAR2(8))` failed with "unrecognized character". Non-ASCII bytes are now
+  identifier characters, matching PostgreSQL's scanner (unquoted names are
+  still folded, ASCII-only).
+- `bicdb … | head` no longer panics with a broken pipe.
+
 ## [0.1.1] — 2026-10-06
 
 **Fixes a write-blocking wall and several half-wired paths found by a full-tree
@@ -136,3 +227,4 @@ P1–P4 are implemented; P5 (SQL / catalog) is in progress.
 
 [0.1.0]: https://github.com/xuji755/bicdb/releases/tag/v0.1.0
 [0.1.1]: https://github.com/xuji755/bicdb/releases/tag/v0.1.1
+[0.2.0]: https://github.com/xuji755/bicdb/releases/tag/v0.2.0
