@@ -355,11 +355,17 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
             input,
             groups,
             aggs,
-        } => Box::new(crate::agg::HashAgg::new(
-            build(input, env, open_cursor)?,
-            groups.clone(),
-            aggs.clone(),
-        )),
+        } => {
+            let op = crate::agg::HashAgg::new(
+                build(input, env, open_cursor)?,
+                groups.clone(),
+                aggs.clone(),
+            );
+            match env.spill {
+                Some(space) => Box::new(op.with_spill(space)),
+                None => Box::new(op),
+            }
+        }
         PlanNode::SortedAgg {
             input,
             groups,

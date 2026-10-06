@@ -201,14 +201,20 @@ pub fn kind_name(kind: ColKind) -> &'static str {
 pub fn row_bytes(row: &Row) -> usize {
     let mut n = 16; // 行结构开销
     for v in &row.values {
-        n += match v {
-            Value::Null => 0,
-            Value::Bool(_) => 1,
-            Value::Number(num) => num.encoded_len().max(8),
-            Value::Bytes(b) => b.len().max(8),
-        };
+        n += value_bytes(v);
     }
     n
+}
+
+/// **一个值的估计内存**（含容器开销；`HashSet`/`HashMap` 键的内存记账用）。
+#[must_use]
+pub fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(num) => num.encoded_len().max(8),
+        Value::Bytes(b) => b.len().max(8),
+    }
 }
 
 /// **显式转换**（`CAST`；切片 2b 的确定面）。

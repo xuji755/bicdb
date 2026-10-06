@@ -12,12 +12,13 @@ use std::collections::{HashMap, HashSet};
 
 use bicdb_types::Number;
 
-use crate::context::ExecContext;
+use crate::context::{ExecContext, WorkAreaOutcome};
 use crate::error::ExecError;
 use crate::expr::{self, Expr};
 use crate::operator::Operator;
 use crate::sort::SortKey;
 use crate::value::{Row, Value};
+use crate::wmm::{AreaClaim, WorkArea};
 
 /// 聚合函数（SQL 面清单：`COUNT(*)`/`COUNT(x)`/`SUM`/`AVG`/`MIN`/`MAX`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +148,27 @@ impl AggAcc {
         Ok(())
     }
 
+    /// **转移 + 内存记账**（`HashAgg` 溢出判定用）：与 [`AggAcc::advance`]
+    /// 语义相同，另返回本次新增占用字节（`DISTINCT` 已见值集增长——
+    /// 非 DISTINCT 的累加器大小不随行数增长，返回 0）。
+    pub fn advance_accounted(
+        &mut self,
+        value: Option<&Value>,
+        params: &[Value],
+    ) -> Result<u64, ExecError> {
+        let before = self.seen.as_ref().map_or(0, HashSet::len);
+        self.advance(value, params)?;
+        let after = self.seen.as_ref().map_or(0, HashSet::len);
+        if after == before {
+            return Ok(0);
+        }
+        // 新增了一个已见值（值本身 + 集合项开销）。
+        Ok(match value {
+            Some(v) => (crate::value::value_bytes(v) + 32) as u64,
+            None => 0,
+        })
+    }
+
     /// **收尾**（三段式的末段）：聚合结果值。
     pub fn finalize(&self) -> Result<Value, ExecError> {
         Ok(match &self.state {
@@ -266,21 +288,35 @@ impl Operator for ScalarAgg<'_> {
     }
 }
 
-/// **`HashAgg`**（有 `GROUP BY`）：组表 + 逐组状态；输出为**哈希序**（无序）。
-pub struct HashAgg<'a> {
+/// **`HashAgg`**（有 `GROUP BY`）：组表 + 逐组状态；输出为**键出现序**
+/// （全内存路径；溢出路径 = 分区序 + 分区内出现序——无 `ORDER BY` 的 SQL
+/// 本无顺序保证，设计 §4.2.1 ③）。
+///
+/// **溢出（切片 6b-2c）**：超额度且有溢出空间 ⇒ **改档重来**——清表、重读
+/// 输入（聚合状态不可逆，不缝合）、按分组键哈希分区落 temp、逐分区读回聚合；
+/// 分区仍超额度 ⇒ 换种子**二次重分区**（计 `multi-pass`），深度上限 3。
+pub struct HashAgg<'a, 's, 'io> {
     input: Box<dyn Operator + 'a>,
     groups: Vec<Expr>,
     specs: Vec<AggSpec>,
+    spill: Option<&'s crate::spill::SpillSpace<'io>>,
+    area: Option<WorkArea>,
+    declared: u64,
+    bytes0: (u64, u64),
     table: HashMap<GroupKey, Vec<AggAcc>>,
     order: Vec<GroupKey>,
     out: Vec<Row>,
     at: usize,
     loaded: bool,
+    /// 组表占用估计（新组 + `DISTINCT` 已见值集增量）。
+    used: u64,
+    /// 发生过二级及以上重分区（`multi-pass` 判定；设计 §4.2.1 ③）。
+    multi_pass: bool,
     slot: usize,
     opened: bool,
 }
 
-impl<'a> HashAgg<'a> {
+impl<'a, 's, 'io> HashAgg<'a, 's, 'io> {
     /// 构造。
     #[must_use]
     pub fn new(input: Box<dyn Operator + 'a>, groups: Vec<Expr>, specs: Vec<AggSpec>) -> Self {
@@ -288,58 +324,252 @@ impl<'a> HashAgg<'a> {
             input,
             groups,
             specs,
+            spill: None,
+            area: None,
+            declared: 0,
+            bytes0: (0, 0),
             table: HashMap::new(),
             order: Vec::new(),
             out: Vec::new(),
             at: 0,
             loaded: false,
+            used: 0,
+            multi_pass: false,
             slot: 0,
             opened: false,
         }
     }
+
+    /// 带溢出空间。
+    #[must_use]
+    pub fn with_spill(mut self, spill: &'s crate::spill::SpillSpace<'io>) -> Self {
+        self.spill = Some(spill);
+        self
+    }
+
+    /// 额度（池形态每次重读；否则固定预算）。
+    fn budget(&self, cx: &ExecContext<'_>) -> Option<u64> {
+        cx.budget_for(self.area.as_ref())
+    }
+
+    /// 改档（倍增才重申报；`benefit = ideal`——哈希族省下的是"写进 temp
+    /// 再读回"的**一趟**流量，入口溢出时数据尚未写盘）。
+    fn redeclare(&mut self, used: u64) {
+        let Some(area) = &self.area else { return };
+        if used > self.declared && (self.declared == 0 || used >= self.declared.saturating_mul(2)) {
+            area.regrade(AreaClaim {
+                ideal: used,
+                one_pass: 0,
+                benefit: used,
+            });
+            self.declared = used;
+        }
+    }
+
+    /// **喂一行进组表**（含内存记账）。
+    fn aggregate_row(&mut self, cx: &ExecContext<'_>, row: &Row) -> Result<(), ExecError> {
+        let key = group_key(&self.groups, row, cx.params())?;
+        let entry = match self.table.get_mut(&key) {
+            Some(accs) => accs,
+            None => {
+                // 新组：键 + 每个聚合项的累加器开销。
+                let key_bytes: usize =
+                    key.iter().map(crate::value::value_bytes).sum::<usize>() + 32;
+                self.used += (key_bytes + 24 * self.specs.len()) as u64;
+                self.order.push(key.clone());
+                self.table
+                    .entry(key)
+                    .or_insert_with(|| self.specs.iter().cloned().map(AggAcc::new).collect())
+            }
+        };
+        for acc in entry.iter_mut() {
+            let v = match &acc.spec.arg {
+                Some(e) => Some(expr::eval(e, row, cx.params())?),
+                None => None,
+            };
+            self.used += acc.advance_accounted(v.as_ref(), cx.params())?;
+        }
+        Ok(())
+    }
+
+    /// 组表收尾 → 结果行（按键出现序）。
+    fn finish_table(&mut self) -> Result<Vec<Row>, ExecError> {
+        let mut rows = Vec::with_capacity(self.order.len());
+        for key in &self.order {
+            let accs = self.table.get(key).expect("已登记");
+            let mut values = key.clone();
+            for acc in accs {
+                values.push(acc.finalize()?);
+            }
+            rows.push(Row::new(values));
+        }
+        Ok(rows)
+    }
+
+    /// 收尾记账：三态计数 + extra bytes（spill 字节差）。
+    fn note_done(&self, cx: &mut ExecContext<'_>, partitioned: bool) {
+        let outcome = if self.multi_pass {
+            WorkAreaOutcome::MultiPass
+        } else if partitioned {
+            WorkAreaOutcome::OnePass
+        } else {
+            WorkAreaOutcome::Optimal
+        };
+        cx.note_work_area(outcome);
+        if let Some(space) = self.spill {
+            cx.note_extra_bytes(
+                space.bytes_written() - self.bytes0.0,
+                space.bytes_read() - self.bytes0.1,
+            );
+        }
+    }
+
+    /// **改档重来**：清表 → 重读输入 → 一级分区落 temp → 逐分区读回聚合。
+    fn run_partitioned(&mut self, cx: &mut ExecContext<'_>) -> Result<Vec<Row>, ExecError> {
+        self.table.clear();
+        self.order.clear();
+        self.used = 0;
+        self.input.rescan(cx)?;
+
+        // 一级分区（分区数 = 无统计信息下的稳妥默认）。
+        let budget = self.budget(cx).unwrap_or(u64::MAX);
+        let parts = crate::part::PARTITIONS_LEVEL1;
+        let space = self.spill.expect("分区路径必有溢出空间");
+        let mut runs: Vec<Vec<usize>> = vec![Vec::new(); parts];
+        let mut buf = crate::part::BucketBuffer::new(crate::part::seed_for(0), parts, budget);
+        while let Some(row) = self.input.next(cx)? {
+            cx.check()?;
+            let key = group_key(&self.groups, &row, cx.params())?;
+            buf.push(&key, row, space, &mut runs)?;
+        }
+        buf.flush_all(space, &mut runs)?;
+
+        // 逐分区读回聚合（分区仍超额度 ⇒ 深一层重分区）。
+        let mut out = Vec::new();
+        for pruns in &runs {
+            if pruns.is_empty() {
+                continue; // 空分区不产组
+            }
+            self.aggregate_partition(cx, pruns, 0, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// **聚合一个分区**（流式读回；超额度 ⇒ 换种子重分区，深度 ≤ 3）。
+    fn aggregate_partition(
+        &mut self,
+        cx: &mut ExecContext<'_>,
+        runs: &[usize],
+        depth: u32,
+        out: &mut Vec<Row>,
+    ) -> Result<(), ExecError> {
+        let space = self.spill.expect("分区路径必有溢出空间");
+        self.table.clear();
+        self.order.clear();
+        self.used = 0;
+
+        let mut stream = space.open_runs(runs)?;
+        let mut overflow_at: Option<u64> = None;
+        while let Some(row) = stream.next_row()? {
+            cx.check()?;
+            self.aggregate_row(cx, &row)?;
+            self.redeclare(self.used);
+            if let Some(budget) = self.budget(cx) {
+                if self.used > budget {
+                    overflow_at = Some(self.used);
+                    break;
+                }
+            }
+        }
+        if overflow_at.is_none() {
+            // 分区装下了：收尾输出（分区内 = 键出现序）。
+            let rows = self.finish_table()?;
+            out.extend(rows);
+            return Ok(());
+        }
+
+        // 分区仍超额度 ⇒ 深一层重分区（部分数据多写多读一遍 = multi-pass）。
+        self.multi_pass = true;
+        if depth >= crate::part::MAX_PARTITION_DEPTH {
+            // 极端键偏斜：哈希怎么分都挤一桶——按当前额度继续（记 multi-pass）。
+            self.table.clear();
+            self.order.clear();
+            self.used = 0;
+            let mut stream = space.open_runs(runs)?;
+            while let Some(row) = stream.next_row()? {
+                cx.check()?;
+                self.aggregate_row(cx, &row)?;
+            }
+            let rows = self.finish_table()?;
+            out.extend(rows);
+            return Ok(());
+        }
+
+        let budget = self.budget(cx).unwrap_or(u64::MAX);
+        let parts = crate::part::parts_for(overflow_at.unwrap_or(budget), budget);
+        let sub_seed = crate::part::seed_for(depth + 1);
+
+        // 读回本分区 → 换种子重分区落 temp。
+        let mut sub_runs: Vec<Vec<usize>> = vec![Vec::new(); parts];
+        let mut buf = crate::part::BucketBuffer::new(sub_seed, parts, budget);
+        let mut stream = space.open_runs(runs)?;
+        while let Some(row) = stream.next_row()? {
+            cx.check()?;
+            let key = group_key(&self.groups, &row, cx.params())?;
+            buf.push(&key, row, space, &mut sub_runs)?;
+        }
+        buf.flush_all(space, &mut sub_runs)?;
+
+        for sruns in &sub_runs {
+            if sruns.is_empty() {
+                continue;
+            }
+            self.aggregate_partition(cx, sruns, depth + 1, out)?;
+        }
+        Ok(())
+    }
 }
 
-impl Operator for HashAgg<'_> {
+impl Operator for HashAgg<'_, '_, '_> {
     fn open(&mut self, cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
         if !self.opened {
             self.slot = cx.register_op("HashAgg");
             self.opened = true;
+        }
+        if self.spill.is_some() {
+            self.area = cx.claim_area("HashAgg");
+            if let Some(space) = self.spill {
+                self.bytes0 = (space.bytes_written(), space.bytes_read());
+            }
         }
         self.input.open(cx)
     }
 
     fn next(&mut self, cx: &mut ExecContext<'_>) -> Result<Option<Row>, ExecError> {
         if !self.loaded {
+            // 阻塞段：耗尽输入；超额度 ⇒ 改档重来（有溢出空间时）。
+            let mut partitioned = false;
             while let Some(row) = self.input.next(cx)? {
-                let key = group_key(&self.groups, &row, cx.params())?;
-                let entry = match self.table.get_mut(&key) {
-                    Some(accs) => accs,
-                    None => {
-                        self.order.push(key.clone());
-                        self.table.entry(key).or_insert_with(|| {
-                            self.specs.iter().cloned().map(AggAcc::new).collect()
-                        })
+                self.aggregate_row(cx, &row)?;
+                self.redeclare(self.used);
+                if let Some(budget) = self.budget(cx) {
+                    if self.used > budget {
+                        if self.spill.is_none() {
+                            return Err(ExecError::WorkMemoryExceeded {
+                                used: self.used,
+                                budget,
+                            });
+                        }
+                        self.out = self.run_partitioned(cx)?;
+                        partitioned = true;
+                        break;
                     }
-                };
-                for acc in entry.iter_mut() {
-                    let v = match &acc.spec.arg {
-                        Some(e) => Some(expr::eval(e, &row, cx.params())?),
-                        None => None,
-                    };
-                    acc.advance(v.as_ref(), cx.params())?;
                 }
             }
-            // 收尾：按键出现序输出（组间稳定——比哈希迭代序可复现）。
-            let mut rows = Vec::with_capacity(self.order.len());
-            for key in &self.order {
-                let accs = self.table.get(key).expect("已登记");
-                let mut values = key.clone();
-                for acc in accs {
-                    values.push(acc.finalize()?);
-                }
-                rows.push(Row::new(values));
+            if !partitioned {
+                self.out = self.finish_table()?;
             }
-            self.out = rows;
+            self.note_done(cx, partitioned);
             self.loaded = true;
         }
         match self.out.get(self.at) {
@@ -358,6 +588,8 @@ impl Operator for HashAgg<'_> {
         self.out.clear();
         self.at = 0;
         self.loaded = false;
+        self.used = 0;
+        self.multi_pass = false;
         self.input.rescan(cx)
     }
 

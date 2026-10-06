@@ -32,6 +32,7 @@ pub mod index_scan;
 pub mod join;
 pub mod nodes;
 pub mod operator;
+pub mod part;
 pub mod plan;
 pub mod setops;
 pub mod sort;

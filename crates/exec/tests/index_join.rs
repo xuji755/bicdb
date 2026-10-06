@@ -329,3 +329,71 @@ fn left_join_pads_unmatched_outer_rows() {
         "匹配到的是 id+1 = 2"
     );
 }
+
+#[test]
+fn nested_loop_over_seq_scan_inner_rewinds_the_scan() {
+    // **重扫回到起点**（实测踩过：`SeqScan` 曾用缺省 no-op rescan，
+    // 内表每次重扫只读到"尾巴"——结果静默少行）。这里内表 = `SeqScan`
+    // 全表，外层 4 行 ⇒ 内外同表自连接 4×4 对（朴素参考）。
+    let io = mem_io();
+    let mut env = build_env(io);
+    let table = create_table(&mut env, io, &self_join_rows());
+    let blocks = table.blocks.clone();
+
+    let plan = PlanNode::NestedLoop {
+        outer: Box::new(PlanNode::SeqScan {
+            source: 0,
+            shape: shape(),
+        }),
+        inner: Box::new(PlanNode::Filter {
+            input: Box::new(PlanNode::SeqScan {
+                source: 0,
+                shape: shape(),
+            }),
+            predicate: Expr::Compare {
+                op: CmpOp::Eq,
+                left: Box::new(col(0)),
+                right: Box::new(Expr::Param(0)),
+            },
+        }),
+        inner_params: vec![col(0)],
+        kind: JoinKind::Inner,
+        qual: None,
+        inner_width: 2,
+    };
+    let mut open = |_src| {
+        Ok(Box::new(HeapScanner::new(
+            env.pool,
+            &env.chain,
+            env.snapshot,
+            DATA_FID,
+            blocks.clone(),
+        )) as Box<dyn RowCursor>)
+    };
+    let envx = ExecEnv {
+        pool: env.pool,
+        chain: Some(&env.chain),
+        spill: None,
+        writer: None,
+    };
+    let mut op = build(&plan, &envx, &mut open).unwrap();
+    let mut cx = ExecContext::new(env.snapshot);
+    let joined = collect(op.as_mut(), &mut cx).unwrap();
+
+    let rows = self_join_rows();
+    let mut expected: Vec<Row> = Vec::new();
+    for o in &rows {
+        for i in &rows {
+            if o.values[0] == i.values[0] {
+                let mut v = o.values.clone();
+                v.extend(i.values.iter().cloned());
+                expected.push(Row::new(v));
+            }
+        }
+    }
+    assert_eq!(
+        joined, expected,
+        "内表重扫必须回到起点（4 行 × 同行配对——少一行都是没复位）"
+    );
+    assert_eq!(joined.len(), 6, "1×1 + 2×2 + 1×1 = 6 对");
+}

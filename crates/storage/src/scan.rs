@@ -231,6 +231,16 @@ impl<'a, 'b, 'io, 'f> HeapScanner<'a, 'b, 'io, 'f> {
     }
 
     /// 取下一行（ROWID + 行字节）。`None` = 扫完。
+    /// **复位到扫描起点**（重扫：同快照、同块列表；区读/CR 诊断计数
+    /// 不清零——它们是本扫描器实例的累计）。
+    pub fn rewind(&mut self) {
+        self.at = 0;
+        self.run.clear();
+        self.run_blocks.clear();
+        self.pending.clear();
+    }
+
+    /// 取下一行（区读 ≤ 8 页 + 每块一次 CR）。
     pub fn next_row(&mut self) -> Result<Option<(RowId, Vec<u8>)>, ScanError> {
         loop {
             if let Some(item) = self.pending.pop_front() {

@@ -55,6 +55,11 @@ impl Operator for SeqScan<'_> {
             }
         }
     }
+
+    fn rescan(&mut self, _cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
+        // 复位存储游标（同快照、同边界）；不可复位的来源报具名错误。
+        self.cursor.rewind()
+    }
 }
 
 /// **过滤**（谓词只放行 TRUE；三值逻辑）。

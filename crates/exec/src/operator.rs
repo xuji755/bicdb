@@ -24,11 +24,23 @@ use crate::value::Row;
 pub trait RowCursor {
     /// 取下一行（ROWID + 存储行字节）；`None` = 扫完。
     fn next_row(&mut self) -> Result<Option<(RowId, Vec<u8>)>, ExecError>;
+
+    /// **复位到扫描起点**（重扫路径：`SeqScan` 重扫 / `HashAgg` 改档重来；
+    /// 快照与边界不变）。缺省 = 不可复位 ⇒ **具名错误**——绝不允许
+    /// "从半路接着读"这种静默错（实测踩过：扫描只读到尾巴）。
+    fn rewind(&mut self) -> Result<(), ExecError> {
+        Err(ExecError::NoRescan)
+    }
 }
 
 impl RowCursor for HeapScanner<'_, '_, '_, '_> {
     fn next_row(&mut self) -> Result<Option<(RowId, Vec<u8>)>, ExecError> {
         HeapScanner::next_row(self).map_err(ExecError::from)
+    }
+
+    fn rewind(&mut self) -> Result<(), ExecError> {
+        HeapScanner::rewind(self);
+        Ok(())
     }
 }
 
