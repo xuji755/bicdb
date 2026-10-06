@@ -6,7 +6,7 @@
 | --- | --- |
 | 设计依据 | `doc/执行算子设计_v0.1.md`（PG 拉取模型 + Oracle 批量化技巧；证据包 `exec-ops-20261006`） |
 | 对应阶段 | P5（切片 1 已落地） |
-| 当前状态 | **v0.7**——v0.6 + **溢出底座 `SpillSpace`**（行落 temp 段、流式 run 读、k 路归并）与 **`Sort` 外部归并**（超预算分批落 run；低预算与大预算逐行一致） |
+| 当前状态 | **v0.8**——v0.7 + **DML 族**（`Insert`/`Update`/`Delete` 经 `TableWriter` 写侧接事务引擎；`WithRowId` 行定位；语句 = 一事务；影响行数口径）。**设计 §7 的算子闭集全部落地** |
 
 ## 状态说明
 
@@ -32,7 +32,7 @@
   **LIMIT 真短路**（扫描行数可观测：`SeqScan` 统计 = LIMIT）、取消与截止
   （两路同判定）、NULL 三值逻辑。
 
-**下一步（切片 7 起）**：DML 算子（`Insert`/`Update`/`Delete` 接事务引擎）；
-6b-2（HashAgg/HashJoin 分批 + 完整 WMM）——见设计 §7 切片表。
+**余项**：6b-2（HashAgg/HashJoin 构建侧分批 + 完整 WMM 分配算法）；
+SQL 前端（Binder/计划器）与执行器/会话层随 P5 主线——见设计 §7 切片表。
 
 实现进度请以仓库根 `README.md` 的阶段表为准。
