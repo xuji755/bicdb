@@ -13,6 +13,7 @@ dependencies = [
  "bicdb-common",
  "bicdb-index",
  "bicdb-storage",
+ "bicdb-types",
  "bicdb-workspace",
 ]
 

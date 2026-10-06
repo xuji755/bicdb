@@ -24,9 +24,13 @@
 
 pub mod create;
 pub mod dict;
+pub mod open;
+pub mod row;
 
 pub use create::{create_dictionary, BootstrapObject, BuiltDictionary, CreateError};
 pub use dict::{
     bootstrap_entries_normal, bootstrap_entries_public, index_kind, is_public_only, namespace,
     obj_kind, self_check, table_opt, ColDef, ColTypeCode, DictTable, KeyDef, DICT_TABLES,
 };
+pub use open::{comp_num, comp_text, Catalog, OpenError};
+pub use row::{decode as decode_row, encode as encode_row, DictValue};

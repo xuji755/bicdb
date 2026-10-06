@@ -23,7 +23,7 @@ use bicdb_storage::page::{Page, PageType};
 use bicdb_storage::rowid::RowId;
 use bicdb_storage::segment::{self, SegType, Segment, SegmentSpaceError};
 
-use crate::dict::{self, is_public_only, ColTypeCode, DictTable};
+use crate::dict::{self, ColTypeCode, DictTable};
 
 /// 建区期错误。
 #[derive(Debug)]
@@ -136,24 +136,6 @@ impl BuiltDictionary {
     }
 }
 
-/// 自举集清单（按建区顺序展开）：`(表, 其每个键)`——表先、索引后。
-fn bootstrap_plan(is_public: bool) -> Vec<(&'static DictTable, Option<dict::KeyDef>)> {
-    let mut out = Vec::new();
-    for t in dict::DICT_TABLES {
-        if !t.bootstrap {
-            continue; // stat$/seq$ 由自举层描述（DDL 路径建），不在引导页
-        }
-        if is_public_only(t.name) != is_public && is_public_only(t.name) {
-            continue; // 普通工作区不建 public 独有三张
-        }
-        out.push((t, None));
-        for k in t.keys {
-            out.push((t, Some(*k)));
-        }
-    }
-    out
-}
-
 /// **建自举集**（§5.1 的第 ②③ 步 + 引导页写入）。
 ///
 /// `file` 必须是已建好的 **file 0**（role = 0，带式排布、块 0 文件头已写）；
@@ -169,7 +151,7 @@ pub fn create_dictionary(
     // 常量自检先跑（常量坏了不能建出坏字典）。
     dict::self_check().map_err(CreateError::ConstantsBroken)?;
 
-    let plan = bootstrap_plan(is_public);
+    let plan = dict::bootstrap_plan(is_public);
     let mut entries = Vec::with_capacity(plan.len());
     let mut objects = Vec::with_capacity(plan.len());
 

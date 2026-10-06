@@ -556,6 +556,28 @@ pub fn is_public_only(name: &str) -> bool {
     matches!(name, "user$" | "ws$" | "fs$")
 }
 
+/// **自举计划**（按建区顺序展开）：`(表, 其每个键)`——**表先、索引后**。
+///
+/// **顺序即身份**：引导页条目只有 `dataobj#`；建区（`create`）与打开
+/// （`open`）用**同一份计划**对位，因此这里的顺序是**格式的一部分**。
+#[must_use]
+pub fn bootstrap_plan(is_public: bool) -> Vec<(&'static DictTable, Option<KeyDef>)> {
+    let mut out = Vec::new();
+    for t in DICT_TABLES {
+        if !t.bootstrap {
+            continue; // stat$/seq$ 由自举层描述（DDL 路径建），不在引导页
+        }
+        if is_public_only(t.name) && !is_public {
+            continue; // 普通工作区不建 public 独有三张
+        }
+        out.push((t, None));
+        for k in t.keys {
+            out.push((t, Some(*k)));
+        }
+    }
+    out
+}
+
 /// **单表自检**（`self_check` 的判据本体；测试可直接喂坏表验证判据）。
 ///
 /// `seen_keys` 跨表累积（键名全局唯一）。检查项见 [`self_check`]。
