@@ -67,6 +67,34 @@ fn run_sort(
     Ok((rows, cx.work_area_stats()))
 }
 
+/// 跑一次排序（**AUTO 形态**：上下文接共享池——额度由池当场给）。
+fn run_sort_pool(
+    fx: &Fixture,
+    plan: &PlanNode,
+    pool: &std::sync::Arc<bicdb_exec::WorkMemoryPool>,
+    spill: Option<&SpillSpace<'_>>,
+) -> Result<(Vec<Row>, WorkAreaStats), ExecError> {
+    let mut open = |_src: u32| {
+        Ok(Box::new(HeapScanner::new(
+            fx.pool,
+            &fx.chain,
+            fx.snapshot,
+            DATA_FID,
+            fx.blocks.clone(),
+        )) as Box<dyn RowCursor>)
+    };
+    let env = ExecEnv {
+        pool: fx.pool,
+        chain: Some(&fx.chain),
+        spill,
+        writer: None,
+    };
+    let mut op = build(plan, &env, &mut open)?;
+    let mut cx = ExecContext::new(fx.snapshot).with_work_memory_pool(std::sync::Arc::clone(pool));
+    let rows = collect(op.as_mut(), &mut cx)?;
+    Ok((rows, cx.work_area_stats()))
+}
+
 #[test]
 fn external_merge_matches_in_memory_sort_row_by_row() {
     let io = mem_io();
@@ -116,4 +144,39 @@ fn external_merge_matches_in_memory_sort_row_by_row() {
         matches!(err, ExecError::WorkMemoryExceeded { .. }),
         "无溢出空间 ⇒ 具名错误：{err}"
     );
+
+    // ⑤ **AUTO 形态**（上下文接共享池）：额度 = 5% 单区上限。
+    //    大池（target 20 GiB ⇒ 单区 1 GiB）⇒ optimal、零额外字节、结果一致。
+    use bicdb_exec::WorkMemoryPool;
+    use std::sync::Arc;
+    let big = Arc::new(WorkMemoryPool::new(20 << 30));
+    let (pool_big, stats_big) = run_sort_pool(&fx, &plan, &big, None).unwrap();
+    assert_eq!(pool_big, in_memory, "池形态（大池）结果一致");
+    assert_eq!(stats_big.optimal, 1, "大池 ⇒ optimal");
+    assert_eq!(stats_big.extra_bytes_written, 0);
+    assert_eq!(
+        big.area_count(),
+        0,
+        "算子退场 ⇒ 内存区句柄注销（Drop 即注销）"
+    );
+
+    //    小池（target 20×2 KiB ⇒ 单区 2 KiB）⇒ 走溢出：三态记 one-pass、
+    //    额外字节 **写=读**（每个 run 恰好读回一次）。
+    let small = Arc::new(WorkMemoryPool::new(20 * 2048));
+    let (pool_small, stats_small) = run_sort_pool(&fx, &plan, &small, Some(space)).unwrap();
+    assert_eq!(pool_small, in_memory, "池形态（小池/溢出）结果逐行一致");
+    assert_eq!(
+        stats_small.one_pass, 1,
+        "记 one-pass（实际 {stats_small:?}）"
+    );
+    assert!(
+        stats_small.extra_bytes_written > 0,
+        "额外字节记账（写 {}）",
+        stats_small.extra_bytes_written
+    );
+    assert_eq!(
+        stats_small.extra_bytes_written, stats_small.extra_bytes_read,
+        "排序的溢出：写一次、读一次"
+    );
+    assert_eq!(small.area_count(), 0);
 }

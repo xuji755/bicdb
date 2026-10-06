@@ -38,6 +38,9 @@ struct RunRange {
 /// （中间不让出），因此各 run 的页区间天然连续。
 pub struct SpillSpace<'io> {
     inner: std::cell::RefCell<SpillInner<'io>>,
+    /// **extra bytes**（`V$PGASTAT` 口径：溢出写/读的载荷字节——设计 §4.2 ④）。
+    bytes_written: std::cell::Cell<u64>,
+    bytes_read: std::cell::Cell<u64>,
 }
 
 struct SpillInner<'io> {
@@ -62,12 +65,28 @@ impl<'io> SpillSpace<'io> {
                 ws: ws8,
                 runs: Vec::new(),
             }),
+            bytes_written: std::cell::Cell::new(0),
+            bytes_read: std::cell::Cell::new(0),
         })
+    }
+
+    /// 累计**写出的额外字节**（载荷口径；诊断/`note_extra_bytes` 用）。
+    #[must_use]
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written.get()
+    }
+
+    /// 累计**读回的额外字节**。
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.get()
     }
 
     /// 把一批行写成一个 **run**（返回 run 号）。
     pub fn write_run(&self, rows: &[Row]) -> Result<usize, ExecError> {
         let blob = serialize_rows(rows)?;
+        self.bytes_written
+            .set(self.bytes_written.get() + blob.len() as u64);
         let mut inner = self.inner.borrow_mut();
         let mut first = 0u32;
         let mut pages = 0u32;
@@ -139,6 +158,7 @@ impl<'io> SpillSpace<'io> {
                     .expect("4 字节"),
             ) as usize;
             blob.extend_from_slice(&page.as_bytes()[PAGE_HEADER + 4..PAGE_HEADER + 4 + len]);
+            self.bytes_read.set(self.bytes_read.get() + len as u64);
         }
         Ok(blob)
     }
@@ -315,9 +335,53 @@ impl RunCursor {
             ) as usize;
             self.bytes
                 .extend_from_slice(&page.as_bytes()[PAGE_HEADER + 4..PAGE_HEADER + 4 + len]);
+            space.bytes_read.set(space.bytes_read.get() + len as u64);
             self.next_logical += 1;
             self.pages_left -= 1;
         }
+    }
+}
+
+/// **跨 run 的流式读游标**（哈希族的读回口：一个分区的若干 run 顺序拼接，
+/// 一次只持一行 + 一页——与 `Sort` 的归并同内存界）。
+pub struct RunStream<'s, 'io> {
+    space: &'s SpillSpace<'io>,
+    ranges: Vec<RunRange>,
+    at: usize,
+    cur: Option<RunCursor>,
+}
+
+impl<'s, 'io> RunStream<'s, 'io> {
+    /// 取下一条（跨 run 自动续读；全部耗尽 ⇒ `None`）。
+    pub fn next_row(&mut self) -> Result<Option<Row>, ExecError> {
+        loop {
+            if let Some(cur) = &mut self.cur {
+                if let Some(row) = cur.next_row(self.space)? {
+                    return Ok(Some(row));
+                }
+            }
+            if self.at >= self.ranges.len() {
+                return Ok(None);
+            }
+            self.cur = Some(RunCursor::new(self.ranges[self.at]));
+            self.at += 1;
+        }
+    }
+}
+
+impl<'io> SpillSpace<'io> {
+    /// **打开一个分区的读回流**：`runs` 里各 run 顺序拼接、流式读
+    /// （哈希族的分区 = 若干 run——每次缓冲满写出一个 run）。
+    pub fn open_runs(&self, runs: &[usize]) -> Result<RunStream<'_, 'io>, ExecError> {
+        let inner = self.inner.borrow();
+        let ranges: Vec<RunRange> = runs.iter().map(|&r| inner.runs[r]).collect();
+        drop(inner);
+        Ok(RunStream {
+            space: self,
+            ranges,
+            at: 0,
+            cur: None,
+        })
     }
 }
 
@@ -450,5 +514,45 @@ mod tests {
         assert!(space.run_pages(0) > 1, "大 run 跨多页");
         assert_eq!(space.read_run(0).unwrap(), big, "跨页 run 往返一致");
         assert_eq!(space.read_run(1).unwrap(), big[..10].to_vec());
+    }
+
+    #[test]
+    fn run_stream_concatenates_a_partition_across_runs_streaming() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let file = Box::leak(Box::new(
+            DataFile::open_temp_reset(&io, Path::new("/mem/stream.dat"), WS, 512)
+                .expect("临时数据文件"),
+        ));
+        let space =
+            SpillSpace::create(file, bicdb_storage::temp::TempKind::Sort, WS).expect("溢出空间");
+        let mk = |i: usize| Row::new(vec![Value::Number(Number::parse(&i.to_string()).unwrap())]);
+        // 一个"分区" = 3 个 run（模拟分区缓冲满一次写一个 run）。
+        let a: Vec<Row> = (0..20_000).map(mk).collect();
+        let w0 = space.bytes_written();
+        space.write_run(&a).unwrap();
+        space.write_run(&a[..5]).unwrap();
+        space.write_run(&a[..7]).unwrap();
+        let part_bytes = space.bytes_written() - w0;
+        let _other = space.write_run(&[mk(999)]).unwrap(); // 别的分区（不读）
+        let r0 = space.bytes_read();
+
+        let mut stream = space.open_runs(&[0, 1, 2]).unwrap();
+        let mut got = Vec::new();
+        while let Some(row) = stream.next_row().unwrap() {
+            got.push(row);
+        }
+        let expect: Vec<Row> = a
+            .iter()
+            .cloned()
+            .chain(a[..5].iter().cloned())
+            .chain(a[..7].iter().cloned())
+            .collect();
+        assert_eq!(got, expect, "跨 run 顺序拼接、逐行一致");
+        assert_eq!(
+            space.bytes_read() - r0,
+            part_bytes,
+            "读回字节 = 该分区写出字节（不含别的 run）"
+        );
     }
 }
