@@ -267,7 +267,7 @@ pub fn insert_row(
 
     // ② 占用 ITL 槽（复用/清除/新占用都在 `occupy_itl` 里，§5.4.1）——
     //    新行随插入即被本事务锁住。
-    let (slot, _) = occupy_itl(pool, log, chain, txn, &mut local, block)?;
+    let (slot, _) = occupy_itl(pool, log, chain, txn, &mut local, block, policy.itl_max)?;
 
     // ③ 插行（快照上，**回填行头的 `itl_slot`**）+ 记"插入"撤销记录。
     let mut patched = row.to_vec();
@@ -305,6 +305,7 @@ pub fn delete_row(
     txn: &mut Txn,
     block: BufferKey,
     row_no: u16,
+    policy: &InsertPolicy,
 ) -> Result<(), TxnError> {
     require_pool_bound(chain, pool)?;
     let (data_before, mut local) = {
@@ -320,7 +321,16 @@ pub fn delete_row(
     // **加锁 + 占用 ITL 条目**（清除/复用/新占用 + `ITL 覆盖` 记录）——
     // 行锁与可见性的落点；行被他人活动事务锁住 ⇒ `RowLocked`（调用方登记
     // 等待后重试，§5.4.2 ①），**不得静默失败**。
-    let (_slot, _reentrant) = lock_and_occupy(pool, log, chain, txn, &mut local, block, row_no)?;
+    let (_slot, _reentrant) = lock_and_occupy(
+        pool,
+        log,
+        chain,
+        txn,
+        &mut local,
+        block,
+        row_no,
+        policy.itl_max,
+    )?;
     let rid = RowId::from_parts(block.rdba.file_id(), block.rdba.block_id(), row_no)?;
     append_undo_via_pool(
         pool,
@@ -398,7 +408,16 @@ pub fn update_row(
         // 不增：就地重写（等长到收缩同径——收缩时尾部旧字节一并进补丁，
         // 撤销按偏移写回即恢复原长；行区留下的洞由 defrag 处理，§6.8）。
         // 加锁 + 占用 ITL（行被他人锁住 ⇒ `RowLocked`，同 delete）。
-        let (slot, _) = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
+        let (slot, _) = lock_and_occupy(
+            pool,
+            log,
+            chain,
+            txn,
+            &mut src_local,
+            block,
+            row_no,
+            policy.itl_max,
+        )?;
         let patches = row_patches(&old_row, new_row);
         append_undo_via_pool(
             pool,
@@ -460,7 +479,16 @@ pub fn update_row(
     let dest_before = *dest_local.as_bytes();
 
     // ① 源页：占用 ITL + "删除"记录（= 迁移的"旧位置"半边）。
-    let (src_slot, _) = lock_and_occupy(pool, log, chain, txn, &mut src_local, block, row_no)?;
+    let (src_slot, _) = lock_and_occupy(
+        pool,
+        log,
+        chain,
+        txn,
+        &mut src_local,
+        block,
+        row_no,
+        policy.itl_max,
+    )?;
     append_undo_via_pool(
         pool,
         log,
@@ -475,7 +503,16 @@ pub fn update_row(
         src_slot
     } else {
         // 目的页上的**新行**：随插入即被本事务锁住（无既有锁可争）。
-        occupy_itl(pool, log, chain, txn, &mut dest_local, dest_key)?.0
+        occupy_itl(
+            pool,
+            log,
+            chain,
+            txn,
+            &mut dest_local,
+            dest_key,
+            policy.itl_max,
+        )?
+        .0
     };
     let mut patched = new_row.to_vec();
     patched[1] = dest_slot as u8;
@@ -630,6 +667,7 @@ fn ensure_itl_entry(
     page: &mut Page,
     chain: &UndoChain<'_, '_>,
     txn_id: TxnId,
+    itl_max: u16,
 ) -> Result<ItlAcquire, TxnError> {
     cleanout_committed(page, chain)?;
     for i in 0..itl::itl_count(page)? {
@@ -638,7 +676,7 @@ fn ensure_itl_entry(
             return Ok(ItlAcquire::Existing(i));
         }
     }
-    acquire_itl_slot(page, txn_id)
+    acquire_itl_slot(page, txn_id, itl_max)
 }
 
 /// **占用入口**（insert/delete/update 共用）：返回槽号；新占用时先记
@@ -654,8 +692,9 @@ fn occupy_itl(
     txn: &Txn,
     local: &mut Page,
     block: BufferKey,
+    itl_max: u16,
 ) -> Result<(u16, bool), TxnError> {
-    match ensure_itl_entry(local, chain, txn.txn_id)? {
+    match ensure_itl_entry(local, chain, txn.txn_id, itl_max)? {
         ItlAcquire::Existing(slot) => Ok((slot, false)),
         ItlAcquire::Fresh { slot, old } => {
             // `ITL 覆盖` 是**块级**动作：记录里的行号只借它的 file/block 定位块。
@@ -821,6 +860,7 @@ fn lock_and_occupy(
     local: &mut Page,
     block: BufferKey,
     row_no: u16,
+    itl_max: u16,
 ) -> Result<(u16, bool), TxnError> {
     match decide_row_lock(local, chain, txn, block, row_no)? {
         LockOutcome::WouldWait { holder } => Err(TxnError::RowLocked {
@@ -833,7 +873,7 @@ fn lock_and_occupy(
             Ok((u16::from(row[1]), true))
         }
         LockOutcome::Acquired { reentrant: false } => {
-            let (slot, fresh) = occupy_itl(pool, log, chain, txn, local, block)?;
+            let (slot, fresh) = occupy_itl(pool, log, chain, txn, local, block, itl_max)?;
             if fresh {
                 // 新占用：条目已按"第一把行锁"计 1（见 `occupy_itl`）。
             } else {
@@ -954,6 +994,7 @@ pub fn lock_row(
     txn: &Txn,
     block: BufferKey,
     row_no: u16,
+    policy: &InsertPolicy,
 ) -> Result<bool, TxnError> {
     require_pool_bound(chain, pool)?;
     let guard = pool.pin(block)?;
@@ -964,7 +1005,16 @@ pub fn lock_row(
         .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
         .to_vec();
     let old_slot = row[1];
-    let (slot, reentrant) = lock_and_occupy(pool, log, chain, txn, &mut local, block, row_no)?;
+    let (slot, reentrant) = lock_and_occupy(
+        pool,
+        log,
+        chain,
+        txn,
+        &mut local,
+        block,
+        row_no,
+        policy.itl_max,
+    )?;
     // **锁也落行级痕**（§4.6.2："占用时旧字节随本行第一条 undo 记录"）：
     // 行头 `itl_slot` 从旧值改写为本事务的槽——这条 `Update` 记录（补丁可为空，
     // 当旧字节恰好已是本槽）就是"**锁与修改同源**"判据
@@ -1407,7 +1457,7 @@ fn require_pool_bound(chain: &UndoChain<'_, '_>, pool: &BufferPool<'_>) -> Resul
 
 /// 在数据页上占用一个 **ITL 槽**（复用优先；否则扩展）。
 /// 前像：原为空闲（`Free`）⇒ `None`（"原为空闲"的编码）。
-fn acquire_itl_slot(page: &mut Page, _txn_id: TxnId) -> Result<ItlAcquire, TxnError> {
+fn acquire_itl_slot(page: &mut Page, _txn_id: TxnId, itl_max: u16) -> Result<ItlAcquire, TxnError> {
     if let Some(slot) = itl::find_reusable(page)? {
         let old = itl::snapshot(page, slot)?;
         let entry = itl::read_itl(page, slot)?;
@@ -1419,8 +1469,9 @@ fn acquire_itl_slot(page: &mut Page, _txn_id: TxnId) -> Result<ItlAcquire, TxnEr
         };
         return Ok(ItlAcquire::Fresh { slot, old });
     }
-    // 没有可复用槽 → 扩展（itl_max 由调用方经段/表选项控制；此处用上限 32）。
-    let slot = itl::grow(page, itl::ITL_MAX_LIMIT)?;
+    // 没有可复用槽 → 扩展（上限来自**表选项** `itl_max`，经插入策略传下来；
+    // 缺省 = 格式上限）。到达上限 ⇒ 具名 `NoSlotAvailable`，不静默。
+    let slot = itl::grow(page, itl_max)?;
     Ok(ItlAcquire::Fresh { slot, old: None })
 }
 
@@ -2254,7 +2305,16 @@ mod tests {
             &mut no_alloc,
         )
         .unwrap();
-        delete_row(&pool, &mut log, &mut chain, &mut t1, key, rid.row_id()).unwrap();
+        delete_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid.row_id(),
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
         // 回滚整条链：删除→更新→插入 逐条撤销 ⇒ 回到"没有这一行"。
         rollback(&pool, &mut log, &mut chain, &mut t1).unwrap();
         pool.flush_workspace(WS).unwrap();
@@ -2952,7 +3012,16 @@ mod tests {
 
         // T1：删除，不提交。
         let mut t1 = begin(&pool, &mut log, &mut chain, seq(2)).unwrap();
-        delete_row(&pool, &mut log, &mut chain, &mut t1, key, rid.row_id()).unwrap();
+        delete_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut t1,
+            key,
+            rid.row_id(),
+            &InsertPolicy::in_place(0),
+        )
+        .unwrap();
 
         let page = page_snapshot(&pool, key);
         let count = bicdb_storage::itl::itl_count(&page).unwrap();

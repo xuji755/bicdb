@@ -18,6 +18,7 @@ use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
 
 use bicdb_cli::boot;
+use bicdb_exec::Value;
 use bicdb_sql::session::{QueryResult, Session, SessionError};
 
 const USAGE: &str = "\
@@ -25,7 +26,8 @@ bicdb —— 带撤销/日志的页式数据库（V1.0 单工作区）
 
 用法：
   bicdb init  <dir>               建区
-  bicdb sql   <dir> <SQL>…        执行 SQL（多条用 `;` 分隔；`-` = 读 stdin）
+  bicdb sql   <dir> <SQL>…       执行 SQL（多条用 `;` 分隔；`-` = 读 stdin）
+              [--param 名=值 …]   给语句里的 `:名` 传值（可重复）
   bicdb shell <dir>               交互式 shell
   bicdb version                   版本
   bicdb help                      本帮助
@@ -34,6 +36,7 @@ bicdb —— 带撤销/日志的页式数据库（V1.0 单工作区）
   bicdb init ./demo
   bicdb sql ./demo \"CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))\"
   bicdb sql ./demo \"INSERT INTO t VALUES (1, 'a')\"
+  bicdb sql ./demo --param id=1 \"SELECT name FROM t WHERE id = :id\"
   bicdb sql ./demo \"SELECT * FROM t\"
 ";
 
@@ -55,6 +58,15 @@ fn main() -> ExitCode {
 enum Exit {
     Usage(String),
     Failed(String),
+}
+
+impl Exit {
+    /// 供"两条错一起报"的场合取文本。
+    fn message(&self) -> &str {
+        match self {
+            Exit::Usage(m) | Exit::Failed(m) => m,
+        }
+    }
 }
 
 impl From<SessionError> for Exit {
@@ -86,7 +98,7 @@ fn run(args: &[String]) -> Result<(), Exit> {
             let dir = args
                 .get(1)
                 .ok_or_else(|| Exit::Usage("init 缺目录".to_owned()))?;
-            let inst = boot::create_instance(std::path::Path::new(dir))?;
+            let mut inst = boot::create_instance(std::path::Path::new(dir))?;
             inst.shutdown()?;
             println!("已建区：{dir}");
             println!("  工作区    {}", String::from_utf8_lossy(&boot::WS));
@@ -98,21 +110,34 @@ fn run(args: &[String]) -> Result<(), Exit> {
             let dir = args
                 .get(1)
                 .ok_or_else(|| Exit::Usage("sql 缺目录".to_owned()))?;
+            let (params, sql_args) = split_params(&args[2..])?;
             let mut inst = boot::open_instance(std::path::Path::new(dir))?;
             banner_brief(&inst);
-            let text = sql_text(&args[2..])?;
+            let text = sql_text(&sql_args)?;
+            let named: Vec<(&str, Value)> = params
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.clone()))
+                .collect();
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             let r = with_session(&mut inst, |s| {
-                for r in s.execute(&text)? {
+                for r in s.execute_with_params(&text, &named)? {
                     print_result(&mut out, &r)?;
                 }
                 Ok(())
             });
             let closed = inst.shutdown();
-            r?;
-            closed?;
-            out.flush().ok();
+            // 两条错都要报（会话错在前也不能把关闭失败吞掉）。
+            match (r, closed) {
+                (Err(e), Ok(())) => return Err(e),
+                (Ok(()), Err(e)) => return Err(e.into()),
+                (Err(e), Err(c)) => {
+                    return Err(Exit::Failed(format!("{}；关闭时又出错：{c}", e.message())))
+                }
+                (Ok(()), Ok(())) => {}
+            }
+            out.flush()
+                .map_err(|e| Exit::Failed(format!("写输出失败：{e}")))?;
             Ok(())
         }
         "shell" => {
@@ -123,8 +148,14 @@ fn run(args: &[String]) -> Result<(), Exit> {
             banner(&inst);
             let r = repl(&mut inst);
             let closed = inst.shutdown();
-            r?;
-            closed?;
+            match (r, closed) {
+                (Err(e), Ok(())) => return Err(e),
+                (Ok(()), Err(e)) => return Err(e.into()),
+                (Err(e), Err(c)) => {
+                    return Err(Exit::Failed(format!("{}；关闭时又出错：{c}", e.message())))
+                }
+                (Ok(()), Ok(())) => {}
+            }
             Ok(())
         }
         other => Err(Exit::Usage(format!("未知子命令 `{other}`"))),
@@ -139,6 +170,74 @@ fn with_session<R>(
     let seq = inst.seq();
     let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
     f(&mut session)
+}
+
+/// **一句话完了吗**（`;` 结尾，**行注释不算**）。
+///
+/// `SELECT 1; -- 说明` 这种输入此前永远等不到 `;` 结尾（行尾是注释）——
+/// 语句挂起、不执行、不报错。这里按"剥掉行注释再看"的口径判定。
+fn ends_statement(text: &str) -> bool {
+    let mut last_sig = String::new();
+    for line in text.lines() {
+        let code = match line.find("--") {
+            Some(at) => &line[..at],
+            None => line,
+        };
+        if !code.trim().is_empty() {
+            last_sig = code.trim_end().to_owned();
+        }
+    }
+    last_sig.ends_with(';')
+}
+
+/// `--param` 解析结果：`(参数表, 其余实参 = SQL 文本)`。
+type ParamsAndSql = (Vec<(String, Value)>, Vec<String>);
+
+/// **切出 `--param 名=值`**（其余是 SQL 文本）。
+fn split_params(args: &[String]) -> Result<ParamsAndSql, Exit> {
+    let mut params = Vec::new();
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--param" || a == "-p" {
+            let kv = it
+                .next()
+                .ok_or_else(|| Exit::Usage("--param 缺 `名=值`".to_owned()))?;
+            params.push(parse_param(kv)?);
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((params, rest))
+}
+
+/// `名=值` 的值文本 → [`Value`]：`NULL` / `TRUE|FALSE` / `'文本'` / 其余按数值。
+fn parse_param(kv: &str) -> Result<(String, Value), Exit> {
+    let (name, text) = kv
+        .split_once('=')
+        .ok_or_else(|| Exit::Usage(format!("--param 要 `名=值`，给的是 `{kv}`")))?;
+    if name.is_empty() {
+        return Err(Exit::Usage("--param 的名字为空".to_owned()));
+    }
+    let v = if text.eq_ignore_ascii_case("NULL") {
+        Value::Null
+    } else if text.eq_ignore_ascii_case("TRUE") {
+        Value::Bool(true)
+    } else if text.eq_ignore_ascii_case("FALSE") {
+        Value::Bool(false)
+    } else if let Some(inner) = text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        Value::Bytes(inner.as_bytes().to_vec())
+    } else {
+        match bicdb_types::Number::parse(text) {
+            Ok(n) => Value::Number(n),
+            Err(e) => {
+                return Err(Exit::Usage(format!(
+                    "--param {name} 的值 `{text}` 既不是数值也不是 '文本'：{e}"
+                )))
+            }
+        }
+    };
+    Ok((name.to_owned(), v))
 }
 
 /// `sql` 子命令的文本来源：给了参数就拼接；`-` 或缺参数 ⇒ 读 stdin。
@@ -264,7 +363,14 @@ fn repl(inst: &mut boot::Instance) -> Result<(), Exit> {
             .map_err(|e| Exit::Failed(format!("读 stdin 失败：{e}")))?;
         if n == 0 {
             println!();
-            return Ok(()); // EOF
+            // **EOF 不静默丢语句**：挂着没执行完的东西要说出来。
+            if !pending.trim().is_empty() {
+                eprintln!(
+                    "错误：输入结束，但还有未执行的语句（缺 `;`）：\n  {}",
+                    pending.trim()
+                );
+            }
+            return Ok(());
         }
         let line = buf.trim_end();
         if pending.trim().is_empty() {
@@ -280,7 +386,7 @@ fn repl(inst: &mut boot::Instance) -> Result<(), Exit> {
         }
         pending.push_str(line);
         pending.push('\n');
-        if !pending.trim_end().ends_with(';') {
+        if !ends_statement(&pending) {
             continue;
         }
         let text = std::mem::take(&mut pending);

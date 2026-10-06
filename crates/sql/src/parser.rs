@@ -1433,7 +1433,11 @@ impl Parser<'_> {
         }
     }
 
-    /// 一元 `+` / `-`（PG 的 `%right UMINUS`；表达为 `lexpr = NULL` 的 `A_Expr`）。
+    /// 一元 `+` / `-`（PG 的 `%right UMINUS`）。
+    ///
+    /// **`-` 作用于数值字面量 ⇒ 折叠进常量**（PG `gram.y` 的 `doNegate` 同款）：
+    /// 常量原文本前加 `-`，位置改记符号处；非字面量仍表达为
+    /// `lexpr = NULL` 的 `A_Expr`（PG 形态——绑定侧再脱糖）。
     fn unary_expr(&mut self) -> Result<Expr, ParseError> {
         let name = match self.peek().kind {
             TokenKind::Punct(Punct::Minus) => "-",
@@ -1442,6 +1446,21 @@ impl Parser<'_> {
         };
         let location = self.advance().span;
         let operand = self.unary_expr()?;
+        if name == "-" {
+            if let Expr::AConst(c) = &operand {
+                let folded = match &c.value {
+                    Some(ConstValue::Int(t)) => Some(ConstValue::Int(format!("-{t}"))),
+                    Some(ConstValue::Float(t)) => Some(ConstValue::Float(format!("-{t}"))),
+                    _ => None,
+                };
+                if let Some(value) = folded {
+                    return Ok(Expr::AConst(AConst {
+                        value: Some(value),
+                        location,
+                    }));
+                }
+            }
+        }
         Ok(Expr::AExpr(AExpr {
             kind: AExprKind::Op,
             name: name.to_owned(),

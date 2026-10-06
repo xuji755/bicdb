@@ -117,9 +117,16 @@ impl<'a, 'b, 'io, 'f> TableAccessWriter<'a, 'b, 'io, 'f> {
         self.indexes = Some(indexes);
     }
 
-    /// 表选项里的 `pctfree`（链到 [`bicdb_access`] 的选址判据）。
-    pub fn set_pctfree(&mut self, pctfree: u8) {
-        self.policy = InsertPolicy::in_place(pctfree);
+    /// **表选项落到写侧策略**：`pctfree`（页内预留）+ `itl_max`（ITL 上限）。
+    ///
+    /// 两者来自 `tab$`（会话在语句开始时取），此前写路径恒用缺省值 —— 选项
+    /// 只落字典不生效（2026-10-06 审计）。`itl_max = 0` 视为未设（用格式上限）。
+    pub fn set_table_options(&mut self, pctfree: u8, itl_max: u16) {
+        self.policy = if itl_max == 0 {
+            InsertPolicy::in_place(pctfree)
+        } else {
+            InsertPolicy::in_place(pctfree).with_itl_max(itl_max)
+        };
     }
 
     /// **借出当前事务**（两种模式统一入口）：事务字段**移出**再放回——
@@ -204,9 +211,7 @@ impl TableWriter for TableAccessWriter<'_, '_, '_, '_> {
         let heap_seg = self.heap_seg;
         self.use_txn(|s, txn| {
             s.table
-                .update(
-                    s.log, s.chain, txn, s.file, heap_seg, rid, row, &policy,
-                )
+                .update(s.log, s.chain, txn, s.file, heap_seg, rid, row, &policy)
                 .map_err(ExecError::TableAccess)
         })
     }
@@ -215,9 +220,10 @@ impl TableWriter for TableAccessWriter<'_, '_, '_, '_> {
         if self.indexes.is_some() {
             return Err(ExecError::NoIndexMaintenance("DELETE"));
         }
+        let policy = self.policy;
         self.use_txn(|s, txn| {
             s.table
-                .delete(s.log, s.chain, txn, s.file, rid)
+                .delete(s.log, s.chain, txn, s.file, rid, &policy)
                 .map_err(ExecError::TableAccess)
         })
     }

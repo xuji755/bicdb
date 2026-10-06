@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use bicdb_common::seq::CommitSeq;
 use bicdb_storage::buffer::{BufferKey, BufferPool};
-use bicdb_storage::undo::{TxnId, TxnState, UndoChain};
+use bicdb_storage::undo::{TxnId, TxnState, UndoChain, UndoError};
 use bicdb_wal::group::GroupWriter;
 
 use crate::lock::{Deadlock, WaitGate};
@@ -141,12 +141,35 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
     }
 
     /// **开始事务**（语句快照 = 当前提交序号水位）。
+    ///
+    /// **事务表满 ⇒ 先回收再试**（§4.6.5）：撤销段的事务表是定长槽表
+    /// （256 槽），已提交的事务靠 [`write::reclaim`] 出链回收——本方法在
+    /// "槽满"这一条路径上按**最老活跃快照**水位回收一次后重试。
+    /// （长跑不回收 ⇒ 第 257 个事务起再也开不出来，这是 2026-10-06 审计
+    /// 实测到的墙；回收口本身早已实现并有测试，缺的就是这条接线。）
     pub fn begin(&self) -> Result<TxnHandle, TxnError> {
         let snapshot = *self.current_seq.lock().unwrap_or_else(|e| e.into_inner());
         let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
         let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let txn = write::begin(self.pool, &mut wal, &mut chain, snapshot)?;
+        let txn = match write::begin(self.pool, &mut wal, &mut chain, snapshot) {
+            Ok(t) => t,
+            Err(TxnError::Undo(UndoError::NoFreeSlot)) => {
+                let watermark = self.reclaim_watermark(snapshot);
+                let _ = write::reclaim(self.pool, &mut wal, &mut chain, watermark)?;
+                write::begin(self.pool, &mut wal, &mut chain, snapshot)?
+            }
+            Err(e) => return Err(e),
+        };
         Ok(TxnHandle { txn })
+    }
+
+    /// **回收水位**：最老活跃快照（无活跃快照 ⇒ 调用方给的水位）。
+    ///
+    /// 语句快照的生命周期是"语句内"（`snapshot`/`release_snapshot`），
+    /// V1.0 的会话在扫描期外不注册快照 ⇒ 绝大多数时候这里给出的是
+    /// "全部已提交事务都可回收"。
+    fn reclaim_watermark(&self, fallback: CommitSeq) -> Option<CommitSeq> {
+        self.oldest_snapshot().or(Some(fallback))
     }
 
     /// **语句快照**（REQ-TXN-001：语句开始取、结束释放）——句柄进注册表，
@@ -389,6 +412,9 @@ impl<'a, 'b, 'io, 'f> StatementContext for LockCtx<'_, 'a, 'b, 'io, 'f> {
     fn attempt(&mut self, txn: &mut Txn) -> Result<LockStatus, TxnError> {
         let mut wal = self.engine.wal.lock().unwrap_or_else(|e| e.into_inner());
         let mut chain = self.engine.chain.lock().unwrap_or_else(|e| e.into_inner());
+        // 锁路径没有表上下文 ⇒ 用**缺省插入策略**（ITL 上限 = 格式上限）；
+        // 表级 `itl_max` 经写路径（insert/update/delete 的 `InsertPolicy`）生效。
+        let policy = bicdb_storage::heap::InsertPolicy::in_place(0);
         let reentrant = crate::write::lock_row(
             self.engine.pool,
             &mut wal,
@@ -396,6 +422,7 @@ impl<'a, 'b, 'io, 'f> StatementContext for LockCtx<'_, 'a, 'b, 'io, 'f> {
             txn,
             self.block,
             self.row_no,
+            &policy,
         )?;
         Ok(LockStatus { reentrant })
     }

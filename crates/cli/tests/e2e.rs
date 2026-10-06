@@ -131,7 +131,10 @@ fn create_ddl_dml_index_txn_and_reopen() {
 fn unique_index_treats_nulls_as_distinct() {
     let dir = TempDir::new("nulls");
     let mut inst = create_instance(dir.path()).expect("建区");
-    ok(&mut inst, "CREATE TABLE n (id NUMBER NOT NULL, code VARCHAR2(8))");
+    ok(
+        &mut inst,
+        "CREATE TABLE n (id NUMBER NOT NULL, code VARCHAR2(8))",
+    );
     ok(&mut inst, "INSERT INTO n VALUES (1, 'a'); INSERT INTO n VALUES (2, NULL); INSERT INTO n VALUES (3, NULL)");
     // 建索引时两个 NULL 键不得判成重复（DDL 的唯一性口径同一条）。
     ok(&mut inst, "CREATE UNIQUE INDEX n_code ON n (code)");
@@ -140,6 +143,86 @@ fn unique_index_treats_nulls_as_distinct() {
     assert!(e.contains("唯一约束冲突"), "非 NULL 重复应拒：{e}");
     assert_eq!(rows(&ok(&mut inst, "SELECT id FROM n")).len(), 4);
     inst.shutdown().expect("关闭");
+}
+
+/// **表选项真的走到写路径**（2026-10-06 审计：`pctfree`/`itl_max` 原先只落
+/// 字典与段头、存储层恒用缺省值）。黑盒判据：同样 200 行，`pctfree = 50`
+/// 的表必须用**更多页**（页内预留生效）。
+#[test]
+fn table_options_reach_the_write_path() {
+    let dir = TempDir::new("options");
+    let mut inst = create_instance(dir.path()).expect("建区");
+    ok(
+        &mut inst,
+        "CREATE TABLE tight (id NUMBER NOT NULL, v VARCHAR2(64)) WITH (pctfree = 0)",
+    );
+    ok(
+        &mut inst,
+        "CREATE TABLE loose (id NUMBER NOT NULL, v VARCHAR2(64)) WITH (pctfree = 50, itl_max = 4)",
+    );
+    // 行要足够多、足够大：`pctfree = 50` 的表必须**多用页**才看得见效果。
+    for i in 1..=800 {
+        let v = format!("{}-{i:04}", "x".repeat(36));
+        ok(&mut inst, &format!("INSERT INTO tight VALUES ({i}, '{v}')"));
+        ok(&mut inst, &format!("INSERT INTO loose VALUES ({i}, '{v}')"));
+    }
+    let pages = |inst: &mut Instance, t: &str| -> u32 {
+        let obj = inst
+            .catalog
+            .resolve(
+                bicdb_common::seq::CommitSeq::from_raw(inst.seq()).unwrap(),
+                bicdb_catalog::dict::namespace::TABLE,
+                t,
+            )
+            .expect("解析表")
+            .obj;
+        let seg_block =
+            bicdb_catalog::ddl::live_segment_block(&mut inst.catalog, obj).expect("段头");
+        inst.catalog.segment_at(seg_block).expect("开段").hwm()
+    };
+    let tight = pages(&mut inst, "tight");
+    let loose = pages(&mut inst, "loose");
+    assert!(
+        loose > tight,
+        "pctfree=50 应占更多页（预留生效）：tight={tight} loose={loose}"
+    );
+    assert_eq!(rows(&ok(&mut inst, "SELECT id FROM tight")).len(), 800);
+    inst.shutdown().expect("关闭");
+}
+
+/// **打开链的一致性核对是活的**（2026-10-06 审计：`catalog::consistency` 此前
+/// 只有单测消费者）。判据：`file_scn` 随干净关闭推进；把**旧的**控制文件换回来
+/// ⇒ 文件"超前" ⇒ **拒绝打开**（而不是照常恢复进入运行）。
+#[test]
+fn a_stale_control_file_is_refused_at_open() {
+    let dir = TempDir::new("consistency");
+    let mut inst = create_instance(dir.path()).expect("建区");
+    ok(&mut inst, "CREATE TABLE c (id NUMBER NOT NULL)");
+    ok(&mut inst, "INSERT INTO c VALUES (1)");
+    inst.shutdown().expect("关闭"); // 推进 file_scn 到检查点位点
+    drop(inst);
+
+    // 备份"当前"控制文件，再走一次写入/关闭让位点前进，然后换回旧的。
+    let cur_a = std::fs::read(dir.path().join("cf_a")).expect("读 cf_a");
+    let cur_b = std::fs::read(dir.path().join("cf_b")).expect("读 cf_b");
+    let mut inst = open_instance(dir.path()).expect("重开");
+    ok(&mut inst, "INSERT INTO c VALUES (2)");
+    inst.shutdown().expect("关闭");
+    drop(inst);
+    std::fs::write(dir.path().join("cf_a"), &cur_a).expect("写回旧 cf_a");
+    std::fs::write(dir.path().join("cf_b"), &cur_b).expect("写回旧 cf_b");
+
+    match open_instance(dir.path()) {
+        Ok(_) => panic!("旧控制文件 + 新文件 ⇒ 应拒绝打开"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("超前"), "错误应指认超前：{msg}");
+        }
+    }
+
+    // 复原（好控制文件 = 刚才那份新的）——把备份放回去，实例仍可打开。
+    std::fs::write(dir.path().join("cf_a"), &cur_a).ok();
+    std::fs::write(dir.path().join("cf_b"), &cur_b).ok();
 }
 
 /// **崩溃语义**：不调 `shutdown`（脏页留在池里、WAL 是唯一耐久源）⇒

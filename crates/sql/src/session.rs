@@ -45,6 +45,8 @@ pub enum SessionError {
     Segment(bicdb_storage::segment::SegmentSpaceError),
     /// 会话状态非法（DDL 落在显式事务里 / 提交时无事务 …）。
     State(String),
+    /// **参数面**（缺值 / 多给 / 形态不符）——语句声明了参数却没配对。
+    Params(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -57,6 +59,7 @@ impl std::fmt::Display for SessionError {
             SessionError::Txn(e) => write!(f, "事务：{e}"),
             SessionError::Segment(e) => write!(f, "段：{e}"),
             SessionError::State(why) => f.write_str(why),
+            SessionError::Params(why) => write!(f, "参数：{why}"),
         }
     }
 }
@@ -118,6 +121,8 @@ pub struct Session<'a, 'b, 'io, 'f> {
     seq: u64,
     /// **本事务已写过的唯一键**（语句内/事务内的重复检测；`COMMIT`/`ROLLBACK` 清空）。
     seen_keys: crate::dml_index::SeenKeys,
+    /// **本语句的参数值**（按绑定期给出的**出现序**摆好；空 = 无参数）。
+    exec_params: Vec<Value>,
 }
 
 impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
@@ -138,6 +143,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             txn: None,
             seq,
             seen_keys: crate::dml_index::SeenKeys::new(),
+            exec_params: Vec::new(),
         }
     }
 
@@ -153,12 +159,37 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         self.txn.is_some()
     }
 
-    /// **跑一条语句**（`sql` 可以是多条以 `;` 分隔）。
+    /// **跑一条语句**（`sql` 可以是多条以 `;` 分隔；无参数）。
+    ///
+    /// 语句声明了参数（`:name`）而没有给值 ⇒ [`SessionError::Params`]——
+    /// **不**让执行器抛"参数下标越界"（那是实现细节，不是用户看到的错）。
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>, SessionError> {
+        self.execute_with_params(sql, &[])
+    }
+
+    /// **带参数跑一条语句**：`named` = 调用方按名给的值（语句里 `:name`）。
+    ///
+    /// 摆位规则 = **绑定期记下的出现序**（`BoundParams::list()`）——同一参数在
+    /// 语句里出现多次只占一个位（绑定期已按名归并），因此这里按名查值即可。
+    pub fn execute_with_params(
+        &mut self,
+        sql: &str,
+        named: &[(&str, Value)],
+    ) -> Result<Vec<QueryResult>, SessionError> {
         let stmts = parse(sql)?;
         let mut out = Vec::with_capacity(stmts.len());
+        // **参数是"整批共用"的**：一条语句只用其中几个是正常的
+        // （`BEGIN; INSERT … :p; COMMIT`）——"多给"只在**整批**都没用到时才报。
+        let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for stmt in &stmts {
-            out.push(self.execute_one(stmt)?);
+            out.push(self.execute_one(stmt, named, &mut used)?);
+        }
+        for (name, _) in named {
+            if !used.contains(name) {
+                return Err(SessionError::Params(format!(
+                    "整批语句都没用到参数 `:{name}`"
+                )));
+            }
         }
         Ok(out)
     }
@@ -167,7 +198,12 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         CommitSeq::from_raw(self.seq + 1).expect("48 位域内")
     }
 
-    fn execute_one(&mut self, stmt: &crate::ast::Stmt) -> Result<QueryResult, SessionError> {
+    fn execute_one<'c>(
+        &mut self,
+        stmt: &crate::ast::Stmt,
+        named: &'c [(&'c str, Value)],
+        used: &mut std::collections::HashSet<&'c str>,
+    ) -> Result<QueryResult, SessionError> {
         // ① 解析已完成（调用方）；② 绑定。
         let snapshot = self.snapshot();
         let bound = {
@@ -175,6 +211,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             let mut resolver = NameResolver::new(&mut view);
             bind_statement(&mut resolver, stmt)?
         };
+        // **参数摆位**（绑定期的清单 + 调用方按名给的值）。
+        self.exec_params = place_params(&bound, named, used)?;
 
         match bound {
             crate::bind::BoundStatement::Transaction(kind) => self.transaction(kind),
@@ -296,6 +334,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         };
         let node = plan.node.clone();
         let columns = plan.output_names.clone();
+        let params_in = self.exec_params.clone();
         let pool = self.pool;
         // 扫描期与 CR 共持撤销链（**读上下文**；语句内完成，不做长事务）。
         let rows = self.engine.with_read_context(|pool_ref, chain| {
@@ -315,7 +354,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 writer: None,
             };
             let mut op = build(&node, &envx, &mut open)?;
-            let mut cx = ExecContext::new(snapshot);
+            let mut cx = ExecContext::new(snapshot).with_params(&params_in);
             collect(op.as_mut(), &mut cx)
         })?;
         let _ = pool;
@@ -341,14 +380,21 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             .first()
             .ok_or_else(|| SessionError::State("INSERT 缺目标表".to_owned()))?;
         let node = plan.node.clone();
+        let params_in = self.exec_params.clone();
         let seg_block = source.seg_block;
         let table_obj = source.table_obj;
         // 索引清单（写前一次；空清单 = 不装口，写侧零开销）。
         let ws = self.ws;
         let mut indexes = crate::dml_index::table_indexes(self.catalog, snapshot, table_obj)?;
+        // **表选项**（`tab$`）：`pctfree` 管页内预留、`itl_max` 管 ITL 扩展上限——
+        // 两者此前只在字典/段头里躺着，写路径恒用缺省值（本次接线修掉）。
+        let opts = self
+            .catalog
+            .table_options(snapshot, table_obj)
+            .map_err(|e| SessionError::State(format!("读表选项：{e}")))?;
         // **唯一性预检**（写前；同键活行 ⇒ 冲突，语句整体不写）。
         if indexes.has_unique() {
-            let rows = plan_row_bytes(&plan.node)?;
+            let rows = plan_row_bytes(&plan.node, &self.exec_params)?;
             let mut seen = std::mem::take(&mut self.seen_keys);
             let checked = self.engine.with_read_context(|pool, chain| {
                 crate::dml_index::check_unique(
@@ -382,6 +428,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     ws,
                     t,
                 );
+                writer.set_table_options(opts.pctfree as u8, opts.itl_max as u16);
                 if has_indexes {
                     writer.set_indexes(&mut indexes);
                 }
@@ -397,7 +444,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     writer: Some(&cell),
                 };
                 let mut op = build(&node, &envx, &mut open)?;
-                let mut cx = ExecContext::new(snapshot);
+                let mut cx = ExecContext::new(snapshot).with_params(&params_in);
                 collect(op.as_mut(), &mut cx)?;
                 Ok::<u64, bicdb_exec::ExecError>(cx.rows_affected_of("Insert"))
             });
@@ -426,7 +473,10 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
 ///
 /// `INSERT … VALUES` 的行在计划里恒为**字面量**（绑定期的形态）——非字面量
 /// 走到这里即计划形状不符（明确报错，不静默跳过预检）。
-fn plan_row_bytes(node: &bicdb_exec::PlanNode) -> Result<Vec<Vec<u8>>, SessionError> {
+fn plan_row_bytes(
+    node: &bicdb_exec::PlanNode,
+    params: &[Value],
+) -> Result<Vec<Vec<u8>>, SessionError> {
     let bicdb_exec::PlanNode::Insert { shape, rows } = node else {
         return Err(SessionError::State(
             "INSERT 的计划节点不是 Insert".to_owned(),
@@ -438,16 +488,80 @@ fn plan_row_bytes(node: &bicdb_exec::PlanNode) -> Result<Vec<Vec<u8>>, SessionEr
         for e in row {
             match e {
                 bicdb_exec::Expr::Literal(v) => values.push(v.clone()),
-                _ => {
-                    return Err(SessionError::State(
-                        "唯一性预检要求 INSERT 的行是字面量".to_owned(),
-                    ))
+                // **参数**：按已摆好的位取值（与执行期同一份序列）。
+                bicdb_exec::Expr::Param(i) => values.push(
+                    params
+                        .get(*i)
+                        .cloned()
+                        .ok_or_else(|| SessionError::Params(format!("参数位 {i} 无值")))?,
+                ),
+                other => {
+                    return Err(SessionError::State(format!(
+                        "唯一性预检只认字面量与参数，行里出现 {other:?}"
+                    )))
                 }
             }
         }
         out.push(bicdb_exec::encode_row(&Row::new(values), shape).map_err(SessionError::Exec)?);
     }
     Ok(out)
+}
+
+/// **参数摆位**：绑定期的清单（名 + 形态 + 出现序）× 调用方按名给的值
+/// ⇒ 执行期参数序列（位置 = 出现序）。
+///
+/// 三条判定都是**具名**的：缺值 / 多给（语句里没这个参数）/ 形态不符。
+/// `NULL` 对任何形态都放行（它本来就没有类型）。
+fn place_params<'n>(
+    bound: &crate::bind::BoundStatement,
+    named: &'n [(&'n str, Value)],
+    used: &mut std::collections::HashSet<&'n str>,
+) -> Result<Vec<Value>, SessionError> {
+    use crate::bind::BoundStatement as B;
+    let declared: Vec<(&str, bicdb_exec::ColKind)> = match bound {
+        B::Select(s) => s.params.list(),
+        B::Insert(i) => i.params.list(),
+        _ => Vec::new(),
+    };
+    for (name, _) in named {
+        if declared.iter().any(|(d, _)| *d == *name) {
+            used.insert(name);
+        }
+    }
+    let mut out = Vec::with_capacity(declared.len());
+    for (name, kind) in &declared {
+        let (_, v) = named
+            .iter()
+            .find(|(n, _)| n == name)
+            .ok_or_else(|| SessionError::Params(format!("缺参数值 `:{name}`")))?;
+        if !matches!(v, Value::Null) {
+            let ok = matches!(
+                (kind, v),
+                (bicdb_exec::ColKind::Number, Value::Number(_))
+                    | (bicdb_exec::ColKind::Bytes, Value::Bytes(_))
+                    | (bicdb_exec::ColKind::Bool, Value::Bool(_))
+            );
+            if !ok {
+                return Err(SessionError::Params(format!(
+                    "参数 `:{name}` 应是{}，给的是{}",
+                    crate::bind::kind_name(*kind),
+                    value_kind_name(v)
+                )));
+            }
+        }
+        out.push(v.clone());
+    }
+    Ok(out)
+}
+
+/// 值的形态名（诊断）。
+fn value_kind_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NULL",
+        Value::Number(_) => "数值",
+        Value::Bytes(_) => "字节串",
+        Value::Bool(_) => "布尔",
+    }
 }
 
 /// **会话收尾**：显式事务还没收尾就丢会话 ⇒ 回滚（不留输家给下次恢复）。

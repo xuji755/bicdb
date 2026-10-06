@@ -429,9 +429,16 @@ fn with_ddl_txn<R>(
             Ok((r, seq.as_raw()))
         }
         Err(e) => {
-            let _ = engine.rollback(&mut txn);
+            // 回滚失败**不吞**：DDL 的错误是主错，但回滚失败意味着锁/undo 可能
+            // 未清（后续语句会撞上），要一并报出来。
+            let rolled = engine.rollback(&mut txn);
             cat.row_cache().bump_and_clear();
-            Err(e)
+            match rolled {
+                Ok(_) => Err(e),
+                Err(rb) => Err(DdlError::BadTableDef(format!(
+                    "DDL 失败且回滚也失败：{e} / {rb}"
+                ))),
+            }
         }
     }
 }
@@ -661,7 +668,14 @@ impl<'a, 'b, 'io, 'lio, 'lf> DictWriter<'a, 'b, 'io, 'lio, 'lf> {
             )?;
         }
         let mut access = TableAccess::new(self.pool, self.ws());
-        access.delete(self.log, self.chain, self.txn, self.cat.file_mut(), landed)?;
+        access.delete(
+            self.log,
+            self.chain,
+            self.txn,
+            self.cat.file_mut(),
+            landed,
+            &InsertPolicy::in_place(0),
+        )?;
         Ok(())
     }
 
@@ -1145,43 +1159,14 @@ pub fn create_index(
         })?;
         col_numbers.push(col.col);
     }
-    let (scan_cols, base_seg) = scan_view(cat, table_obj)?;
+    let base_seg = live_segment_block(cat, table_obj)?;
     let (outcome, seq) = with_ddl_txn(cat, engine, |w| {
-        create_index_inner(w, spec, table_obj, &col_numbers, scan_cols, base_seg)
+        create_index_inner(w, spec, table_obj, &col_numbers, base_seg)
     })?;
     Ok(CreateIndexOutcome {
         commit_seq: seq,
         ..outcome
     })
-}
-
-/// **基表扫描视图**：列定义（`ColDef` 形态）+ 段头块。
-///
-/// `col$` 是列定义的唯一事实；`ColDef.name` 是 `&'static str` ⇒ 活路径造不出来，
-/// 用占位名（解码/求键只用列号与类型码）。
-fn scan_view(
-    cat: &mut Catalog<'_>,
-    table_obj: u32,
-) -> Result<(Vec<crate::dict::ColDef>, u32), DdlError> {
-    let snap = CommitSeq::from_raw(cat.current_seq())
-        .ok_or_else(|| DdlError::BadTableDef("装载戳越域".to_owned()))?;
-    let base_cols = cat
-        .columns(snap, table_obj)
-        .map_err(|e| DdlError::BadTableDef(format!("读基表列定义：{e}")))?;
-    let mut scan_cols: Vec<crate::dict::ColDef> = Vec::with_capacity(base_cols.len());
-    for c in &base_cols {
-        let type_code = crate::dict::ColTypeCode::from_u8(c.type_code as u8)
-            .ok_or_else(|| DdlError::BadTableDef("列类型码不认识".to_owned()))?;
-        scan_cols.push(crate::dict::ColDef {
-            col: c.col as u16,
-            name: "<live>",
-            type_code,
-            length: c.length,
-            nullable: c.nullable,
-        });
-    }
-    let base_seg = live_segment_block(cat, table_obj)?;
-    Ok((scan_cols, base_seg))
 }
 
 /// **建索引的内层**（同一个 DDL 事务里做事；`create_index` 与 `rebuild_index` 共用）。
@@ -1191,13 +1176,16 @@ fn create_index_inner(
     spec: &IndexSpec,
     table_obj: u32,
     col_numbers: &[u32],
-    scan_cols: Vec<crate::dict::ColDef>,
     base_seg: u32,
 ) -> Result<CreateIndexOutcome, DdlError> {
     let obj = allocate_obj_number(w, None)?;
     // ① 建索引对象（段 + 空树 + obj$/ind$/icol$/seg$ 行）。
     let seg_block = create_index_object(w, obj, table_obj, &spec.name, col_numbers, spec.unique)?;
     // ② 扫描基表求键（**当前已提交状态**——单写者下池即真值）。
+    let ordinals: Vec<usize> = col_numbers
+        .iter()
+        .map(|cn| usize::from(*cn as u16) - 1)
+        .collect();
     let mut entries = Vec::new();
     {
         let hwm = w.cat.segment_at(base_seg)?.hwm();
@@ -1223,18 +1211,12 @@ fn create_index_inner(
                 };
                 let rid = RowId::from_parts(w.cat.file_mut().file_id(), b, slot)
                     .map_err(|_| DdlError::BadTableDef("行号越域".to_owned()))?;
-                let values = row::decode(bytes, &scan_cols)?;
-                let mut comps: Vec<Option<Vec<u8>>> = Vec::with_capacity(col_numbers.len());
-                let mut has_null = false;
-                for cn in col_numbers {
-                    let idx = usize::from(*cn as u16) - 1;
-                    let col_def = &scan_cols[idx];
-                    let c = row::component_bytes(&values[idx], col_def)?;
-                    has_null |= c.is_none();
-                    comps.push(c);
-                }
-                let refs: Vec<Option<&[u8]>> = comps.iter().map(|c| c.as_deref()).collect();
-                entries.push((bicdb_storage::key::encode(&refs), rid, has_null));
+                // **键 = 行内列字节直取**（`arch/06` §6.0："索引比较即字节比较"）：
+                // 不经 `DictValue`——字典的值模型只承载整数 NUMBER，走那一趟会让
+                // 小数/大数段的键"求不出来"（实测：`CREATE INDEX` 于含 1.5 的表报
+                // "数值列越出字典域"）。
+                let rk = row::row_key(bytes, &ordinals)?;
+                entries.push((rk.bytes, rid, rk.has_null));
             }
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.to_bytes().cmp(&b.1.to_bytes())));
@@ -1449,27 +1431,23 @@ fn drop_index_rows(
     let entries = w
         .cat
         .range_index("i_icol_pk", Some(&icol_lo), Some(&icol_hi))?;
-    let _unused_icol_block = w.table("icol$")?;
     let icol_def = w.cat.table_def("icol$")?;
     for (_k, rid) in entries {
         w.delete_row("icol$", icol_def, rid)?;
     }
     // ind$（主键点查）。
-    let _unused_ind_block = w.table("ind$")?;
     let ind_def = w.cat.table_def("ind$")?;
     let ind_key = crate::open::comp_num(u64::from(obj));
     if let Some((rid, _)) = w.cat.lookup("i_ind_pk", &[Some(&ind_key)])? {
         w.delete_row("ind$", ind_def, rid)?;
     }
     // seg$（按 dataobj# 主键）。
-    let _unused_seg_block = w.table("seg$")?;
     let seg_def = w.cat.table_def("seg$")?;
     let seg_key = crate::open::comp_num(u64::from(obj));
     if let Some((rid, _)) = w.cat.lookup("i_seg_pk", &[Some(&seg_key)])? {
         w.delete_row("seg$", seg_def, rid)?;
     }
     // obj$（最后删：名字/对象号自此不可解析）。
-    let _unused_obj_block = w.table("obj$")?;
     let obj_def = w.cat.table_def("obj$")?;
     let obj_key = crate::open::comp_num(u64::from(obj));
     if let Some((rid, _)) = w.cat.lookup("i_obj_pk", &[Some(&obj_key)])? {
@@ -1496,26 +1474,22 @@ fn drop_table_rows(
         Some(&[0xFFu8; 32]),
     ]);
     let cols = w.cat.range_index("i_col_pk", Some(&lo), Some(&hi))?;
-    let _unused_col_block = w.table("col$")?;
     let col_def = w.cat.table_def("col$")?;
     for (_k, rid) in cols {
         w.delete_row("col$", col_def, rid)?;
     }
     // tab$。
-    let _unused_tab_block = w.table("tab$")?;
     let tab_def = w.cat.table_def("tab$")?;
     let tab_key = crate::open::comp_num(u64::from(obj));
     if let Some((rid, _)) = w.cat.lookup("i_tab_pk", &[Some(&tab_key)])? {
         w.delete_row("tab$", tab_def, rid)?;
     }
     // seg$。
-    let _unused_seg_block = w.table("seg$")?;
     let seg_def = w.cat.table_def("seg$")?;
     if let Some((rid, _)) = w.cat.lookup("i_seg_pk", &[Some(&tab_key)])? {
         w.delete_row("seg$", seg_def, rid)?;
     }
     // obj$。
-    let _unused_obj_block = w.table("obj$")?;
     let obj_def = w.cat.table_def("obj$")?;
     if let Some((rid, _)) = w.cat.lookup("i_obj_pk", &[Some(&tab_key)])? {
         w.delete_row("obj$", obj_def, rid)?;
@@ -1994,10 +1968,10 @@ pub fn rebuild_index(
         columns,
     };
     // 同事务内换段：先删旧对象，再按同一规格建新（名字在这次事务里被释放）。
-    let (scan_cols, base_seg) = scan_view(cat, bobj)?;
+    let base_seg = live_segment_block(cat, bobj)?;
     let (out, seq) = with_ddl_txn(cat, engine, |w| {
         drop_index_rows(w, obj, name)?;
-        create_index_inner(w, &spec, bobj, &col_numbers, scan_cols, base_seg)
+        create_index_inner(w, &spec, bobj, &col_numbers, base_seg)
     })?;
     Ok(CreateIndexOutcome {
         commit_seq: seq,

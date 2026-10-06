@@ -149,6 +149,10 @@ impl std::fmt::Display for SegmentError {
 
 impl std::error::Error for SegmentError {}
 
+/// **自动扩展的固定增量**（块；8 MiB）——区分配越出文件长度时按此追加
+/// （Oracle `NEXT` / InnoDB autoextend 的固定增量形态，见 `存储架构设计` §3.3）。
+pub const FILE_EXTEND_BLOCKS: u64 = 512;
+
 /// 段头（公共部分的值形态；§5.11）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
@@ -952,6 +956,29 @@ impl<'io, 'f> Segment<'io, 'f> {
         Ok(())
     }
 
+    /// **分配一个区；文件满则先增长文件再试**（自动扩展，§3.3）。
+    ///
+    /// 判据：区分配越出**当前文件长度**（`FileFull`）⇒ `set_len` 尾部追加
+    /// [`FILE_EXTEND_BLOCKS`] 块 + 更新文件头（`DataFile::extend`，零搬移），
+    /// 然后重试。**位图区在文件前部且全量预留**，所以增长不搬任何元数据。
+    ///
+    /// 上限由覆盖域把关（`extend` 自带 `BeyondCoverage`）；重试有界
+    /// （每次至少 +1 区，增量远大于一区 ⇒ 一次即够，防御性再留一次）。
+    fn allocate_extent_growing(
+        &mut self,
+        current: CurrentPages<'_>,
+    ) -> Result<crate::datafile::PlannedExtent, SegmentSpaceError> {
+        match self.file.plan_allocate_extent(current) {
+            Ok(p) => Ok(p),
+            Err(crate::datafile::DataFileError::FileFull) => {
+                let want = self.file.blocks() + FILE_EXTEND_BLOCKS;
+                self.file.extend(want)?;
+                Ok(self.file.plan_allocate_extent(current)?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// **计划扩展**（**不写盘**）：分配新区 + 段头页（区映射/计数）+ 段内
     /// 位图页的（前像、后像）——写路径经缓冲池落盘（redo 保护，
     /// §11.5.3"页/区分配是系统操作"）。决策已在返回镜像里定下。
@@ -964,7 +991,7 @@ impl<'io, 'f> Segment<'io, 'f> {
         &mut self,
         current: CurrentPages<'_>,
     ) -> Result<PlannedExtend, SegmentSpaceError> {
-        let planned = self.file.plan_allocate_extent(current)?;
+        let planned = self.allocate_extent_growing(current)?;
         let rdba = Rdba::from_parts(
             self.file.file_id(),
             self.file.layout().first_block_of(planned.extent),
