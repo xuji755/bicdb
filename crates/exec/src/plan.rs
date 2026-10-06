@@ -97,6 +97,33 @@ pub enum PlanNode {
         /// 回表批量大小（§9.4；`None` = 默认 256）。
         batch: Option<usize>,
     },
+    /// **合并追加**（`UNION ALL`；流水）。
+    Append {
+        /// 子输入（按序）。
+        inputs: Vec<PlanNode>,
+    },
+    /// **相邻去重**（输入须已按去重键有序；`SELECT DISTINCT` / `UNION` 去重）。
+    Unique {
+        /// 输入子树。
+        input: Box<PlanNode>,
+        /// 去重键（`None` = 全列升序，宽度由 `width` 给）。
+        keys: Option<Vec<crate::sort::SortKey>>,
+        /// 行宽（全列键用）。
+        width: usize,
+    },
+    /// **集合运算**（`INTERSECT [ALL]` / `EXCEPT [ALL]`；两侧自动按全列排序）。
+    SetOp {
+        /// 左侧子树。
+        left: Box<PlanNode>,
+        /// 右侧子树。
+        right: Box<PlanNode>,
+        /// 运算种类。
+        kind: crate::setops::SetOpKind,
+        /// `ALL`（多重集）与否（去重形态）。
+        all: bool,
+        /// 行宽（全列比较键）。
+        width: usize,
+    },
     /// **单组聚合**（无 `GROUP BY`；空输入恒出一行）。
     ScalarAgg {
         /// 输入子树。
@@ -189,6 +216,41 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a>(
                 Some(n) => scan.with_batch(*n),
                 None => scan,
             })
+        }
+        PlanNode::Append { inputs } => {
+            let mut ops = Vec::with_capacity(inputs.len());
+            for i in inputs {
+                ops.push(build(i, env, open_cursor)?);
+            }
+            Box::new(crate::setops::Append::new(ops))
+        }
+        PlanNode::Unique { input, keys, width } => {
+            let keys = keys
+                .clone()
+                .unwrap_or_else(|| crate::setops::all_columns_keys(*width));
+            // 相邻去重要求输入按去重键有序 ⇒ 一律前置 `Sort`
+            // （输入已有序时的冗余排序属**优化**，随索引序复用切片再消）。
+            let inner = Sort::new(build(input, env, open_cursor)?, keys.clone());
+            Box::new(crate::setops::Unique::new(Box::new(inner), keys))
+        }
+        PlanNode::SetOp {
+            left,
+            right,
+            kind,
+            all,
+            width,
+        } => {
+            let keys = crate::setops::all_columns_keys(*width);
+            // 两侧必须按**同一总序**排序（相等即相邻）。
+            let l = Sort::new(build(left, env, open_cursor)?, keys.clone());
+            let r = Sort::new(build(right, env, open_cursor)?, keys.clone());
+            Box::new(crate::setops::SetOp::new(
+                Box::new(l),
+                Box::new(r),
+                *kind,
+                *all,
+                keys,
+            ))
         }
         PlanNode::ScalarAgg { input, aggs } => Box::new(crate::agg::ScalarAgg::new(
             build(input, env, open_cursor)?,

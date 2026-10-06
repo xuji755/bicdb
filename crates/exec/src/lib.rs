@@ -31,6 +31,7 @@ pub mod join;
 pub mod nodes;
 pub mod operator;
 pub mod plan;
+pub mod setops;
 pub mod sort;
 pub mod value;
 
@@ -44,6 +45,7 @@ pub use join::{JoinKind, NestedLoop};
 pub use nodes::{Filter, Limit, Project, SeqScan};
 pub use operator::{collect, Operator, RowCursor};
 pub use plan::{build, ExecEnv, PlanNode, SourceId};
+pub use setops::{all_columns_keys, Append, SetOp, SetOpKind, Unique};
 pub use sort::{Sort, SortKey, TopN};
 pub use value::{
     cast_value, decode_row, encode_row, kind_name, row_bytes, ColKind, Row, RowShape, Value,
