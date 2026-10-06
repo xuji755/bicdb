@@ -529,7 +529,7 @@ CPU 预算、I/O 带宽、文件数、资产字节、向量数、图遍历与临
 | 维度 | 工作区上限 | 实例总上限 |
 | --- | --- | --- |
 | 缓冲池 | 间接（经工作集） | `max_buffers` |
-| 查询内存 | `max_query_memory` | ✓ |
+| 查询内存 | `max_query_memory` | **`work_memory_target`**（实例级工作内存目标；默认 **4 GiB**，2026-10-06 冻结） |
 | 连接 | `max_connections` | ✓ |
 | 任务队列 | `max_task_queue` | ✓ |
 | CPU | `cpu_budget` | ✓ |
