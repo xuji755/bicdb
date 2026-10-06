@@ -149,6 +149,23 @@ pub enum PlanNode {
         /// 聚合项（按序）。
         aggs: Vec<crate::agg::AggSpec>,
     },
+    /// **哈希连接**（构建侧建表 + 探测侧流式；组合行 = 探测 ++ 构建）。
+    HashJoin {
+        /// 构建侧（小表）。
+        build: Box<PlanNode>,
+        /// 探测侧（大表）。
+        probe: Box<PlanNode>,
+        /// 构建侧键表达式。
+        build_keys: Vec<Expr>,
+        /// 探测侧键表达式。
+        probe_keys: Vec<Expr>,
+        /// 连接类型。
+        kind: JoinKind,
+        /// 连接条件（组合行 = 探测 ++ 构建 上求值；`None` = 键等值即匹配）。
+        qual: Option<Expr>,
+        /// 构建侧列数（LEFT 补 NULL 用）。
+        build_width: usize,
+    },
     /// **嵌套循环连接**（内表参数化重扫）。
     NestedLoop {
         /// 外层子树。
@@ -273,6 +290,23 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a>(
             build(input, env, open_cursor)?,
             groups.clone(),
             aggs.clone(),
+        )),
+        PlanNode::HashJoin {
+            build: build_side,
+            probe: probe_side,
+            build_keys,
+            probe_keys,
+            kind,
+            qual,
+            build_width,
+        } => Box::new(crate::hash_join::HashJoin::new(
+            build(build_side, env, open_cursor)?,
+            build(probe_side, env, open_cursor)?,
+            build_keys.clone(),
+            probe_keys.clone(),
+            *kind,
+            qual.clone(),
+            *build_width,
         )),
         PlanNode::NestedLoop {
             outer,

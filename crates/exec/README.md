@@ -6,7 +6,7 @@
 | --- | --- |
 | 设计依据 | `doc/执行算子设计_v0.1.md`（PG 拉取模型 + Oracle 批量化技巧；证据包 `exec-ops-20261006`） |
 | 对应阶段 | P5（切片 1 已落地） |
-| 当前状态 | **v0.5**——v0.4 + **去重与集合运算**（`Append`/`Unique`/`SetOp`：UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL]，排序归并路线、NULL 等价类、重数语义） |
+| 当前状态 | **v0.6**——v0.5 + **`HashJoin`**（INNER/LEFT；构建侧建表 + 探测侧流式；组合行 = 探测 ++ 构建） |
 
 ## 状态说明
 
@@ -32,6 +32,7 @@
   **LIMIT 真短路**（扫描行数可观测：`SeqScan` 统计 = LIMIT）、取消与截止
   （两路同判定）、NULL 三值逻辑。
 
-**下一步（切片 6 起）**：`HashJoin` + 溢出（temp 段 + 完整 WMM：分配/缩减/三态）；DML（切片 7）——见设计 §7 切片表。
+**下一步（切片 6b 起）**：溢出（temp 段接入：`SpillSpace` + Sort 外部归并 + HashAgg/HashJoin 分批 + 完整 WMM）；
+DML（切片 7）——见设计 §7 切片表。
 
 实现进度请以仓库根 `README.md` 的阶段表为准。
