@@ -31,13 +31,16 @@ use crate::page::{Page, PageType, SlotEntry, SlotStatus, MAX_SLOTS, PAGE_SIZE};
 use crate::row::{RowHeader, ROW_HEADER_FIXED_LEN};
 use crate::rowid::RowId;
 
-/// 插入策略（来自表选项：`update_mode` 与 `PCTFREE`）。
+/// 插入策略（来自表选项：`update_mode`、`PCTFREE`、`ITL_MAX`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InsertPolicy {
     /// 是否复用空闲槽（`in_place` = 是；`append_only` = 否）。
     pub reuse_free_slots: bool,
     /// `PCTFREE` 百分比（0–99；`append_only` 无更新、取 0）。
     pub pctfree: u8,
+    /// **ITL 槽上限**（表选项 `itl_max`；不设 = 格式上限
+    /// [`crate::itl::ITL_MAX_LIMIT`]）。ITL 扩展受它封顶。
+    pub itl_max: u16,
 }
 
 impl InsertPolicy {
@@ -47,6 +50,7 @@ impl InsertPolicy {
         Self {
             reuse_free_slots: true,
             pctfree: pctfree.min(99),
+            itl_max: crate::itl::ITL_MAX_LIMIT,
         }
     }
 
@@ -56,7 +60,15 @@ impl InsertPolicy {
         Self {
             reuse_free_slots: false,
             pctfree: 0,
+            itl_max: crate::itl::ITL_MAX_LIMIT,
         }
+    }
+
+    /// 设 **ITL 槽上限**（表选项 `itl_max`；下限 1，上限 = 格式上限）。
+    #[must_use]
+    pub fn with_itl_max(mut self, itl_max: u16) -> Self {
+        self.itl_max = itl_max.clamp(1, crate::itl::ITL_MAX_LIMIT);
+        self
     }
 
     /// PCTFREE 预留字节数（`ceil(pctfree% × 页大小)`）。

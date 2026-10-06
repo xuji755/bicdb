@@ -21,10 +21,9 @@ use bicdb_catalog::ColTypeCode;
 use bicdb_exec::{ColKind, Expr as PlanExpr, RowShape};
 
 use super::expr::{bind_expr, kind_name, BindScope, BoundColumn, BoundParams};
-use super::{BindError, CatalogObject, CatalogView, NameResolver, NameSpace, ResolvedName};
+use super::{BindError, CatalogObject, CatalogView, NameResolver, ResolvedName};
 use crate::ast::{
-    self, AlterWorkspaceAction, DefElemArg, Expr, FromItem, InsertStmt, ObjectType, SelectStmt,
-    SetOperation, SortByDir, Stmt,
+    self, DefElemArg, Expr, FromItem, InsertStmt, ObjectType, SelectStmt, SortByDir, Stmt,
 };
 
 /// 一条绑定后的语句。
@@ -607,7 +606,3 @@ pub fn col_kind(code: u32) -> Option<ColKind> {
         | ColTypeCode::AssetRef => Some(ColKind::Bytes),
     }
 }
-
-/// `AlterWorkspaceAction` 的再导出（会话层用；避免未用告警）。
-#[allow(dead_code)]
-fn _unused(_: AlterWorkspaceAction, _: SetOperation, _: NameSpace) {}

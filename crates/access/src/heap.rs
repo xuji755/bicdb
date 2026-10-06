@@ -338,7 +338,7 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         }
     }
 
-    /// **按 ROWID 删一行**。
+    /// **按 ROWID 删一行**（`policy` 供 ITL 上限：表选项 `itl_max`）。
     pub fn delete(
         &mut self,
         log: &mut GroupWriter<'_, '_>,
@@ -346,6 +346,7 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         txn: &mut Txn,
         file: &DataFile<'_>,
         rid: RowId,
+        policy: &InsertPolicy,
     ) -> Result<(), TableAccessError> {
         write::delete_row(
             self.pool,
@@ -354,6 +355,7 @@ impl<'a, 'b> TableAccess<'a, 'b> {
             txn,
             self.key_of(file.file_id(), rid.block_id())?,
             rid.row_id(),
+            policy,
         )?;
         Ok(())
     }

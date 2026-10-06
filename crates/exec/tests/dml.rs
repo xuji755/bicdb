@@ -118,8 +118,16 @@ impl TableWriter for TestWriter<'_, '_, '_, '_> {
             WS,
             bicdb_storage::rowid::Rdba::from_parts(rid.file_id(), rid.block_id()).unwrap(),
         );
-        delete_row(self.pool, &mut self.log, self.chain, txn, key, rid.row_id())
-            .map_err(|e| ExecError::Spill(format!("delete：{e}")))
+        delete_row(
+            self.pool,
+            &mut self.log,
+            self.chain,
+            txn,
+            key,
+            rid.row_id(),
+            &bicdb_storage::heap::InsertPolicy::in_place(0),
+        )
+        .map_err(|e| ExecError::Spill(format!("delete：{e}")))
     }
 
     fn commit(&mut self) -> Result<(), ExecError> {

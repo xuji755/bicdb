@@ -29,8 +29,14 @@
 //! [`ast::WorkRef`]/[`ast::FsRef`] 双形态（**解析只认形态**——名字查找与唯一性
 //! 在 ② 绑定期）；`CREATE WORKSPACE` 去掉 `CLONE OF`（评审点①）。
 //!
-//! **未落地**：Binder（②）、逻辑表示与变换（③）、物理计划（④）、计划缓存、
-//! 执行接口——按设计 §10 的切片 S2–S8 推进；`GRAPH_TABLE` 随图域接入。
+//! **已落地（2026-10-06）**：② Binder（`bind/`：名字解析三格、类型推导、参数
+//! 定型、写目标检查、版本捕获）、④ 物理计划（`plan.rs`，**首版直映射**）、
+//! ⑤ 会话（`session.rs`：`parse → bind → plan → execute`、事务边界、DML 索引维护
+//! 与唯一性预检 `dml_index.rs`）。
+//!
+//! **未落地**：③ 逻辑表示与白名单变换（触发条件 = REQ-SQL-007 首条规则启用）、
+//! 计划缓存（S6）、`UPDATE`/`DELETE`/聚合/连接/集合运算/`DISTINCT`/`LIKE`
+//! （**绑定期具名拒绝**）、`GRAPH_TABLE`（随图域接入）。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

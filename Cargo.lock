@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "bicdb-access"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-common",
  "bicdb-index",
@@ -17,11 +17,11 @@ dependencies = [
 
 [[package]]
 name = "bicdb-asset"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bicdb-catalog"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-access",
  "bicdb-common",
@@ -35,24 +35,26 @@ dependencies = [
 
 [[package]]
 name = "bicdb-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-catalog",
  "bicdb-common",
+ "bicdb-exec",
  "bicdb-sql",
  "bicdb-storage",
  "bicdb-txn",
+ "bicdb-types",
  "bicdb-wal",
  "bicdb-workspace",
 ]
 
 [[package]]
 name = "bicdb-common"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bicdb-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-common",
  "bicdb-storage",
@@ -61,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "bicdb-exec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-access",
  "bicdb-common",
@@ -75,11 +77,11 @@ dependencies = [
 
 [[package]]
 name = "bicdb-graph"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bicdb-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-common",
  "bicdb-storage",
@@ -88,19 +90,19 @@ dependencies = [
 
 [[package]]
 name = "bicdb-memory"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bicdb-net"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bicdb-retrieval"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bicdb-sql"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-access",
  "bicdb-catalog",
@@ -116,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "bicdb-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-common",
  "bicdb-workspace",
@@ -124,14 +126,14 @@ dependencies = [
 
 [[package]]
 name = "bicdb-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-storage",
 ]
 
 [[package]]
 name = "bicdb-txn"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-common",
  "bicdb-index",
@@ -143,11 +145,11 @@ dependencies = [
 
 [[package]]
 name = "bicdb-types"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bicdb-wal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bicdb-common",
  "bicdb-storage",
@@ -156,4 +158,4 @@ dependencies = [
 
 [[package]]
 name = "bicdb-workspace"
-version = "0.1.0"
+version = "0.1.1"

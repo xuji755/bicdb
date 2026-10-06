@@ -52,9 +52,15 @@ pub trait Operator {
     /// 取下一行（`None` = 本算子树耗尽）。**每次调用先查取消/截止**。
     fn next(&mut self, cx: &mut ExecContext<'_>) -> Result<Option<Row>, ExecError>;
 
-    /// **参数化重扫**（NL 内表的参数变了）；缺省 = 无状态算子，无需动作。
+    /// **参数化重扫**（NL 内表的参数变了）。
+    ///
+    /// 缺省 = **具名拒绝**（[`ExecError::NoRescan`]）——与
+    /// [`crate::operator::RowCursor::rewind`] 同一口径"绝不允许静默错"：
+    /// 有状态的算子（含缓冲/游标/累计）必须各自实现；无状态算子（`SeqScan`
+    /// /`Filter`/`Project`/`Limit`/`Append` 等）显式写成空实现。
+    /// 此前缺省静默 `Ok(())` ⇒ 内表未重扫、外行配到的是**上一轮的行**。
     fn rescan(&mut self, _cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
-        Ok(())
+        Err(ExecError::NoRescan)
     }
 
     /// 释放（临时段/游标/记账）；幂等；取消路径也必须走到。

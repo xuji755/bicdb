@@ -31,7 +31,7 @@
 use bicdb_common::seq::CommitSeq;
 use bicdb_storage::key;
 
-use crate::cache::{CacheError, ColRow, IcolRow, IndRow, ObjRow};
+use crate::cache::{CacheError, ColRow, IcolRow, IndRow, ObjRow, TabRow};
 use crate::fixed::{self, FixedTable};
 use crate::open::{Catalog, OpenError};
 use crate::row::RowCodecError;
@@ -176,6 +176,9 @@ pub struct IndexRef {
     /// 表达式键来源（表达式索引才有）。
     pub expr_src: Option<Vec<u8>>,
 }
+
+/// `ind$` 全量 + `icol$` 按对象成组（`load_all_indexes` 的返回形态）。
+type LoadedIndexes = (Vec<IndRow>, std::collections::BTreeMap<u32, Vec<IcolRow>>);
 
 /// **DML 索引维护清单**的一条（表的每个**可用**索引 = 一条）。
 ///
@@ -333,6 +336,25 @@ impl<'io> Catalog<'io> {
         Ok(rows)
     }
 
+    // ───────────────────────── 表选项 ─────────────────────────
+
+    /// **表选项**（`tab$` 一行；DML/DDL 的行为参数：`pctfree`/`itl_max`/…）。
+    ///
+    /// 缓存优先，未命中回查 `i_tab_pk`（与 `columns` 同一形态）。
+    pub fn table_options(&mut self, snapshot: CommitSeq, obj: u32) -> Result<TabRow, CatalogError> {
+        if let Some(row) = self.cache.get_tab(snapshot, obj) {
+            return Ok(row);
+        }
+        let key = crate::open::comp_num(u64::from(obj));
+        let hit = self
+            .lookup("i_tab_pk", &[Some(&key)])?
+            .ok_or(CatalogError::NotFound)?;
+        let row = TabRow::from_values(&hit.1)?;
+        let stamp = CommitSeq::from_raw(self.current_seq).unwrap_or_else(zero_seq);
+        self.cache.put_tab(stamp, row.clone());
+        Ok(row)
+    }
+
     // ───────────────────────── 索引 ─────────────────────────
 
     /// **可进选路的索引清单**（`目录详设` §5.5）：`status == 1` 且 `bobj#` 有效。
@@ -355,15 +377,23 @@ impl<'io> Catalog<'io> {
     ///
     /// V1.0 无 `bobj#` 索引 ⇒ 全扫 `i_ind_pk`/`i_icol_pk`（索引数有界），
     /// 结果行**写穿缓存**供后续 `resolve`/点查用。
+    ///
+    /// **`_snapshot` 在本路径上没有拦截面**（记档）：目录的读是**当前已提交
+    /// 状态**（单写者下池即真值，与 `ddl` 的扫描同一条口径）；缓存条目的
+    /// 装载戳取 `current_seq`（内容比任何更老的快照都新，不能拿快照号冒充）。
+    /// 并发写者接入时这里要改成快照读（见 `doc/待讨论清单.md`）。
     pub fn indexes_of(
         &mut self,
-        snapshot: CommitSeq,
+        _snapshot: CommitSeq,
         table_obj: u32,
     ) -> Result<Vec<IndexRef>, CatalogError> {
-        let inds = self.load_all_indexes()?;
+        let (inds, icols) = self.load_all_indexes()?;
         let mut out = Vec::new();
         for ind in inds.iter().filter(|i| i.bobj == table_obj) {
-            let cols = self.cache.get_icols(snapshot, ind.obj).unwrap_or_default();
+            // **键列取自本次装载的事实**（不是从缓存再取一次）：
+            // 缓存有快照门（`snapshot < loaded_at` ⇒ 未命中），在那里退化会得到
+            // **空键列**——所有行同键，唯一索引要么全判冲突要么全漏判，且无声。
+            let cols = icols.get(&ind.obj).cloned().unwrap_or_default();
             out.push(IndexRef {
                 obj: ind.obj,
                 bobj: ind.bobj,
@@ -386,7 +416,7 @@ impl<'io> Catalog<'io> {
     }
 
     /// 全扫 `ind$` + `icol$`（结果写穿缓存）。
-    fn load_all_indexes(&mut self) -> Result<Vec<IndRow>, CatalogError> {
+    fn load_all_indexes(&mut self) -> Result<LoadedIndexes, CatalogError> {
         let ind_entries = self.scan_index("i_ind_pk")?;
         let mut inds = Vec::with_capacity(ind_entries.len());
         for (_k, rid) in ind_entries {
@@ -411,10 +441,10 @@ impl<'io> Catalog<'io> {
         for ind in &inds {
             self.cache.put_ind(stamp, ind.clone());
         }
-        for (obj, rows) in by_obj {
-            self.cache.put_icols(stamp, obj, rows);
+        for (obj, rows) in &by_obj {
+            self.cache.put_icols(stamp, *obj, rows.clone());
         }
-        Ok(inds)
+        Ok((inds, by_obj))
     }
 
     // ───────────────────────── 版本 ─────────────────────────

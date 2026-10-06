@@ -30,16 +30,21 @@
 //! 已刷前缀的下一页边界——**已刷出的页不再改写**（重开会丢弃最后一个
 //! 部分页的尾部空位，这是"页序列永远是文件前缀"的代价与保证）。
 //!
-//! # 成员（2 份）暂未实现
+//! # 多成员镜像（已实现；`member_count ≥ 1`）
 //!
-//! 本切片先做**单成员**（`member_count = 1`）；镜像冗余与 `STALE` 重建
-//! 随后——§11.9 把 `STALE` 记在"成员文件头页"，而我们的 redo 文件是
-//! **纯页流、无文件头页**，落点需先定案（已记入待讨论清单）。
+//! 扇出写全部成员 → **写失败的成员标 `STALE`**（`member_stale` 位）→
+//! 刷盘跳过 STALE 成员（全坏才报 `Damaged`）→ [`GroupWriter::rebuild_member`]
+//! 从健康成员复制已用前缀并清位。位记在**控制文件的 Reo 条目**里（redo 文件
+//! 是纯页流、无文件头页——§11.9 原写"记在成员文件头页"，落点按本实现修正）。
+//!
+//! **发布纪律**：标脏可能发生在**没有控制文件的线程**（LGWR/池的 `WalGuard`
+//! 走 [`WalShared`]）——位先记在共享态并置 `stale_dirty`，由**下一次前台
+//! 发布**（`flush` / `publish_checkpoint`）取走并落控制文件（`take_stale_dirty`）。
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bicdb_common::latch::{Latch, LatchGuard};
@@ -282,6 +287,9 @@ pub struct WalShared<'io> {
     state: Latch<WalState>,
     /// 当前组的起始 LSN（原子量：刷盘快路径与追加预检都要读）。
     current_start: AtomicU64,
+    /// **成员 `STALE` 位有待发布到控制文件**（后台 LGWR/池写失败时置；
+    /// 前台发布时取走）。见 [`WalShared::take_stale_dirty`]。
+    stale_dirty: AtomicBool,
 }
 
 /// 文件侧写盘账（[`WalShared`] 的可变部分）。
@@ -289,7 +297,7 @@ pub struct WalShared<'io> {
 pub struct WalState {
     /// 当前组（0 起）。
     current: u8,
-    /// 每组成员已刷出的页数（单成员先行）。
+    /// 每组成员已刷出的页数（成员各自记账；组长取未失败成员的最大值）。
     written_pages: Vec<u64>,
     /// 各组的结尾 LSN（最后一张已写页的终点；未用过的组为 `None`）。
     group_ends: [Option<Lsn>; MAX_REDO_GROUPS],
@@ -365,6 +373,18 @@ impl<'io> WalShared<'io> {
         self.state.lock()
     }
 
+    /// **某组的成员 `STALE` 位**（共享态 = 权威值；控制文件里的是上次发布的副本）。
+    #[must_use]
+    pub fn member_stale(&self, group: u8) -> u8 {
+        self.state.lock().member_stale[usize::from(group)]
+    }
+
+    /// **取走"成员位有待发布"标志**（前台发布路径用；取走即清）。
+    #[must_use]
+    pub fn take_stale_dirty(&self) -> bool {
+        self.stale_dirty.swap(false, Ordering::SeqCst)
+    }
+
     /// **刷盘到 `target`**（组提交语义：已覆盖即直接返回；失败 ⇒ `synced_lsn`
     /// 不前进）。**这是 LGWR 的全部工作**——可从任意线程调用。
     pub fn flush_to(&self, target: Lsn) -> Result<FlushOutcome, GroupError> {
@@ -418,6 +438,13 @@ impl<'io> WalShared<'io> {
                 st.member_stale[g] |= 1 << active[i];
                 changed = true;
             }
+        }
+        if changed {
+            // **待发布标志**：本条路径可能来自后台（LGWR/池的 WalGuard），那里
+            // 没有控制文件可写；由下一次前台"发布"（`GroupWriter::flush` /
+            // `publish_checkpoint`）取走并落控制文件——否则后台发现的成员损坏
+            // 永远到不了控制文件，`rebuild_member` 会以"没坏"静默拒绝重建。
+            self.stale_dirty.store(true, Ordering::SeqCst);
         }
         Ok(FlushOutcome {
             synced,
@@ -542,6 +569,7 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
                 },
             ),
             current_start: AtomicU64::new(start_lsn.as_raw()),
+            stale_dirty: AtomicBool::new(false),
         });
         let mut writer = Self {
             cf,
@@ -642,6 +670,7 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
                 },
             ),
             current_start: AtomicU64::new(current_start.as_raw()),
+            stale_dirty: AtomicBool::new(false),
         });
         Ok(Self {
             cf,
@@ -725,7 +754,9 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
     /// [`WalShared::flush_to`]，这里只做"标脏后发布控制文件"的收尾）。
     pub fn flush(&mut self, target: Lsn) -> Result<Lsn, GroupError> {
         let out = self.wal.flush_to(target)?;
-        if out.stale_changed {
+        // **后台标脏也在这里发布**：本条路径新标脏（`out.stale_changed`）或
+        // 后台/池早已标脏（`take_stale_dirty`）——两者都落控制文件。
+        if out.stale_changed || self.wal.take_stale_dirty() {
             // 成员降级要发布进控制文件（下一次 open/诊断看得到）。
             let st = self.wal.state();
             for (g, entry) in self.entries.groups.iter_mut().enumerate() {
@@ -751,9 +782,12 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         if g >= self.wal.spec().group_count as usize || m >= self.wal.spec().member_count as usize {
             return Err(GroupError::Spec("组号/成员号越界"));
         }
-        if self.entries.groups[g].member_stale & (1 << m) == 0 {
+        // 权威 = **共享态**（后台刷盘直接写它）；`entries` 只是上次发布出去的
+        // 副本，可能还没带上后台刚标的位——两者不一致时以共享态为准。
+        if self.wal.member_stale(group) & (1 << m) == 0 {
             return Ok(()); // 没坏，不用重建
         }
+        self.entries.groups[g].member_stale = self.wal.member_stale(group);
         let source = (0..self.wal.spec().member_count as usize)
             .find(|&k| k != m && self.entries.groups[g].member_stale & (1 << k) == 0)
             .ok_or(GroupError::Spec("没有健康成员可作重建源"))?;
@@ -937,6 +971,15 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
                     demoted += 1;
                 }
             }
+        }
+        // **顺带发布"待发布"的成员位**（后台 LGWR 标脏的那批）：检查点本就要
+        // 写一次控制文件，带上它们不额外花代价。
+        if self.wal.take_stale_dirty() {
+            let st = self.wal.state();
+            for (g, entry) in self.entries.groups.iter_mut().enumerate() {
+                entry.member_stale = st.member_stale[g];
+            }
+            drop(st);
         }
         self.cf
             .write_checkpoint_and_groups(progress, &self.entries)?;
@@ -1938,6 +1981,64 @@ mod tests {
         // 控制文件里的位也清了。
         let entries = cf.redo_entries().unwrap();
         assert_eq!(entries.groups[0].member_stale, 0);
+    }
+
+    /// **后台标脏必须在下次前台发布时进控制文件**（2026-10-06 审计发现的缺陷）：
+    /// LGWR/池经 `WalShared` 刷盘时没有控制文件可写；若前台发布只看"本次是否
+    /// 新失败"，位一旦置上（该成员此后被跳过、不再产生"新失败"）就再也发布
+    /// 不出去 ⇒ 重启后仍以为成员健康、`rebuild_member` 也以"没坏"静默拒绝。
+    #[test]
+    fn background_stale_is_published_by_the_next_foreground_flush() {
+        let io = FlakyIo::new();
+        io.inner.add_dir("/mem");
+        io.inner.add_dir(WAL);
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 2).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut w = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 2, 8).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        w.flush(w.appended_lsn()).unwrap();
+
+        w.append(|l| RedoRecord::commit(l, 9, 3)).unwrap();
+        io.arm("_m2");
+        // **后台路径**（模拟 LGWR）：经共享核心刷盘——它写不了控制文件。
+        let shared = w.shared();
+        let out = shared.flush_to(shared.appended_lsn()).unwrap();
+        assert!(out.stale_changed, "本次刷盘新标脏");
+        assert_eq!(shared.member_stale(0), 0b10);
+        {
+            let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+            assert_eq!(
+                cf_ro.redo_entries().unwrap().groups[0].member_stale,
+                0,
+                "后台没有发布口——此刻控制文件确实还没这个位（这正是要修的）"
+            );
+        }
+
+        // 下一次前台刷盘：**取走待发布位**并落控制文件。
+        w.flush(w.appended_lsn()).unwrap();
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        assert_eq!(
+            cf_ro.redo_entries().unwrap().groups[0].member_stale,
+            0b10,
+            "后台标的位由下一次前台发布带上"
+        );
+        // 也顺带钉住：`rebuild_member` 认这个位（不会以"没坏"静默返回）。
+        io.disarm();
+        w.rebuild_member(0, 1).unwrap();
+        assert_eq!(w.member_stale(0), 0, "重建后清位");
     }
 
     #[test]

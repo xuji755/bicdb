@@ -197,10 +197,40 @@ fn bind_aexpr(
     expect: Option<bicdb_exec::ColKind>,
 ) -> Result<(PlanExpr, bicdb_exec::ColKind), BindError> {
     use bicdb_exec::ColKind;
-    let lexpr = ae
-        .lexpr
-        .as_deref()
-        .ok_or_else(|| BindError::Unsupported("缺左操作数".to_owned()))?;
+    // **一元 `+`/`-`**（PG 形态：`lexpr = NULL`）。本引擎**没有运算符目录**
+    // （运算符是闭集，见 §3.1 的节点映射），故在绑定期脱糖：
+    // `+x` ⇒ `x`；`-x` ⇒ `0 - x`。数值字面量的一元负号已在**语法期折叠**
+    // （PG `doNegate` 同款），走到这里的都是非字面量操作数。
+    let Some(lexpr) = ae.lexpr.as_deref() else {
+        let operand = ae
+            .rexpr
+            .as_deref()
+            .ok_or_else(|| BindError::Unsupported("一元运算缺操作数".to_owned()))?;
+        let (e, k) = bind_expr(operand, scope, params, Some(bicdb_exec::ColKind::Number))?;
+        require_kind(k, bicdb_exec::ColKind::Number, "一元 +/-")?;
+        return Ok(match ae.name.as_str() {
+            "+" => (e, k),
+            "-" => {
+                let zero = PlanExpr::Literal(Value::Number(Number::parse("0").map_err(|err| {
+                    BindError::BadLiteral {
+                        text: "0".to_owned(),
+                        why: err.to_string(),
+                    }
+                })?));
+                (
+                    PlanExpr::Arith {
+                        op: ArithOp::Sub,
+                        left: Box::new(zero),
+                        right: Box::new(e),
+                    },
+                    bicdb_exec::ColKind::Number,
+                )
+            }
+            other => {
+                return Err(BindError::Unsupported(format!("一元运算符 `{other}`")));
+            }
+        });
+    };
     // `IN (…)`：左侧形态即列表的期望形态。
     if matches!(ae.kind, AExprKind::In | AExprKind::NotIn) {
         let (left, lk) = bind_expr(lexpr, scope, params, None)?;

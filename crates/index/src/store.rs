@@ -57,10 +57,6 @@ pub fn no_link() -> RowId {
     RowId::from_bytes(&[0u8; ROWID_LEN])
 }
 
-/// 便于测试的零值。
-#[allow(dead_code)]
-const _: [u8; ROWID_LEN] = [0u8; ROWID_LEN];
-
 /// **执行器接入的 I/O 口**（索引页的**分配**与**写**）。
 ///
 /// 树算法只经 [`PageStore`] 说话；这一层把"新页从哪来、改页怎么写"交给
@@ -393,9 +389,13 @@ impl PageStore for SegmentStore<'_, '_, '_> {
         let mut pairs: Vec<(u32, u32)> = self.map.iter().map(|(&b, &l)| (b, l)).collect();
         pairs.sort_unstable();
         for (block, logical) in pairs {
-            let Ok(page) = self.segment.read_page(logical) else {
-                continue;
-            };
+            // **读失败即错误**（本 crate 的口径："明确判定，不静默"）：枚举口
+            // 的对象来自段自己的位图，读不出来 = 段/页真有问题——静默跳过会让
+            // `fast_full_scan` 少返条目、`validate` 漏检、`statistics` 偏小。
+            let page = self
+                .segment
+                .read_page(logical)
+                .map_err(|e| IndexError::Io(format!("段内页 {logical} 读失败：{e}")))?;
             if matches!(
                 page.header().map(|h| h.page_type),
                 Some(PageType::IndexLeaf | PageType::IndexBranch | PageType::IndexRoot)

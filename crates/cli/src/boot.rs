@@ -151,6 +151,10 @@ fn resolve(file0: FileHandle, undo: FileHandle, r: Rdba) -> Option<(FileHandle, 
 pub struct Instance {
     /// 实例目录。
     pub dir: PathBuf,
+    /// 文件 I/O（关闭路径要再开一次撤销文件推进 `file_scn`）。
+    pub io: &'static OsFileIo,
+    /// 撤销文件路径。
+    pub undo_path: PathBuf,
     /// 缓冲池。
     pub pool: &'static BufferPool<'static>,
     /// 事务引擎。
@@ -180,8 +184,18 @@ impl Instance {
     /// **关闭**：完全检查点（脏页写回 + 发布低水位）——干净退出。
     ///
     /// 崩溃不走这里：此时 WAL 是唯一耐久源，`open` 的重做阶段负责重建。
-    pub fn shutdown(&self) -> Result<(), BootError> {
-        self.engine.checkpoint_full(WS)?;
+    pub fn shutdown(&mut self) -> Result<(), BootError> {
+        let report = self.engine.checkpoint_full(WS)?;
+        // **推进 `file_scn`**（§2.4）：干净关闭后，两个文件的内容确实达到了
+        // 检查点位点——头字段是"打开链核对"（`check_files`）的事实来源，
+        // 长期不推进的话那道核对永远不可能发现"文件超前"。
+        let lsn = report.progress.checkpoint_lsn.as_raw();
+        self.catalog.file_mut().set_file_scn(lsn)?;
+        self.catalog.file_mut().sync()?;
+        let mut undo = DataFile::open(self.io, &self.undo_path)?;
+        undo.set_file_scn(lsn)?;
+        undo.sync()?;
+        undo.close()?;
         Ok(())
     }
 
@@ -277,6 +291,8 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
 
     Ok(Instance {
         dir: dir.to_path_buf(),
+        io,
+        undo_path: undo_path.clone(),
         pool,
         engine,
         catalog,
@@ -312,6 +328,12 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
         cf_ro.checkpoint_progress()?
     };
 
+    // **打开链的事实核对**（`目录详设` §2.5）：各文件头位点 vs 控制文件检查点。
+    // 超前（文件比控制文件新：拷错/配错控制文件）⇒ **拒绝打开**；本函数此前
+    // 直接进恢复，`catalog::consistency` 整模块只有单测消费者（2026-10-06 审计）。
+    let file0_scn = DataFile::open(io_dyn, &file0_path)?.file_scn();
+    let undo_scn = DataFile::open(io_dyn, &undo_path)?.file_scn();
+
     // 写口（续写位置在组集内部重建）+ 只读组视图（恢复的扫描面）。
     let cf: &'static mut ControlFile<'static> =
         Box::leak(Box::new(ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?));
@@ -322,6 +344,35 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
     let summary = {
         let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
         let groups = online_groups(io_dyn, &cf_ro, &wal_path, spec)?;
+        // 核对：文件位点 vs 检查点（`chain_start` = 在线组的最小起点；无日志 ⇒ None）。
+        let chain_start = groups.iter().map(|g| g.start_lsn).min();
+        let points = vec![
+            bicdb_catalog::FilePoint::Readable {
+                file_id: FILE0_ID,
+                role: META_ROLE,
+                file_scn: file0_scn,
+            },
+            bicdb_catalog::FilePoint::Readable {
+                file_id: UNDO_ID,
+                role: 1,
+                file_scn: undo_scn,
+            },
+        ];
+        let report = bicdb_catalog::check_files(progress.checkpoint_lsn, chain_start, &points);
+        if report.refused {
+            return Err(BootError::Catalog(format!(
+                "拒绝打开：文件超前于控制文件（{}）——像是配错了控制文件/拷错文件",
+                report
+                    .findings
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            )));
+        }
+        if !report.is_clean() {
+            eprintln!("（一致性核对有发现：{report:?}）");
+        }
         let mut resolve = |r: Rdba| resolve(file0_handle, undo_handle, r);
         let report = recover(
             io_dyn,
@@ -364,6 +415,8 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
 
     Ok(Instance {
         dir: dir.to_path_buf(),
+        io,
+        undo_path: undo_path.clone(),
         pool,
         engine,
         catalog,
