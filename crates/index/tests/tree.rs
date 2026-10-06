@@ -387,3 +387,114 @@ fn statistics_of_an_empty_tree_are_zero() {
     assert_eq!(st.leaf_blocks, 1, "空索引 = 一张空叶页");
     assert_eq!(st.blevel, 0);
 }
+
+// ───────────────────────── 批量灌树（`bulk_load`）─────────────────────────
+
+/// 批量灌树：多级树 + 全量点查 + 范围扫 + 结构自检 + 叶链方向。
+#[test]
+fn bulk_load_builds_a_multi_level_tree_bottom_up() {
+    let n = 5_000u32;
+    // 输入**升序**（保序键）。
+    let entries: Vec<(Vec<u8>, RowId)> = (0..n)
+        .map(|i| (key(i), rid(1 + i / 1000, (i % 1000 + 1) as u16)))
+        .collect();
+    let mut s = store(2048);
+    let report = {
+        let (tree, report) = Tree::bulk_load(&mut s, FILE_ID, WS, &entries, true, 90).unwrap();
+        let height = tree.height();
+        // 建完即读：点查、范围扫、结构自检。
+        let mut tree = tree;
+        tree.validate().unwrap();
+        assert!(height >= 1, "5000 项必然多级（height = {height}）");
+        assert_eq!(tree.height(), height);
+        for i in (0..n).step_by(37) {
+            assert_eq!(
+                tree.lookup(&key(i)).unwrap(),
+                Some(rid(1 + i / 1000, (i % 1000 + 1) as u16)),
+                "点查命中：{i}"
+            );
+        }
+        let part = tree.range(Some(&key(100)), Some(&key(199)), 1000).unwrap();
+        assert_eq!(part.len(), 100, "闭区间 [100, 199] 恰好 100 条");
+        assert_eq!(part[0].0, key(100));
+        assert_eq!(part[99].0, key(199));
+        // 全扫：条数与键序。
+        let all = tree.full_scan(n as usize + 10).unwrap();
+        assert_eq!(all.len(), n as usize);
+        assert!(all.windows(2).all(|w| w[0].0 <= w[1].0), "叶链按键升序");
+        report
+    };
+    // 诊断值（钉住"自底向上"确实产出多级）：
+    assert!(report.leaf_blocks > 1 && report.branch_blocks >= 1);
+    assert_eq!(report.root.file_id(), FILE_ID);
+}
+
+/// 唯一索引的重复键 ⇒ 具名拒绝；未排序输入 ⇒ 具名拒绝。
+#[test]
+fn bulk_load_rejects_duplicates_and_unsorted_input() {
+    let mut s = store(64);
+    let dup = vec![
+        (key(1), rid(1, 1)),
+        (key(2), rid(1, 2)),
+        (key(2), rid(1, 3)),
+    ];
+    let err = match Tree::bulk_load(&mut s, FILE_ID, WS, &dup, true, 90) {
+        Err(e) => e,
+        Ok(_) => panic!("唯一索引遇重复键应拒绝"),
+    };
+    assert!(matches!(err, IndexError::DuplicateKey { .. }), "{err}");
+    // 非唯一索引允许等键。
+    let mut s2 = store(64);
+    let (ok, _) = Tree::bulk_load(&mut s2, FILE_ID, WS, &dup, false, 90).unwrap();
+    assert_eq!(ok.height(), 0, "3 条小键：单页即根");
+    let mut ok = ok;
+    assert_eq!(ok.lookup(&key(2)).unwrap(), Some(rid(1, 2)));
+    // 未排序。
+    let mut s3 = store(64);
+    let unsorted = vec![(key(2), rid(1, 2)), (key(1), rid(1, 1))];
+    let err2 = match Tree::bulk_load(&mut s3, FILE_ID, WS, &unsorted, false, 90) {
+        Err(e) => e,
+        Ok(_) => panic!("未排序输入应拒绝"),
+    };
+    assert!(matches!(err2, IndexError::NotSorted), "{err2}");
+}
+
+/// 空输入 ⇒ 一张空叶页（`Tree::create` 的形态）；之后可继续逐行插。
+#[test]
+fn bulk_load_empty_matches_create_and_accepts_later_inserts() {
+    let mut s = store(64);
+    let (mut tree, _) = Tree::bulk_load(&mut s, FILE_ID, WS, &[], false, 90).unwrap();
+    assert_eq!(tree.height(), 0);
+    assert_eq!(tree.lookup(&key(1)).unwrap(), None);
+    tree.insert(&key(1), rid(1, 1)).unwrap();
+    assert_eq!(tree.lookup(&key(1)).unwrap(), Some(rid(1, 1)));
+    tree.validate().unwrap();
+}
+
+/// 灌完的树与"逐行插入的树"语义等价（同键集 ⇒ 同查询结果）。
+#[test]
+fn bulk_load_matches_incremental_insert_results() {
+    let n = 400u32;
+    let entries: Vec<(Vec<u8>, RowId)> = (0..n).map(|i| (key(i), rid(1, (i + 1) as u16))).collect();
+    let mut s1 = store(512);
+    let (mut bulk, _) = Tree::bulk_load(&mut s1, FILE_ID, WS, &entries, true, 90).unwrap();
+    let mut s2 = store(512);
+    let mut incr = Tree::create(&mut s2, FILE_ID, WS).unwrap();
+    for (k, r) in &entries {
+        incr.insert(k, *r).unwrap();
+    }
+    for i in 0..n {
+        assert_eq!(
+            bulk.lookup(&key(i)).unwrap(),
+            incr.lookup(&key(i)).unwrap(),
+            "两路同结果：{i}"
+        );
+    }
+    bulk.validate().unwrap();
+    incr.validate().unwrap();
+    // 两种形态的条目数一致。
+    assert_eq!(
+        bulk.statistics().unwrap().entries,
+        incr.statistics().unwrap().entries
+    );
+}

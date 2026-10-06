@@ -153,6 +153,16 @@ impl<'s, S: PageStore> Tree<'s, S> {
         self.root
     }
 
+    /// 由已知（根、高度）装配（**批量灌树**用：页已由建树过程写好）。
+    pub(crate) fn from_parts(store: &'s mut S, file_id: u16, root: RowId, height: u32) -> Self {
+        Self {
+            store,
+            file_id,
+            root,
+            height,
+        }
+    }
+
     /// 高度。
     #[must_use]
     pub fn height(&self) -> u32 {

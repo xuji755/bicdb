@@ -119,6 +119,47 @@ fn open_seg<'io, 'f>(
     Ok(Segment::open_pooled(pool, file, page0, ws)?)
 }
 
+/// **建索引（批量灌树；`目录详设` §5.3 ④ 的落点）**。
+///
+/// ```text
+/// 调用方：扫描基表（语句快照）→ 逐行求键 → 排序（唯一索引在此步检出重复）
+/// 本函数：bulk_load（自底向上）→ 树头经 redo 落盘 → 报告建了多少页
+/// ```
+///
+/// **为什么批量而不是逐行插入**：`arch/09` §9.1.5 的建索引路径——顺序写每页
+/// 一次（无下行、无分裂的页写放大）。**输入必须按键升序**；`unique = true` 时
+/// 相邻等键 ⇒ [`bicdb_index::IndexError::DuplicateKey`]（DDL 事务据此整体回滚）。
+#[allow(clippy::too_many_arguments)]
+pub fn build_index(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    file: &mut DataFile<'_>,
+    ws: [u8; 8],
+    seg_page0: u32,
+    txn: &Txn,
+    entries: &[(Vec<u8>, RowId)],
+    unique: bool,
+) -> Result<bicdb_index::BulkLoadReport, TableAccessError> {
+    let file_id = file.file_id();
+    let mut seg = open_seg(pool, file, seg_page0, ws)?;
+    let (root, report) = {
+        let mut io = TxnIndexIo::new(pool, log, &mut seg, txn);
+        let mut store = bicdb_index::PoolStore::new(pool, &mut io, file_id, ws);
+        let (tree, report) = bicdb_index::Tree::bulk_load(
+            &mut store,
+            file_id,
+            ws,
+            entries,
+            unique,
+            bicdb_index::DEFAULT_FILL_PERCENT,
+        )?;
+        (tree.root(), report)
+    };
+    drop(seg);
+    write_tree_head_redo(pool, log, file, ws, seg_page0, txn, root)?;
+    Ok(report)
+}
+
 /// **树头回写（经页差异 redo）**：段头页扩展区的 6B 根页地址。
 #[allow(clippy::too_many_arguments)]
 pub fn write_tree_head_redo(
@@ -216,6 +257,154 @@ mod tests {
     /// 键 = 保序数值编码（与目录同法）。
     fn key_of(i: u32) -> Vec<u8> {
         bicdb_types::Number::parse(&i.to_string()).unwrap().encode()
+    }
+
+    /// **建索引（批量灌树）端到端**：空表灌入 → 逐行求键 → 排序 → `build_index`
+    /// （自底向上）→ 崩溃 → 仅重放 redo → 索引点查全对。
+    ///
+    /// 这是 CREATE INDEX 的核心路径（`目录详设` §5.3 ④）：DDL 侧只差"写字典行 +
+    /// 事务/锁"的外壳。
+    #[test]
+    fn build_index_bulk_loads_and_survives_a_crash() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let spec = GroupSpec::new(2, 1, 8192).unwrap();
+        let seg_page0;
+        let idx_page0;
+        let data_handle;
+        {
+            let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+            let undo_handle = undo_file.handle();
+            let undo_seg = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+
+            let mut data_file =
+                DataFile::create(&io, Path::new(DATA_F), DATA_FID, 3, WS, 4096).unwrap();
+            data_handle = data_file.handle();
+            seg_page0 = {
+                let seg = Segment::create(&mut data_file, SegType::Heap, 10, 10, 8, 0, 0).unwrap();
+                seg.page0_block()
+            };
+            idx_page0 = {
+                let seg = Segment::create(&mut data_file, SegType::BTree, 11, 11, 8, 0, 0).unwrap();
+                seg.page0_block()
+            };
+            let pool = BufferPool::with_config(
+                &io,
+                64,
+                move |_ws, r| match r.file_id() {
+                    1 => Some((undo_handle, r.block_id())),
+                    DATA_FID => Some((data_handle, r.block_id())),
+                    _ => None,
+                },
+                FakeWal,
+                SystemClock,
+                CacheConfig::for_capacity(64),
+            )
+            .unwrap();
+            let mut chain = UndoChain::open(undo_seg).with_pool(&pool);
+            let mut cf = ControlFile::format(
+                &io,
+                Path::new(CF_A),
+                Path::new(CF_B),
+                &WorkspaceEntry {
+                    workspace_id: WorkspaceId::from_raw(1).unwrap(),
+                    created_at: 0,
+                    derived_from: None,
+                    derived_at_seq: seq(0),
+                },
+                &RedoEntries::new(2, 1).unwrap(),
+                &ArchiveRecord::new(ArchiveMode::NoArchive),
+            )
+            .unwrap();
+            let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec, lsn(0)).unwrap();
+            let mut txn = write::begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+
+            // ① 灌表（无索引）。
+            let mut rowids = Vec::new();
+            {
+                let mut table = TableAccess::new(&pool, WS);
+                let policy = InsertPolicy::in_place(0);
+                for i in 0..ROWS {
+                    let rid = table
+                        .insert(
+                            &mut log,
+                            &mut chain,
+                            &mut txn,
+                            &mut data_file,
+                            seg_page0,
+                            &row_of(i),
+                            &policy,
+                        )
+                        .unwrap();
+                    rowids.push(rid);
+                }
+            }
+            // ② 逐行求键 + 排序（唯一索引：排序后等键即冲突）。
+            let mut entries: Vec<(Vec<u8>, RowId)> =
+                (0..ROWS).map(|i| (key_of(i), rowids[i as usize])).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.to_bytes().cmp(&b.1.to_bytes())));
+            // ③ 批量建索引（自底向上）。
+            let report = build_index(
+                &pool,
+                &mut log,
+                &mut data_file,
+                WS,
+                idx_page0,
+                &txn,
+                &entries,
+                true,
+            )
+            .unwrap();
+            assert_eq!(report.entries, ROWS as usize);
+            assert!(
+                report.leaf_blocks > 1 && report.branch_blocks >= 1,
+                "多级树：{report:?}"
+            );
+            write::commit(&pool, &mut log, &mut chain, &mut txn, seq(1)).unwrap();
+
+            log.flush(log.appended_lsn()).unwrap();
+            drop(chain);
+            drop(pool);
+            drop(log);
+        }
+
+        // 恢复 → 索引点查全对。
+        let cf_ro = ControlFile::open(&io, Path::new(CF_A), Path::new(CF_B)).unwrap();
+        let groups = bicdb_wal::group::online_groups(&io, &cf_ro, Path::new(WAL), spec).unwrap();
+        let reopened = DataFile::open(&io, Path::new(DATA_F)).unwrap();
+        let data_handle2 = reopened.handle();
+        let undo_reopened = DataFile::open(&io, Path::new(UNDO_F)).unwrap();
+        let undo_handle2 = undo_reopened.handle();
+        let mut resolve = |r: bicdb_storage::rowid::Rdba| match r.file_id() {
+            1 => Some((undo_handle2, r.block_id())),
+            DATA_FID => Some((data_handle2, r.block_id())),
+            _ => None,
+        };
+        redo_from(&io, &groups, lsn(0), &mut resolve).unwrap();
+
+        let mut data_file = DataFile::open(&io, Path::new(DATA_F)).unwrap();
+        let pool2 = BufferPool::with_config(
+            &io,
+            64,
+            move |_ws, r| match r.file_id() {
+                DATA_FID => Some((data_handle2, r.block_id())),
+                _ => None,
+            },
+            FakeWal,
+            SystemClock,
+            CacheConfig::for_capacity(64),
+        )
+        .unwrap();
+        let root = {
+            let seg = Segment::open_pooled(&pool2, &mut data_file, idx_page0, WS).unwrap();
+            segment::read_tree_head(&seg.read_page(0).unwrap()).unwrap()
+        };
+        let mut store = bicdb_index::ReadOnlyStore::new(&pool2, DATA_FID, WS);
+        let mut tree = bicdb_index::Tree::open(&mut store, DATA_FID, root).unwrap();
+        tree.validate().expect("恢复后叶链与根清点相符");
+        for i in (0..ROWS).step_by(53) {
+            assert!(tree.lookup(&key_of(i)).unwrap().is_some(), "点查命中：{i}");
+        }
     }
 
     /// 端到端（真件）：**空表灌入 + 表增长 + 索引维护 + 崩溃恢复**。

@@ -10,6 +10,10 @@
 //! 读写全部经表引擎"）。两者要的能力**完全同形**（选址、增长、行写、索引维护、
 //! 树头持久化），实现只应有一份 ⇒ 落在本 crate，两侧都依赖它。
 //!
+//! **建索引口**（DDL 用）：[`index::build_index`]——逐行求键 + 排序由调用方
+//! （前端/DDL）完成，本口做**批量灌树**（`bicdb_index::Tree::bulk_load`，自底
+//! 向上；唯一索引的重复键在此具名拒绝）+ 树头经 redo 落盘。
+//!
 //! # 三条纪律（逐条有据）
 //!
 //! 1. **表增长经 redo**：新页 = 段追加位置计划（`plan_advance_append`，经池 +
@@ -33,4 +37,4 @@ pub mod heap;
 pub mod index;
 
 pub use heap::{TableAccess, TableAccessError};
-pub use index::{delete_entry, insert_entry, write_tree_head_redo, IndexTarget};
+pub use index::{build_index, delete_entry, insert_entry, write_tree_head_redo, IndexTarget};

@@ -20,14 +20,22 @@
 //! **页存取**经 [`store::PageStore`] 抽象（缓冲池/段由执行器接入；
 //! 测试用 [`store::MemStore`]）——树算法因此可以脱离 I/O 单测。
 //! **并发**：latch 由调用方提供；结构性规则已就位（见 [`tree`] 模块文档）。
+//!
+//! **批量灌树（2026-10-06）**：[`Tree::bulk_load`]（[`bulk`] 模块）——**自底向上**
+//! 建树（`目录详设` §5.3 ④ 的 CREATE INDEX 落点）：叶子层顺序装填 + 叶链双向、
+//! 逐层向上、单页即根；输入**必须升序**，唯一索引的相邻等键 ⇒
+//! [`IndexError::DuplicateKey`]（DDL 事务据此整体回滚）。页写路径仍是
+//! [`store::IndexIo`]（执行器/表访问服务侧带 redo）。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod bulk;
 pub mod page;
 pub mod store;
 pub mod tree;
 
+pub use bulk::{BulkLoadReport, DEFAULT_FILL_PERCENT};
 pub use page::{Entry, IndexPage, IndexPageMut, KEY_LEN_INFINITY, MAX_ENTRY_LEN, MAX_KEY_LEN};
 pub use store::{IndexIo, MemStore, PageStore, PoolStore, ReadOnlyStore, SegmentStore};
 pub use tree::{IndexStats, InsertOutcome, SplitKind, Tree, FFS_RUN_PAGES};
@@ -59,6 +67,13 @@ pub enum IndexError {
     StoreFull,
     /// 底层 I/O（池/页文件/日志；经 [`IndexIo`] 接入的执行器错误）。
     Io(String),
+    /// **唯一索引的重复键**（批量灌树/插入时检出；`目录详设` §5.3 的唯一性口径）。
+    DuplicateKey {
+        /// 重复的键字节（诊断用前 32 字节的十六进制）。
+        key: String,
+    },
+    /// **批量灌树的输入未按键升序**（调用方必须先排好——设计 §5.3 ④）。
+    NotSorted,
 }
 
 impl std::fmt::Display for IndexError {
@@ -74,6 +89,10 @@ impl std::fmt::Display for IndexError {
             IndexError::BlockNotFound { block } => write!(f, "页仓中没有块 {block}"),
             IndexError::StoreFull => f.write_str("页仓已满"),
             IndexError::Io(why) => write!(f, "索引 I/O：{why}"),
+            IndexError::DuplicateKey { key } => {
+                write!(f, "唯一约束冲突（重复键 {key}）")
+            }
+            IndexError::NotSorted => f.write_str("批量灌树的输入未按键升序"),
         }
     }
 }
