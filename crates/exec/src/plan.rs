@@ -7,6 +7,7 @@ use crate::error::ExecError;
 use crate::expr::Expr;
 use crate::nodes::{Filter, Limit, Project, SeqScan};
 use crate::operator::{Operator, RowCursor};
+use crate::sort::{Sort, SortKey, TopN};
 use crate::value::RowShape;
 
 /// 行源标识（切片 1：单表；编号由计划给出，执行期映射到存储服务的表）。
@@ -45,6 +46,22 @@ pub enum PlanNode {
         /// `OFFSET m`。
         offset: u64,
     },
+    /// 全排序（阻塞；切片 2c 内存形态，外部归并随切片 6）。
+    Sort {
+        /// 输入子树。
+        input: Box<PlanNode>,
+        /// 排序键（按序）。
+        keys: Vec<SortKey>,
+    },
+    /// 有界排序（`ORDER BY … LIMIT` 合并；输入仍全读——§4.1）。
+    TopN {
+        /// 输入子树。
+        input: Box<PlanNode>,
+        /// 排序键（按序）。
+        keys: Vec<SortKey>,
+        /// 保留行数（**已含 `OFFSET` 份额**——计划侧给）。
+        keep: u64,
+    },
 }
 
 /// **构建算子树**：`open_cursor` 按行源标识开一个**新**行游标
@@ -68,5 +85,11 @@ pub fn build<'a>(
             limit,
             offset,
         } => Box::new(Limit::new(build(input, open_cursor)?, *limit, *offset)),
+        PlanNode::Sort { input, keys } => {
+            Box::new(Sort::new(build(input, open_cursor)?, keys.clone()))
+        }
+        PlanNode::TopN { input, keys, keep } => {
+            Box::new(TopN::new(build(input, open_cursor)?, keys.clone(), *keep))
+        }
     })
 }

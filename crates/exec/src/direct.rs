@@ -12,7 +12,7 @@ use crate::error::ExecError;
 use crate::expr::{self, Expr};
 use crate::operator::RowCursor;
 use crate::plan::{PlanNode, SourceId};
-use crate::value::{decode_row, Row, RowShape};
+use crate::value::{decode_row, Row, RowShape, Value};
 
 /// **语义查询**（切片 1：单表 SELECT 子集）。
 ///
@@ -28,6 +28,8 @@ pub struct SelectQuery {
     pub predicate: Option<Expr>,
     /// 投影（顺序 = 输出列序）。
     pub projection: Vec<Expr>,
+    /// `ORDER BY`（空 = 无排序；语义与算子路径共用 [`crate::sort::compare_keys`]）。
+    pub order_by: Vec<crate::sort::SortKey>,
     /// `LIMIT n`。
     pub limit: Option<u64>,
     /// `OFFSET m`。
@@ -48,6 +50,21 @@ impl SelectQuery {
                 predicate: pred.clone(),
             };
         }
+        if !self.order_by.is_empty() {
+            // **排序在投影之下**（`ORDER BY` 可引用未投影的列）；`ORDER BY` +
+            // `LIMIT` ⇒ `TopN`（省排序内存，输入仍全读），无 `LIMIT` ⇒ 全排序。
+            node = match self.limit {
+                Some(limit) => PlanNode::TopN {
+                    input: Box::new(node),
+                    keys: self.order_by.clone(),
+                    keep: limit + self.offset,
+                },
+                None => PlanNode::Sort {
+                    input: Box::new(node),
+                    keys: self.order_by.clone(),
+                },
+            };
+        }
         node = PlanNode::Project {
             input: Box::new(node),
             exprs: self.projection.clone(),
@@ -63,14 +80,15 @@ impl SelectQuery {
     }
 }
 
-/// **直译执行**：逐行按语义求值（不建哈希、不下推、不用索引）。
+/// **直译执行**：逐行按语义求值（不建哈希、不下推、不用索引；
+/// 排序 = 收全后稳定排序——**参考模型不做 Top-N 优化**，语义与 `TopN` 同规）。
 pub fn execute_direct(
     query: &SelectQuery,
     cursor: &mut dyn RowCursor,
     cx: &mut ExecContext<'_>,
 ) -> Result<Vec<Row>, ExecError> {
-    let mut out = Vec::new();
-    let mut skipped = 0u64;
+    // ① 扫 + 过滤（收集——排序需要全量；无 ORDER BY 时才走下面的短路路径）。
+    let mut rows: Vec<Row> = Vec::new();
     loop {
         cx.check()?;
         let Some((_rid, bytes)) = cursor.next_row()? else {
@@ -82,10 +100,47 @@ pub fn execute_direct(
                 continue;
             }
         }
-        if skipped < query.offset {
-            skipped += 1;
-            continue;
+        rows.push(row);
+        // 无 ORDER BY：无需收全——本可以是流式，但参考模型从简（见模块文档）。
+        if query.order_by.is_empty() {
+            if let Some(limit) = query.limit {
+                if rows.len() as u64 >= limit + query.offset {
+                    break;
+                }
+            }
         }
+    }
+    // ② 排序（稳定；键在输入行上求值——`ORDER BY` 可引用未投影列）。
+    if !query.order_by.is_empty() {
+        let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let keys: Vec<Value> = query
+                .order_by
+                .iter()
+                .map(|k| expr::eval(&k.expr, &row, cx.params()))
+                .collect::<Result<_, _>>()?;
+            keyed.push((keys, row));
+        }
+        let mut err: Option<ExecError> = None;
+        keyed.sort_by(
+            |a, b| match crate::sort::compare_keys(&query.order_by, &a.0, &b.0) {
+                Ok(ord) => ord,
+                Err(e) => {
+                    if err.is_none() {
+                        err = Some(e);
+                    }
+                    std::cmp::Ordering::Equal
+                }
+            },
+        );
+        if let Some(e) = err {
+            return Err(e);
+        }
+        rows = keyed.into_iter().map(|(_, r)| r).collect();
+    }
+    // ③ 投影 + OFFSET/LIMIT。
+    let mut out = Vec::new();
+    for row in rows.into_iter().skip(query.offset as usize) {
         let mut values = Vec::with_capacity(query.projection.len());
         for e in &query.projection {
             values.push(expr::eval(e, &row, cx.params())?);
@@ -96,6 +151,7 @@ pub fn execute_direct(
                 break;
             }
         }
+        cx.check()?;
     }
     Ok(out)
 }

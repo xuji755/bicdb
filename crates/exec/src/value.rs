@@ -179,15 +179,67 @@ fn expect_kind(actual: ColKind, expected: ColKind) -> Result<(), ExecError> {
         return Ok(());
     }
     Err(ExecError::TypeMismatch {
-        expected: match expected {
-            ColKind::Number => "NUMBER",
-            ColKind::Bool => "BOOLEAN",
-            ColKind::Bytes => "BYTES",
-        },
-        got: match actual {
-            ColKind::Number => "NUMBER",
-            ColKind::Bool => "BOOLEAN",
-            ColKind::Bytes => "BYTES",
-        },
+        expected: kind_name(expected),
+        got: kind_name(actual),
     })
+}
+
+/// 列形态的类型名（错误文案用）。
+#[must_use]
+pub fn kind_name(kind: ColKind) -> &'static str {
+    match kind {
+        ColKind::Number => "NUMBER",
+        ColKind::Bool => "BOOLEAN",
+        ColKind::Bytes => "BYTES",
+    }
+}
+
+/// **一行的估计内存**（工作内存记账用；保守估计 + 固定开销）。
+#[must_use]
+pub fn row_bytes(row: &Row) -> usize {
+    let mut n = 16; // 行结构开销
+    for v in &row.values {
+        n += match v {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Number(num) => num.encoded_len().max(8),
+            Value::Bytes(b) => b.len().max(8),
+        };
+    }
+    n
+}
+
+/// **显式转换**（`CAST`；切片 2b 的确定面）。
+///
+/// 转换的**结果**是契约（`TYP` REQ-TYP-004）。已实现且语义明确的：
+/// - `→ NUMBER`：`BYTES` 按**严格十进制文本**解析（`Number::parse` 同规；
+///   不静默兜底）、`NUMBER` 恒等；
+/// - `→ BYTES`：`NUMBER` 取**规范十进制文本**（`.` 为小数点；NLS 面
+///   记录为未核验）、`BYTES` 恒等；
+/// - `NULL` 恒转 `NULL`；
+/// - **其余方向（含 `BOOLEAN` 两向）具名拒绝**——参考环境的转换细则
+///   （Oracle SQL 层 BOOLEAN 为 23c 时代特性）未核验，不凭记忆补语义。
+pub fn cast_value(value: &Value, to: ColKind) -> Result<Value, ExecError> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    match (value, to) {
+        (Value::Number(n), ColKind::Number) => Ok(Value::Number(n.clone())),
+        (Value::Bytes(b), ColKind::Number) => {
+            let text = std::str::from_utf8(b).map_err(|_| ExecError::TypeMismatch {
+                expected: "NUMBER",
+                got: "BYTES",
+            })?;
+            Number::parse(text)
+                .map(Value::Number)
+                .map_err(|e| ExecError::BadStoredRow(e.to_string()))
+        }
+        (Value::Number(n), ColKind::Bytes) => Ok(Value::Bytes(n.to_decimal_string().into_bytes())),
+        (Value::Bytes(b), ColKind::Bytes) => Ok(Value::Bytes(b.clone())),
+        (Value::Bool(b), ColKind::Bool) => Ok(Value::Bool(*b)),
+        (v, k) => Err(ExecError::TypeMismatch {
+            expected: kind_name(k),
+            got: v.type_name(),
+        }),
+    }
 }

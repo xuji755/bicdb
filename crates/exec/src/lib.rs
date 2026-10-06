@@ -28,13 +28,17 @@ pub mod expr;
 pub mod nodes;
 pub mod operator;
 pub mod plan;
+pub mod sort;
 pub mod value;
 
-pub use context::{ExecContext, OpStat};
+pub use context::{ExecContext, OpStat, WorkAreaOutcome, WorkAreaStats};
 pub use direct::{execute_direct, SelectQuery};
 pub use error::ExecError;
-pub use expr::{CmpOp, Expr, Truth};
+pub use expr::{ArithOp, CmpOp, Expr, Truth};
 pub use nodes::{Filter, Limit, Project, SeqScan};
 pub use operator::{collect, Operator, RowCursor};
 pub use plan::{build, PlanNode, SourceId};
-pub use value::{decode_row, encode_row, ColKind, Row, RowShape, Value};
+pub use sort::{Sort, SortKey, TopN};
+pub use value::{
+    cast_value, decode_row, encode_row, kind_name, row_bytes, ColKind, Row, RowShape, Value,
+};

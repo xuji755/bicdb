@@ -38,6 +38,18 @@ pub enum ExecError {
     },
     /// 存储服务错误（保真外传——`scan` 模块的判定）。
     Scan(ScanError),
+    /// 数值运算越出 `NUMBER` 域（溢出/下溢——`TYP` 的明确判定，不回绕）。
+    NumericOverflow,
+    /// 除以零（SQL 层的确定错误）。
+    DivisionByZero,
+    /// **工作内存超预算**（切片 2c 的临时形态：外部归并/分区随切片 6 的
+    /// WMM + temp 段接入——届时本错误在正常路径不可达）。
+    WorkMemoryExceeded {
+        /// 已用（估计字节）。
+        used: u64,
+        /// 预算（字节；`0` = 未设预算）。
+        budget: u64,
+    },
 }
 
 impl std::fmt::Display for ExecError {
@@ -55,6 +67,12 @@ impl std::fmt::Display for ExecError {
             }
             ExecError::NoSuchSource { id } => write!(f, "计划引用的行源 {id} 不存在"),
             ExecError::Scan(e) => write!(f, "存储服务：{e}"),
+            ExecError::NumericOverflow => f.write_str("数值运算越出 NUMBER 域"),
+            ExecError::DivisionByZero => f.write_str("除以零"),
+            ExecError::WorkMemoryExceeded { used, budget } => write!(
+                f,
+                "工作内存超预算：已用约 {used} 字节、预算 {budget} 字节（溢出随切片 6）"
+            ),
         }
     }
 }
