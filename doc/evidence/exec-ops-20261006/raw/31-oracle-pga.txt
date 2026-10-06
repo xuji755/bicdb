@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] PGA 自动管理 pga_aggregate_target 工作区 排序 哈希 内存分配
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 13，摘要筛选通过 11，批次 1；本路已取尽
+  KnowledgeEntry：已取 64，摘要筛选通过 56，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 13，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     Oracle 9i 自动 PGA 内存管理通过 WORKAREA_SIZE_POLICY=AUTO 与 PGA_AGGREGATE_TARGET 参数启用，替代了 SORT_AREA_SIZE、HASH_AREA_SIZE 等手动设置。PGA_AGGREGATE_TARGET 定义实例可用的 PGA 内存上限，数据库智能分配工作区内存，避免因工作区不足导致。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:223730.1 Automatic PGA Memory Managment in 9i  (排序分: 15.0)
+     └ 摘要：Oracle 9i 自动 PGA 内存管理通过 WORKAREA_SIZE_POLICY=AUTO 与 PGA_AGGREGATE_TARGET 参数启用，替代了 SORT_AREA_SIZE、HASH_AREA_SIZE 等手动设置。PGA_AGGREGATE_TARGET 定义实例可用的 PGA 内存上限，数据库智能分配工作区内存，避免因工作区不足导致。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996523
+
+     [KnowledgeEntry] L1：Note:223730.1 Automatic PGA Memory Management in 9i and 10g  (排序分: 15.0)
+     └ 摘要：介绍 Oracle9i/10g 自动 PGA 内存管理，通过 PGA_AGGREGATE_TARGET 和 WORKAREA_SIZE_POLICY=AUTO 替代手动设置 SORT_AREA_SIZE、HASH_AREA_SIZE 等参数，自动为 SQL 工作区分配内存。工作区可分为 optimal、one-pass、multi-pass 三种大小，multi-pass 会显著延长。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2049008
+
+     [KnowledgeEntry] L1：Note:147806.1 Oracle9i New Feature: Automated SQL Execution Memory Management Open-Remarks: See <RemarksOn:NOTE:147806.1>  (排序分: 14.7)
+     └ 摘要：Oracle9i Automated SQL Execution Memory Management 特性通过参数 WORKAREA_SIZE_POLICY=AUTO 和 PGA_AGGREGATE_TARGET 自动管理 SQL 工作区内存（如排序、哈希连接），替代手工设置 sort_area_size 等参数。PGA 分为可调与不可调部分，总 PGA 尽量不超过 PGA_。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996659
+
+     [KnowledgeEntry] PGA自动管理的会话工作区域分配上限  (排序分: 10.0)
+     └ 摘要：PGA自动管理原则：每个会话分配的SQL工作区域不超过PGA_AGGREGATE_TARGET的5%；并行操作每个会话不超过30%；并行处理的每个子作业不超过（PGA_AGGREGATE_TARGET×30%）÷并行度。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257077
+
+     [CaseStudy] Bug 2805580&nbsp;&nbsp;PGA memory corruption possible using PGA_AGGREGATE_TARGET  (排序分: 9.8)
+     └ 摘要：使用PGA_AGGREGATE_TARGET时可能发生PGA内存损坏，根因为Bug 2805580，影响Oracle Server（Rdbms），典型场景为启用自动PGA管理时触发内存损坏，可能导致数据库异常。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:385492
+
+     [FaultModel] PGA过度分配导致临时表空间使用  (排序分: 9.3)
+     └ 摘要：PGA过度分配（PGA_OVERALLOCATION）现象：PGA_AGGREGATE_TARGET设置过小，导致大型排序或哈希操作溢出到临时段。根因：PGA_AGGREGATE_TARGET不足，自动模式下工作区大小被压缩，迫使磁盘操作。影响：磁盘I/O增加，性能下降。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:324063
+

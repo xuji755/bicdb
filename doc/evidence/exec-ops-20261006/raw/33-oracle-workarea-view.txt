@@ -1,0 +1,119 @@
+
+============================================================
+  [问题诊断] V$SQL_WORKAREA 最优大小 期望大小 实际内存 临时段 趟数
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 23，摘要筛选通过 18，批次 1；本路已取尽
+  CaseStudy：已取 10，摘要筛选通过 1，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  🎯 精确/强相关系统对象 (1)
+
+     [bic_agent_SystemView,SyncEntity,KGV2Managed] SYS.V$SQL_WORKAREA  (匹配: fuzzy)
+     └ 描述: 物理对象：SYS.V_$SQL_WORKAREA。
+You can use this view to find out answers to the following questions: What are the top 10 work areas that require the most cache area? For work areas allocated in AUTO mode, what percentage of work areas are running using maximum memory?
+Synonym for V_$SQL_WORKAREA
+说明（10gR2/NON_CDB、11gR2/NON_CDB）：V$SQL_WORKAREA displays information about work areas used by SQL cursors. Each SQL statement stored in the shared pool has one or more child cursors that are listed in the V$SQL view. V$SQL_WORKAREA lists all work areas needed by these child cursors; V$SQL_WORKAREA can be joined with V$SQLAREA on ( ADDRESS , HASH_VALUE ) and with V$SQL on ( ADDRESS , HASH_VALUE , CHILD_NUMB…
+     └ 已收录版本（Oracle）: 10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+     └ 字段(21，显示12):
+        ACTIVE_TIME                         NUMBER               Average time this work area is active (in hundredths of a second)
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        ADDRESS                             RAW(8)               Address of the parent cursor handle
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+类型差异：10gR2/NON_CDB = RAW(4)；11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = RAW(8)。
+字节长度差异：10gR2/NON_CDB = 4；11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = 8。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        CHILD_NUMBER                        NUMBER               Number of the child cursor that uses this work area. The columns PARENT_HANDLE , HASH_VALUE , and CHILD_NUMBER can be used to join with V$SQL to locate the child cursor using this area.
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        CON_ID                              NUMBER               The ID of the container to which the data pertains. Possible values include: 0 : This value is used for rows containing data that pertain to the entire CDB. This value is also used for rows in non-CDBs. 1 : This value is used for rows containing data that pertain to only the root n : Where n is the applicable container ID for the rows containing data
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。 版本：12c, 18c, 19c, 21c, 23ai, 26ai
+        ESTIMATED_ONEPASS_SIZE              NUMBER               Estimated size (in bytes) required by this work area to execute the operation in a single pass. Derived from either optimizer statistics or previous executions.
+说明（10gR2/NON_CDB）：Estimated size (in KB) required by this work area to execute the operation in a single pass. Derived from either optimizer statistics or previous executions.
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        ESTIMATED_OPTIMAL_SIZE              NUMBER               Estimated size (in bytes) required by this work area to execute the operation completely in memory (optimal execution). Derived from either optimizer statistics or previous executions.
+说明（10gR2/NON_CDB）：Estimated size (in KB) required by this work area to execute the operation completely in memory (optimal execution). Derived from either optimizer statistics or previous executions.
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        HASH_VALUE                          NUMBER               Hash value of the parent statement in the library cache. Two columns PARENT_HANDLE and HASH_VALUE can be used to join with V$SQLAREA to locate the parent cursor.
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        LAST_DEGREE                         NUMBER               Degree of parallelism used during the last execution of this operation
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        LAST_EXECUTION                      VARCHAR2(10 BYTE)    Indicates whether this work area runs using OPTIMAL, ONE PASS , or ONE PASS memory requirement (or MULTI-PASS ), during the last execution of the cursor
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+类型差异：10gR2/NON_CDB = VARCHAR2(40 BYTE)；11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = VARCHAR2(10 BYTE)。
+字节长度差异：10gR2/NON_CDB = 40；11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = 10。
+字符长度差异：10gR2/NON_CDB = 40；11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = 10。
+排序规则差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = USING_NLS_COMP。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        LAST_MEMORY_USED                    NUMBER               Memory (in bytes) used by this work area during the last execution of the cursor
+说明（10gR2/NON_CDB）：Memory (in KB) used by this work area during the last execution of the cursor
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        LAST_TEMPSEG_SIZE                   NUMBER               Temporary segment size (in bytes) created in the last instantiation of this work area. This column is NULL if the last instantiation of this work area did not spill to disk.
+说明（10gR2/NON_CDB）：Temporary segment size (in bytes) created in the last instantiation of this work area. This column is null if the last instantiation of this work area did not spill to disk.
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        MAX_TEMPSEG_SIZE                    NUMBER               Maximum temporary segment size (in bytes) created by an instantiation of this work area. This column is NULL if this work area has never spilled to disk.
+说明（10gR2/NON_CDB）：Maximum temporary segment size (in bytes) created by an instantiation of this work area. This column is null if this work area has never spilled to disk.
+说明（23ai/PDB、23ai/CDB_ROOT）：该范围尚无可靠字段说明。
+实测支持范围：10gR2/NON_CDB、11gR2/NON_CDB、12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT。
+NULL默认值行为差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。
+标识列差异：10gR2/NON_CDB、11gR2/NON_CDB = NULL；12c/PDB、12c/CDB_ROOT、18c/PDB、18c/CDB_ROOT、19c/PDB、19c/CDB_ROOT、21c/PDB、21c/CDB_ROOT、23ai/PDB、23ai/CDB_ROOT、26ai/PDB、26ai/CDB_ROOT = NO。 版本：10gR2, 11gR2, 12c, 18c, 19c, 21c, 23ai, 26ai
+        … 其余 9 个字段请使用 entity view/table 或 detail 查看
+
+  ✅ 答案要点
+     Note:148.346.1 描述了 Oracle9i 自动 SQL 执行内存管理的监控方法，利用 V$SYSSTAT 和 V$SESSTAT 中 'workarea memory allocated' 与 'workarea executions - optimal/onepass/multipass' 统计值评估 PGA 工作区执行效率，结合 V$SQL_WORKAREA 和 V$SQL_WORKAREA_ACTIVE 视图。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:148346.1 Oracle9i Monitoring Automated SQL Execution Memory Management  (排序分: 14.5)
+     └ 摘要：Note:148.346.1 描述了 Oracle9i 自动 SQL 执行内存管理的监控方法，利用 V$SYSSTAT 和 V$SESSTAT 中 'workarea memory allocated' 与 'workarea executions - optimal/onepass/multipass' 统计值评估 PGA 工作区执行效率，结合 V$SQL_WORKAREA 和 V$SQL_WORKAREA_ACTIVE 视图。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996657
+
+     [KnowledgeEntry] L1：Note:245840.1 Bug 6817844 - Multi pass sort with auto memory management even with plenty of PGA [ID 6817844.8]  (排序分: 14.5)
+     └ 摘要：Bug 6817844 描述在自动内存管理下，即使 PGA 内存充足，新排序算法（由隐藏参数 _newsort_enabled 控制）仍可能执行多遍排序，导致性能下降，可通过 V$SQL_WORKAREA 观察到多遍执行。该条目适用于诊断排序效率低下、PGA 自动管理异。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2042451
+
+     [KnowledgeEntry] 使用 v$sql_workarea 定位最大临时段占用的 SQL 工作区  (排序分: 10.0)
+     └ 摘要：查询 v$sql_workarea，将 max_tempseg_size 和 last_tempseg_size 除以 1024/1024 转为 MB，过滤 max_tempseg_size is not null，并按 max_tempseg_size desc 排序，可快速找出占用临时表空间最大的 SQL 工作区操作。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3258210
+
+     [KnowledgeEntry] "V$SQL_WORKAREA" Reference Note  (排序分: 10.0)
+     └ 详情：# "V$SQL_WORKAREA" Reference Note > **来源**: chm/Database Categories | **文件**: /180931.1.htm > **Doc ID**: 180931.1 The information here contains the view description from the Oracle9 i documentation along with any additional Support / Historical Notes related to this view.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:341852
+
+     [KnowledgeEntry] 代码清单7-1：按 SQL_ID 查询 v$sql_workarea  (排序分: 10.0)
+     └ 摘要：该 SQL 在格式化列后查询 v$sql_workarea，where sql_id='37qjh5yuha3x9'，输出 operation_type、policy、estimated_optimal_size、estimated_onepass_size、last_memory_used、last_execution、total_executions、optimal_executions、onepass_executions、multipasses_executions、active_time、max_tempseg_size、last_tempseg_size，并将内存除以 1024/1024 转为 MB、active_time 除以 1000000 转为秒。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3258110
+
+     [CaseStudy] "V$SQL_WORKAREA" Reference Note  (排序分: 9.8)
+     └ 摘要：V$SQL_WORKAREA视图用于监控SQL工作区内存使用情况，可诊断排序、哈希等操作的内存分配问题，根因涉及工作区大小配置不当，典型场景为PGA内存不足导致磁盘排序。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:391511
+

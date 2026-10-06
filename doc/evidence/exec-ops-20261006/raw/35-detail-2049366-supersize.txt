@@ -1,0 +1,31 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:453540.1 How To Super-Size Work Area Memory Size Used By Sessions
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2049366
+
+  ── 描述 ──
+  How To Super-Size Work Area Memory Size Used By Sessions Solution References Oracle Confidential
+  (INTERNAL). Do not distribute to customers Reason: Use of this information should be guided by
+  Oracle Support. (AuthWiz 2.5.3) Created from SR 6409593.993 with ODM Click here to edit in wizard.
+  Applies to: Oracle Server - Enterprise Edition - Version: 10.2.0.1 to 10.2.0.3 Information in this
+  document applies to any platform. Goal How to super-size the work area memory size that can be used
+  by any session in the database Solution With the automatic PGA management mode, you can control the
+  size for the work area sizes (e.g. for a big sort).You have to set the following parameters to
+  proper values:1. PGA_AGGREGATE TARGET-> should be set to five times the desired work area size2.
+  _PGA_MAX_SIZE-> should be set in minimum of twice the desired work area size3. _SMM_MAX_SIZE->
+  normally this parameter is not needed but maybe under certain circumstances-> if set it should be
+  equal to the desired work area size (in kb !)Example:If you like to use a sort area size of 2GB for
+  a special operation (e.g for thecreating of an index on a large table) you could set the values as
+  follows:PGA_AGGREGATE TARGET = 10G"_PGA_MAX_SIZE" = 2G"_SMM_MAX_SIZE" = 2097152Please note that
+  there is an internal limitation that a single workarea size is limited to 2GB. _PGA_MAX_SIZE is set
+  up to 2GB (1GB limit for 32-bit) per bug 3946308Also please be careful that the above changes are
+  very dangerous because the values affect all sessions in the database. If you need to have granular
+  control of the work area for a single session, then it is better to set at the session level
+  WORKAREA_SIZE_POLICY=MANUAL and *_AREA_SIZE as high as needed. References Bug 3946308 - ORACLE FAILS
+  TO TAKE ADVANTAGE OF LARGE VALUE OF PGA_AGGREGATE_TARGET Note 420986.1 - Init.ora Parameter
+  "_PGA_MAX_SIZE" Reference Note TAR 5853484.992 Keywords 'WORKAREA_SIZE_POLICY' 'PGA' . Copyright ©
+  2006, Oracle. All rights reserved.
+
+  ── 摘要 ──
+  该条目介绍如何在自动PGA管理模式下突破常规工作区大小限制，通过设置 PGA_AGGREGATE_TARGET 为期望工作区大小五倍、_PGA_MAX_SIZE 至少两倍、可选 _SMM_MAX_SIZE 等于期望大小（单位为KB）来实现超大排序或索引创建所需内存。注意单。

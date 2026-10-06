@@ -1,0 +1,93 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:223730.1 Automatic PGA Memory Management in 9i and 10g
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2049008
+
+  ── 描述 ──
+  Automatic PGA Memory Management in 9i and 10g PURPOSE ------- This Document briefly describes how
+  Oracle 9i manage PGA work area and how to tune it and some of the common issues and some of the
+  common misunderstood issues. This Note is continuation to Note 147806.1 and Note 148346.1 and should
+  provide more information about this New 9i Feature. SCOPE & APPLICATION --------------------- DBAs
+  and Application Developers might benefit from this article. Automatic PGA Memory Management
+  ------------------------------- Process Global Area, often known as the Program Global Area (PGA)
+  resides in the process private memory of the server process. It contains global variables and data
+  structures and control information for a server process. example of such information is the runtime
+  area of a cursor. Each time a cursor is executed, a new runtime area is created for that cursor in
+  the PGA memory region of the server process executing that cursor. The performance of complex long
+  running queries, typical in a DSS environment, depend to a large extent on the memory available in
+  the Program Global Area (PGA). which is also called work area. The size of a work area can be
+  controlled and tuned. Generally, bigger work areas can significantly improve the performance of a
+  particular operator at the cost of higher memory consumption. Ideally, the size of a work area is
+  big enough that it can accommodate the input data and auxiliary memory structures allocated by its
+  associated SQL operator. This is known as the optimal size of a work area (e.g. a memory sort). When
+  the size of the work area is smaller than optimal (e.g. a disk sort), the response time increases,
+  because an extra pass is performed over part of the input data. This is known as the one-pass size
+  of the work area. Under the one-pass threshold, when the size of a work area is far too small
+  compared to the input data size, multiple passes over the input data are needed. This could
+  dramatically increase the response time of the operator. This is known as the multi-pass size of the
+  work area. In Oracle8i administrators sized the PGA by carefully adjusting a number of
+  initialization parameters, such as, SORT_AREA_SIZE, HASH_AREA_SIZE, BITMAP_MERGE_AREA_SIZE, and
+  CREATE_BITMAP_AREA_SIZE, etc. Oracle9i provides an option to completely automate the management of
+  PGA memory. to an instance using a newly introduced initialization parameter PGA_AGGREGATE_TARGET.
+  The database server automatically distributes this memory among various active queries in an
+  intelligent manner so as to ensure maximum performance benefits and the most efficient utilization
+  of memory. Furthermore, Oracle9i can adapt itself to changing workload thus utilizing resources
+  efficiently regardless of the load on the system. The amount of the PGA memory available to an
+  instance can be changed dynamically by altering the value of the PGA_AGGREGATE_TARGET parameter
+  making it possible to add to and remove PGA memory from an active instance online. Since the
+  database engine itself is better equipped to determine SQL execution memory requirements, database
+  administrators should use this feature and not try to tune the PGA manually. This should translate
+  to better throughput for large number of users on the system as well as improved response time for
+  queries. The automatic SQL execution memory management feature is enabled by setting the parameter
+  WORKAREA_SIZE_POLICY to AUTO and by specifying a size of PGA_AGGREGATE_TARGET in the initialization
+  file. These two parameters can also be set dynamically using the ALTER SYSTEM command. In the
+  absence of either of these parameters, the database will revert to manual PGA management mode. In
+  Oracle9i Release 2, advisory for PGA_AGGREGATE_TARGET was introduced. Just like in Buffer Cache
+  Advisory, the PGA Advisory will suggest the appropriate size for PGA memory and thus make PGA tuning
+  an even simpler task. Note: Until 9iR2, PGA_AGGREGATE_TARGET parameter controls the sizing of
+  workareas for all dedicated server connections, but it has no effect on shared servers (aka MTS)
+  connections and the *_AREA_SIZE parameters will take precedence in this case. In 10g,
+  PGA_AGGREGATE_TARGET controls workareas allocated by both dedicated and shared connections. How To
+  Tune PGA_AGGREGATE_TARGET ---------------------------------- The first question we will have when we
+  set this parameter is what is the best value for it To determine the appropriate setting for
+  PGA_AGGREGATE_TARGET parameter I recommend to follow the following steps 1- Make a first estimate
+  for PGA_AGGREGATE_TARGET based on the following rule - For OLTP systems PGA_AGGREGATE_TARGET =
+  (<Total Physical Memory > * 80%) * 20% - For DSS systems PGA_AGGREGATE_TARGET = (<Total Physical
+  Memory > * 80%) * 50% So for example if we have an Oracle instance configured on system with 16G of
+  Physical memory, then the suggested PGA_AGGREGATE_TARGET parameter value we should start with incase
+  we have OLTP system is (16 G * 80%)*20% ~= 2.5G and incase we have DSS system is (16 G * 80%)* 50%
+  ~= 6.5 G. In the above equation we assume that 20 % of the memory will be used by the OS, and in
+  OLTP system 20 % of the remaining memory will be used for PGA_AGGREGATE_TARGET and the remaining
+  memory is going for Oracle SGA memory and non-oracle processes memory. So make sure that you have
+  enough memory for your SGA and also for non-oracle processes 2- Second step in tuning the
+  PGA_AGGREGATE_TARGET is to monitor performance using available PGA statistics and see if
+  PGA_AGGREGATE_TARGET is under sized or over sized. Several dynamic performance views are available
+  for this purpose: - V$PGASTAT This view provides instance-level statistics on the PGA memory usage
+  and the automatic PGA memory manager. For example: SELECT * FROM V$PGASTAT; NAME VALUE
+  -------------------------------------------------------- aggregate PGA target parameter 524288000
+  bytes aggregate PGA auto target 463435776 bytes global memory bound 25600 bytes total PGA inuse
+  9353216 bytes total PGA allocated 73516032 bytes maximum PGA allocated 698371072 bytes total PGA
+  used for auto workareas 0 bytes maximum PGA used for auto workareas 560744448 bytes total PGA used
+  for manual workareas 0 bytes maximum PGA used for manual workareas 0 bytes over allocation count 0
+  bytes total bytes processed 4.0072E+10 bytes total extra bytes read/written 3.1517E+10 bytes cache
+  hit percentage 55.97 percent Main statistics to look at (a) aggregate PGA auto target : This gives
+  the amount of PGA memory Oracle can use for work areas running in automatic mode. This part of
+  memory represent the tunable part of PGA memory,i.e. memory allocated for intensive memory SQL
+  operators like sorts, hash-join, group-by, bitmap merge and bitmap index create. This memory part
+  can be shrinked/expanded in function of the system load. Other parts of PGA memory are known as
+  untunable, i.e. they require a size that can't be negociated (e.g. context information for each
+  session, for each open/active cursor, PL/SQL or Java memory). So, the aggregate PGA auto target
+  should not be small compared to the value of PGA_AGGREGATE_TARGET. You must ensure that enough PGA
+  memory is left for work areas running in automatic mode. (b) total PGA used for auto workarea: This
+  gives the actual tunable PGA memory used by the system. The 'maximum PGA used for auto workareas'
+  gives the maximum reached by previous statistic since instance startup. the detail of this figure
+  stands in the KSUSEPGAAUTO column of X$KSUSE (c) total PGA in used: This gives the total PGA memory
+  in use. The detail of this value can be found in the PGA_USED_MEM column of the v$process view.
+  Oracle92 only: (d) over allocation count: Over-allocating PGA memory can happen if the value of
+  PGA_AGGREGATE_TARGET is too small to accommodate the untunable PGA memory part plus the minimum
+  memory required to execute the work area workload. When this happens, Oracle cannot honor the
+  initialization parameter PGA_AGGREGATE_TARGET, and
+
+  ── 摘要 ──
+  介绍 Oracle9i/10g 自动 PGA 内存管理，通过 PGA_AGGREGATE_TARGET 和 WORKAREA_SIZE_POLICY=AUTO 替代手动设置 SORT_AREA_SIZE、HASH_AREA_SIZE 等参数，自动为 SQL 工作区分配内存。工作区可分为 optimal、one-pass、multi-pass 三种大小，multi-pass 会显著延长。

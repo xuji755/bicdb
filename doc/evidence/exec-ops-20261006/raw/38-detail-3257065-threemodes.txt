@@ -1,0 +1,11 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: PGA工作区三种执行模式：Optimal、One-Pass、Multi-Pass
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3257065
+
+  ── 描述 ──
+  optimal模式表示工作区所需内存充足，操作在PGA内存中完成，效率最高。One-Pass和Multi-Pass模式需要将中间结果写入临时表空间或从外部辅助空间读取，导致额外I/O，性能下降。
+
+  ── 摘要 ──
+  PGA工作区操作有优化模式(optimal)、One-Pass和Multi-Pass三种。optimal模式完全在内存中完成；当PGA空间不足时，Oracle使用外部辅助空间，结合One-Pass或Multi-Pass模式完成操作，系统性能将受到影响。

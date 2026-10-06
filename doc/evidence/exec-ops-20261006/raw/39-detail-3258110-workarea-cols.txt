@@ -1,0 +1,18 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 代码清单7-1：按 SQL_ID 查询 v$sql_workarea
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:3258110
+
+  ── 描述 ──
+  代码清单7-1 先使用 col op format a15 trunc、col policy format a8 trunc、col last format a10 trunc、set
+  numwidth 8、set line 200 设置输出格式，然后执行 select operation_type as op, operation_id as id, policy,
+  round(estimated_optimal_size/1024/1024,2) as e_opt, round(estimated_onepass_size/1024/1024,2) as
+  e_one, round(last_memory_used/1024/1024,2) as l_mem, last_execution as last, total_executions as
+  tot, optimal_executions as opt, onepass_executions as one, multipasses_executions as mult,
+  round(active_time/1000000,2) as sec, round(max_tempseg_size/1024/1024,2) as tmp_m,
+  round(last_tempseg_size/1024/1024,2) as tmp_L from v$sql_workarea where
+  sql_id='37qjh5yuha3x9';。该脚本用于查看指定 SQL 的工作区操作类型、策略、内存估算和临时段使用。
+
+  ── 摘要 ──
+  该 SQL 在格式化列后查询 v$sql_workarea，where sql_id='37qjh5yuha3x9'，输出 operation_type、policy、estimated_optimal_size、estimated_onepass_size、last_memory_used、last_execution、total_executions、optimal_executions、onepass_executions、multipasses_executions、active_time、max_tempseg_size、last_tempseg_size，并将内存除以 1024/1024 转为 MB、active_time 除以 1000000 转为秒。

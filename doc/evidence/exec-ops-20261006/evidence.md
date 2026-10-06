@@ -84,3 +84,38 @@
 
 **未核验**：PG `HashSetOp` 是否支持 spill（内存不足时的行为）；Oracle MINUS 是否
 改写为反连接。两项都不影响本库取法（见设计 §2.7 的路线评估）。
+
+---
+
+## 追加（2026-10-06）：Oracle PGA 自动管理与工作内存（WMM 设计依据）
+
+**问题**：工作内存/溢出管理——Oracle PGA 自动算法 vs PG `work_mem` 手工；
+本库该采用什么。
+
+| # | 证据 | 要点 |
+| --- | --- | --- |
+| `2049008`（Note:223730.1） | 9i/10g 自动 PGA 管理 | `PGA_AGGREGATE_TARGET` + `WORKAREA_SIZE_POLICY=AUTO` 取代 `SORT_AREA_SIZE`/`HASH_AREA_SIZE` 等手工参数；**官方口径："数据库引擎自己更清楚 SQL 执行的内存需求，DBA 不应手工调 PGA"** |
+| `2049008` | **三种尺寸** | **optimal**（内存完成）/ **one-pass**（小一档 ⇒ 对部分输入**多走一趟**；如磁盘排序） / **multi-pass**（远小于输入 ⇒ 多趟，**显著拖长**）——定义与机理原文 |
+| `2049008` | `V$PGASTAT` 口径 | aggregate PGA target / **aggregate PGA auto target**（可调面）/ **global memory bound**（单工作区上限）/ total PGA inuse·allocated / **over allocation count** / total bytes processed / **total extra bytes read/written** / **cache hit percentage** |
+| `3257077` | **单会话上限规则** | 串行会话 ≤ **目标 5%**；并行 ≤30%；并行子作业 ≤ (30%×目标)/DOP |
+| `2049366`（Note:453540.1） | 超规格互证 | 想拿到"期望工作区大小"需 `PGA_AGGREGATE_TARGET ≥ 5×`（即**单工作区 ≈ 目标/5** 的另一面）+ `_PGA_MAX_SIZE`/`_SMM_MAX_SIZE` |
+| `3257065` | 三态定义 | optimal = 内存充足；one-pass/multi-pass 需写临时表空间或读外部辅助空间，多付 I/O |
+| `1996657`/`4116381`/`3258110` | **监测口径** | `V$SYSSTAT` 的 `workarea executions - optimal/onepass/multipass` + `V$SQL_WORKAREA(_ACTIVE)`：**`estimated_optimal_size`/`estimated_onepass_size`**/last_memory_used/number_passes/`max_tempseg_size`；**判读：绝大多数 optimal 才是目标正确**（示例 100% optimal） |
+| `2239823` | 顾问视图 | `V$PGA_TARGET_ADVICE`：`estd_pga_cache_hit_percentage` + `estd_overalloc_count` 按目标值评估（示例：1500MB → 95% 命中、0 过分配）；AWR 口径：**"增大 PGA 直到额外磁盘 I/O 不再明显下降且 Overalloc = 0"** |
+| `324063` | 故障形态 | PGA 目标过小 ⇒ 工作区被压缩 ⇒ **溢出到临时段、磁盘 I/O 上升**（PGA_OVERALLOCATION） |
+| `2042451`（Bug 6817844） | 反面教训 | 自动管理下**PGA 充足仍多趟排序**（新排序算法）——**自动算法本身也会有坏形态，监测口径是设计的一部分** |
+
+**结论（供设计引用）**：
+
+1. Oracle 模型 = **实例目标（全局硬上界）+ 每会话/工作区自动分配 + 三态尺寸 +
+   可判读监测**；PG 模型 = **每算子手工上限（work_mem）**，并发下无全局上界
+   （N 会话 × M 算子 × work_mem 可相乘放大；KB `3362144` 亦记"work_mem 过大致
+   内存不足"）。
+2. **对本库（多工作区隔离 + agent 使用 + 不手工调参）自动模型更契合**：
+   全局上界天然存在（我们本来就有配额体系），且三态计数是我们需要的判读口径。
+3. 自动化的**风险面**也已记档（`2042451`/`324063`）：输入估计错 → 先落盘再发现
+   ⇒ 必须配"执行期改档 + 三态计数"两条防线；**"自动"不等于"不可观测"**。
+
+**未核验**：Oracle 内存管理器在"需求 > 目标"时的**具体缩减策略**（按收益排序的
+细节、目标大小的精确公式）知识库未收录 ⇒ 我们自研分配/缩减算法（设计 §4.2），
+并在形式上对齐已核验的：5% 单工作区上限、三态尺寸、监测口径。

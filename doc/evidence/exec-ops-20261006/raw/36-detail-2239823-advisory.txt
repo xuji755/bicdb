@@ -1,0 +1,13 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed,KEOpSQLReviewed
+  名称: 使用 V$PGA_TARGET_ADVICE 评估 PGA 目标大小
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2239823
+
+  ── 描述 ──
+  原文给出 SQL：SELECT ROUND(pga_target_for_estimate/1024/1024) target_mb, estd_pga_cache_hit_percentage
+  cache_hit_perc, estd_overalloc_count FROM V$PGA_TARGET_ADVICE; 该视图用于获取 PGA 目标大小的建议。示例输出显示 250MB 时命中率
+  66%、过分配 13703；500MB 时 87%、86；1000MB 时 95%、4；1500MB 时 95%、0；2000MB 及以上 98%-99%、0。
+
+  ── 摘要 ──
+  通过查询 V$PGA_TARGET_ADVICE，按 pga_target_for_estimate 查看不同目标值下的 estd_pga_cache_hit_percentage 和 estd_overalloc_count，以确定 PGA 目标大小。示例中 1500MB 目标对应 95% 命中率且过分配计数为 0。

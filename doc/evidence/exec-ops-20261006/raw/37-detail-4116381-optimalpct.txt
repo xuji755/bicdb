@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity
+  名称: 通过 V$SYSSTAT 计算 workarea 执行模式百分比
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:4116381
+
+  ── 描述 ──
+  原文 SQL：SELECT name PROFILE, cnt COUNT, DECODE(total, 0, 0, ROUND(cnt*100/total)) PERCENTAGE FROM
+  (SELECT name, value cnt, (sum(value) over ()) total FROM V$SYSSTAT WHERE name like 'workarea
+  exec%'); 结论：Since almost all the sorting and temporary operation are carried out in optimal category
+  we can conclude that out PGA is sized correctly.
+
+  ── 摘要 ──
+  查询 V$SYSSTAT 中 name like 'workarea exec%' 的统计，并用窗口函数计算 optimal、onepass、multipass 执行次数占总数的百分比；若绝大多数为 optimal，可判断 PGA 大小正确。示例 optimal 26154868 次占 100%，onepass 14607 次占 0%，multipass 0 次。
