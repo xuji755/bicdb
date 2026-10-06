@@ -8,10 +8,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bicdb-access = { path = "../access" }
 bicdb-common = { path = "../common" }
 bicdb-storage = { path = "../storage" }
 bicdb-index = { path = "../index" }
+bicdb-txn = { path = "../txn" }
 bicdb-types = { path = "../types" }
+bicdb-wal = { path = "../wal" }
 bicdb-workspace = { path = "../workspace" }
 
 [dev-dependencies]

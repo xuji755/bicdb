@@ -27,7 +27,7 @@ use crate::heap::TableAccessError;
 
 impl From<IndexError> for TableAccessError {
     fn from(e: IndexError) -> Self {
-        Self::Segment(SegmentSpaceError::Io(std::io::Error::other(e.to_string())))
+        Self::Index(e)
     }
 }
 

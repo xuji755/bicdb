@@ -19,9 +19,11 @@ use std::path::Path;
 
 use bicdb_index::{IndexError, SegmentStore, Tree};
 use bicdb_storage::bootstrap::{self, BootstrapEntry};
+use bicdb_storage::buffer::BufferPool;
 use bicdb_storage::datafile::{DataFile, DataFileError};
 use bicdb_storage::heap::{self, InsertPolicy};
 use bicdb_storage::key;
+use bicdb_storage::page::SlotStatus;
 use bicdb_storage::page::{Page, PageType};
 use bicdb_storage::row::RowView;
 use bicdb_storage::rowid::RowId;
@@ -135,6 +137,10 @@ pub struct Catalog<'io> {
     indexes: BTreeMap<&'static str, (u32, KeyDef, &'static str)>,
     /// **字典行缓存**（§4.2；每工作区一份——不跨工作区）。
     pub(crate) cache: crate::cache::RowCache,
+    /// **缓冲池**（活系统形态）：段/页读取经池——元数据页 **no-force**，
+    /// 直读文件会拿到旧像（`append_pos`/树头/刚写的行）。`None` = 直读形态
+    /// （打开链/工具/测试的静默期）。
+    pool: Option<&'io BufferPool<'io>>,
     /// **当前的提交序号**（装载戳；打开时 = 恢复后的最新已提交序号）。
     pub(crate) current_seq: u64,
 }
@@ -216,6 +222,7 @@ impl<'io> Catalog<'io> {
             tables,
             indexes,
             cache: crate::cache::RowCache::new(0),
+            pool: None,
             current_seq: 0,
         })
     }
@@ -253,39 +260,166 @@ impl<'io> Catalog<'io> {
             .1)
     }
 
-    /// 某个键的定义（按索引名）。
-    pub fn key_def(&self, index: &str) -> Result<(&'static str, KeyDef), OpenError> {
-        let (_, k, t) = self
+    /// **表的段头块**（`seg$.block_id`；DDL 写侧用）。
+    pub fn table_segment_block(&self, table: &str) -> Result<u32, OpenError> {
+        Ok(self
+            .tables
+            .get(table)
+            .ok_or_else(|| OpenError::NoSuchObject(table.to_owned()))?
+            .0)
+    }
+
+    /// **索引的段头块**（DDL 写侧用）。
+    pub fn index_segment_block(&self, index: &str) -> Result<u32, OpenError> {
+        Ok(self
             .indexes
             .get(index)
+            .ok_or_else(|| OpenError::NoSuchObject(index.to_owned()))?
+            .0)
+    }
+
+    /// 工作区标识（`[u8;8]`；DDL 写侧直接借出）。
+    #[must_use]
+    pub fn ws(&self) -> [u8; 8] {
+        self.ws
+    }
+
+    /// **字典所在文件的可变借用**（DDL 写侧经表访问服务写 file 0）。
+    pub fn file_mut(&mut self) -> &mut DataFile<'io> {
+        &mut self.file
+    }
+
+    /// 某个键的定义（按索引名）。
+    pub fn key_def(&self, index: &str) -> Result<(&'static str, KeyDef), OpenError> {
+        if let Some((_, k, t)) = self.indexes.get(index) {
+            return Ok((*t, *k));
+        }
+        // **活路径**：DDL 新建的字典表索引（`stat$`/`seq$` 的键）——定义仍来自
+        // 内核常量，段头块走 `index_target_live`。
+        let (t, k) = dict::DICT_TABLES
+            .iter()
+            .find_map(|t| t.keys.iter().find(|k| k.name == index).map(|k| (t.name, k)))
             .ok_or_else(|| OpenError::NoSuchObject(index.to_owned()))?;
-        Ok((*t, *k))
+        Ok((t, *k))
+    }
+
+    /// **索引的段头块**（活路径：`obj$`(索引命名空间) → `seg$`）。
+    fn index_target_live(&mut self, index: &str) -> Result<u32, OpenError> {
+        let ns = comp_num(u64::from(dict::namespace::INDEX));
+        let nm = comp_text(index);
+        let (_, obj_row) = self
+            .lookup("i_obj_name", &[Some(&ns), Some(&nm)])?
+            .ok_or_else(|| OpenError::NoSuchObject(index.to_owned()))?;
+        let dataobj = match obj_row.get(4) {
+            Some(DictValue::Num(n)) => *n,
+            _ => return Err(mismatch("obj$.dataobj# 形态非法")),
+        };
+        let skey = comp_num(dataobj);
+        let (_, seg_row) = self
+            .lookup("i_seg_pk", &[Some(&skey)])?
+            .ok_or_else(|| OpenError::NoSuchObject(format!("seg$ 无 dataobj# {dataobj}")))?;
+        match seg_row.get(2) {
+            Some(DictValue::Num(b)) => Ok(*b as u32),
+            _ => Err(mismatch("seg$.block_id 形态非法")),
+        }
+    }
+
+    /// **索引的段头块**（静态映射 → 活路径回退）。
+    fn index_block_of(&mut self, index: &str) -> Result<u32, OpenError> {
+        if let Some((block, _, _)) = self.indexes.get(index) {
+            return Ok(*block);
+        }
+        self.index_target_live(index)
+    }
+
+    /// **接上缓冲池**（活系统形态）：此后段/页读取经池（no-force 纪律）。
+    ///
+    /// 打开链/静默期（`pool == None`）保持直读——两者读的是同一张盘，只在
+    /// "页已改未落盘"的窗口里不同；活系统的正确读法只有经池这一条。
+    pub fn attach_pool(&mut self, pool: &'io BufferPool<'io>) {
+        self.pool = Some(pool);
+    }
+
+    /// **一张页的当前镜像**（池优先；`None` 池/未命中 = 直读文件）。
+    fn page_pooled(&self, block: u32) -> Result<Page, OpenError> {
+        if let Some(pool) = self.pool {
+            let rdba = bicdb_storage::rowid::Rdba::from_parts(self.file.file_id(), block)
+                .ok_or(OpenError::NotAHeapPage { block })?;
+            let key = bicdb_storage::buffer::BufferKey::new(self.ws, rdba);
+            if let Ok(g) = pool.pin(key) {
+                return Ok(Page::from_bytes(Box::new(*g.as_bytes())));
+            }
+        }
+        Ok(self.file.read_page(block)?)
+    }
+
+    /// 打开一个段（**池优先**；`None` 池 = 直读）。
+    fn open_segment<'s>(&'s mut self, block: u32) -> Result<Segment<'io, 's>, OpenError> {
+        match self.pool {
+            Some(pool) => Ok(Segment::open_pooled(pool, &mut self.file, block, self.ws)?),
+            None => Ok(Segment::open(&mut self.file, block)?),
+        }
+    }
+
+    /// **表的段头块**（静态映射 → **活路径**回退：`obj$` → `seg$`）。
+    ///
+    /// 静态映射只覆盖自举集；`stat$`/`seq$`/用户表的段头事实在 `seg$` 里。
+    pub fn segment_block_of(&mut self, table: &str) -> Result<u32, OpenError> {
+        if let Some((block, _)) = self.tables.get(table) {
+            return Ok(*block);
+        }
+        let ns = comp_num(u64::from(dict::namespace::TABLE));
+        let nm = comp_text(table);
+        let (_, obj_row) = self
+            .lookup("i_obj_name", &[Some(&ns), Some(&nm)])?
+            .ok_or_else(|| OpenError::NoSuchObject(table.to_owned()))?;
+        let dataobj = match obj_row.get(4) {
+            Some(DictValue::Num(n)) => *n,
+            _ => return Err(mismatch("obj$.dataobj# 形态非法")),
+        };
+        let skey = comp_num(dataobj);
+        let (_, seg_row) = self
+            .lookup("i_seg_pk", &[Some(&skey)])?
+            .ok_or_else(|| OpenError::NoSuchObject(format!("seg$ 无 dataobj# {dataobj}")))?;
+        match seg_row.get(2) {
+            Some(DictValue::Num(b)) => Ok(*b as u32),
+            _ => Err(mismatch("seg$.block_id 形态非法")),
+        }
     }
 
     /// 按名取表段（作用域内借用——段打开是廉价的：读一张段头页）。
     pub fn segment<'s>(&'s mut self, table: &str) -> Result<Segment<'io, 's>, OpenError> {
-        let (block, _) = self
-            .tables
-            .get(table)
-            .ok_or_else(|| OpenError::NoSuchObject(table.to_owned()))?;
-        Ok(Segment::open(&mut self.file, *block)?)
+        let block = self.segment_block_of(table)?;
+        self.open_segment(block)
+    }
+
+    /// 按段头块取段（DDL 用）。
+    pub fn segment_at<'s>(&'s mut self, block: u32) -> Result<Segment<'io, 's>, OpenError> {
+        self.open_segment(block)
     }
 
     /// **扫全表**（字典表都很小；返回 `(ROWID, 行值)`，按物理序）。
     pub fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Vec<DictValue>)>, OpenError> {
-        let def = self.table_def(table)?;
+        let types = self.table_type_codes(table)?;
         let fid = self.file.file_id();
-        let seg = self.segment(table)?;
-        let hwm = seg.hwm();
-        let mut out = Vec::new();
-        for logical in 0..hwm {
-            if logical == 0 || seg.is_bitmap_page(logical) {
-                continue;
+        // 先取"段内数据页清单"（借用段即取即放），再逐页经池读。
+        let blocks: Vec<u32> = {
+            let seg = self.segment(table)?;
+            let hwm = seg.hwm();
+            let mut out = Vec::new();
+            for logical in 0..hwm {
+                if logical == 0 || seg.is_bitmap_page(logical) {
+                    continue;
+                }
+                if let Some(block) = seg.logical_block(logical) {
+                    out.push(block);
+                }
             }
-            let Some(block) = seg.logical_block(logical) else {
-                continue;
-            };
-            let page = seg.read_page(logical)?;
+            out
+        };
+        let mut out = Vec::new();
+        for block in blocks {
+            let page = self.page_pooled(block)?;
             if page.header().map(|h| h.page_type) != Some(PageType::HeapTable) {
                 continue;
             }
@@ -295,19 +429,101 @@ impl<'io> Catalog<'io> {
                 };
                 let rid =
                     RowId::from_parts(fid, block, row_no).map_err(|_| mismatch("行号越域"))?;
-                out.push((rid, row::decode(bytes, def.columns)?));
+                out.push((rid, row::decode_typed(bytes, &types)?));
             }
         }
         Ok(out)
     }
 
-    /// **按 ROWID 取一行**。
+    /// **表的列类型码序列**（**活路径**：内核常量表有就用，否则读 `col$`）。
+    ///
+    /// 为什么需要它：`fetch`/`scan` 要按列解行，而新建对象（`stat$`/`seq$`/
+    /// 用户表）不在内核常量里——列定义的事实只有 `col$` 一处。
+    fn table_type_codes(&mut self, table: &str) -> Result<Vec<dict::ColTypeCode>, OpenError> {
+        if let Some((_, def)) = self.tables.get(table) {
+            return Ok(def.columns.iter().map(|c| c.type_code).collect());
+        }
+        // 活路径：obj$（表命名空间）→ col$（`i_col_pk` 前缀扫）。
+        let ns = comp_num(u64::from(dict::namespace::TABLE));
+        let nm = comp_text(table);
+        let hit = self.lookup("i_obj_name", &[Some(&ns), Some(&nm)])?;
+        let (_, obj_row) = hit.ok_or_else(|| OpenError::NoSuchObject(table.to_owned()))?;
+        let obj = match obj_row.first() {
+            Some(DictValue::Num(n)) => *n,
+            _ => return Err(mismatch("obj$.obj# 形态非法")),
+        };
+        let lo = key::encode(&[Some(&comp_num(obj))]);
+        let hi = key::encode(&[Some(&comp_num(obj)), Some(&[0xFFu8; 32])]);
+        let rows = self.range_index("i_col_pk", Some(&lo), Some(&hi))?;
+        let mut typed: Vec<(u32, dict::ColTypeCode)> = Vec::with_capacity(rows.len());
+        for (_k, rid) in rows {
+            let Some(values) = self.fetch_opt("col$", rid)? else {
+                continue; // 死索引项
+            };
+            let (col_no, code) = match (values.get(1), values.get(3)) {
+                (Some(DictValue::Num(c)), Some(DictValue::Num(t))) => (*c, *t),
+                _ => continue,
+            };
+            let t = dict::ColTypeCode::from_u8(code as u8)
+                .ok_or_else(|| mismatch("col$.type# 不认识"))?;
+            typed.push((col_no as u32, t));
+        }
+        typed.sort_by_key(|(c, _)| *c);
+        Ok(typed.into_iter().map(|(_, t)| t).collect())
+    }
+
+    /// **取一行（容忍死索引项）**：回滚留下的孤儿条目（`arch/09` §9.1.2：
+    /// 索引项**不做独立撤销**）回表会取不到行——那不是错误，是"该项已死"。
+    ///
+    /// 唯一索引至多一条活条目 ⇒ 读到死条目即视同"不存在"，无须续查。
+    pub fn fetch_opt(
+        &mut self,
+        table: &str,
+        rid: RowId,
+    ) -> Result<Option<Vec<DictValue>>, OpenError> {
+        match self.fetch(table, rid) {
+            Ok(v) => Ok(Some(v)),
+            Err(OpenError::RowMissing(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// **解析转发指针**（行迁移：ROWID 稳定，落点可能被搬过，`arch/06` §12.4）。
+    ///
+    /// 有限跳（16）——环即拒。`Forwarding` 槽的 6B 载荷 = 落点 ROWID。
+    pub fn resolve_rid(&mut self, rid: RowId) -> Result<RowId, OpenError> {
+        let mut cur = rid;
+        for _ in 0..16 {
+            let page = self.page_pooled(cur.block_id())?;
+            match heap::slot_status(&page, cur.row_id()) {
+                Some(SlotStatus::Forwarding) => {
+                    cur = heap::forwarding_target(&page, cur.row_id())
+                        .ok_or(OpenError::RowMissing(cur))?;
+                }
+                Some(SlotStatus::Normal | SlotStatus::FragmentHead) => return Ok(cur),
+                _ => return Err(OpenError::RowMissing(cur)),
+            }
+        }
+        Err(mismatch("转发链过长（疑似环）"))
+    }
+
+    /// **按 ROWID 取一行**（页读池优先——活系统形态）。
     pub fn fetch(&mut self, table: &str, rid: RowId) -> Result<Vec<DictValue>, OpenError> {
-        let def = self.table_def(table)?;
-        let mut seg = self.segment(table)?;
-        let page = read_page_of(&mut seg, rid.block_id())?;
+        let types = self.table_type_codes(table)?;
+        {
+            // 段内校验：该块必须属于本表的段（逻辑页可换算）。
+            let seg = self.segment(table)?;
+            if seg.logical_of_block(rid.block_id()).is_none() {
+                return Err(OpenError::NotAHeapPage {
+                    block: rid.block_id(),
+                });
+            }
+        }
+        // **跟随转发指针**（迁移过的行：索引里存的是稳定的旧 ROWID）。
+        let rid = self.resolve_rid(rid)?;
+        let page = self.page_pooled(rid.block_id())?;
         let bytes = row::read_from_page(&page, rid.row_id()).ok_or(OpenError::RowMissing(rid))?;
-        Ok(row::decode(bytes, def.columns)?)
+        Ok(row::decode_typed(bytes, &types)?)
     }
 
     /// **按索引点查**：`components` 与索引键列一一对应（`None` = NULL），
@@ -327,25 +543,27 @@ impl<'io> Catalog<'io> {
             )));
         }
         let encoded = key::encode(components);
-        let (block, _, _) = self
-            .indexes
-            .get(index)
-            .ok_or_else(|| OpenError::NoSuchObject(index.to_owned()))?;
-        let block = *block;
+        let block = self.index_block_of(index)?;
         let fid = self.file.file_id();
-        let found = {
-            let mut seg = Segment::open(&mut self.file, block)?;
-            let root = segment::read_tree_head(&seg.read_page(0)?)?;
-            let mut store = SegmentStore::new(&mut seg, self.ws);
-            let mut tree = Tree::open(&mut store, fid, root)?;
-            tree.lookup(&encoded)?
+        let ws = self.ws;
+        let root = segment::read_tree_head(&self.page_pooled(block)?)?;
+        let found = match self.pool {
+            // 活系统形态：树读**经池**（索引页 no-force；直读会拿到旧像）。
+            Some(pool) => {
+                let mut store = bicdb_index::ReadOnlyStore::new(pool, fid, ws);
+                let mut tree = Tree::open(&mut store, fid, root)?;
+                tree.lookup(&encoded)?
+            }
+            None => {
+                let mut seg = self.open_segment(block)?;
+                let mut store = SegmentStore::new(&mut seg, ws);
+                let mut tree = Tree::open(&mut store, fid, root)?;
+                tree.lookup(&encoded)?
+            }
         };
         match found {
             None => Ok(None),
-            Some(rid) => {
-                let row = self.fetch(table, rid)?;
-                Ok(Some((rid, row)))
-            }
+            Some(rid) => Ok(self.fetch_opt(table, rid)?.map(|row| (rid, row))),
         }
     }
 
@@ -358,18 +576,22 @@ impl<'io> Catalog<'io> {
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
     ) -> Result<Vec<IndexEntry>, OpenError> {
-        let (block, _, _) = self
-            .indexes
-            .get(index)
-            .ok_or_else(|| OpenError::NoSuchObject(index.to_owned()))?;
-        let block = *block;
+        let block = self.index_block_of(index)?;
         let fid = self.file.file_id();
-        let entries = {
-            let mut seg = Segment::open(&mut self.file, block)?;
-            let root = segment::read_tree_head(&seg.read_page(0)?)?;
-            let mut store = SegmentStore::new(&mut seg, self.ws);
-            let mut tree = Tree::open(&mut store, fid, root)?;
-            tree.range(lo, hi, usize::MAX)?
+        let ws = self.ws;
+        let root = segment::read_tree_head(&self.page_pooled(block)?)?;
+        let entries = match self.pool {
+            Some(pool) => {
+                let mut store = bicdb_index::ReadOnlyStore::new(pool, fid, ws);
+                let mut tree = Tree::open(&mut store, fid, root)?;
+                tree.range(lo, hi, usize::MAX)?
+            }
+            None => {
+                let mut seg = self.open_segment(block)?;
+                let mut store = SegmentStore::new(&mut seg, ws);
+                let mut tree = Tree::open(&mut store, fid, root)?;
+                tree.range(lo, hi, usize::MAX)?
+            }
         };
         let mut result = Vec::with_capacity(entries.len());
         for (k, rid) in entries {
@@ -383,16 +605,6 @@ impl<'io> Catalog<'io> {
     pub fn scan_index(&mut self, index: &str) -> Result<Vec<IndexEntry>, OpenError> {
         self.range_index(index, None, None)
     }
-}
-
-fn read_page_of(seg: &mut Segment<'_, '_>, block: u32) -> Result<Page, OpenError> {
-    let hwm = seg.hwm();
-    for logical in 0..hwm {
-        if seg.logical_block(logical) == Some(block) {
-            return Ok(seg.read_page(logical)?);
-        }
-    }
-    Err(OpenError::NotAHeapPage { block })
 }
 
 // ─────────────── 键分量的字节形态（与行内字节同源）───────────────

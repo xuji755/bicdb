@@ -52,6 +52,8 @@ pub enum TableAccessError {
     },
     /// 行不存在（ROWID 指向空槽）。
     RowMissing(RowId),
+    /// **索引层错误**（保真外传——唯一冲突等具名判定不得被压成字符串）。
+    Index(bicdb_index::IndexError),
 }
 
 impl std::fmt::Display for TableAccessError {
@@ -66,6 +68,7 @@ impl std::fmt::Display for TableAccessError {
                 write!(f, "行 {row_len} 字节超过单页上限 {limit}")
             }
             TableAccessError::RowMissing(rid) => write!(f, "ROWID {rid} 的行不存在"),
+            TableAccessError::Index(e) => write!(f, "表访问·索引：{e}"),
         }
     }
 }
@@ -354,6 +357,85 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         )?;
         Ok(())
     }
+}
+
+/// **经 redo 建段**（DDL 的 `CREATE TABLE`/`CREATE INDEX` 落点）。
+///
+/// ```text
+/// ① 计划建段（storage::plan_create）：分配一个区 + 段头/段内位图页首像
+/// ② 文件位图页（既有页）：经池写**页差异 redo**
+/// ③ 全新页（段头 + 段内位图）：**先格式化落盘 + fsync**，再**全页 redo**
+/// ④ 返回段头块（`seg$.block_id`）
+/// ```
+///
+/// 崩溃语义：②③ 之后段即"已创建"；DDL 事务回滚/崩溃 ⇒ 段成为**无人引用的
+/// 空闲段**（区仍标记已分配——回收随"段回收"切片；与建区期"全有或全无"不同，
+/// 这里以**不破坏已提交数据**为第一位）。
+#[allow(clippy::too_many_arguments)]
+pub fn create_segment(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    txn: &Txn,
+    file: &mut DataFile<'_>,
+    ws: [u8; 8],
+    seg_type: bicdb_storage::segment::SegType,
+    obj: u32,
+    dataobj: u32,
+    itl_max: u8,
+    pctfree: u8,
+    table_opts: u16,
+) -> Result<u32, TableAccessError> {
+    let file_id = file.file_id();
+    let planned = {
+        let mut current = {
+            move |block: u32| -> Option<Page> {
+                let rdba = Rdba::from_parts(file_id, block)?;
+                let g = pool.pin(BufferKey::new(ws, rdba)).ok()?;
+                Some(Page::from_bytes(Box::new(*g.as_bytes())))
+            }
+        };
+        bicdb_storage::segment::plan_create(
+            file,
+            seg_type,
+            obj,
+            dataobj,
+            itl_max,
+            pctfree,
+            table_opts,
+            &mut current,
+        )?
+    };
+    // ② 既有页（文件位图）：页差异 redo。
+    for (rdba, before, after) in &planned.images {
+        write::write_page_change(
+            pool,
+            log,
+            txn.raw(),
+            BufferKey::new(ws, *rdba),
+            before.as_bytes(),
+            after.as_bytes(),
+            false,
+        )?;
+    }
+    // ③ 全新页：先格式化落盘 + fsync、再全页 redo。
+    //   借段来落盘：段头页/段内位图页都还没进区映射（段尚未打开），故用
+    //   `Segment::open_pooled` 之外的最小落盘口——`DataFile::write_page` 是
+    //   物理块直写，正合"先格式化"的语义。
+    for (rdba, page) in &planned.fresh {
+        let mut p = Page::from_bytes(Box::new(*page.as_bytes()));
+        file.write_page(rdba.block_id(), &mut p)?;
+    }
+    file.sync()?;
+    for (rdba, page) in &planned.fresh {
+        let key = BufferKey::new(ws, *rdba);
+        let mut physical = |p: &Page| -> Result<(), TableAccessError> {
+            let mut q = Page::from_bytes(Box::new(*p.as_bytes()));
+            file.write_page(rdba.block_id(), &mut q)?;
+            Ok(())
+        };
+        write::fresh_page_with_redo(pool, log, txn.raw(), key, page, &mut physical)?;
+    }
+    Ok(planned.page0)
 }
 
 /// **下一个可写逻辑页**（跳过/物化段内位图页；必要时扩展段）——每一步立即入 redo。

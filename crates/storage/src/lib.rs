@@ -63,7 +63,10 @@
 //!   一律以覆盖层为读-改-写基准（提供者只反映已落地内容）。回归用例
 //!   `materializes_bitmap_windows_across_repeated_extensions`（连物化 10 个窗口）。
 //!   `Segment::plan_advance_append`（推进 `append_pos` + 抬 `hwm`，池视角基准）、
-//!   `Segment::read_physical_page`（物理块不校验读；池路径判断"是否已格式化"）。
+//!   `Segment::read_physical_page`（物理块不校验读；池路径判断"是否已格式化"）、
+//!   **`plan_create`**（**计划形态的建段**：区分配镜像经 redo、段头/段内位图页
+//!   作为全新页交给调用方"先格式化落盘 + fsync 再进 redo"——DDL 的
+//!   `CREATE TABLE`/`CREATE INDEX` 落点；与直写形态 `create` 共用同一套页镜像）。
 //!   （续，v0.28）**多工作集分区**（`BufferPool::with_partitions`：每分区自带
 //!   链/桶/写列表与具名闩锁，`H(工作区) mod N` 稳定哈希——§5.10 的 P4 形态）；
 //!   **NUMA 重绑定原语**——帧的页缓冲**惰性分配**（装页线程 = 首次触碰者，

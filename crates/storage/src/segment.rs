@@ -599,6 +599,144 @@ fn current_page(
     }
 }
 
+/// **计划形态的建段**（**不落盘**；DDL 的 `CREATE TABLE`/`CREATE INDEX` 用）。
+///
+/// 与直写的 [`Segment::create`] 是**同一套页镜像**，区别只在落地方式：
+/// - `images`：**既有页**的（前像、后像）——这里是文件级位图页（区分配）；
+///   调用方经池写**页差异 redo**；
+/// - `fresh`：**全新页**（段头页 + 段内位图页）——调用方必须**先格式化落盘 +
+///   fsync、再让它们进 redo**（与撤销页/索引页同一条纪律：物理增量无法重建
+///   一个不存在的页）。
+///
+/// 落地完成后用 [`Segment::open_pooled`] 打开（池优先段头读）。
+#[derive(Debug)]
+pub struct PlannedCreate {
+    /// 分配的区号。
+    pub extent: crate::bitmap::ExtentNo,
+    /// 段头页物理块（= `first_block_of(extent)`；`seg$` 的 `block_id`）。
+    pub page0: u32,
+    /// 既有页镜像（文件位图页）：经池 + 页差异 redo。
+    pub images: Vec<(Rdba, Page, Page)>,
+    /// 全新页（段头 + 段内位图页）：先格式化落盘 + fsync，再全页 redo。
+    pub fresh: Vec<(Rdba, Page)>,
+}
+
+/// **计划建段**：分配一个区、组装段头页与段内位图页的首像（不写盘）。
+///
+/// 参数表与直写形态 [`Segment::create`] 同构（+ 计划器的当前镜像提供者）——
+/// 刻意摆明"建段要哪些表参数"，不打包成结构体。
+#[allow(clippy::too_many_arguments)]
+pub fn plan_create(
+    file: &mut crate::datafile::DataFile<'_>,
+    seg_type: SegType,
+    obj: u32,
+    dataobj: u32,
+    itl_max: u8,
+    pctfree: u8,
+    table_opts: u16,
+    current: CurrentPages<'_>,
+) -> Result<PlannedCreate, SegmentSpaceError> {
+    let planned = file.plan_allocate_extent(current)?;
+    let page0 = file.layout().first_block_of(planned.extent);
+    let file_id = file.file_id();
+    // 文件级位图页的镜像 → rdba（与 `plan_extend` 同款换算）。
+    let mut images: Vec<(Rdba, Page, Page)> = Vec::new();
+    for (page_in_run, before, after) in planned.images {
+        let block = planned.run_start + u32::from(page_in_run);
+        let rdba = Rdba::from_parts(file_id, block)
+            .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?;
+        images.push((rdba, before, after));
+    }
+    // 全新页：段头 + 段内位图页。
+    let (page, _header, _map) = format_segment_header_page(
+        file, page0, seg_type, obj, dataobj, itl_max, pctfree, table_opts,
+    )?;
+    let bmp = format_segment_bitmap_page(file, page0 + 1)?;
+    let fresh = vec![
+        (
+            Rdba::from_parts(file_id, page0)
+                .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?,
+            page,
+        ),
+        (
+            Rdba::from_parts(file_id, page0 + 1)
+                .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?,
+            bmp,
+        ),
+    ];
+    Ok(PlannedCreate {
+        extent: planned.extent,
+        page0,
+        images,
+        fresh,
+    })
+}
+
+/// 段头页的首像（公共部分 + 首个区间项 + 内存镜像）。
+#[allow(clippy::too_many_arguments)]
+fn format_segment_header_page(
+    file: &crate::datafile::DataFile<'_>,
+    page0: u32,
+    seg_type: SegType,
+    obj: u32,
+    dataobj: u32,
+    itl_max: u8,
+    pctfree: u8,
+    table_opts: u16,
+) -> Result<(Page, SegmentHeader, Vec<ExtentEntry>), SegmentSpaceError> {
+    let header = SegmentHeader {
+        seg_type,
+        map_format: SEG_MAP_FORMAT,
+        flags: 0,
+        dataobj,
+        obj,
+        pages_per_extent: EXTENT_BLOCKS as u8,
+        itl_max,
+        pctfree,
+        table_opts,
+        hwm: 2, // 逻辑页 0/1 = 元数据；数据页从 2 起
+        append_pos: 2,
+        first_bitmap_page: 1,
+        insert_hint: 1,
+        extent_count: 0, // append_extent 落定首区后为 1
+        bitmap_pages: 1,
+        next_map_page: 0,
+    };
+    let rdba = Rdba::from_parts(file.file_id(), page0)
+        .ok_or(SegmentSpaceError::Format(SegmentError::Malformed))?;
+    let mut page = Page::new(
+        PageType::SegmentHeader,
+        file.workspace_ref(),
+        file.file_id(),
+        page0,
+    );
+    write_header(&mut page, &header)?;
+    let map = append_extent(&mut page, ExtentEntry::new(rdba, 1))?;
+    let header = read_header(&page)?;
+    Ok((page, header, map))
+}
+
+/// 段内位图页（类型 8，kind = 空闲级别；own_index = 0）的首像。
+fn format_segment_bitmap_page(
+    file: &crate::datafile::DataFile<'_>,
+    block: u32,
+) -> Result<Page, SegmentSpaceError> {
+    let mut bmp = Page::new(
+        PageType::Bitmap,
+        file.workspace_ref(),
+        file.file_id(),
+        block,
+    );
+    crate::bitmap::init(&mut bmp, crate::bitmap::BitmapKind::FreeLevel, 0)?;
+    for k in 0..2u32 {
+        crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::Full)?;
+    }
+    for k in 2..EXTENT_BLOCKS {
+        crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::High)?;
+    }
+    Ok(bmp)
+}
+
 /// 一个段：段头 + 区映射的内存镜像 + 其所在的数据文件。
 ///
 /// 布局约定（每个段的**首区**）：逻辑页 0 = 段头页、逻辑页 1 = **首个段内
@@ -642,52 +780,12 @@ impl<'io, 'f> Segment<'io, 'f> {
     ) -> Result<Self, SegmentSpaceError> {
         let extent = file.allocate_extent()?;
         let page0 = file.layout().first_block_of(extent);
-        let header = SegmentHeader {
-            seg_type,
-            map_format: SEG_MAP_FORMAT,
-            flags: 0,
-            dataobj,
-            obj,
-            pages_per_extent: EXTENT_BLOCKS as u8,
-            itl_max,
-            pctfree,
-            table_opts,
-            hwm: 2, // 逻辑页 0/1 = 元数据；数据页从 2 起
-            append_pos: 2,
-            first_bitmap_page: 1,
-            insert_hint: 1,
-            extent_count: 0, // append_extent 落定首区后为 1
-            bitmap_pages: 1,
-            next_map_page: 0,
-        };
-        let rdba = Rdba::from_parts(file.file_id(), page0).expect("块号在 28 位内");
-        let mut page = Page::new(
-            PageType::SegmentHeader,
-            file.workspace_ref(),
-            file.file_id(),
-            page0,
-        );
-        write_header(&mut page, &header)?;
-        let map = append_extent(&mut page, ExtentEntry::new(rdba, 1))?;
-        let header = read_header(&page)?;
+        let (mut page, header, map) = format_segment_header_page(
+            file, page0, seg_type, obj, dataobj, itl_max, pctfree, table_opts,
+        )?;
         file.write_page(page0, &mut page)?;
-
-        // 段内位图页（类型 8，kind = 空闲级别；own_index = 0）。
-        let mut bmp = Page::new(
-            PageType::Bitmap,
-            file.workspace_ref(),
-            file.file_id(),
-            page0 + 1,
-        );
-        crate::bitmap::init(&mut bmp, crate::bitmap::BitmapKind::FreeLevel, 0)?;
-        for k in 0..2u32 {
-            crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::Full)?;
-        }
-        for k in 2..EXTENT_BLOCKS {
-            crate::bitmap::set_free_level(&mut bmp, k, crate::bitmap::FreeLevel::High)?;
-        }
+        let mut bmp = format_segment_bitmap_page(file, page0 + 1)?;
         file.write_page(page0 + 1, &mut bmp)?;
-
         Ok(Self {
             file,
             header,
@@ -697,7 +795,7 @@ impl<'io, 'f> Segment<'io, 'f> {
         })
     }
 
-    /// **打开既有段**（段头物理块已知——来自 `seg$` / 引导页）。
+    /// **打开既有段**（段头物理块已知——来自 `seg$` / 引导页）。    /// **打开既有段**（段头物理块已知——来自 `seg$` / 引导页）。
     pub fn open(
         file: &'f mut crate::datafile::DataFile<'io>,
         page0: u32,

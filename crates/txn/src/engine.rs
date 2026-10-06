@@ -221,6 +221,30 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         Ok(seq)
     }
 
+    /// **借出写上下文**（表访问服务/索引维护的入口）：池 + 日志写口 + 撤销链
+    /// + 内层事务句柄，**一次给全**。
+    ///
+    /// 用途：DDL/表访问的写路径要同时用这四样（行写 `txn::write`、索引维护
+    /// `bicdb-index` 的写口、建段/增长经池 + redo），而它们分别藏在引擎的
+    /// 私有字段里（各自带锁）。开口而不是开字段：**三把内部锁在 `f` 期间被持有**
+    /// （单写者语义下本就是串行段），`f` 内**不得再调引擎方法**（会自锁）。
+    ///
+    /// `f` 的返回值原样返回；`f` 内的错误由调用方自行处理（本方法不吞错）。
+    pub fn with_write_context<R>(
+        &self,
+        handle: &mut TxnHandle,
+        f: impl FnOnce(
+            &BufferPool<'b>,
+            &mut GroupWriter<'io, 'f>,
+            &mut bicdb_storage::undo::UndoChain<'io, 'f>,
+            &mut crate::write::Txn,
+        ) -> R,
+    ) -> R {
+        let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
+        let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
+        f(self.pool, &mut wal, &mut chain, &mut handle.txn)
+    }
+
     /// **提交**：提交记录入流 + 等它耐久（提交点）→ 发布新提交序号 →
     /// **唤醒等待者**（§5.4.2 ③ 的后半步）。返回提交序号。
     ///

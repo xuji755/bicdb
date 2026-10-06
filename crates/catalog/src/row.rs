@@ -121,6 +121,29 @@ pub fn encode(values: &[DictValue], columns: &[ColDef]) -> Result<Vec<u8>, RowCo
     Ok(out)
 }
 
+/// **一个列值的"分量字节"**（= 行里该列的字节形态；`None` = NULL）。
+///
+/// **行编码与索引维护共用这一份实现**：索引键的分量必须与行内字节**逐字节相同**
+/// （`arch/06` §6.0 的保序编码口径——索引比较即字节比较），两处各写一份迟早走样。
+pub fn component_bytes(v: &DictValue, c: &ColDef) -> Result<Option<Vec<u8>>, RowCodecError> {
+    let bad = || RowCodecError::TypeMismatch {
+        col: c.col,
+        name: c.name,
+    };
+    Ok(match (c.type_code, v) {
+        (_, DictValue::Null) => None,
+        (ColTypeCode::Number, DictValue::Num(n)) => {
+            let num = bicdb_types::Number::parse(&n.to_string()).map_err(|_| bad())?;
+            Some(num.encode())
+        }
+        (ColTypeCode::Boolean, DictValue::Bool(b)) => Some(vec![u8::from(*b)]),
+        (ColTypeCode::Varchar2, DictValue::Text(t)) => Some(t.as_bytes().to_vec()),
+        (ColTypeCode::Varchar2, DictValue::Bytes(b)) => Some(b.clone()),
+        (ColTypeCode::Bytes, DictValue::Bytes(b)) => Some(b.clone()),
+        _ => return Err(bad()),
+    })
+}
+
 /// 追加一个非 NULL 值的字节（**列类型只用于形态校验**）。
 fn push_value(
     data: &mut Vec<u8>,
@@ -144,6 +167,62 @@ fn push_value(
         _ => return Err(bad()),
     }
     Ok(())
+}
+
+/// **按类型码解码**（**活对象**用：列定义来自 `col$` 而非内核常量——
+/// `ColDef` 的名字是 `&'static str`，活路径造不出来；类型码足够解码）。
+pub fn decode_typed(bytes: &[u8], types: &[ColTypeCode]) -> Result<Vec<DictValue>, RowCodecError> {
+    let view = RowView::new(bytes).map_err(|e| RowCodecError::Format(e.to_string()))?;
+    let header = view.header();
+    if header.col_count as usize != types.len() {
+        return Err(RowCodecError::ColumnCount {
+            expected: types.len(),
+            got: header.col_count as usize,
+        });
+    }
+    view.validate_var_offsets(0)
+        .map_err(|e| RowCodecError::Format(e.to_string()))?;
+    let mut out = Vec::with_capacity(types.len());
+    for (i, t) in types.iter().enumerate() {
+        if view.is_null(i as u16) {
+            out.push(DictValue::Null);
+            continue;
+        }
+        let raw = view
+            .var_column(i, 0)
+            .ok_or_else(|| RowCodecError::Format("缺列字节".to_owned()))?;
+        out.push(read_value_typed(raw, *t)?);
+    }
+    Ok(out)
+}
+
+/// 解释一列的非 NULL 字节（按类型码）。
+fn read_value_typed(raw: &[u8], t: ColTypeCode) -> Result<DictValue, RowCodecError> {
+    Ok(match t {
+        ColTypeCode::Number => {
+            let num = bicdb_types::Number::decode(raw)
+                .map_err(|_| RowCodecError::Format("数值列字节非法".to_owned()))?;
+            DictValue::Num(
+                num.to_string()
+                    .parse::<u64>()
+                    .map_err(|_| RowCodecError::Format("数值列越出字典域".to_owned()))?,
+            )
+        }
+        ColTypeCode::Boolean => match raw {
+            [0] => DictValue::Bool(false),
+            [1] => DictValue::Bool(true),
+            _ => return Err(RowCodecError::Format("布尔列字节非法".to_owned())),
+        },
+        ColTypeCode::Bytes | ColTypeCode::Uuid | ColTypeCode::AssetRef | ColTypeCode::Vector => {
+            DictValue::Bytes(raw.to_vec())
+        }
+        // 其余（Char/Varchar2/Date/Timestamp/TimestampTz/Json）按文本承载：
+        // 字典域里这些列的出现面随 DDL 扩展，先按 UTF-8 文本解释。
+        _ => DictValue::Text(
+            String::from_utf8(raw.to_vec())
+                .map_err(|_| RowCodecError::Format("非 UTF-8 文本".to_owned()))?,
+        ),
+    })
 }
 
 /// **解码一行**（按列定义解释字节）。

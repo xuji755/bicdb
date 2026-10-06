@@ -26,8 +26,12 @@
 //!   `object_version`——缓存回查 + 不可区分的 `NotFound`）；
 //! - [`fixed`]（C3）：**固定表 `file$`**（内容 = 控制文件内存映像；只读、不落盘）。
 //!
-//! **未落地**：DDL 写侧（C4：建表/建索引/删表 + `stat$`/`seq$` 接入）
-//! 与 `Move` 失效落点（C5）。
+//! - [`ddl`]（C4）：**DDL 写侧**——`create_table`/`create_index`/`drop_table`/
+//!   `drop_index` + 建区收尾 `init_dictionary_tables`（`stat$`/`seq$`）：
+//!   字典行经**表访问服务**（ITL/锁/undo/redo）+ 索引同步维护 + `mtime` =
+//!   预约的提交序号；建段与建索引都**经 redo**。
+//!
+//! **未落地**：`Move` 失效落点（C5）与"段回收"（DROP 的区归还）。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -36,6 +40,7 @@ pub mod api;
 pub mod cache;
 pub mod consistency;
 pub mod create;
+pub mod ddl;
 pub mod dict;
 pub mod fixed;
 pub mod open;
@@ -48,6 +53,11 @@ pub use cache::{
 };
 pub use consistency::{check_files, ConsistencyReport, FileCheck, FilePoint, FileVerdict, Finding};
 pub use create::{create_dictionary, BootstrapObject, BuiltDictionary, CreateError};
+pub use ddl::{
+    create_index, create_table, drop_index, drop_table, init_dictionary_tables, ColumnSpec,
+    CreateIndexOutcome, CreateTableOutcome, DdlError, DropOutcome, IndexSpec, TableOptions,
+    TableSpec,
+};
 pub use dict::{
     bootstrap_entries_normal, bootstrap_entries_public, index_kind, is_public_only, namespace,
     obj_kind, self_check, table_opt, ColDef, ColTypeCode, DictTable, KeyDef, DICT_TABLES,

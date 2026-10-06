@@ -296,7 +296,9 @@ impl<'io> Catalog<'io> {
         let entries = self.range_index("i_col_pk", Some(&lo), Some(&hi))?;
         let mut rows = Vec::with_capacity(entries.len());
         for (_comps, rid) in entries {
-            let values = self.fetch("col$", rid)?;
+            let Some(values) = self.fetch_opt("col$", rid)? else {
+                continue; // 死索引项（回滚孤儿）
+            };
             rows.push(ColRow::from_values(&values)?);
         }
         rows.sort_by_key(|r| r.col);
@@ -348,13 +350,17 @@ impl<'io> Catalog<'io> {
         let ind_entries = self.scan_index("i_ind_pk")?;
         let mut inds = Vec::with_capacity(ind_entries.len());
         for (_k, rid) in ind_entries {
-            let values = self.fetch("ind$", rid)?;
+            let Some(values) = self.fetch_opt("ind$", rid)? else {
+                continue; // 死索引项（回滚孤儿）
+            };
             inds.push(IndRow::from_values(&values)?);
         }
         let icol_entries = self.scan_index("i_icol_pk")?;
         let mut by_obj: std::collections::BTreeMap<u32, Vec<IcolRow>> = Default::default();
         for (_k, rid) in icol_entries {
-            let values = self.fetch("icol$", rid)?;
+            let Some(values) = self.fetch_opt("icol$", rid)? else {
+                continue; // 死索引项（回滚孤儿）
+            };
             let row = IcolRow::from_values(&values)?;
             by_obj.entry(row.obj).or_default().push(row);
         }

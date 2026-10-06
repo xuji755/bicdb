@@ -36,5 +36,5 @@
 pub mod heap;
 pub mod index;
 
-pub use heap::{TableAccess, TableAccessError};
+pub use heap::{create_segment, TableAccess, TableAccessError};
 pub use index::{build_index, delete_entry, insert_entry, write_tree_head_redo};

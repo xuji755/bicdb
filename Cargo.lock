@@ -23,10 +23,13 @@ version = "0.0.0"
 name = "bicdb-catalog"
 version = "0.0.0"
 dependencies = [
+ "bicdb-access",
  "bicdb-common",
  "bicdb-index",
  "bicdb-storage",
+ "bicdb-txn",
  "bicdb-types",
+ "bicdb-wal",
  "bicdb-workspace",
 ]
 
