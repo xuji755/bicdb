@@ -1,0 +1,40 @@
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] clustering factor 计算 算法 相邻 数据块 变化 计数 次数
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 34，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 44，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     son to the table that it is based upon. It is used as an indicator for computing the estimated cost of the table lookup foilowing an index access. The Clustering Factor records the number of data blocks that will be accessed when scanning an index. Clustering 
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：Note:39836.1 Clustering Factor  (排序分: 14.4)
+     └ 摘要：Clustering Factor 记录索引扫描时访问的数据块数，其值可通过 ALL|DBA|USER_INDEXES 等视图查看。它通过顺序扫描索引并比较相邻 rowid 所指向的数据块是否变化来计数，若值接近表的块数，索引顺序良好；若接近行数，则索引顺序较。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996805
+
+     [KnowledgeEntry] 聚簇因子 (Clustering Factor)  (排序分: 9.4)
+     └ 摘要：聚簇因子衡量表数据与索引顺序的一致性，通过扫描叶子块中的相邻行ID计算得出。当聚簇因子接近表的块数时，说明索引顺序与数据物理存储顺序一致，索引扫描仅需读取少量数据块；若聚簇因子接近行数，则数据随机分布，每个索引条目可能对应不同数据块，导致大量随机I/O。因此，聚簇因子是CBO判断索引效率的重要依据。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:272640
+
+     [KnowledgeEntry] Oracle | 索引优化 | Index Clustering Factor — 索引效率的深层指标  (排序分: 9.4)
+     └ 摘要：Index Clustering Factor是Oracle数据库中衡量索引效率的关键指标，记录在DBA_INDEXES视图中，其值介于表块数与行数之间。当CF较低（接近块数）时，相邻索引项指向相同数据块，回表I/O少，优化器倾向使用索引；当CF较高（接近行数）时，索引项指向分散的数据块，回表I/O多，优化器更倾向全表扫描。通过按索引键顺序重建表可以降低CF，从而提升索引效率。诊断时可通过查询DBA_INDEXES计算CF与行数的百分比来评估索引效率。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:891503
+
+     [KnowledgeEntry] 恢复算法：通过重做日志前滚数据块  (排序分: 9.4)
+     └ 详情：应用重做（Applying Redo）的核心机制是：通过将重做日志中的变更向量（Change Vectors）重新应用到数据块的正确版本，从而将数据块前滚（Rolls data blocks forward）。这确保了所有已提交的事务都能在恢复后反映在数据文件中。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1554808
+
+     [CaseStudy] 数据块损坏诊断案例  (排序分: 9.1)
+     └ 摘要：场景：查询特定表时出现ORA-01578: ORACLE data block corrupted错误。诊断：启用DATA_BLOCK_INTEGRITY_CHECK事件（`alter session set events 'DATA_BLOCK_INTEGRITY_CHECK'`），重新执行查询后，告警日志记录了损坏的数据块信息。使用dbv工具验证数据文件完整性。处理：从备份中恢复损坏的数据块，或使用RMAN的`blockrecover`命令。后续建议：启用数据库的块检查功能，设置参数`db_block_checking`和`db_block_checksum`。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1538513
+
+     [FaultModel] 数据块损坏（介质故障）  (排序分: 8.6)
+     └ 摘要：数据文件中的一个或多个数据块因物理损坏而无法读取，导致数据访问失败。原因：磁盘硬件故障、I/O子系统错误、操作系统错误或内存错误导致数据块内容损坏。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1538183
+

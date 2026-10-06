@@ -1,0 +1,31 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed
+  名称: L1：Note:39836.1 Clustering Factor
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1996805
+
+  ── 描述 ──
+  son to the table that it is based upon. It is used as an indicator for computing the estimated cost
+  of the table lookup foilowing an index access. The Clustering Factor records the number of data
+  blocks that will be accessed when scanning an index. Clustering factor values can be seen in the
+  following views: ALL|DBA|USER_INDEXES. It can be set also in the ALL|DBA|USER_IND_PARTITIONS and
+  ALL|DBA|USER_IND_SUBPARTITIONS when the indexes are partitioned. It is calculated as follows: o The
+  index is scanned in order. o The block portion of the rowid pointed at by the current indexed value
+  is compared with that pointed at by the previous indexed value. This is achieved by comparing
+  adjacent rowids in the index leaf block (the blocks themselves do not need to be visited). o If
+  these rowids are pointing at different blocks then a counter is incremented. o This is continued
+  throughout the whole index o The resultant count is then stored. If the count is close to the number
+  of blocks in the table then the index is well ordered. This is true because the counter only gets
+  incremented when the actual data is found in a different block from the last piece of row data. If
+  the count is close to the number of rows in the table then the index is less well ordered. In this
+  case adjacent index entries do not tend to point to the same block in the table, thus more block
+  reads are likely to be required. Data blocks are more likely to have to be revistited with a higher
+  clustering factor. The clustering factor can be used to adjust the potential numberof blocks that
+  will be accessed by a particular predicate or query. This is useful for determining the number of
+  base table blocks that will be visited when accessed via the index. The clustering factor is
+  effectively a count of the number of data blocks visited as the result of an index lookup.
+  Multiplying the clustering factor by the selectivity will give the cost of the operation. It is
+  predominately used to calculate costs for index range scans. .
+
+  ── 摘要 ──
+  Clustering Factor 记录索引扫描时访问的数据块数，其值可通过 ALL|DBA|USER_INDEXES 等视图查看。它通过顺序扫描索引并比较相邻 rowid 所指向的数据块是否变化来计数，若值接近表的块数，索引顺序良好；若接近行数，则索引顺序较。

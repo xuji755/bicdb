@@ -24,6 +24,18 @@ pub trait PageStore {
     fn allocate(&mut self) -> Result<u32, IndexError>;
     /// 页大小（测试/断言用）。
     fn block_count(&self) -> u32;
+    /// **本段索引页的物理序枚举**（FFS 用，§9.1.6）：块号**升序** = 区序。
+    ///
+    /// 实现方只列**索引页**（叶/枝/根）——段头页与段内位图页不属于树，
+    /// 由执行器的实现侧排除；FFS 对枚举到的每一页做页类型与块号自证。
+    fn blocks(&mut self) -> Result<Vec<u32>, IndexError>;
+    /// **区读（多块读）**（§5.12）：一次读取 `[first, first + count)` 的
+    /// **连续**块，返回与请求**同序**的页。
+    ///
+    /// 调用方保证：块号连续、落在同一文件内、`count ≥ 1`（FFS 按物理区分组，
+    /// 上限见 [`crate::tree::FFS_RUN_PAGES`]）。池形态下命中页拷副本、缺失页
+    /// 一次 `pread` 读入（不是逐页读盘）。
+    fn read_run(&mut self, first: u32, count: u32) -> Result<Vec<Page>, IndexError>;
 }
 
 /// **ROWID ↔ 块号**：索引树的页地址（file_id + block）——单文件索引段下
@@ -61,6 +73,9 @@ pub trait IndexIo {
     /// **把一页的新内容写下去**：执行器实现为"经池改页 + redo + 标脏"；
     /// 盘上尚无该页（新分配）⇒ 直接以 `after` 装入。
     fn apply_page(&mut self, block: u32, after: &Page) -> Result<(), IndexError>;
+    /// **本段索引页的物理序块号**（升序）——[`PageStore::blocks`] 的落点；
+    /// 执行器从段空间管理取（排除段头页与段内位图页）。
+    fn allocated_blocks(&mut self) -> Result<Vec<u32>, IndexError>;
 }
 
 /// **池存取口**（执行器接入的最小形态）：读经**缓冲池**（命中拷副本；
@@ -114,6 +129,23 @@ impl<I: IndexIo> PageStore for PoolStore<'_, '_, '_, I> {
 
     fn block_count(&self) -> u32 {
         u32::MAX // 池形态没有固定表上限（诊断口；段空间管理负责报满）
+    }
+
+    fn blocks(&mut self) -> Result<Vec<u32>, IndexError> {
+        self.io.allocated_blocks()
+    }
+
+    fn read_run(&mut self, first: u32, count: u32) -> Result<Vec<Page>, IndexError> {
+        let rdba = Rdba::from_parts(self.file_id, first)
+            .ok_or(IndexError::Malformed("块号越出 ROWID 域"))?;
+        self.pool
+            .read_run(self.ws, rdba, count)
+            .map_err(|e| match e {
+                BufferError::Unresolved { rdba } => IndexError::BlockNotFound {
+                    block: rdba.block_id(),
+                },
+                e => IndexError::Io(e.to_string()),
+            })
     }
 }
 
@@ -193,5 +225,23 @@ impl PageStore for MemStore {
 
     fn block_count(&self) -> u32 {
         self.pages.len() as u32
+    }
+
+    fn blocks(&mut self) -> Result<Vec<u32>, IndexError> {
+        Ok(self
+            .pages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.as_ref().map(|_| i as u32))
+            .collect())
+    }
+
+    fn read_run(&mut self, first: u32, count: u32) -> Result<Vec<Page>, IndexError> {
+        // 内存仓没有"一次读盘"的成本差别：逐页取，语义与池的区读相同。
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            out.push(self.read(first + i)?);
+        }
+        Ok(out)
     }
 }

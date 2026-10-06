@@ -1,0 +1,14 @@
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed,KEOpSQLReviewed
+  名称: Oracle | 索引优化 | Index Clustering Factor — 索引效率的深层指标
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:891503
+
+  ── 描述 ──
+  Index Clustering Factor是DBA_INDEXES中的关键指标，范围约在表块数~行数之间。低CF（接近块数）意味着相邻索引项指向相同数据块——回表I/O少，优化器倾向走索引。高CF
+  （接近行数）意味着索引项指向分散块——回表I/O多，优化器倾向全表扫描。可通过按索引键顺序重建表降低CF。 诊断： ```sql SELECT index_name,
+  clustering_factor, num_rows, ROUND(clustering_factor/num_rows*100, 2) cf_pct FROM dba_indexes WHERE
+  owner='SCHEMA' AND table_name='BIG_TABLE'; ```
+
+  ── 摘要 ──
+  Index Clustering Factor是Oracle数据库中衡量索引效率的关键指标，记录在DBA_INDEXES视图中，其值介于表块数与行数之间。当CF较低（接近块数）时，相邻索引项指向相同数据块，回表I/O少，优化器倾向使用索引；当CF较高（接近行数）时，索引项指向分散的数据块，回表I/O多，优化器更倾向全表扫描。通过按索引键顺序重建表可以降低CF，从而提升索引效率。诊断时可通过查询DBA_INDEXES计算CF与行数的百分比来评估索引效率。

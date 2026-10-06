@@ -30,7 +30,7 @@ pub mod tree;
 
 pub use page::{Entry, IndexPage, IndexPageMut, KEY_LEN_INFINITY, MAX_ENTRY_LEN, MAX_KEY_LEN};
 pub use store::{IndexIo, MemStore, PageStore, PoolStore};
-pub use tree::{InsertOutcome, SplitKind, Tree};
+pub use tree::{IndexStats, InsertOutcome, SplitKind, Tree, FFS_RUN_PAGES};
 
 /// 索引层错误（**明确判定**，不静默）。
 #[derive(Debug, Clone, PartialEq, Eq)]

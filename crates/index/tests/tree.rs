@@ -3,8 +3,10 @@
 //! 用内存页仓（`MemStore`）驱动树：插入/查找/范围/删除/分裂/根生长/
 //! 99-1 常态路径/重复键/空页留树/结构自检。
 
-use bicdb_index::{InsertOutcome, MemStore, SplitKind, Tree};
+use bicdb_index::{IndexError, InsertOutcome, MemStore, PageStore, SplitKind, Tree};
+use bicdb_storage::page::Page;
 use bicdb_storage::rowid::RowId;
+use std::cell::Cell;
 
 const FILE_ID: u16 = 3;
 const WS: [u8; 8] = [7u8; 8];
@@ -250,4 +252,138 @@ fn long_common_prefix_keys_split_with_prefix_truncation() {
     }
     assert!(tree.height() >= 1);
     tree.validate().unwrap();
+}
+
+// -- #43 收尾：FFS 与索引统计（§9.1.6；证据包 index-stats-20261006） ----------
+
+/// 区读/逐页读计数（FFS 应走区读——多块读，§5.12）。
+/// 计数器独立于 store（`&Counters`）⇒ 树持 `&mut store` 期间也能读/清。
+#[derive(Default)]
+struct Counters {
+    runs: Cell<usize>,
+    run_pages: Cell<usize>,
+    reads: Cell<usize>,
+}
+
+impl Counters {
+    fn reset(&self) {
+        self.runs.set(0);
+        self.run_pages.set(0);
+        self.reads.set(0);
+    }
+}
+
+struct CountingStore<'a> {
+    inner: &'a mut MemStore,
+    c: &'a Counters,
+}
+
+impl PageStore for CountingStore<'_> {
+    fn read(&mut self, block: u32) -> Result<Page, IndexError> {
+        self.c.reads.set(self.c.reads.get() + 1);
+        self.inner.read(block)
+    }
+    fn write(&mut self, block: u32, page: &mut Page) -> Result<(), IndexError> {
+        self.inner.write(block, page)
+    }
+    fn allocate(&mut self) -> Result<u32, IndexError> {
+        self.inner.allocate()
+    }
+    fn block_count(&self) -> u32 {
+        self.inner.block_count()
+    }
+    fn blocks(&mut self) -> Result<Vec<u32>, IndexError> {
+        self.inner.blocks()
+    }
+    fn read_run(&mut self, first: u32, count: u32) -> Result<Vec<Page>, IndexError> {
+        self.c.runs.set(self.c.runs.get() + 1);
+        self.c
+            .run_pages
+            .set(self.c.run_pages.get() + count as usize);
+        self.inner.read_run(first, count)
+    }
+}
+
+#[test]
+fn fast_full_scan_reads_in_physical_runs_and_sees_every_entry() {
+    let mut s = store(4096);
+    let counters = Counters::default();
+    let mut cs = CountingStore {
+        inner: &mut s,
+        c: &counters,
+    };
+    let mut tree = Tree::create(&mut cs, FILE_ID, WS).unwrap();
+    for i in 0..400u32 {
+        tree.insert(&big_key(i, 120), rid(1, (i % 1000 + 1) as u16))
+            .unwrap();
+    }
+    assert!(tree.height() >= 1, "多页树");
+    let ordered = tree.full_scan(10_000).unwrap();
+
+    counters.reset();
+    let ffs = tree.fast_full_scan(10_000).unwrap();
+    let runs = counters.runs.get();
+    let run_pages = counters.run_pages.get();
+    let reads = counters.reads.get();
+
+    // 同一组条目（FFS 不保序 ⇒ 排序后比对）。
+    assert_eq!(ffs.len(), ordered.len(), "FFS 与 IFS 同样见全量条目");
+    let mut a = ffs.clone();
+    let mut b = ordered.clone();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "FFS 与 IFS 是同一组条目");
+    // 多块读形态：全走区读（8 页成组）、零逐页读。
+    assert_eq!(reads, 0, "FFS 不逐页 read");
+    assert_eq!(runs, run_pages.div_ceil(8), "FFS 按 ≤ 8 页成组区读");
+    assert!(run_pages >= 3, "多页树至少若干页（实读 {run_pages}）");
+    // limit 生效；FFS 不改结构。
+    assert_eq!(tree.fast_full_scan(7).unwrap().len(), 7);
+    tree.validate().unwrap();
+    // 统计与 IFS 对账（entries = 叶条目数；叶页数 ≥ 2）。
+    let st = tree.statistics().unwrap();
+    assert_eq!(st.entries, ordered.len() as u64);
+    assert!(st.leaf_blocks >= 2, "叶页数 {}", st.leaf_blocks);
+    assert_eq!(st.blevel, tree.height());
+}
+
+#[test]
+fn clustering_factor_follows_oracle_cluf_semantics() {
+    // A) 完美聚簇：每 10 条同块、块号随键序递增 ⇒ CF = 块区间数（10）。
+    let mut s = store(64);
+    let mut tree = Tree::create(&mut s, FILE_ID, WS).unwrap();
+    for i in 0..100u32 {
+        tree.insert(&key(i), rid(1 + i / 10, (i % 10 + 1) as u16))
+            .unwrap();
+    }
+    let st = tree.statistics().unwrap();
+    assert_eq!(st.entries, 100);
+    assert_eq!(st.leaf_blocks, 1, "小键 100 条 = 单叶页");
+    assert_eq!(st.blevel, 0);
+    assert_eq!(st.clustering_factor, 10, "10 个块区间 ⇒ CF = 10");
+
+    // B) 完全离散：块号在 1/2 间交替 ⇒ 每条都换块 ⇒ CF = 行数（最坏）。
+    let mut s2 = store(64);
+    let mut t2 = Tree::create(&mut s2, FILE_ID, WS).unwrap();
+    for i in 0..100u32 {
+        t2.insert(&key(i), rid(1 + (i % 2), (i % 10 + 1) as u16))
+            .unwrap();
+    }
+    let st2 = t2.statistics().unwrap();
+    assert_eq!(st2.entries, 100);
+    assert_eq!(st2.clustering_factor, 100, "交替块 ⇒ CF = 行数（最坏）");
+    // 值域不变量：块数 ≤ CF ≤ 行数。
+    assert!(st.clustering_factor <= st.entries);
+    assert!(st2.clustering_factor <= st2.entries);
+}
+
+#[test]
+fn statistics_of_an_empty_tree_are_zero() {
+    let mut s = store(8);
+    let mut tree = Tree::create(&mut s, FILE_ID, WS).unwrap();
+    let st = tree.statistics().unwrap();
+    assert_eq!(st.entries, 0);
+    assert_eq!(st.clustering_factor, 0, "空索引无聚簇因子");
+    assert_eq!(st.leaf_blocks, 1, "空索引 = 一张空叶页");
+    assert_eq!(st.blevel, 0);
 }

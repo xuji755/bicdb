@@ -48,6 +48,25 @@ pub struct InsertOutcome {
     pub grew: bool,
 }
 
+/// **FFS 的区读上限**（§5.12：一次 `pread` ≤ 8 页 = 128 KiB）。
+pub const FFS_RUN_PAGES: u32 = 8;
+
+/// **索引统计量**（[`Tree::statistics`] 的产物；持久化随目录域 `stat$`，
+/// 本切片只计算——口径对照 Oracle `SYS.IND$`，证据包 `index-stats-20261006`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndexStats {
+    /// 叶条目数（= 被索引行数）。
+    pub entries: u64,
+    /// 叶页数（Oracle `LEAFCNT` 口径）。
+    pub leaf_blocks: u64,
+    /// 树高 − 1（Oracle `BLEVEL` 口径；空树 = 0——示例 `BLEVEL=1` = 高度 2）。
+    pub blevel: u32,
+    /// **聚簇因子**（Oracle `CLUFAC` 口径，Note:39836.1）：按索引序扫叶，
+    /// 相邻条目的 `(file_id, block_id)` 变化则 +1（首条计 1）。
+    /// 值域 [表块数, 行数]；空索引 = 0。
+    pub clustering_factor: u64,
+}
+
 /// **分裂点校正**（§9.1.5 的收尾）：按形态取的分裂点必须保证**左半 +
 /// 新高键 + 目录**放得进原页——高键在分裂时从 ∞（8B）变成真实键（可达 615B）
 /// 时尤其明显：不校正会把"装不下的左半"留在原页（实测 NoSpace）。
@@ -252,6 +271,107 @@ impl<'s, S: PageStore> Tree<'s, S> {
     /// **全扫描**（IFS：叶链顺序）。
     pub fn full_scan(&mut self, limit: usize) -> Result<Vec<(Vec<u8>, RowId)>, IndexError> {
         self.range(None, None, limit)
+    }
+
+    /// **快速全扫描 FFS**（§9.1.6）：按**物理块序**读全段索引页（连续块成组
+    /// 区读），**只取叶页条目——不沿叶链、不保序、不承诺快照一致性**。
+    ///
+    /// 与 IFS 的分工：IFS 产出**有序流**（可直接满足 `ORDER BY`）；FFS 产出
+    /// **无序**，只喂不接受顺序的消费方（统计/无条件聚合）。块的合法性由
+    /// 页校验 + **页头自证**（块号/文件与请求一致）保证——不需要叶链协议。
+    pub fn fast_full_scan(&mut self, limit: usize) -> Result<Vec<(Vec<u8>, RowId)>, IndexError> {
+        let mut out = Vec::new();
+        let blocks = self.store.blocks()?;
+        let mut at = 0usize;
+        while at < blocks.len() {
+            // 连续块成组（区读）：枚举为升序 = 物理序，相邻且差 1 即可同组。
+            let first = blocks[at];
+            let mut count = 1u32;
+            while at + (count as usize) < blocks.len()
+                && blocks[at + count as usize] == first + count
+                && count < FFS_RUN_PAGES
+            {
+                count += 1;
+            }
+            let pages = self.store.read_run(first, count)?;
+            if pages.len() != count as usize {
+                return Err(IndexError::Malformed("区读返回的页数与请求不符"));
+            }
+            for (i, page) in pages.iter().enumerate() {
+                // **块引用自证**：读回的页必须自述为请求的那一块（串页防线）。
+                match page.header() {
+                    Some(h) if h.block_id == first + i as u32 && h.file_id == self.file_id => {}
+                    _ => {
+                        return Err(IndexError::Malformed("FFS 读回的页自述身份与请求不符"));
+                    }
+                }
+                // 非索引页 = 枚举实现缺陷（执行器应排除段头/位图页）——响亮失败。
+                let view = IndexPage::new(page)?;
+                if !view.is_leaf() {
+                    continue; // 枝/根页：读但不取（Oracle FFS 同款，§9.1.6）
+                }
+                let n = usize::from(view.entry_count());
+                for j in 1..n {
+                    if let Entry::Leaf { key, rowid } = view.entry(j)? {
+                        out.push((key, rowid));
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
+            at += count as usize;
+        }
+        Ok(out)
+    }
+
+    /// **索引统计**（沿叶链一趟；**零回表 I/O**——只比较条目自带的 ROWID 字节）。
+    ///
+    /// **聚簇因子**按 Oracle `CLUFAC` 口径（Note:39836.1，证据包
+    /// `index-stats-20261006`）：**按索引序**扫叶条目，当前条目的
+    /// `(file_id, block_id)` 与上一条**不同**则计数 +1（首条计 1）——
+    /// 值域 [表块数, 行数]：接近块数 = 索引序与块序贴合，接近行数 = 随机。
+    /// 用途：`CF × 选择率 ≈ 回表块成本`（只进**需回表**的范围扫描/IFS 成本）。
+    pub fn statistics(&mut self) -> Result<IndexStats, IndexError> {
+        let mut block = self.leftmost_leaf()?;
+        let mut entries = 0u64;
+        let mut leaf_blocks = 0u64;
+        let mut clustering_factor = 0u64;
+        let mut prev: Option<(u16, u32)> = None;
+        loop {
+            let page = self.store.read(block)?;
+            let view = IndexPage::new(&page)?;
+            if !view.is_leaf() {
+                return Err(IndexError::Malformed("叶链上出现非叶页"));
+            }
+            leaf_blocks += 1;
+            let n = usize::from(view.entry_count());
+            for i in 1..n {
+                if let Entry::Leaf { rowid, .. } = view.entry(i)? {
+                    entries += 1;
+                    let cur = (rowid.file_id(), rowid.block_id());
+                    if prev != Some(cur) {
+                        clustering_factor += 1;
+                    }
+                    prev = Some(cur);
+                }
+            }
+            let (_, next) = view.links()?;
+            if next == no_link() {
+                // 链的尽头必须是 ∞ 页（与 `validate` 同款防线）。
+                if view.high_key()?.is_some() {
+                    return Err(IndexError::Malformed("叶链提前终止（尽头非 ∞ 页）"));
+                }
+                break;
+            }
+            block = crate::store::block_of(next);
+        }
+        Ok(IndexStats {
+            entries,
+            leaf_blocks,
+            blevel: self.height,
+            clustering_factor,
+        })
     }
 
     /// 最左叶（下行时取最左子指针）。

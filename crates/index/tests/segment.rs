@@ -81,6 +81,25 @@ impl IndexIo for TestIo<'_, '_, '_> {
         self.redo.push((block, after.as_bytes().to_vec()));
         Ok(())
     }
+
+    /// 本段索引页枚举（FFS 用）：逻辑页 1..append_pos，排除段内位图页。
+    fn allocated_blocks(&mut self) -> Result<Vec<u32>, bicdb_index::IndexError> {
+        let end = self
+            .segment
+            .append_position()
+            .map_err(|e| bicdb_index::IndexError::Io(e.to_string()))?;
+        let mut out = Vec::new();
+        for logical in 1..end {
+            if self.segment.is_bitmap_page(logical) {
+                continue;
+            }
+            if let Some(block) = self.segment.logical_block(logical) {
+                out.push(block);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
 }
 
 fn key(i: u32) -> Vec<u8> {
@@ -194,6 +213,19 @@ fn tree_lives_in_a_btree_segment_and_survives_reopen_through_the_pool() {
         }
         prev = Some(k.clone());
     }
+    // ⑤′ FFS（§9.1.6）：按物理区序区读全段——同一组条目，不依赖叶链。
+    let ffs = tree.fast_full_scan(10_000).expect("快速全扫描");
+    assert_eq!(ffs.len(), 300, "FFS 见到全部键");
+    let mut a = ffs.clone();
+    let mut b = all.clone();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "FFS 与 IFS 是同一组条目");
+    // ⑤″ 统计：entries 与扫描对账；CF 落在 [块数, 行数] 里（本用例行同块）。
+    let st = tree.statistics().expect("统计");
+    assert_eq!(st.entries, 300);
+    assert_eq!(st.blevel, tree.height());
+    assert!(st.clustering_factor <= st.entries, "CF ≤ 行数");
     // ⑥ redo 形态：插入期每次改页都留下**完整正文**镜像（分裂的新页也能被
     //    重放重建，§9.1.5 第 5 步）；镜像的页头与键自洽。
     assert!(!redo_log.is_empty(), "插入产生 redo 镜像");
