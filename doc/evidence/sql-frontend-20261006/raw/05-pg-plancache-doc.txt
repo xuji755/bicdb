@@ -1,0 +1,88 @@
+### doc_retrieve pg 'generic plan custom plan plancache 选择策略'
+🔍 图搜索: "generic plan custom plan plancache 选择 五次" [db=postgresql]
+
+  匹配: 5
+  ✅ 官方文档: 5
+
+======================================================================
+📘官方文档: [postgresql] 07 · 规划器与代价模型（costsize / selfuncs / disabled_nodes / Mackert-Lohman / 选择率 / JIT 判定 / plan cache）
+  源: doc/07-规划器与代价.md
+======================================================================
+# openGauss 6.0 规划器与代价 —— 源码锚点式融合笔记
+
+> **主题**：planner() 钩子链 → standard_planner（动态 SMP/WLM 内存/向量化决策）→ subquery_planner 重写流水线 → internal_grouping_planner（聚合策略/两级聚合）→ costsize 代价模型（RAND_COST_OPT/OpMemInfo/落盘代价）→ joinpath/indxpath/createplan 的 openGauss 扩展
+> **源码根**：`D:\deepseek\opengauss-src\openGauss-server-master`（openGauss 6.0）
+> **核心文件**：`src/gausskernel/optimizer/plan/planner.cpp`（16,372 行）、`plan/createplan.cpp`（11,703 行）、`path/costsize.cpp`（7,160 行）、`path/indxpath.cpp`（4,878 行）、`path/joinpath.cpp`（3,279 行）、`optimizer/aioptimizer/`、`optimizer/gplanmgr/`
+> **方法**：grep 定位 + read 逐行精读，结论均来自实际读到的代码与注释。
+> **阅读方式**：每单元以「文件:行号」为锚点，五维融合。
+> **对照基线**：openGauss 由 PostgreSQL 9.2/9.6 演化，凡"与 PG 不同"均以 PG 9.6~12 对应实现为参照。
+
+---
+
+## §P1. planner() 入口与钩子链 —— 扩展点全景
+
+> **summary**：`planner()`（planner.cpp:387）是扩展链的汇聚点——`spq_planner_hook`（SPQ 计算池）、`streaming_planner_hook`（流引擎 agg 改写）、`pluginPlannerHook`（插件）、PGXC 下 `pgxc_planner`、通用 `planner_hook` → `standard_planner`，计划完成后还有 `ndp_pushdown_hook`（近数据处理下推）。
+> **search_text**：planner, spq_planner_hook, streaming_planner_hook, pluginPlannerHook, pgxc_planner, planner_hook, ndp_pushdown_hook, standard_planner
+
+**代码位置**：
+- `planner.cpp:387`（planner 入口）、`:394`（spq_planner_hook）、`:405`（streaming_planner_hook）、`:412`（pluginPlannerHook）、`:416`（pgxc_planner）、`:419-420`（planner_hook → standard_planner）、`:428`（ndp_pushdown_hook）
+
+**机制说明**（planner.cpp 实测）：
+```cpp
+// planner.cpp:387-430 —— 钩子链(节选)
+spq_planner_hook(parse, cursorOptions, boundParams);          /* :394 SPQ 计算池 */
+streaming_planner_hook(parse, cursorOptions, boundParams);    /* :405 流引擎 agg 改写 */
+pluginPlannerHook(parse, cursorOptions, boundParams);         /* :412 插件 */
+if (IS_PGXC_COORDINATOR) ... return pgxc_planner(...);       /* :416 */
+if (planner_hook) result = planner_hook(parse, cursorOptions, boundParams); /* :419 */
+else result = standard_planner(parse, cursorOptions, boundParams);          /* :420 */
+...
+ndp_pushdown_hook(...);                                        /* :428 近数据计
+
+======================================================================
+📘官方文档: [postgresql] 案例-添加索引性能下降和generic plan
+  源: doc/35a25c59-ef37-41fe-a6e2-798cb4c1962d-20250913___E6_A1_88_E4_BE_8B-_E6_B7_BB_E5_8A_A0_E7_B4_A2_E5_BC_95_E6_8.md
+======================================================================
+# 案例-添加索引性能下降和generic plan
+
+- 知识域：PostgreSQL（2104）
+- 原始产品分类：数据库 / PostgreSQL 运维与内核
+- 来源类别：公开技术博客（lastdba.com「最后的DBA」；个人 DBA 实践经验，非官方文档、非官方发布渠道）
+- 原文链接：https://lastdba.com/2025/09/13/%E6%A1%88%E4%BE%8B-%E6%B7%BB%E5%8A%A0%E7%B4%A2%E5%BC%95%E6%80%A7%E8%83%BD%E4%B8%8B%E9%99%8D%E5%92%8Cgeneric-plan/
+- 发布时间：2025-09-13
+- 原文站点标签：PostgreSQL、数据库运维、源码与原理
+- 适用范围：以正文标注的版本范围为准；正文未统一声明适用版本
+- 数据来源说明：正文由站点文章页 HTML 的正文区域（div.article-content）转换而来，代码块按原样保留并标注语言；未改写原文内容。原文为个人博客，属经验性/解读性材料，与官方文档结论不一致时以官方文档为准。
+
+---
+
+## 问题现象
+
+前晚添加索引，第二天早上cpu打爆，sql容易定位，问题sql就1条。该sql跑了30多s，但是昨天跑3s左右，所以要看下前后执行计划变化。
+
+执行计划只贴关键部分。
+
+加索引前的执行计划：
+
+```sql
+            ->  Nested Loop  (cost=19.92..2259694.20 rows=265822 width=33)
+                  ->  Index Scan using uk_lzl_task on lzl_task t  (cost=0.29..20007.99 rows=195 width=24)
+                        Filter: ((created_by)::text = 'LIUZHILONG62'::text)
+                  ->  Append  (cost=19.63..11337.15 rows=14842 width=57)
+                        ->  Bitmap Heap Scan on lzl_202501 cc_1  (cost=19.63..3053.69 rows=1467 width=66)
+                              Recheck Cond: ((task_no)::text = (t.task_no)::text)
+                              Filter: ((created_date > '2025-01-07 09:00:00'::timestamp without time zone) AND (created_date < '2025-09-03 12:56:44.973'::timestamp without time zone))
+                              ->  Bitmap Index Scan on lzl_202501_task_no_idx  (cost=0.00..19.27 rows=1594 width=0)
+                                    Index Cond: ((task_no)::text = (t.task_no)::text)
+                        ->  Bitmap Heap Scan on lzl_202502 cc_2  (cost=21.67..3066.85 rows=1604 width=66)
+                              Recheck Cond: ((task_no)::text = (t.task_no)::text)
+                              Filter: ((created_date > '2025-01-07 09:00:00'::timestamp without time zone) AND (created_date < '2025-09-03 12:56:44.973'::timestamp without time zone))
+                              ->  Bitmap Index Scan on lzl_202502_task_no_idx  (cost=0.00..21.27 rows=1605 width
+
+======================================================================
+📘官方文档: [postgresql] 第 16 章：查询执行阶段 – PostgreSQL 14 Internals <meta name="description" content="16.1 示例数据库 本书前面部分的示例都是基于仅有
+  源: /home/jacks/knowledge-base/postgresql/txt_cache/pg14_internals_chapter16_index.txt
+======================================================================
+ 第 16 章：查询执行阶段 – PostgreSQL 14 Internals <meta name="description" content="16.1 示例数据库 本书前面部分的示例都是基于仅有少量行的表。此章节及后续部分将讨论查询执行，这方面的要求会更高：我们需要行数更多的表。我没有为每个例子都创建一个新的数据集，而是使用了一个现有的示例数据库，其展示了俄罗斯的客运航空量 1。它有多个版本；我们将使用于 2017 年 8 月 15 日创建的数据量更大的版本。要安装此版本，你需要从归档中提取包含数据库副本的文件 2，并在 psql 中运行此文件。 在开发这个示例数据库时，我们尽量让其模式简单到无需额外解释即可理解；同时，我们希望它也足够复杂，能够编写有意义的查询语句。数据库中填充了贴近现实的数据，这使得示例更加全面，使用起来应该会很有趣。 此处我只会简要介绍主要的数据库对象；如果你想查看整个模式，可以查看脚注中引用的完整描述。 主要实体是预订 (映射到 bookings 表)。一次预订可以包含几个乘客，每个乘客都有一张单独的电子机票 (tickets)。乘客不构成单独的实体；为了我们的实验，我们将假设所有的乘客都是唯一的。 每张机票包括一个或多个航段 (映射到 ticket_fights 表)。在两种情况下，单张机票可以有多个航段：要么是往返机票，要么是为转机而签发的。尽管在模式中没有相应的约束，但假定一个预订中的所有机票都有相同的航段。 每个航班 (flights) 从一个机场 (airports) 飞往另一个机场。具有相同航班号的航班具有相同的出发点和目的地，但出发日期不同。 routes 视图基于 flights 表；它显示了与特定航班日期无关的航线信息。 在办理登机手续时，每位乘客都会被签发一张带有座位号的登机牌 (boarding_passes)。只有在机票中包含该航班时，乘客才能办理登机手续。航班与座位的组合必须是唯一的，因此不可能为同一个座位签发两张登机牌。 飞机上的座位 (seats) 数量及其在不同舱位之间的分布取决于执飞的特定飞机模型 (aircrafts)。假设每个飞机模型只能有一个座舱配置。 一些表有代理主键，而其他表使用原生主键 (其中一些是复合主键)。这仅仅是出于演示的目的，并不是一个可以效仿的例子。 示例数据库可以被视为真实系统的转储：它包含了过去某个特定时刻获取的数据快照。要显示此时间，你可以调用 bookings.now() 函数。在示例查询中使用此函数，需要在现实世界中使用 now() 函数。 机场名、城市名和飞机型号的名称存储在 airports_data 和 aircrafts_data 表中；它们有两种语言，英语和俄语。为了构造本章中的示例，我通常会查询实体关系图中显示的 airports 和 aircrafts 视图；这些视图基于 bookings.lang 参数的值选择输出语言。尽管如此，一些基表的名称仍可能出现在查询计划中。 16.2 简单查询协议 一个简单版本的 client-server 协议 3 支持执行 SQL 查询：它将查询文本发送至服务器，并获得完整的执行结果，无论其中包含多少行数据 4。发送到服务器的查询历经几个阶段：解析、转换、规划，然后执行。" /> <meta itemprop="description" content="16.1 示例数据库 本书前面部分的示例都是基于仅有少量行的表。此章节及后续部分将讨论查询执行，这方面的要求会更高：我们需要行数更多的表。我没有为每个例子都创建一个新的数据集，而是使用了一个现有的示例数据库，其展示了俄罗斯的客运航空量 1。它有多个版本；我们将使用于 2017 年 8 月 15 日创建的数据量更大的版本。要安装此版本，你需要从归档中提取包含数据库副本的文件 2，并在 psql 中运行此文件。 在开发这个示例数据库时，我们尽量让其模式简单到无需额外解释即可理解；同时，我们希望它也足够复杂，能够编写有意义的查询语句。数据库中填充了贴近现实的数据，这使得示例更加全面，使用起来应该会很有趣。 此处我只会简要介绍主要的数据库对象；如果你想查看整个模式，可以查看脚注中引用的完整描述。 主要实体是预订 (映射到 bookings 表)。一次预订可以包含几个乘客，每个乘客都有一张单独的电子机票 (tickets)。乘客不构成单独的实体；为了我们的实验，我们将假设所有的乘客都是唯一的。 每张机票包括一个或多个航段 (映射到 ticket_fights 表)。在两种情况下，单张机票可以有多个航段：要么是往返机票，要么是为转机而签发的。尽管在模式中没有相应的约束，但假定一个预订中的所有机票都有相同的航段。 每个航班 (flights) 从
+
+... 还有 2 个匹配文档未展示。使用 --list 查看全部。

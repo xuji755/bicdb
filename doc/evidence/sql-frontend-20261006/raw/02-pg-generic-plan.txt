@@ -1,0 +1,12 @@
+### detail 965656 generic plan
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,SyncEntity,KGV2Managed
+  名称: generic plan
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:965656
+
+  ── 描述 ──
+  generic plan 是预备语句的通用计划，包含缓存和失效逻辑。实现位于 plancache.c。
+
+  ── 摘要 ──
+  预备语句的通用计划（缓存/失效逻辑）；源码 src/backend/utils/cache/plancache.c

@@ -1,0 +1,13 @@
+### detail 1488138 CaseStudy 倾斜 generic/custom
+
+  📖 实体详情
+  类型: bic_agent_CaseStudy,KGV2Managed
+  名称: 数据倾斜导致generic plan选择非最优计划
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1488138
+
+  ── 描述 ──
+  案例：数据倾斜导致generic plan选择非最优计划 摘要：诊断：数据倾斜导致generic plan选择非最优计划，id=2的查询使用全表扫描（最优应为索引扫描），而custom
+  plan能正确选择。处理：避免强制通用计划，或针对倾斜数据使用参数化查询。
+
+  ── 摘要 ──
+  诊断：数据倾斜导致generic plan选择非最优计划，id=2的查询使用全表扫描（最优应为索引扫描），而custom plan能正确选择。处理：避免强制通用计划，或针对倾斜数据使用参数化查询。
