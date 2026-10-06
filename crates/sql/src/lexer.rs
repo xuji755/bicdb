@@ -214,6 +214,25 @@ pub enum Keyword {
     Truncate,
     /// `ADD`（`ALTER TABLE ADD`）
     Add,
+    // ── DCL（`doc/DCL语句设计_v0.1.md` §2.1；语法冻入 D1）──────────
+    /// `SYSTEM`
+    System,
+    /// `DATABASE`
+    Database,
+    /// `SESSION`
+    Session,
+    /// `TEMPLATE`
+    Template,
+    /// `FILESYSTEM`
+    Filesystem,
+    /// `ALLOCATE`
+    Allocate,
+    /// `OFF`
+    Off,
+    /// `CLEAR`
+    Clear,
+    /// `TO`（`ALTER DATABASE ALTER WORKSPACE … TO TEMPLATE`）
+    To,
 }
 
 impl Keyword {
@@ -304,6 +323,16 @@ impl Keyword {
             "SAVEPOINT" => Self::Savepoint,
             "TRUNCATE" => Self::Truncate,
             "ADD" => Self::Add,
+            // ── DCL ──
+            "SYSTEM" => Self::System,
+            "DATABASE" => Self::Database,
+            "SESSION" => Self::Session,
+            "TEMPLATE" => Self::Template,
+            "FILESYSTEM" => Self::Filesystem,
+            "ALLOCATE" => Self::Allocate,
+            "OFF" => Self::Off,
+            "CLEAR" => Self::Clear,
+            "TO" => Self::To,
             _ => return None,
         })
     }
@@ -395,6 +424,15 @@ impl Keyword {
             Self::Savepoint => "SAVEPOINT",
             Self::Truncate => "TRUNCATE",
             Self::Add => "ADD",
+            Self::System => "SYSTEM",
+            Self::Database => "DATABASE",
+            Self::Session => "SESSION",
+            Self::Template => "TEMPLATE",
+            Self::Filesystem => "FILESYSTEM",
+            Self::Allocate => "ALLOCATE",
+            Self::Off => "OFF",
+            Self::Clear => "CLEAR",
+            Self::To => "TO",
         }
     }
 }

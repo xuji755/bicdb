@@ -16,6 +16,13 @@
 //!   **优先级表照抄 PG**（`gram.y`）；语句闭集（REQ-SQL-005 正面清单），
 //!   清单外构造**没有产生式**（REQ-SQL-006 闭集纪律）。
 //!
+//! **D1 已落地**（2026-10-06；`doc/DCL语句设计_v0.1.md` §5——**纯解析，先于 S2**）：
+//! DCL 语句面——[`ast::Stmt::VariableSet`]（`ALTER SESSION SET/CLEAR`）、
+//! [`ast::Stmt::AlterSystem`]（F 组：文件系统池三动作）、
+//! [`ast::Stmt::AlterDatabase`]（W2 克隆双源 + T1–T3 模板四动作）、
+//! [`ast::WorkRef`]/[`ast::FsRef`] 双形态（**解析只认形态**——名字查找与唯一性
+//! 在 ② 绑定期）；`CREATE WORKSPACE` 去掉 `CLONE OF`（评审点①）。
+//!
 //! **未落地**：Binder（②）、逻辑表示与变换（③）、物理计划（④）、计划缓存、
 //! 执行接口——按设计 §10 的切片 S2–S8 推进；`GRAPH_TABLE` 随图域接入。
 
@@ -27,13 +34,14 @@ pub mod lexer;
 pub mod parser;
 
 pub use ast::{
-    AConst, AExpr, AExprKind, Alias, AlterWorkspaceAction, AlterWorkspaceStmt, BoolExpr,
-    BoolExprType, CaseExpr, CaseWhen, CoalesceExpr, ColumnDef, ColumnRef, ColumnRefField,
-    ConstValue, CreateGraphStmt, CreateStmt, CreateWorkspaceStmt, DefElem, DefElemArg, DeleteStmt,
-    DropStmt, Expr, FromItem, FuncCall, IndexElem, IndexStmt, IndexTargetKind, InsertStmt,
-    JoinExpr, JoinType, Location, NullTest, NullTestType, ObjectType, ParamRef, RangeVar,
-    ResTarget, SelectStmt, SetOperation, SortBy, SortByDir, SortByNulls, Stmt, TransactionStmt,
-    TransactionStmtKind, TypeCast, TypeName, UpdateStmt,
+    AConst, AExpr, AExprKind, Alias, AlterDatabaseAction, AlterDatabaseStmt, AlterSystemAction,
+    AlterSystemStmt, AlterWorkspaceAction, AlterWorkspaceStmt, BoolExpr, BoolExprType, CaseExpr,
+    CaseWhen, CoalesceExpr, ColumnDef, ColumnRef, ColumnRefField, ConstValue, CreateGraphStmt,
+    CreateStmt, CreateWorkspaceStmt, DefElem, DefElemArg, DeleteStmt, DropStmt, Expr, FromItem,
+    FsRef, FuncCall, IndexElem, IndexStmt, IndexTargetKind, InsertStmt, JoinExpr, JoinType,
+    Location, NullTest, NullTestType, ObjectType, ParamRef, RangeVar, ResTarget, SelectStmt,
+    SetOperation, SortBy, SortByDir, SortByNulls, Stmt, TransactionStmt, TransactionStmtKind,
+    TypeCast, TypeName, UpdateStmt, VariableSetKind, VariableSetStmt, WorkRef, WorkspaceSource,
 };
 pub use lexer::{tokenize, Keyword, LexError, Punct, Span, Token, TokenKind};
 pub use parser::{parse, parse_many, ParseError};

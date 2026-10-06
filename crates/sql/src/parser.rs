@@ -176,13 +176,68 @@ impl Parser<'_> {
         }
     }
 
-    /// 工作区 id（`ALTER/DROP WORKSPACE <id>`；数字或标识符形态）。
-    fn workspace_ref(&mut self) -> Result<(String, Span), ParseError> {
+    /// **工作区引用**（`DCL语句设计` §1.1）：`整数 | Str [ FOR USER <主体> ]`。
+    ///
+    /// 解析器**只认形态**：不做名字查找、不判唯一性（绑定期的事）。
+    fn work_ref(&mut self) -> Result<WorkRef, ParseError> {
         let t = self.advance();
         match t.kind {
-            TokenKind::Ident(s) | TokenKind::QIdent(s) | TokenKind::Number(s) => Ok((s, t.span)),
+            TokenKind::Number(text) => {
+                let id = text.parse::<u64>().map_err(|_| ParseError {
+                    message: format!("工作区 id 必须是整数：`{text}`"),
+                    span: t.span,
+                })?;
+                Ok(WorkRef {
+                    id: Some(id),
+                    name: None,
+                    user: None,
+                    location: t.span,
+                })
+            }
+            TokenKind::Str(name) => {
+                let user = if self.eat_kw(Keyword::For) {
+                    self.expect_kw(Keyword::User)?;
+                    Some(self.col_id()?.0)
+                } else {
+                    None
+                };
+                Ok(WorkRef {
+                    id: None,
+                    name: Some(name),
+                    user,
+                    location: t.span,
+                })
+            }
             _ => Err(ParseError {
-                message: "期望工作区 id".to_owned(),
+                message: "期望工作区**引用**：id（整数）或名字（字符串 [FOR USER <主体>]）"
+                    .to_owned(),
+                span: t.span,
+            }),
+        }
+    }
+
+    /// **文件系统引用**（§1.3）：`整数（槽位） | Str（挂载点）`。
+    fn fs_ref(&mut self) -> Result<FsRef, ParseError> {
+        let t = self.advance();
+        match t.kind {
+            TokenKind::Number(text) => {
+                let slot = text.parse::<u32>().map_err(|_| ParseError {
+                    message: format!("文件系统槽位必须是整数：`{text}`"),
+                    span: t.span,
+                })?;
+                Ok(FsRef {
+                    slot: Some(slot),
+                    mount: None,
+                    location: t.span,
+                })
+            }
+            TokenKind::Str(mount) => Ok(FsRef {
+                slot: None,
+                mount: Some(mount),
+                location: t.span,
+            }),
+            _ => Err(ParseError {
+                message: "期望文件系统**引用**：槽位（整数）或挂载点（字符串）".to_owned(),
                 span: t.span,
             }),
         }
@@ -308,23 +363,25 @@ impl Parser<'_> {
         };
         let missing_ok = false;
         let mut objects = Vec::new();
+        let mut workspaces = Vec::new();
         loop {
-            let (relname, iloc) = if remove_type == ObjectType::Workspace {
-                self.workspace_ref()?
+            if remove_type == ObjectType::Workspace {
+                workspaces.push(self.work_ref()?);
             } else {
-                self.col_id()?
-            };
-            objects.push(RangeVar {
-                relname,
-                alias: None,
-                location: iloc,
-            });
+                let (relname, iloc) = self.col_id()?;
+                objects.push(RangeVar {
+                    relname,
+                    alias: None,
+                    location: iloc,
+                });
+            }
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
         }
         Ok(Stmt::Drop(DropStmt {
             objects,
+            workspaces,
             remove_type,
             missing_ok,
             location,
@@ -333,12 +390,22 @@ impl Parser<'_> {
 
     fn alter_stmt(&mut self) -> Result<Stmt, ParseError> {
         let location = self.expect_kw(Keyword::Alter)?.span;
-        if !self.eat_kw(Keyword::Workspace) {
-            return Err(
-                self.err_here("不支持该构造：`ALTER` 只提供 `ALTER WORKSPACE`（REQ-SQL-006）")
-            );
+        if self.eat_kw(Keyword::Session) {
+            return self.variable_set(location);
         }
-        let (workspace_id, _) = self.workspace_ref()?;
+        if self.eat_kw(Keyword::System) {
+            return self.alter_system(location);
+        }
+        if self.eat_kw(Keyword::Database) {
+            return self.alter_database(location);
+        }
+        if !self.eat_kw(Keyword::Workspace) {
+            return Err(self.err_here(
+                "不支持该构造：`ALTER` 只提供 WORKSPACE / SESSION / SYSTEM / DATABASE 四类 \
+                 （`DCL语句设计` §1 的闭集）",
+            ));
+        }
+        let workspace = self.work_ref()?;
         self.expect_kw(Keyword::Set)?;
         if self.eat_kw(Keyword::Name) {
             self.expect_punct(Punct::Eq)?;
@@ -348,20 +415,198 @@ impl Parser<'_> {
                 Some(self.expect_string()?.0)
             };
             Ok(Stmt::AlterWorkspace(AlterWorkspaceStmt {
-                workspace_id,
+                workspace,
                 action: AlterWorkspaceAction::SetName(name),
                 location,
             }))
         } else if self.eat_kw(Keyword::Quota) {
-            let items = self.def_elem_list()?;
+            let items = self.quota_list()?;
             Ok(Stmt::AlterWorkspace(AlterWorkspaceStmt {
-                workspace_id,
+                workspace,
                 action: AlterWorkspaceAction::SetQuota(items),
                 location,
             }))
         } else {
             Err(self.err_here("`ALTER WORKSPACE … SET` 之后只能是 `NAME` 或 `QUOTA`"))
         }
+    }
+
+    /// **`ALTER SESSION SET/CLEAR <参数>`**（S 组；白名单在 ② 判）。
+    fn variable_set(&mut self, location: Span) -> Result<Stmt, ParseError> {
+        let kind = if self.eat_kw(Keyword::Set) {
+            VariableSetKind::Set
+        } else if self.eat_kw(Keyword::Clear) {
+            VariableSetKind::Clear
+        } else {
+            return Err(self.err_here("`ALTER SESSION` 之后只能是 `SET` 或 `CLEAR`"));
+        };
+        let (name, _) = self.col_id()?;
+        let mut args = Vec::new();
+        if kind == VariableSetKind::Set {
+            self.expect_punct(Punct::Eq)?;
+            let t = self.advance();
+            let value = match t.kind {
+                TokenKind::Number(text) => Some(classify_number(&text)),
+                TokenKind::Str(text) => Some(ConstValue::Str(text)),
+                _ => {
+                    return Err(ParseError {
+                        message: "会话参数值：整数 / 浮点 / 字符串（内存量照 PG：`'64MB'`）"
+                            .to_owned(),
+                        span: t.span,
+                    })
+                }
+            };
+            args.push(AConst {
+                value,
+                location: t.span,
+            });
+        }
+        Ok(Stmt::VariableSet(VariableSetStmt {
+            kind,
+            name,
+            args,
+            location,
+        }))
+    }
+
+    /// **`ALTER SYSTEM …`**（F 组：文件系统池；闭集三个产生式）。
+    fn alter_system(&mut self, location: Span) -> Result<Stmt, ParseError> {
+        let action = if self.eat_kw(Keyword::Add) {
+            self.expect_kw(Keyword::Filesystem)?;
+            AlterSystemAction::AddFilesystem {
+                mount: self.expect_string()?.0,
+            }
+        } else if self.eat_kw(Keyword::Alter) {
+            self.expect_kw(Keyword::Filesystem)?;
+            let fs = self.fs_ref()?;
+            self.expect_kw(Keyword::Set)?;
+            self.expect_kw(Keyword::Allocate)?;
+            self.expect_punct(Punct::Eq)?;
+            let allocate = if self.eat_kw(Keyword::On) {
+                true
+            } else if self.eat_kw(Keyword::Off) {
+                false
+            } else {
+                return Err(self.err_here("`ALLOCATE` 的值只能是 `ON` 或 `OFF`"));
+            };
+            AlterSystemAction::AlterFilesystem { fs, allocate }
+        } else if self.eat_kw(Keyword::Drop) {
+            self.expect_kw(Keyword::Filesystem)?;
+            AlterSystemAction::DropFilesystem { fs: self.fs_ref()? }
+        } else {
+            return Err(self.err_here(
+                "`ALTER SYSTEM` 只提供 ADD / ALTER / DROP FILESYSTEM 三个动作 \
+                 （`DCL语句设计` §2.1 的 F 组——闭集）",
+            ));
+        };
+        Ok(Stmt::AlterSystem(AlterSystemStmt { action, location }))
+    }
+
+    /// **`ALTER DATABASE …`**（W2 克隆 + T1–T3 模板；**不带库名**——记档）。
+    fn alter_database(&mut self, location: Span) -> Result<Stmt, ParseError> {
+        let action = if self.eat_kw(Keyword::Clone) {
+            self.expect_kw(Keyword::Workspace)?;
+            let name = self.expect_string()?.0;
+            self.expect_kw(Keyword::From)?;
+            let source = if self.eat_kw(Keyword::Workspace) {
+                WorkspaceSource::Workspace(self.work_ref()?)
+            } else if self.eat_kw(Keyword::Template) {
+                WorkspaceSource::Template(self.expect_string()?.0)
+            } else {
+                return Err(
+                    self.err_here("克隆源：`FROM WORKSPACE <引用>` 或 `FROM TEMPLATE '<名>'`")
+                );
+            };
+            AlterDatabaseAction::CloneWorkspace { name, source }
+        } else if self.eat_kw(Keyword::Add) {
+            self.expect_kw(Keyword::Template)?;
+            let name = self.expect_string()?.0;
+            self.expect_kw(Keyword::From)?;
+            AlterDatabaseAction::AddTemplate {
+                name,
+                from: self.work_ref()?,
+            }
+        } else if self.eat_kw(Keyword::Alter) {
+            self.expect_kw(Keyword::Workspace)?;
+            let ws = self.work_ref()?;
+            self.expect_kw(Keyword::To)?;
+            self.expect_kw(Keyword::Template)?;
+            AlterDatabaseAction::WorkspaceToTemplate {
+                ws,
+                name: self.expect_string()?.0,
+            }
+        } else if self.eat_kw(Keyword::Drop) {
+            self.expect_kw(Keyword::Template)?;
+            AlterDatabaseAction::DropTemplate {
+                name: self.expect_string()?.0,
+            }
+        } else {
+            return Err(self.err_here(
+                "`ALTER DATABASE` 只提供 CLONE / ADD TEMPLATE / ALTER WORKSPACE … TO TEMPLATE / \
+                 DROP TEMPLATE 四个动作（`DCL语句设计` §2.1 的 W2 与 T 组——闭集）",
+            ));
+        };
+        Ok(Stmt::AlterDatabase(AlterDatabaseStmt { action, location }))
+    }
+
+    /// **配额项**（`QuotaItem` 的产生式只有四个键——闭集；见 §2.3）。
+    fn quota_list(&mut self) -> Result<Vec<DefElem>, ParseError> {
+        self.expect_punct(Punct::LParen)?;
+        let mut items = Vec::new();
+        loop {
+            let (defname, location) = self.col_id()?;
+            if !matches!(defname.as_str(), "data" | "undo" | "temp" | "asset") {
+                return Err(ParseError {
+                    message: format!(
+                        "配额键 `{defname}` 不在闭集内（只有 data / undo / temp / asset）"
+                    ),
+                    span: location,
+                });
+            }
+            self.expect_punct(Punct::Eq)?;
+            let (arg, _) = self.def_value()?;
+            items.push(DefElem {
+                defname,
+                arg,
+                location,
+            });
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RParen)?;
+        Ok(items)
+    }
+
+    /// 一个 `DefElem` 的值（`def_elem_list` 与 `quota_list` 共用）。
+    fn def_value(&mut self) -> Result<(DefElemArg, Span), ParseError> {
+        let t = self.advance();
+        let arg = match t.kind {
+            TokenKind::Number(s) => DefElemArg::Const(AConst {
+                value: Some(classify_number(&s)),
+                location: t.span,
+            }),
+            TokenKind::Str(s) => DefElemArg::Const(AConst {
+                value: Some(ConstValue::Str(s)),
+                location: t.span,
+            }),
+            TokenKind::Ident(s) | TokenKind::QIdent(s) => DefElemArg::Ident(s),
+            TokenKind::Keyword(_) => {
+                let raw = self
+                    .src
+                    .get(t.span.start..t.span.end)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                DefElemArg::Ident(raw)
+            }
+            _ => {
+                return Err(ParseError {
+                    message: "选项值形态非法".to_owned(),
+                    span: t.span,
+                })
+            }
+        };
+        Ok((arg, t.span))
     }
 
     // ── DDL 体（PG 的产生式删减）──────────────────────────
@@ -458,32 +703,7 @@ impl Parser<'_> {
         loop {
             let (defname, location) = self.col_id()?;
             self.expect_punct(Punct::Eq)?;
-            let t = self.advance();
-            let arg = match t.kind {
-                TokenKind::Number(s) => DefElemArg::Const(AConst {
-                    value: Some(classify_number(&s)),
-                    location: t.span,
-                }),
-                TokenKind::Str(s) => DefElemArg::Const(AConst {
-                    value: Some(ConstValue::Str(s)),
-                    location: t.span,
-                }),
-                TokenKind::Ident(s) | TokenKind::QIdent(s) => DefElemArg::Ident(s),
-                TokenKind::Keyword(_) => {
-                    let raw = self
-                        .src
-                        .get(t.span.start..t.span.end)
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    DefElemArg::Ident(raw)
-                }
-                _ => {
-                    return Err(ParseError {
-                        message: "选项值形态非法".to_owned(),
-                        span: t.span,
-                    })
-                }
-            };
+            let (arg, _) = self.def_value()?;
             items.push(DefElem {
                 defname,
                 arg,
@@ -564,26 +784,28 @@ impl Parser<'_> {
         })
     }
 
+    /// `CREATE WORKSPACE FOR USER <主体> [NAME '<名>']`（W1）。
+    ///
+    /// **`CLONE OF` 已删除**（`DCL语句设计` 评审点①：克隆独立成句 W2——
+    /// 一件事不设两个入口）。
     fn create_workspace(&mut self, location: Span) -> Result<CreateWorkspaceStmt, ParseError> {
         self.expect_kw(Keyword::For)?;
         self.expect_kw(Keyword::User)?;
         let (subject, _) = self.col_id()?;
-        let mut name = None;
-        let mut clone_of = None;
-        loop {
-            if self.eat_kw(Keyword::Name) {
-                name = Some(self.expect_string()?.0);
-            } else if self.eat_kw(Keyword::Clone) {
-                self.expect_kw(Keyword::Of)?;
-                clone_of = Some(self.workspace_ref()?.0);
-            } else {
-                break;
-            }
+        let name = if self.eat_kw(Keyword::Name) {
+            Some(self.expect_string()?.0)
+        } else {
+            None
+        };
+        if self.at_kw(Keyword::Clone) {
+            return Err(self.err_here(
+                "`CLONE OF` 不再提供——克隆独立成句：`ALTER DATABASE CLONE WORKSPACE '<新名>' \
+                 FROM WORKSPACE <引用>`（`DCL语句设计` 评审点①）",
+            ));
         }
         Ok(CreateWorkspaceStmt {
             subject,
             name,
-            clone_of,
             location,
         })
     }

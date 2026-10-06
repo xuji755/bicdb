@@ -113,7 +113,7 @@ ast ──✗──▶ catalog（REQ-SQL-002：AST 模块不得 import 目录接
 | `ColumnDef` | `ColumnDef` | 只留 `colname`/`typeName`/`is_not_null`（+location）——default/约束/存储/压缩/排序规则在清单外 |
 | `IndexStmt` | `IndexStmt` | 只留 `idxname`/`relation`/`indexParams`/`unique` + **`target_kind`（表/图顶点/图边——本库扩展，记档）** |
 | `IndexElem` | `IndexElem` | 只留 `name`/`expr`（+location） |
-| `DropStmt` | `DropStmt` | `objects`/`removeType`/`missing_ok`；对象类型枚举加 **GRAPH / WORKSPACE（本库扩展，记档）** |
+| `DropStmt` | `DropStmt` | `objects`/`removeType`/`missing_ok`；对象类型枚举加 **GRAPH / WORKSPACE（本库扩展，记档）**；**`DROP WORKSPACE` 的目标走 `workspaces: Vec<WorkRef>`**（字符串形态的名字不是 `RangeVar.relname`——记档） |
 | `RangeVar` | `RangeVar` | 只留 `relname`/`alias`/`location`（无 catalog/schema/inh/relpersistence——本库无模式层） |
 | `Alias` | `Alias` | 只留 `aliasname`（无列别名清单） |
 | `JoinExpr` | `JoinExpr` | 只留 `jointype`/`larg`/`rarg`/`quals` |
@@ -131,11 +131,12 @@ ast ──✗──▶ catalog（REQ-SQL-002：AST 模块不得 import 目录接
 | `TypeName` | `TypeName` | `names`（列表）⇒ `name: String`（无模式限定）；`typmods` ⇒ 原文本列表；+location |
 | `DefElem` | `DefElem` | `defname`/`arg: DefElemArg`（`Const(AConst)` 或 `Ident(String)`——PG 的 `arg` 是任意 Node，我们收窄；理由：`table_type = memory` 的裸标识符值是本库写法，PG 的 reloptions 只收字面量） |
 | `TransactionStmt` | `TransactionStmt` | `kind`（BEGIN/COMMIT/ROLLBACK） |
-| `VariableSetStmt` | `VariableSetStmt` | `ALTER SESSION SET/CLEAR`（PG 的 `SET` 与 `ALTER SESSION SET` 同节点）；参数白名单在 ② 判（《DCL语句设计》§1.3） |
-| `AlterSystemStmt` | `AlterSystemStmt` | `ADD/DROP/ALTER FILESYSTEM`（**本库扩展**，形状仿 PG 同类 DDL 节点）——《DCL语句设计》§1.2 |
-| `AlterDatabaseStmt` | `AlterDatabaseStmt` | 只含 `CLONE WORKSPACE`；**本库实例即一个库** ⇒ 不带库名（记档）——《DCL语句设计》§1.1 W2 |
+| `VariableSetStmt` | `VariableSetStmt` | `ALTER SESSION SET/CLEAR`（PG 的 `SET` 与 `ALTER SESSION SET` 同节点；**本库只开后者拼写**）；`kind: Set\|Clear`/`name`/`args: Vec<AConst>`；参数**白名单在 ② 判**（解析照收——《DCL语句设计》§1.4/§2.3） |
+| `AlterSystemStmt` | `AlterSystemStmt` | `action = AddFilesystem{mount} \| AlterFilesystem{fs, allocate} \| DropFilesystem{fs}`（**本库扩展**，形状仿 PG 同类 DDL 节点）——《DCL语句设计》§1.3 |
+| `AlterDatabaseStmt` | `AlterDatabaseStmt` | `action = CloneWorkspace{name, source: WorkspaceSource} \| AddTemplate{name, from} \| WorkspaceToTemplate{ws, name} \| DropTemplate{name}`；**本库实例即一个库** ⇒ 不带库名（记档）——《DCL语句设计》§1.5/§2.2 |
+| —（公共引用位，§2.2） | `WorkRef { id, name, user, location }` / `FsRef { slot, mount, location }` | 双形态（id 或名字）；**解析器只认形态**——名字查找/唯一性/`FOR USER` 限定一律在 **② 绑定期**（REQ-SQL-002 同一条纪律）——《DCL语句设计》§1.1/§1.3 |
 | `ParamRef` | `ParamRef` | **`:name`（本库规格），非 PG 的 `$n`**——**唯一的刻意偏离**，理由 = REQ-SQL-005 明定":name，类型绑定期推导" |
-| —（无 PG 对应） | `CreateGraphStmt` / `CreateWorkspaceStmt` / `AlterWorkspaceStmt` / `DropWorkspaceStmt` | 本库扩展（图/工作区 DDL）；**记档**：形状仿 PG 同类 DDL 节点（`RangeVar` + 选项列表） |
+| —（无 PG 对应） | `CreateGraphStmt` / `CreateWorkspaceStmt` / `AlterWorkspaceStmt` | 本库扩展（图/工作区 DDL）；**记档**：形状仿 PG 同类 DDL 节点（`RangeVar`/`WorkRef` + 选项列表）；`CreateWorkspaceStmt` **无 `CLONE OF`**（克隆独立成句 W2——《DCL语句设计》评审点①）；`ALTER WORKSPACE` 的动作 = `SetName(Option<Vec<u8>>)` / `SetQuota(Vec<DefElem>，键闭集 data/undo/temp/asset)` |
 
 ### 3.2 词法（`lexer.rs`）
 
@@ -419,7 +420,8 @@ cancel(执行句柄) -> 释放锁/页引用/临时空间（走 `ExecContext` 的
 
 | 片 | 内容 | 验收 |
 | --- | --- | --- |
-| **S1** ✅ **已落地（2026-10-06；含 PG 对齐返工）** | 词法 + 语法 + Raw AST（L1 缓存随 S6） | ✅ `crates/sql` **v0.2**：`lexer`（token + 字节区间；关键字闭集；**引号标识符**；未引号名照 PG 折叠小写；数字含 `.5`/`1e3` 形态）+ `ast`（**同名同形于 PG 解析节点**的 Raw AST——`SelectStmt`/`InsertStmt`/`AExpr`/`BoolExpr`/`NullTest`/`FuncCall`/`TypeCast`/`CaseExpr`/`ColumnRef`/`AConst`/`RangeVar`/`JoinExpr`/`ResTarget`/`SortBy`/`IndexStmt`/`DropStmt`…，映射表 §3.1）+ `parser`（**照 PG 的产生式删减**、优先级表照抄 gram.y、集合运算 `op/all/larg/rarg` 左深嵌套）。**用例 21**：闭集语料 62 条全解析、**清单外 24 条零接受**（新增 `INSERT…SELECT`/`NULLS FIRST`/`DROP…IF EXISTS`）、**PG 形状逐点断言**（`*` 是 `ColumnRef[AStar]`、`IN`/`BETWEEN`/`NULLIF` 走 `A_Expr`、`::` 与 `CAST` 同节点、`VALUES` 走 `values_lists`）、优先级三例（含 `a = 1 BETWEEN 2 AND 3` ⇒ `a = (1 BETWEEN …)` 与 `INTERSECT` 更紧）、折叠两例（未引号小写/引号保留） |
+| **S1** ✅ **已落地（2026-10-06；含 PG 对齐返工）** | 词法 + 语法 + Raw AST（L1 缓存随 S6） | ✅ `crates/sql` **v0.2**：`lexer`（token + 字节区间；关键字闭集；**引号标识符**；未引号名照 PG 折叠小写；数字含 `.5`/`1e3` 形态）+ `ast`（**同名同形于 PG 解析节点**的 Raw AST——`SelectStmt`/`InsertStmt`/`AExpr`/`BoolExpr`/`NullTest`/`FuncCall`/`TypeCast`/`CaseExpr`/`ColumnRef`/`AConst`/`RangeVar`/`JoinExpr`/`ResTarget`/`SortBy`/`IndexStmt`/`DropStmt`…，映射表 §3.1）+ `parser`（**照 PG 的产生式删减**、优先级表照抄 gram.y、集合运算 `op/all/larg/rarg` 左深嵌套）。**用例 21**：闭集语料 62 条全解析、**清单外 24 条零接受**（新增 `INSERT…SELECT`/`NULLS FIRST`/`DROP…IF EXISTS`；**D1 后扩到 72/35**）、**PG 形状逐点断言**（`*` 是 `ColumnRef[AStar]`、`IN`/`BETWEEN`/`NULLIF` 走 `A_Expr`、`::` 与 `CAST` 同节点、`VALUES` 走 `values_lists`）、优先级三例（含 `a = 1 BETWEEN 2 AND 3` ⇒ `a = (1 BETWEEN …)` 与 `INTERSECT` 更紧）、折叠两例（未引号小写/引号保留） |
+| **D1** ✅ **已落地（2026-10-06；先于 S2，纯解析）** | 《DCL语句设计》§5 的 D1：DCL 语法与 AST | ✅ `crates/sql`：`Stmt::VariableSet`（`ALTER SESSION SET/CLEAR`——**只开后者拼写**）/`AlterSystem`（F 组三动作）/`AlterDatabase`（W2 克隆 + T 组四动作）+ `WorkRef`/`FsRef` 双形态（**解析只认形态**，名字查找在 ②）；`CreateWorkspaceStmt` **删 `CLONE OF`**（错误文案指向 W2 替代句）；`DropStmt.workspaces`（工作区目标走 `WorkRef`）；**配额键闭集**（data/undo/temp/asset——解析期拒绝）；`ALTER SYSTEM`/`ALTER DATABASE` 未知动作**解析期拒绝**。**用例 +4**：语料扩到 72 条（DCL 19 条）+ 清单外 35 条（含 `CLONE OF`/`ALTER SYSTEM SWITCH LOGFILE`/`ALTER DATABASE RENAME`/非法配额键/`ALLOCATE = MAYBE`/裸 `SET`）+ DCL 形状逐点断言 + 闭集文案两例 |
 | **S2** | Catalog 只读面 + 名字解析三格 + 版本捕获 | 跨区名不可区分；保留名拒绝；`(obj#, mtime)` 被记入 Bound（断点查验） |
 | **S3** | Binder：类型推导 / 参数定型 / 写目标 / 登记点 | 类型错误全在绑定期；参数推导失败拒绝；写固定表/public 拒绝 |
 | **S4** | 逻辑表示 + 白名单变换 | 与**直译执行器**两路差分（无优化 vs 优化，逐行一致）；四条不变量各有用例 |

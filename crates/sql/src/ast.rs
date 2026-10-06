@@ -39,6 +39,12 @@ pub enum Stmt {
     CreateWorkspace(CreateWorkspaceStmt),
     /// `ALTER WORKSPACE`（本库扩展，仅 admin）。
     AlterWorkspace(AlterWorkspaceStmt),
+    /// `ALTER SESSION SET/CLEAR`（PG `VariableSetStmt`；白名单在 ② 判）。
+    VariableSet(VariableSetStmt),
+    /// `ALTER SYSTEM …`（本库扩展；`DCL语句设计` §2.1 的 F 组）。
+    AlterSystem(AlterSystemStmt),
+    /// `ALTER DATABASE …`（PG `AlterDatabaseStmt` 的**无库名**形态；T 组 + W2）。
+    AlterDatabase(AlterDatabaseStmt),
 }
 
 impl Stmt {
@@ -57,6 +63,9 @@ impl Stmt {
             Stmt::CreateGraph(s) => s.location,
             Stmt::CreateWorkspace(s) => s.location,
             Stmt::AlterWorkspace(s) => s.location,
+            Stmt::VariableSet(s) => s.location,
+            Stmt::AlterSystem(s) => s.location,
+            Stmt::AlterDatabase(s) => s.location,
         }
     }
 }
@@ -609,8 +618,10 @@ pub struct IndexElem {
 /// `DROP`（PG `DropStmt` 的裁剪）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropStmt {
-    /// 目标对象（`RangeVar` 列表）。
+    /// 目标对象（`RangeVar` 列表；`remove_type != Workspace` 时用）。
     pub objects: Vec<RangeVar>,
+    /// **工作区目标**（`remove_type == Workspace` 时用；`work_ref` 双形态）。
+    pub workspaces: Vec<WorkRef>,
     /// 对象类型。
     pub remove_type: ObjectType,
     /// `IF EXISTS`（清单外；字段保留）。
@@ -666,21 +677,150 @@ pub struct CreateGraphStmt {
 /// `CREATE WORKSPACE FOR USER …`（本库扩展，仅 admin）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateWorkspaceStmt {
-    /// 主体名。
+    /// 主体名（标识符——折叠照 PG）。
     pub subject: String,
-    /// `NAME '…'`
+    /// `NAME '…'`（**缺省 = 跟随属主名**；`DCL语句设计` §1.2 的 W1）。
     pub name: Option<Vec<u8>>,
-    /// `CLONE OF <id>`
-    pub clone_of: Option<String>,
     /// 位置。
     pub location: Location,
+}
+
+/// **工作区引用**（`DCL语句设计` §1.1）：`整数 | Str [ FOR USER 主体名 ]`。
+///
+/// **解析器只认形态**——名字查找与"裸名不唯一 ⇒ 拒绝"三条规则在 **② 绑定期**
+/// （REQ-SQL-002 同一条纪律：解析不 import 目录）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkRef {
+    /// `workspace_id`（整数形态）。
+    pub id: Option<u64>,
+    /// 名字（字符串形态）。
+    pub name: Option<Vec<u8>>,
+    /// `FOR USER <主体>`（名字形态的属主限定）。
+    pub user: Option<String>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// **文件系统引用**（`DCL语句设计` §1.3）：`整数（槽位） | Str（挂载点）`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FsRef {
+    /// 槽位号（整数形态）。
+    pub slot: Option<u32>,
+    /// 挂载点（字符串形态）。
+    pub mount: Option<Vec<u8>>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER SESSION SET/CLEAR`（PG `VariableSetStmt`；`ALTER SESSION SET` 与
+/// `SET` 同节点——本库**只开** `ALTER SESSION` 拼写，REQ-SQL-006 的会话面）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariableSetStmt {
+    /// `SET` / `CLEAR`。
+    pub kind: VariableSetKind,
+    /// 参数名（未引号折叠小写；**白名单在 ② 判**——解析不判）。
+    pub name: String,
+    /// `SET` 的值（`CLEAR` 为空；内存量照 PG：`'64MB'` / `'4GiB'` / 纯数字）。
+    pub args: Vec<AConst>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 会话变量动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariableSetKind {
+    /// `SET`。
+    Set,
+    /// `CLEAR`（回默认）。
+    Clear,
+}
+
+/// `ALTER SYSTEM …`（本库扩展；F 组——文件系统池）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterSystemStmt {
+    /// 动作。
+    pub action: AlterSystemAction,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER SYSTEM` 的动作（闭集：只有 F1–F3 三个产生式）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterSystemAction {
+    /// `ADD FILESYSTEM '<挂载点>'`。
+    AddFilesystem {
+        /// 挂载点。
+        mount: Vec<u8>,
+    },
+    /// `ALTER FILESYSTEM <fs_ref> SET ALLOCATE = ON | OFF`。
+    AlterFilesystem {
+        /// 目标文件系统。
+        fs: FsRef,
+        /// 分配开关（退役排水阀）。
+        allocate: bool,
+    },
+    /// `DROP FILESYSTEM <fs_ref>`。
+    DropFilesystem {
+        /// 目标文件系统。
+        fs: FsRef,
+    },
+}
+
+/// `ALTER DATABASE …`（PG `AlterDatabaseStmt` 的**无库名**形态——本库实例即
+/// 一个"库"，`DCL语句设计` §2.2 记档）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterDatabaseStmt {
+    /// 动作。
+    pub action: AlterDatabaseAction,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER DATABASE` 的动作（闭集：W2 克隆 + T1–T3 模板）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterDatabaseAction {
+    /// `CLONE WORKSPACE '<新名>' FROM WORKSPACE <work_ref> | FROM TEMPLATE '<名>'`。
+    CloneWorkspace {
+        /// 新工作区名。
+        name: Vec<u8>,
+        /// 源（工作区 / 模板，同一实现）。
+        source: WorkspaceSource,
+    },
+    /// `ADD TEMPLATE '<名>' FROM <work_ref>`（由源区制作模板；源区不动）。
+    AddTemplate {
+        /// 模板名。
+        name: Vec<u8>,
+        /// 源工作区。
+        from: WorkRef,
+    },
+    /// `ALTER WORKSPACE <work_ref> TO TEMPLATE '<名>'`（原地转换）。
+    WorkspaceToTemplate {
+        /// 源工作区。
+        ws: WorkRef,
+        /// 模板名。
+        name: Vec<u8>,
+    },
+    /// `DROP TEMPLATE '<名>'`（克隆是复制、不建依赖 ⇒ 无前置）。
+    DropTemplate {
+        /// 模板名。
+        name: Vec<u8>,
+    },
+}
+
+/// 克隆/制作模板的**源**。
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceSource {
+    /// `FROM WORKSPACE <work_ref>`。
+    Workspace(WorkRef),
+    /// `FROM TEMPLATE '<名>'`。
+    Template(Vec<u8>),
 }
 
 /// `ALTER WORKSPACE …`（本库扩展，仅 admin）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlterWorkspaceStmt {
-    /// 工作区 id（文本）。
-    pub workspace_id: String,
+    /// 工作区引用（`id` 或名字——§1.1 的三条规则在 ② 判）。
+    pub workspace: WorkRef,
     /// 动作。
     pub action: AlterWorkspaceAction,
     /// 位置。
