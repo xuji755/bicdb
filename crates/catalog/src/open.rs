@@ -133,6 +133,10 @@ pub struct Catalog<'io> {
     tables: BTreeMap<&'static str, (u32, &'static DictTable)>,
     /// 索引名 → （段头块、键定义、所属表）。
     indexes: BTreeMap<&'static str, (u32, KeyDef, &'static str)>,
+    /// **字典行缓存**（§4.2；每工作区一份——不跨工作区）。
+    pub(crate) cache: crate::cache::RowCache,
+    /// **当前的提交序号**（装载戳；打开时 = 恢复后的最新已提交序号）。
+    pub(crate) current_seq: u64,
 }
 
 impl<'io> Catalog<'io> {
@@ -211,6 +215,8 @@ impl<'io> Catalog<'io> {
             entries,
             tables,
             indexes,
+            cache: crate::cache::RowCache::new(0),
+            current_seq: 0,
         })
     }
 
@@ -343,9 +349,15 @@ impl<'io> Catalog<'io> {
         }
     }
 
-    /// **一个索引点的全部条目**（`(键分量, ROWID)`，键序）——`i_obj_name`
-    /// 的前缀扫描（"某命名空间下的全部名字"）等用途。
-    pub fn scan_index(&mut self, index: &str) -> Result<Vec<IndexEntry>, OpenError> {
+    /// **一个索引的条目**（`(键分量, ROWID)`，键序；`lo`/`hi` 为闭区间，
+    /// `None` = 无界）——全扫（`i_obj_name` 的清单）与前缀范围扫
+    /// （`i_col_pk` 取某对象的列组）共用本口。
+    pub fn range_index(
+        &mut self,
+        index: &str,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+    ) -> Result<Vec<IndexEntry>, OpenError> {
         let (block, _, _) = self
             .indexes
             .get(index)
@@ -357,11 +369,7 @@ impl<'io> Catalog<'io> {
             let root = segment::read_tree_head(&seg.read_page(0)?)?;
             let mut store = SegmentStore::new(&mut seg, self.ws);
             let mut tree = Tree::open(&mut store, fid, root)?;
-            let mut out = Vec::new();
-            for (key, rowid) in tree.range(None, None, usize::MAX)? {
-                out.push((key, rowid));
-            }
-            out
+            tree.range(lo, hi, usize::MAX)?
         };
         let mut result = Vec::with_capacity(entries.len());
         for (k, rid) in entries {
@@ -369,6 +377,11 @@ impl<'io> Catalog<'io> {
             result.push((comps, rid));
         }
         Ok(result)
+    }
+
+    /// **索引全扫**（键序）。
+    pub fn scan_index(&mut self, index: &str) -> Result<Vec<IndexEntry>, OpenError> {
+        self.range_index(index, None, None)
     }
 }
 

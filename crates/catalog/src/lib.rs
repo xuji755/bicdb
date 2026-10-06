@@ -19,25 +19,39 @@
 //!   走保序编码 ⇒ 索引键直接取行字节）；
 //! - [`open`]（C2b）：**打开链**（file 0 → 引导页自愈读 → 表/索引映射 →
 //!   `scan`/`fetch`/`lookup`/`scan_index`）+ **自举种子**（自洽字典）；
-//! - [`consistency`]（C2c）：**`file_scn` ↔ 控制文件检查点**核对（§2.5 判定表）。
+//! - [`consistency`]（C2c）：**`file_scn` ↔ 控制文件检查点**核对（§2.5 判定表）；
+//! - [`cache`]（C3）：**字典行缓存**（row cache 形态：按型分把 + 快照门槛 +
+//!   写穿 + 世代号精确失效 + `V$ROWCACHE` 统计四件套）；
+//! - [`api`]（C3）：**只读面**（`resolve`/`columns`/`indexes_of`/
+//!   `object_version`——缓存回查 + 不可区分的 `NotFound`）；
+//! - [`fixed`]（C3）：**固定表 `file$`**（内容 = 控制文件内存映像；只读、不落盘）。
 //!
-//! **未落地**：**字典行缓存**（C3，§4.2）、`resolve`/`columns`/`object_version`
-//! 只读面（C3）、DDL 写侧（C4）。
+//! **未落地**：DDL 写侧（C4：建表/建索引/删表 + `stat$`/`seq$` 接入）
+//! 与 `Move` 失效落点（C5）。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod api;
+pub mod cache;
 pub mod consistency;
 pub mod create;
 pub mod dict;
+pub mod fixed;
 pub mod open;
 pub mod row;
 
+pub use api::{CatalogError, ColumnDesc, IndexCol, IndexRef, ObjectRef, ObjectVersion};
+pub use cache::{
+    CacheCaps, CacheError, CacheKind, CacheStats, ColRow, IcolRow, IndRow, ObjRow, RowCache,
+    SegRow, TabRow, UndoRow,
+};
 pub use consistency::{check_files, ConsistencyReport, FileCheck, FilePoint, FileVerdict, Finding};
 pub use create::{create_dictionary, BootstrapObject, BuiltDictionary, CreateError};
 pub use dict::{
     bootstrap_entries_normal, bootstrap_entries_public, index_kind, is_public_only, namespace,
     obj_kind, self_check, table_opt, ColDef, ColTypeCode, DictTable, KeyDef, DICT_TABLES,
 };
+pub use fixed::{FixedColumn, FixedTable};
 pub use open::{comp_num, comp_text, Catalog, OpenError};
 pub use row::{decode as decode_row, encode as encode_row, DictValue};

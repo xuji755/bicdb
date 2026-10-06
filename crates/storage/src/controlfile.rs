@@ -1230,6 +1230,19 @@ impl<'a> ControlFile<'a> {
         DataFileRecord::decode(&self.read_fixed::<DATA_FILE_RECORD_LEN>(page_no, off)?)
     }
 
+    /// **已用的数据文件记录**（`status != 0`；空槽位跳过）——固定表 `file$`
+    /// 的取数口（`arch/03` §3.1.4：内容 = 控制文件的内存映像）。
+    pub fn data_file_records(&self) -> Result<Vec<DataFileRecord>, ControlFileError> {
+        let mut out = Vec::new();
+        for index in 0..MAX_DATA_FILE_RECORDS {
+            let rec = self.data_file_record(index)?;
+            if rec.status != 0 {
+                out.push(rec);
+            }
+        }
+        Ok(out)
+    }
+
     // -- 发布（单区间更新协议；两副本依次）------------------------------------
 
     /// 发布工作区条目（64 B 区间）。
