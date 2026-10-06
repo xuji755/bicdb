@@ -18,6 +18,7 @@ use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
 
 use bicdb_cli::boot;
+use bicdb_cli::config;
 use bicdb_cli::service::{self, ServiceError, StartOptions, StopMode};
 use bicdb_cli::wire;
 use bicdb_exec::Value;
@@ -31,6 +32,7 @@ bicdb —— 带撤销/日志的页式数据库（V1.0 单工作区）
   bicdb start   <dir> [-w 秒]      后台起服务（分离进程 + 实例锁 + 控制套接字）
   bicdb stop    <dir> [-m fast|immediate]   停服务（fast = 完全检查点）
   bicdb status  <dir>              服务/实例状态
+  bicdb params  <dir> [-c 键=值]   有效参数表（默认/文件/命令行三来源）
   bicdb restart <dir>              重启服务
   bicdb sql     <dir> <SQL>…       执行 SQL（服务在跑时经套接字；`-` = 读 stdin）
                 [--param 名=值 …]  给语句里的 `:名` 传值（可重复）
@@ -140,6 +142,36 @@ fn run(args: &[String]) -> Result<(), Exit> {
                 .transpose()?
                 .unwrap_or(StopMode::Fast);
             service::stop(&opts.dir, mode)?;
+            Ok(())
+        }
+        "params" => {
+            // 有效参数表（默认/文件/命令行三来源）+ 建区期（只读）一节。
+            let dir = args
+                .get(1)
+                .ok_or_else(|| Exit::Usage("params 缺目录".to_owned()))?;
+            let overrides =
+                config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
+            let (p, table) = boot::instance_params(std::path::Path::new(dir), &overrides)?;
+            println!("{:<24} {:<28} 来源", "参数", "取值");
+            println!("{:-<24} {:-<28} {:-<8}", "", "", "");
+            for (k, v, src) in &table {
+                println!("{k:<24} {v:<28} {}", src.as_str());
+            }
+            for (k, v) in [
+                ("pool_frames", p.pool_frames.to_string()),
+                ("file_extend_blocks", p.file_extend_blocks.to_string()),
+                ("socket", p.socket.clone()),
+                ("log", p.log.clone()),
+                ("lock_park_ms", p.lock_park_ms.to_string()),
+                ("deadlock_threshold_ms", p.deadlock_threshold_ms.to_string()),
+            ] {
+                if !table.iter().any(|(tk, _, _)| *tk == k) {
+                    println!("{k:<24} {v:<28} 默认");
+                }
+            }
+            println!();
+            println!("建区期参数（**控制文件**权威，改需重建；本文件写它们无效）：");
+            println!("  wal_groups / wal_members / wal_group_pages / initial_file0_blocks");
             Ok(())
         }
         "status" => {
@@ -284,7 +316,8 @@ fn service_opts(args: &[String]) -> Result<StartOptions, Exit> {
         })
         .transpose()?
         .unwrap_or(std::time::Duration::from_secs(30));
-    Ok(StartOptions::new(dir, socket, log, timeout))
+    let overrides = config::parse_cli_overrides(args).map_err(|e| Exit::Failed(e.to_string()))?;
+    Ok(StartOptions::new(dir, socket, log, timeout, overrides))
 }
 
 /// **经服务执行**（服务在跑时的 `sql`/`shell` 走这条）：打印与直连同形。

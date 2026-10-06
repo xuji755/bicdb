@@ -166,6 +166,47 @@ fn a_stale_lock_is_taken_over() {
     let _ = stop(dir.path(), "fast");
 }
 
+/// **参数文件是活的**：`init` 写默认；改文件重启生效；`-c` 覆盖文件；
+/// 未知键**具名拒绝**（闭集）。
+#[test]
+fn parameter_file_drives_the_service() {
+    let dir = TempDir::new("conf");
+    init(dir.path());
+    let d = dir.path().display().to_string();
+    let conf = dir.path().join("bicdb.conf");
+    assert!(conf.exists(), "init 应写出 bicdb.conf");
+
+    // 改文件：池 64 帧 + 等锁 7 ms。
+    let text = std::fs::read_to_string(&conf).expect("读");
+    let text = text
+        .replace("pool_frames           = 256", "pool_frames           = 64")
+        .replace("lock_park_ms          = 50", "lock_park_ms          = 7");
+    std::fs::write(&conf, text).expect("写");
+
+    // `params` 应报"文件"来源与文件里的值。
+    let (code, out, err) = run(&["params", &d]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("pool_frames") && out.contains("64"), "{out}");
+    assert!(out.contains("文件"), "{out}");
+
+    // 命令行覆盖优先。
+    let (_, out, _) = run(&["params", &d, "-c", "pool_frames=128"]);
+    assert!(out.contains("128") && out.contains("命令行"), "{out}");
+
+    // 按参数起的服务应正常就绪（参数真的被用上，没炸）。
+    let (code, out, err) = start(dir.path());
+    assert_eq!(code, 0, "start：{out}{err}");
+    let _ = stop(dir.path(), "fast");
+
+    // 未知键 ⇒ 具名拒绝（闭集），服务**不启动**。
+    let text = std::fs::read_to_string(&conf).expect("读");
+    std::fs::write(&conf, format!("{text}\nnope = 1\n")).expect("写");
+    let (code, _out, err) = start(dir.path());
+    assert_ne!(code, 0, "未知键应拒绝启动");
+    // 死因随错误带上（日志尾行）——用户不必自己去翻日志。
+    assert!(err.contains("未知参数"), "{err}");
+}
+
 #[test]
 fn direct_holder_blocks_the_service() {
     let dir = TempDir::new("direct");

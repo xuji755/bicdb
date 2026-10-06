@@ -39,6 +39,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 - Control protocol (length-prefixed text frames: `HELLO`/`STATUS`/`SQL`/
   `DESCRIBE`/`SHUTDOWN`) — explicitly a **transitional** local protocol; the
   versioned client protocol lands with `bicdb-net`.
+- **Instance parameter file** `<dir>/bicdb.conf` (PostgreSQL's `postgresql.conf`
+  in the data directory; the text half of Oracle's pfile/spfile split).
+  `bicdb init` writes it with all defaults, `bicdb params <dir>` prints the
+  effective values **with their source** (default / file / command line), and
+  `-c key=value` on `bicdb start` overrides the file. Unknown keys are
+  **rejected by name** (closed set — an accepted-but-ignored parameter is
+  exactly the kind of shell the 0.1.1 audit removed), and every parameter has a
+  real sink: buffer pool frames, file auto-extend increment, control socket,
+  service log, lock park timeout, deadlock threshold. Creation-time parameters
+  (WAL groups/members/group pages, initial file blocks) live in the control
+  file and are shown read-only. When the daemon dies during startup, `start`
+  now reports the **last log lines** instead of just timing out.
 
 ### Fixed
 

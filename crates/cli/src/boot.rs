@@ -38,6 +38,7 @@ use bicdb_wal::group::{online_groups, GroupSpec, GroupWriter};
 use bicdb_wal::recovery::recover;
 use bicdb_workspace::io::{FileHandle, FileIo, OsFileIo};
 
+use crate::config::{self, InstanceParams};
 use crate::lock::{self, InstanceLock, LockError, LockMode};
 use bicdb_workspace::WorkspaceId;
 
@@ -62,8 +63,8 @@ const CF_B: &str = "cf_b";
 /// 段扩展会按需长大，这个数字只是"免去建区后立刻扩文件"）。
 const FILE0_BLOCKS: u64 = 4096;
 
-/// **缓冲区帧数**（16 KiB/帧 ⇒ 4 MiB）。
-const POOL_FRAMES: usize = 256;
+/// **自动扩展增量的默认值**（块；与 `storage::segment` 同源）。
+pub const DEFAULT_FILE_EXTEND_BLOCKS: u64 = bicdb_storage::segment::DEFAULT_FILE_EXTEND_BLOCKS;
 
 /// 建区/打开错误。
 #[derive(Debug)]
@@ -74,6 +75,8 @@ pub enum BootError {
     Catalog(String),
     /// **实例被别的进程占着**（单写者纪律；见 `lock.rs`）。
     Occupied(String),
+    /// **参数文件**（未知键/取值非法；见 `config.rs`）。
+    Config(String),
 }
 
 impl std::fmt::Display for BootError {
@@ -82,6 +85,7 @@ impl std::fmt::Display for BootError {
             BootError::Io(e) => write!(f, "I/O：{e}"),
             BootError::Catalog(w) => write!(f, "目录：{w}"),
             BootError::Occupied(w) => f.write_str(w),
+            BootError::Config(w) => write!(f, "参数：{w}"),
         }
     }
 }
@@ -159,6 +163,28 @@ fn workspace_entry() -> WorkspaceEntry {
         derived_from: None,
         derived_at_seq: seq(0),
     }
+}
+
+/// **进程级参数落点**（段层的自动扩展增量：层里没有实例上下文，故设一次）。
+fn apply_process_params(params: &InstanceParams) {
+    let _ = bicdb_storage::segment::set_file_extend_blocks(params.file_extend_blocks);
+}
+
+/// 等锁策略（参数文件 → 引擎）。
+fn wait_policy(params: &InstanceParams) -> bicdb_txn::write::WaitPolicy {
+    bicdb_txn::write::WaitPolicy {
+        park_timeout: std::time::Duration::from_millis(params.lock_park_ms),
+        deadlock_threshold_ms: params.deadlock_threshold_ms,
+        max_waits: None,
+    }
+}
+
+/// 实例参数（`bicdb params` 与诊断用；`dir` 上装载，命令行覆盖可给）。
+pub fn instance_params(
+    dir: &Path,
+    cli: &[(String, String)],
+) -> Result<(InstanceParams, config::ParamTable), BootError> {
+    InstanceParams::load_with_table(dir, cli).map_err(|e| BootError::Config(e.to_string()))
 }
 
 /// **块定位**（池与恢复共用）：file 0 = 字典，file 1 = 撤销段。
@@ -254,6 +280,15 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
     let lock = InstanceLock::acquire(dir, LockMode::Direct, &lock::socket_path(dir))?;
 
     // ① file 0：自举集 + 种子（**建区期直写**，不经池——见 `catalog::create`）。
+    // 参数文件：**先写默认**（`bicdb init` 的产物之一），再按它取参数——
+    // 用户随后编辑的就是这份（PG `initdb` 写 `postgresql.conf` 同款）。
+    let conf = dir.join(config::FILE_NAME);
+    if !conf.exists() {
+        std::fs::write(&conf, InstanceParams::default_file_text())?;
+    }
+    let params = InstanceParams::load(dir, &[]).map_err(|e| BootError::Config(e.to_string()))?;
+    apply_process_params(&params);
+
     let layout = FileLayout::meta();
     let file0_path = p(dir, FILE0);
     let mut file0 = DataFile::create(
@@ -302,19 +337,20 @@ pub fn create_instance(dir: &Path) -> Result<Instance, BootError> {
     let guard = writer.shared();
     let pool: &'static BufferPool<'static> = Box::leak(Box::new(BufferPool::with_config(
         io_dyn,
-        POOL_FRAMES,
+        params.pool_frames,
         move |_ws, r| resolve(file0_handle, undo_handle, r),
         guard,
         SystemClock,
-        CacheConfig::for_capacity(POOL_FRAMES),
+        CacheConfig::for_capacity(params.pool_frames),
     )?));
-    let engine: &'static Engine<'static, 'static, 'static, 'static> =
-        Box::leak(Box::new(Engine::new(
-            pool,
-            writer,
-            UndoChain::open(undo_seg).with_pool(pool),
-            seq(0),
-        )));
+    let mut engine = Engine::new(
+        pool,
+        writer,
+        UndoChain::open(undo_seg).with_pool(pool),
+        seq(0),
+    );
+    engine.set_policy(wait_policy(&params));
+    let engine: &'static Engine<'static, 'static, 'static, 'static> = Box::leak(Box::new(engine));
     let mut catalog =
         Catalog::open(io_dyn, &file0_path).map_err(|e| BootError::Catalog(e.to_string()))?;
     catalog.attach_pool(pool);
@@ -347,6 +383,17 @@ pub fn open_instance(dir: &Path) -> Result<Instance, BootError> {
 
 /// **打开既有实例（锁已由调用方持有）**：守护进程走这条（它拿的是 Service 锁）。
 pub fn open_unlocked(dir: &Path, lock: Option<InstanceLock>) -> Result<Instance, BootError> {
+    let params = InstanceParams::load(dir, &[]).map_err(|e| BootError::Config(e.to_string()))?;
+    open_unlocked_with(dir, lock, &params)
+}
+
+/// **打开（参数已装载）**：服务路径用它（命令行 `-c` 覆盖在这里生效）。
+pub fn open_unlocked_with(
+    dir: &Path,
+    lock: Option<InstanceLock>,
+    params: &InstanceParams,
+) -> Result<Instance, BootError> {
+    apply_process_params(params);
     let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
     let io_dyn: &'static dyn FileIo = io;
     let file0_path = p(dir, FILE0);
@@ -444,15 +491,15 @@ pub fn open_unlocked(dir: &Path, lock: Option<InstanceLock>) -> Result<Instance,
     let guard = writer.shared();
     let pool: &'static BufferPool<'static> = Box::leak(Box::new(BufferPool::with_config(
         io_dyn,
-        POOL_FRAMES,
+        params.pool_frames,
         move |_ws, r| resolve(file0_handle, undo_handle, r),
         guard,
         SystemClock,
-        CacheConfig::for_capacity(POOL_FRAMES),
+        CacheConfig::for_capacity(params.pool_frames),
     )?));
-    let engine: &'static Engine<'static, 'static, 'static, 'static> = Box::leak(Box::new(
-        Engine::new(pool, writer, chain.with_pool(pool), seq(recovered_seq)),
-    ));
+    let mut engine = Engine::new(pool, writer, chain.with_pool(pool), seq(recovered_seq));
+    engine.set_policy(wait_policy(params));
+    let engine: &'static Engine<'static, 'static, 'static, 'static> = Box::leak(Box::new(engine));
     let mut catalog =
         Catalog::open(io_dyn, &file0_path).map_err(|e| BootError::Catalog(e.to_string()))?;
     catalog.attach_pool(pool);

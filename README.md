@@ -149,6 +149,7 @@ cargo build --release
 # background service + SQL*Plus-style client
 ./target/release/bicdb start ./demo            # detached service, instance lock, log
 ./target/release/bicdb status ./demo
+./target/release/bicdb params ./demo            # effective parameters + source
 ./target/release/bicdbcli ./demo               # buffer, `/` re-runs, SPOOL, @script, DESC
 ./target/release/bicdb stop  ./demo            # clean shutdown (full checkpoint)
 ```
@@ -321,6 +322,7 @@ cargo build --release
 # 后台服务 + SQL*Plus 形态客户端
 ./target/release/bicdb start ./demo            # 分离进程 + 实例锁 + 日志
 ./target/release/bicdb status ./demo
+./target/release/bicdb params ./demo            # 有效参数表（默认/文件/命令行）
 ./target/release/bicdbcli ./demo               # 缓冲、`/` 重跑、SPOOL、@脚本、DESC
 ./target/release/bicdb stop  ./demo            # 干净关闭（完全检查点）
 ```

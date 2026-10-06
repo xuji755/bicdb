@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use bicdb_sql::session::Session;
 
-use crate::boot::open_unlocked;
+use crate::boot::open_unlocked_with;
 use crate::lock::{self, InstanceLock, LockError, LockInfo, LockMode};
 use crate::wire::{self, WireError};
 
@@ -46,6 +46,8 @@ pub enum ServiceError {
     State(String),
     /// I/O。
     Io(std::io::Error),
+    /// 参数文件（未知键/取值非法）。
+    Config(crate::config::ConfigError),
 }
 
 impl std::fmt::Display for ServiceError {
@@ -56,6 +58,7 @@ impl std::fmt::Display for ServiceError {
             ServiceError::Wire(e) => write!(f, "{e}"),
             ServiceError::State(w) => f.write_str(w),
             ServiceError::Io(e) => write!(f, "I/O：{e}"),
+            ServiceError::Config(e) => write!(f, "参数：{e}"),
         }
     }
 }
@@ -68,6 +71,7 @@ macro_rules! from_err {
     })* };
 }
 from_err!(
+    Config <- crate::config::ConfigError,
     Lock <- LockError,
     Boot <- crate::boot::BootError,
     Wire <- WireError,
@@ -110,28 +114,34 @@ impl StopMode {
 pub struct StartOptions {
     /// 实例目录。
     pub dir: PathBuf,
-    /// 控制套接字路径（默认 `<dir>/bicdb.sock`）。
+    /// 控制套接字路径（默认取参数文件 `socket`，再默认 `<dir>/bicdb.sock`）。
     pub socket: PathBuf,
-    /// 日志路径（默认 `<dir>/bicdb.log`）。
+    /// 日志路径（默认取参数文件 `log`，再默认 `<dir>/bicdb.log`）。
     pub log: PathBuf,
     /// 就绪等待上限。
     pub timeout: Duration,
+    /// 命令行 `-c 键=值` 覆盖（优先级最高）。
+    pub overrides: Vec<(String, String)>,
 }
 
 impl StartOptions {
-    /// 由实例目录与覆盖项组装。
+    /// 由实例目录 + 命令行覆盖组装（套接字/日志**先看参数文件**，再看默认）。
     #[must_use]
     pub fn new(
         dir: &Path,
         socket: Option<PathBuf>,
         log: Option<PathBuf>,
         timeout: Duration,
+        overrides: Vec<(String, String)>,
     ) -> Self {
+        let params = crate::config::InstanceParams::load(dir, &overrides)
+            .unwrap_or_else(|_| crate::config::InstanceParams::default());
         Self {
             dir: dir.to_path_buf(),
-            socket: socket.unwrap_or_else(|| lock::socket_path(dir)),
-            log: log.unwrap_or_else(|| dir.join("bicdb.log")),
+            socket: socket.unwrap_or_else(|| params.socket_path(dir)),
+            log: log.unwrap_or_else(|| params.log_path(dir)),
             timeout,
+            overrides,
         }
     }
 }
@@ -151,6 +161,16 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
         opts.socket.display()
     ));
 
+    // **参数文件 + 命令行 `-c`**：先装载（未知键/取值非法在此具名拒绝），
+    // 再按它打开实例——与直连路径同一份参数语义。
+    let params = crate::config::InstanceParams::load(&opts.dir, &opts.overrides)?;
+    log.line(&format!(
+        "参数：池 {} 帧，自动扩展 {} 块，等锁 {} ms，死锁阈值 {} ms",
+        params.pool_frames,
+        params.file_extend_blocks,
+        params.lock_park_ms,
+        params.deadlock_threshold_ms
+    ));
     let lock = InstanceLock::acquire(&opts.dir, LockMode::Service, &opts.socket)?;
     log.line(&format!(
         "已取实例锁（pid {}，模式 service）",
@@ -158,7 +178,7 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
     ));
 
     // **打开实例**（三阶段恢复）：可能耗时（重放），先记日志再开工。
-    let mut inst = open_unlocked(&opts.dir, Some(lock))?;
+    let mut inst = open_unlocked_with(&opts.dir, Some(lock), &params)?;
     match inst.recovery {
         Some(r) => log.line(&format!(
             "实例已打开：恢复起点 LSN {}，重放 {} 块，回滚 {} 个事务，续写位 {}",
@@ -306,6 +326,20 @@ pub fn type_name(code: u32, length: u32) -> String {
     }
 }
 
+/// 日志尾几行（启动失败的诊断：把死因直接带给用户）。
+fn log_tail(path: &Path, n: usize) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return "（日志读不到）".to_owned();
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let from = lines.len().saturating_sub(n);
+    lines[from..]
+        .iter()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 追加式日志（服务日志 = PG 的 `-l` 日志文件 / Oracle 的 alert log 的简化）。
 struct LogFile {
     file: std::fs::File,
@@ -362,7 +396,7 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
         .append(true)
         .open(&opts.log)?;
     let errlog = log.try_clone()?;
-    let child = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg("__daemon")
         .arg("--dir")
         .arg(&opts.dir)
@@ -370,6 +404,11 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
         .arg(&opts.socket)
         .arg("--log")
         .arg(&opts.log)
+        .args(
+            opts.overrides
+                .iter()
+                .flat_map(|(k, v)| ["-c".to_owned(), format!("{k}={v}")]),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(errlog))
@@ -392,10 +431,14 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
             }
             return Ok(());
         }
-        // 子进程死了就别等了。
-        if !lock::proc_starttime(pid).is_some_and(|_| true) {
+        // 子进程死了就别等了（`try_wait` 同时**收尸**：僵尸进程在 /proc 里还在，
+        // 只看 proc_starttime 会一直"活着"直到超时——实测踩到过）。
+        if let Ok(Some(st)) = child.try_wait() {
+            // 子进程死因在**日志**里（它的 stderr 也落那儿）——把尾几行带上来，
+            // 省得用户还要去翻文件（启动失败是最常见的支持问题）。
+            let tail = log_tail(&opts.log, 3);
             return Err(ServiceError::State(format!(
-                "服务进程 {pid} 已退出——看日志：{}",
+                "服务进程 {pid} 已退出（{st}）——日志 {}：\n{tail}",
                 opts.log.display()
             )));
         }
