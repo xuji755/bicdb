@@ -1,302 +1,323 @@
-//! **Raw AST**（设计 `doc/SQL前端设计_v0.1.md` §3.3；REQ-SQL-002）。
+//! **Raw AST**（设计 `doc/SQL前端设计_v0.1.md` §3.1）——**形状对齐 PostgreSQL**：
+//! 节点同名同形（字段名用 Rust 命名风格），**只裁剪与本库面无关的字段**。
 //!
-//! **正面清单纪律**（代码审查据此，验收原文"AST 模块不 import 目录接口"）：
-//!
-//! | 有 | 没有 |
-//! | --- | --- |
-//! | 语法节点（语句 / 子句 / 表达式） | 任何对象号 / 对象版本 |
-//! | 标识符的**文本**与大小写 | 任何解析结果（表不存在？列是否存在？） |
-//! | 字面量的原文本与位置 | 任何类型判定（`CAST` 的类型名也只是文本） |
-//! | 源码位置（字节区间） | 任何权限判定 |
-//!
-//! ⇒ 三项收益随之成立：可单测（零目录状态）、**可跨工作区复用**（实例级
-//! AST 缓存安全）、名字探测不可能发生在解析期。
+//! - 每个节点一一对应 PG 的解析节点（`parsenodes.h` / `primnodes.h`，
+//!   REL_16_STABLE；映射表见设计 §3.1，取证 `12-pg-parser-source.txt`）；
+//! - **两处记档差异**：① `location` 用**字节区间**（PG 用起始偏移的 `int`——
+//!   本库规格 REQ-SQL-002 要"字节偏移区间"）；② `ParamRef` 用 `:name`
+//!   （PG 用 `$n`——本库规格 REQ-SQL-005 明定）；
+//! - **正面清单纪律**（REQ-SQL-002）：只有语法与位置——**不 import 任何目录
+//!   接口**、无对象号、无类型判定。
 
 use crate::lexer::Span;
 
-/// 一条语句（Raw AST 根）。
-///
-/// 变体尺寸差异大（`Select` 最大）——本项目按值传递语句对象的场景（解析后
-/// 立即消费/单测比对）不值得引入 `Box`；抑制该 lint 是**有意**的。
-#[allow(clippy::large_enum_variant)]
+/// 位置（PG 的 `int location` 扩展为字节区间——设计 §3.1 记档）。
+pub type Location = Span;
+
+/// 一条语句（PG 的 `RawStmt`；每个变体自带 `location`）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    /// `SELECT …`（含集合运算链）。
+    /// `SELECT`（`SelectStmt`）。
     Select(SelectStmt),
-    /// `INSERT INTO … VALUES …`。
+    /// `INSERT`（`InsertStmt`）。
     Insert(InsertStmt),
-    /// `UPDATE … SET …`。
+    /// `UPDATE`（`UpdateStmt`）。
     Update(UpdateStmt),
-    /// `DELETE FROM …`。
+    /// `DELETE`（`DeleteStmt`）。
     Delete(DeleteStmt),
-    /// `CREATE TABLE …`。
-    CreateTable(CreateTableStmt),
-    /// `DROP TABLE …`。
-    DropTable(DropTableStmt),
-    /// `CREATE [UNIQUE] INDEX …`（表 / 图 / 表达式键）。
-    CreateIndex(CreateIndexStmt),
-    /// `DROP INDEX …`。
-    DropIndex(DropIndexStmt),
-    /// `CREATE GRAPH …`。
+    /// `CREATE TABLE`（`CreateStmt`）。
+    CreateTable(CreateStmt),
+    /// `CREATE [UNIQUE] INDEX`（`IndexStmt`）。
+    Index(IndexStmt),
+    /// `DROP`（`DropStmt`；对象类型区分表/索引/图/工作区）。
+    Drop(DropStmt),
+    /// 事务控制（`TransactionStmt`）。
+    Transaction(TransactionStmt),
+    /// `CREATE GRAPH`（本库扩展；形状仿 PG 的 DDL 节点）。
     CreateGraph(CreateGraphStmt),
-    /// `DROP GRAPH …`。
-    DropGraph(DropGraphStmt),
-    /// `CREATE WORKSPACE …`（仅 admin）。
+    /// `CREATE WORKSPACE`（本库扩展，仅 admin）。
     CreateWorkspace(CreateWorkspaceStmt),
-    /// `ALTER WORKSPACE …`（仅 admin）。
+    /// `ALTER WORKSPACE`（本库扩展，仅 admin）。
     AlterWorkspace(AlterWorkspaceStmt),
-    /// `DROP WORKSPACE …`（仅 admin）。
-    DropWorkspace(DropWorkspaceStmt),
-    /// 事务控制（`BEGIN` / `COMMIT` / `ROLLBACK`）。
-    Txn {
-        /// 哪一种。
-        kind: TxnStmt,
-        /// 位置。
-        span: Span,
-    },
 }
 
-/// 语句整体区间（错误定位 / 缓存文本比对的辅助）。
-#[must_use]
-pub fn stmt_span(stmt: &Stmt) -> Span {
-    match stmt {
-        Stmt::Select(s) => s.span,
-        Stmt::Insert(s) => s.span,
-        Stmt::Update(s) => s.span,
-        Stmt::Delete(s) => s.span,
-        Stmt::CreateTable(s) => s.span,
-        Stmt::DropTable(s) => s.span,
-        Stmt::CreateIndex(s) => s.span,
-        Stmt::DropIndex(s) => s.span,
-        Stmt::CreateGraph(s) => s.span,
-        Stmt::DropGraph(s) => s.span,
-        Stmt::CreateWorkspace(s) => s.span,
-        Stmt::AlterWorkspace(s) => s.span,
-        Stmt::DropWorkspace(s) => s.span,
-        Stmt::Txn { span, .. } => *span,
+impl Stmt {
+    /// 语句起始位置。
+    #[must_use]
+    pub fn location(&self) -> Location {
+        match self {
+            Stmt::Select(s) => s.location,
+            Stmt::Insert(s) => s.location,
+            Stmt::Update(s) => s.location,
+            Stmt::Delete(s) => s.location,
+            Stmt::CreateTable(s) => s.location,
+            Stmt::Index(s) => s.location,
+            Stmt::Drop(s) => s.location,
+            Stmt::Transaction(s) => s.location,
+            Stmt::CreateGraph(s) => s.location,
+            Stmt::CreateWorkspace(s) => s.location,
+            Stmt::AlterWorkspace(s) => s.location,
+        }
     }
 }
 
-// ─────────────────────────── 表达式 ───────────────────────────
+// ─────────────────────────── 表达式（primnodes.h）───────────────────────────
 
-/// 二元操作符。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryOp {
-    /// `OR`
-    Or,
-    /// `AND`
-    And,
-    /// `=`
-    Eq,
-    /// `<>`
-    Ne,
-    /// `<`
-    Lt,
-    /// `<=`
-    Le,
-    /// `>`
-    Gt,
-    /// `>=`
-    Ge,
-    /// `+`
-    Add,
-    /// `-`
-    Sub,
-    /// `*`
-    Mul,
-    /// `/`
-    Div,
-    /// `<->`（向量 L2；RET 接口）
-    VecL2,
-    /// `<=>`（余弦）
-    VecCosine,
-    /// `<#>`（负内积）
-    VecNegInner,
-}
-
-/// 一元操作符。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnaryOp {
-    /// `NOT`
-    Not,
-    /// 一元 `-`
-    Neg,
-    /// 一元 `+`
-    PosAffirm,
-}
-
-/// 字面量（**原文本 + 种类**；值的解析在 ② 走 TYP 内核）。
-#[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
-    /// 数字原文本。
-    Number(String),
-    /// 字符串（已解转义）。
-    Str(Vec<u8>),
-    /// `TRUE` / `FALSE`。
-    Bool(bool),
-    /// `NULL`。
-    Null,
-}
-
-/// 表达式（Raw AST：只有语法与位置）。
+/// 表达式（PG 是 `Node*`；我们用枚举收窄——**记档**）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// 字面量。
-    Literal {
-        /// 字面量本体。
-        value: Literal,
-        /// 位置。
-        span: Span,
-    },
-    /// 列引用（可带 `表.列` 限定）。
-    Column {
-        /// 限定名（可空）。
-        qualifier: Option<String>,
-        /// 列名文本（大小写折叠在 ②）。
-        name: String,
-        /// 位置。
-        span: Span,
-    },
-    /// 函数调用（`COALESCE`/`NULLIF`/`json_get`/`json_exists`/`json_set`/`id`/…——
-    /// **有无此函数、参数个数与类型**都是 ② 的事）。
-    Call {
-        /// 函数名文本。
-        name: String,
-        /// `DISTINCT` 修饰（`COUNT(DISTINCT x)`）——**只对聚合函数合法**，
-        /// 是不是聚合、参数个数对不对，都是 ② 的事。
-        distinct: bool,
-        /// 实参。
-        args: Vec<Expr>,
-        /// 位置。
-        span: Span,
-    },
-    /// 参数 `:name`（类型绑定期推导）。
-    Param {
-        /// 参数名。
-        name: String,
-        /// 位置。
-        span: Span,
-    },
-    /// 二元运算。
-    Binary {
-        /// 操作符。
-        op: BinaryOp,
-        /// 左。
-        left: Box<Expr>,
-        /// 右。
-        right: Box<Expr>,
-        /// 位置。
-        span: Span,
-    },
-    /// 一元运算。
-    Unary {
-        /// 操作符。
-        op: UnaryOp,
-        /// 操作数。
-        expr: Box<Expr>,
-        /// 位置。
-        span: Span,
-    },
-    /// `IS [NOT] NULL`。
-    IsNull {
-        /// 操作数。
-        expr: Box<Expr>,
-        /// 是否 `NOT`。
-        negated: bool,
-        /// 位置。
-        span: Span,
-    },
-    /// `[NOT] IN (列表)`（列表项为表达式——清单只允许字面量，② 判）。
-    InList {
-        /// 操作数。
-        expr: Box<Expr>,
-        /// 列表。
-        list: Vec<Expr>,
-        /// 是否 `NOT`。
-        negated: bool,
-        /// 位置。
-        span: Span,
-    },
-    /// `[NOT] BETWEEN a AND b`。
-    Between {
-        /// 操作数。
-        expr: Box<Expr>,
-        /// 下界。
-        low: Box<Expr>,
-        /// 上界。
-        high: Box<Expr>,
-        /// 是否 `NOT`。
-        negated: bool,
-        /// 位置。
-        span: Span,
-    },
-    /// `CASE [operand] WHEN … THEN … [ELSE …] END`。
-    Case {
-        /// 简单 CASE 的操作数（`None` = 搜索 CASE）。
-        operand: Option<Box<Expr>>,
-        /// `(WHEN, THEN)` 列表。
-        whens: Vec<(Expr, Expr)>,
-        /// `ELSE`。
-        otherwise: Option<Box<Expr>>,
-        /// 位置。
-        span: Span,
-    },
-    /// **实参位置的 `*`**（`COUNT(*)`）。
-    ///
-    /// 只在函数调用的实参位置产生；其他位置（投影项之外的运算数等）语法层
-    /// 就不可达（投影的 `*` 走 [`SelectItem`] 的空表达式形态）。
-    Star {
-        /// 位置。
-        span: Span,
-    },
-    /// `CAST(expr AS 类型名)`（**类型名只是文本**——判定在 ②）。
-    Cast {
-        /// 操作数。
-        expr: Box<Expr>,
-        /// 类型名与参数（如 `NUMBER(10,2)`）。
-        type_name: TypeName,
-        /// 位置。
-        span: Span,
-    },
+    /// 列引用 / `*`（`ColumnRef`）。
+    ColumnRef(ColumnRef),
+    /// 常量（`A_Const`）。
+    AConst(AConst),
+    /// 参数（`ParamRef`；本库用 `:name`）。
+    ParamRef(ParamRef),
+    /// 带名操作符表达式（`A_Expr`；含 `IN`/`BETWEEN`/`NULLIF`）。
+    AExpr(AExpr),
+    /// 布尔表达式（`BoolExpr`；`NOT` 是一元形态）。
+    BoolExpr(BoolExpr),
+    /// `IS [NOT] NULL`（`NullTest`）。
+    NullTest(NullTest),
+    /// 函数调用（`FuncCall`）。
+    FuncCall(FuncCall),
+    /// 转型（`TypeCast`；`CAST(x AS t)` 与 `x::t` 同节点）。
+    TypeCast(TypeCast),
+    /// `CASE`（`CaseExpr`）。
+    CaseExpr(CaseExpr),
+    /// `COALESCE`（`CoalesceExpr`）。
+    CoalesceExpr(CoalesceExpr),
 }
 
 impl Expr {
     /// 位置。
     #[must_use]
-    pub fn span(&self) -> Span {
+    pub fn location(&self) -> Location {
         match self {
-            Expr::Literal { span, .. }
-            | Expr::Column { span, .. }
-            | Expr::Call { span, .. }
-            | Expr::Param { span, .. }
-            | Expr::Binary { span, .. }
-            | Expr::Unary { span, .. }
-            | Expr::IsNull { span, .. }
-            | Expr::InList { span, .. }
-            | Expr::Between { span, .. }
-            | Expr::Case { span, .. }
-            | Expr::Cast { span, .. }
-            | Expr::Star { span } => *span,
+            Expr::ColumnRef(n) => n.location,
+            Expr::AConst(n) => n.location,
+            Expr::ParamRef(n) => n.location,
+            Expr::AExpr(n) => n.location,
+            Expr::BoolExpr(n) => n.location,
+            Expr::NullTest(n) => n.location,
+            Expr::FuncCall(n) => n.location,
+            Expr::TypeCast(n) => n.location,
+            Expr::CaseExpr(n) => n.location,
+            Expr::CoalesceExpr(n) => n.location,
         }
     }
 }
 
-/// 类型名（`CAST` / 列定义用；**文本 + 位置**，合法性与语义在 ② 判）。
+/// `ColumnRef` 的一个字段（PG：`String` 或 `A_Star`）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypeName {
-    /// 类型名文本（如 `NUMBER` / `TIMESTAMP` / `VECTOR`）。
-    pub name: String,
-    /// 参数（如 `NUMBER(10,2)` 的 `10, 2`；原文本）。
-    pub args: Vec<String>,
-    /// 位置。
-    pub span: Span,
+pub enum ColumnRefField {
+    /// 名字（已按 PG 规则折叠：未引号 ⇒ 小写；引号 ⇒ 原样）。
+    Name(String),
+    /// `*`
+    AStar,
 }
 
-// ─────────────────────────── SELECT ───────────────────────────
+/// 列引用（PG `ColumnRef`）。`a.b` = 两个 `Name`；`*` / `t.*` 含 `AStar`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnRef {
+    /// 字段链（≥ 1）。
+    pub fields: Vec<ColumnRefField>,
+    /// 位置。
+    pub location: Location,
+}
 
-/// 集合运算种类。
+/// 常量值（PG `A_Const.val` 的 `ValUnion` 子集；数字**留原文本**）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstValue {
+    /// 整数形态（原文本）。
+    Int(String),
+    /// 浮点形态（原文本；含指数写法）。
+    Float(String),
+    /// 字符串（已解转义）。
+    Str(Vec<u8>),
+    /// 布尔。
+    Bool(bool),
+}
+
+/// 常量（PG `A_Const`）。`value = None` ≡ PG 的 `isnull = true`（NULL）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AConst {
+    /// 值（`None` = `NULL`）。
+    pub value: Option<ConstValue>,
+    /// 位置。
+    pub location: Location,
+}
+
+impl AConst {
+    /// 是不是 `NULL`。
+    #[must_use]
+    pub fn is_null(&self) -> bool {
+        self.value.is_none()
+    }
+}
+
+/// 参数（PG `ParamRef`；本库：`:name`，类型绑定期推导）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamRef {
+    /// 参数名（已折叠）。
+    pub name: String,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `A_Expr_Kind` 的子集（PG 的完整枚举见 `parsenodes.h`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetOpKind {
+pub enum AExprKind {
+    /// 普通操作符（`= <> < <= > >= + - * /` 与向量 `<-> <=> <#>`）。
+    Op,
+    /// `IN`（`name = "="`，值列表在 `rexpr_list`——照 PG 语义）。
+    In,
+    /// `NOT IN`
+    NotIn,
+    /// `BETWEEN`（下界/上界在 `rexpr_list`——照 PG 的二元列表）。
+    Between,
+    /// `NOT BETWEEN`
+    NotBetween,
+    /// `NULLIF`（PG 用 `A_Expr`，无独立节点）。
+    NullIf,
+}
+
+/// 带名操作符表达式（PG `A_Expr`）。
+///
+/// **记档差异**：PG 的 `lexpr`/`rexpr` 都是 `Node*`，`BETWEEN`/`IN` 把
+/// 值列表塞进 `rexpr`；Rust 无此形态 ⇒ 拆为 `rexpr`（单）与 `rexpr_list`（多）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AExpr {
+    /// 种类。
+    pub kind: AExprKind,
+    /// 操作符名（`=`、`+`、`<->`、`BETWEEN`…——照 PG 用字符串）。
+    pub name: String,
+    /// 左操作数（`None` = 一元，如 `+x`）。
+    pub lexpr: Option<Box<Expr>>,
+    /// 单右操作数（`Op` / `NullIf`）。
+    pub rexpr: Option<Box<Expr>>,
+    /// 多右操作数（`In`/`NotIn` 的值表、`Between`/`NotBetween` 的上下界）。
+    pub rexpr_list: Vec<Expr>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `BoolExprType`（PG 同名枚举的子集）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolExprType {
+    /// `AND`
+    And,
+    /// `OR`
+    Or,
+    /// `NOT`（一元；`args` 长 1）
+    Not,
+}
+
+/// 布尔表达式（PG `BoolExpr`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoolExpr {
+    /// 种类。
+    pub boolop: BoolExprType,
+    /// 操作数。
+    pub args: Vec<Expr>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `NullTestType`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullTestType {
+    /// `IS NULL`
+    IsNull,
+    /// `IS NOT NULL`
+    IsNotNull,
+}
+
+/// `IS [NOT] NULL`（PG `NullTest`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NullTest {
+    /// 操作数。
+    pub arg: Box<Expr>,
+    /// 种类。
+    pub nulltesttype: NullTestType,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 函数调用（PG `FuncCall`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncCall {
+    /// 函数名（已折叠）。
+    pub funcname: String,
+    /// 实参（`agg_star` 时为空——`COUNT(*)`）。
+    pub args: Vec<Expr>,
+    /// 实参是 `*`（PG `agg_star`）。
+    pub agg_star: bool,
+    /// `DISTINCT` 修饰（PG `agg_distinct`）。
+    pub agg_distinct: bool,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 转型（PG `TypeCast`；`CAST(x AS t)` 与 `x::t` 同节点）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeCast {
+    /// 操作数。
+    pub arg: Box<Expr>,
+    /// 目标类型。
+    pub type_name: TypeName,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `CASE`（PG `CaseExpr`；去 `casetype`/`casecollid`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseExpr {
+    /// 简单 `CASE` 的操作数（`None` = 搜索 `CASE`）。
+    pub arg: Option<Box<Expr>>,
+    /// `WHEN` 列表。
+    pub args: Vec<CaseWhen>,
+    /// `ELSE`（`None` = 无）。
+    pub defresult: Option<Box<Expr>>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 一个 `WHEN … THEN …`（PG `CaseWhen`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseWhen {
+    /// 条件（或简单 `CASE` 的比较值）。
+    pub expr: Expr,
+    /// 结果。
+    pub result: Expr,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `COALESCE`（PG `CoalesceExpr`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoalesceExpr {
+    /// 实参。
+    pub args: Vec<Expr>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 类型名（PG `TypeName` 的裁剪：`names` 列表 ⇒ 单名；无 OID/数组/`%TYPE`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeName {
+    /// 类型名（已折叠）。
+    pub name: String,
+    /// 类型参数（`NUMBER(10,2)` 的 `10, 2`——**原文本**）。
+    pub typmods: Vec<String>,
+    /// 位置。
+    pub location: Location,
+}
+
+// ─────────────────────────── SELECT 家族 ───────────────────────────
+
+/// 集合运算（PG `SetOperation`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOperation {
     /// `UNION`
     Union,
     /// `INTERSECT`
@@ -305,325 +326,372 @@ pub enum SetOpKind {
     Except,
 }
 
-/// 投影项。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SelectItem {
-    /// 表达式（`*` 用 [`SelectItem::Wildcard`]）。
-    pub expr: Option<Expr>,
-    /// 别名（`AS 名` 或裸名）。
-    pub alias: Option<String>,
-    /// 位置。
-    pub span: Span,
-}
-
-/// `SELECT` 查询表达式（**集合运算链自左向右**；`ORDER BY`/`LIMIT` 作用于
-/// **整个查询表达式**——SQL 标准形态，与执行计划里"排序在集合运算之上"一致）。
+/// `SELECT`（PG `SelectStmt` 的裁剪）。
+///
+/// **集合运算照 PG 用 `op/all/larg/rarg` 左深嵌套**（不设"链"——
+/// PG 的形状更通用；`ORDER BY`/`LIMIT` 在**最外层**节点上）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
-    /// 第一个 `SELECT` 核心。
-    pub first: SelectCore,
-    /// 集合运算链（自左向右）。
-    pub set_ops: Vec<SetOpTail>,
-    /// `ORDER BY`。
-    pub order_by: Vec<OrderItem>,
-    /// `LIMIT`（原文本；值语义在 ②/④）。
-    pub limit: Option<String>,
-    /// `OFFSET`。
-    pub offset: Option<String>,
-    /// 位置。
-    pub span: Span,
-}
-
-/// 集合运算链的一节：`<op> [ALL] <SELECT 核心>`。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SetOpTail {
-    /// 运算。
-    pub op: SetOpKind,
-    /// 是否 `ALL`（未写 = 去重，SQL 标准默认）。
-    pub all: bool,
-    /// 右侧 `SELECT` 核心。
-    pub core: SelectCore,
-    /// 位置。
-    pub span: Span,
-}
-
-/// 一个 `SELECT` 核心（投影 + 来源 + 过滤 + 分组）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SelectCore {
-    /// `DISTINCT`。
+    /// `DISTINCT`（PG 的 `distinctClause` 列表 ⇒ `bool`——**无 `DISTINCT ON`**）。
     pub distinct: bool,
-    /// 投影列表。
-    pub projection: Vec<SelectItem>,
-    /// `FROM`（`None` = 无来源，如 `SELECT 1`）。
-    pub from: Option<FromClause>,
-    /// `WHERE`。
-    pub filter: Option<Expr>,
-    /// `GROUP BY`。
-    pub group_by: Vec<Expr>,
-    /// `HAVING`。
-    pub having: Option<Expr>,
+    /// 投影列表（`ResTarget`）。
+    pub target_list: Vec<ResTarget>,
+    /// `FROM`（PG 的 `List<Node>`：`RangeVar` 或 `JoinExpr`，
+    /// **逗号分隔的项仍是列表里的独立元素**——照 PG 的原始树）。
+    pub from_clause: Vec<FromItem>,
+    /// `WHERE`
+    pub where_clause: Option<Box<Expr>>,
+    /// `GROUP BY`
+    pub group_clause: Vec<Expr>,
+    /// `HAVING`
+    pub having_clause: Option<Box<Expr>>,
+    /// `VALUES` 行（PG `valuesLists`；`INSERT … VALUES` 走它）。
+    pub values_lists: Option<Vec<Vec<Expr>>>,
+    /// `ORDER BY`（`SortBy` 列表）。
+    pub sort_clause: Vec<SortBy>,
+    /// `OFFSET`
+    pub limit_offset: Option<Box<Expr>>,
+    /// `LIMIT`
+    pub limit_count: Option<Box<Expr>>,
+    /// 集合运算种类（`None` = 普通 `SELECT`）。
+    pub op: Option<SetOperation>,
+    /// 集合运算的 `ALL`。
+    pub all: bool,
+    /// 左操作数（集合运算）。
+    pub larg: Option<Box<SelectStmt>>,
+    /// 右操作数（集合运算）。
+    pub rarg: Option<Box<SelectStmt>>,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// 排序项。
+/// `FROM` 的一项（PG 的 `List<Node>` 元素）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct OrderItem {
-    /// 排序表达式。
-    pub expr: Expr,
-    /// `DESC`（缺省升序）。
-    pub desc: bool,
+pub enum FromItem {
+    /// 表引用。
+    RangeVar(RangeVar),
+    /// 连接（`JoinExpr`；盒装以允许递归）。
+    Join(Box<JoinExpr>),
+}
+
+impl FromItem {
     /// 位置。
-    pub span: Span,
+    #[must_use]
+    pub fn location(&self) -> Location {
+        match self {
+            FromItem::RangeVar(r) => r.location,
+            FromItem::Join(j) => j.location,
+        }
+    }
 }
 
-/// `FROM` 子句：基础表 + 连接链。
+/// 表引用（PG `RangeVar` 的裁剪：无 catalog/schema/inh/relpersistence）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct FromClause {
-    /// 基础表引用。
-    pub base: TableRef,
-    /// 连接链（含逗号连接——普通连接）。
-    pub joins: Vec<Join>,
+pub struct RangeVar {
+    /// 关系名（已折叠）。
+    pub relname: String,
+    /// 别名。
+    pub alias: Option<Alias>,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// 表引用。
+/// 别名（PG `Alias` 的裁剪：无列别名清单）。
 #[derive(Debug, Clone, PartialEq)]
-pub enum TableRef {
-    /// 表名 / 固定表名（**是不是固定表在 ② 判**）。
-    Name {
-        /// 名字文本。
-        name: String,
-        /// 别名（`AS 名` 或裸名）。
-        alias: Option<String>,
-        /// 位置。
-        span: Span,
-    },
+pub struct Alias {
+    /// 别名（已折叠）。
+    pub aliasname: String,
 }
 
-/// 一个连接。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Join {
-    /// `INNER` / `LEFT [OUTER]`；逗号连接 = `Inner`（无 `ON`）。
-    pub kind: JoinKind,
-    /// 右表。
-    pub table: TableRef,
-    /// `ON` 条件（逗号连接为 `None`）。
-    pub on: Option<Expr>,
-    /// 位置。
-    pub span: Span,
-}
-
-/// 连接种类（清单：`INNER` / `LEFT [OUTER]`）。
+/// 连接类型（PG `JoinType` 的子集）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinKind {
-    /// `INNER JOIN`（或逗号）。
+pub enum JoinType {
+    /// `INNER JOIN`（逗号连接**不**产生 `JoinExpr`——照 PG 的原始树）
     Inner,
-    /// `LEFT [OUTER] JOIN`。
+    /// `LEFT [OUTER] JOIN`
     Left,
+}
+
+/// 连接（PG `JoinExpr` 的裁剪：只留 `jointype/larg/rarg/quals`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinExpr {
+    /// 连接类型。
+    pub jointype: JoinType,
+    /// 左。
+    pub larg: FromItem,
+    /// 右。
+    pub rarg: FromItem,
+    /// `ON` 条件。
+    pub quals: Option<Box<Expr>>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 投影/赋值目标（PG `ResTarget` 的裁剪：无 `indirection`）。
+///
+/// `SELECT *` 的值是 `ColumnRef{fields:[AStar]}`（**照 PG**——`*` 不是特例节点）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResTarget {
+    /// 输出名（`AS 名` 或裸名）。
+    pub name: Option<String>,
+    /// 值表达式。
+    pub val: Expr,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 排序方向（PG `SortByDir` 的子集；`USING` 在清单外）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortByDir {
+    /// 未写（缺省升序）
+    Default,
+    /// `ASC`
+    Asc,
+    /// `DESC`
+    Desc,
+}
+
+/// NULL 位置（PG `SortByNulls`；**语法规格暂不开 `NULLS FIRST/LAST`**，
+/// 字段保留使将来加入零成本——设计 §3.1 记档）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortByNulls {
+    /// 未写（用本库固定规则：升序在最后、降序在最前）
+    Default,
+    /// `NULLS FIRST`
+    First,
+    /// `NULLS LAST`
+    Last,
+}
+
+/// 排序项（PG `SortBy`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortBy {
+    /// 排序表达式。
+    pub node: Expr,
+    /// 方向。
+    pub sortby_dir: SortByDir,
+    /// NULL 位置。
+    pub sortby_nulls: SortByNulls,
+    /// 位置。
+    pub location: Location,
 }
 
 // ─────────────────────────── DML ───────────────────────────
 
-/// `INSERT INTO t [(cols)] VALUES (…), (…)`。
+/// `INSERT`（PG `InsertStmt` 的裁剪）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStmt {
-    /// 目标表名。
-    pub table: String,
-    /// 列清单（`None` = 全列按定义序）。
-    pub columns: Option<Vec<String>>,
-    /// 行值（每行一组表达式）。
-    pub rows: Vec<Vec<Expr>>,
+    /// 目标表。
+    pub relation: RangeVar,
+    /// 列清单（`ResTarget` 列表——照 PG 的 `insert_column_list`）。
+    pub cols: Vec<ResTarget>,
+    /// 来源（`SELECT`/`VALUES`；**`VALUES` 走 `SelectStmt.values_lists`**——照 PG）。
+    pub select_stmt: Option<Box<SelectStmt>>,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// `UPDATE t SET c = e, … [WHERE …]`。
+/// `UPDATE`（PG `UpdateStmt` 的裁剪）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStmt {
-    /// 目标表名。
-    pub table: String,
-    /// `(列名, 表达式)` 列表。
-    pub sets: Vec<(String, Expr)>,
-    /// `WHERE`。
-    pub filter: Option<Expr>,
+    /// 目标表。
+    pub relation: RangeVar,
+    /// `SET` 列表（`ResTarget`：`name` = 列名、`val` = 表达式）。
+    pub target_list: Vec<ResTarget>,
+    /// `WHERE`
+    pub where_clause: Option<Box<Expr>>,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// `DELETE FROM t [WHERE …]`。
+/// `DELETE`（PG `DeleteStmt` 的裁剪）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStmt {
-    /// 目标表名。
-    pub table: String,
-    /// `WHERE`。
-    pub filter: Option<Expr>,
+    /// 目标表。
+    pub relation: RangeVar,
+    /// `WHERE`
+    pub where_clause: Option<Box<Expr>>,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
 // ─────────────────────────── DDL ───────────────────────────
 
-/// 列定义（`名 类型 [NOT NULL]`；**没有** DEFAULT/PK/FK/CHECK——REQ-SQL-006）。
+/// `CREATE TABLE`（PG `CreateStmt` 的裁剪）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateStmt {
+    /// 表名。
+    pub relation: RangeVar,
+    /// 列定义（PG 的 `tableElts`）。
+    pub table_elts: Vec<ColumnDef>,
+    /// `WITH (…)` 选项（`DefElem` 列表——照 PG）。
+    pub options: Vec<DefElem>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 列定义（PG `ColumnDef` 的裁剪：`default`/约束/存储/压缩在清单外）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
-    /// 列名文本。
-    pub name: String,
-    /// 类型名。
+    /// 列名（已折叠）。
+    pub colname: String,
+    /// 类型。
     pub type_name: TypeName,
-    /// `NOT NULL`。
-    pub not_null: bool,
+    /// `NOT NULL`（PG `is_not_null`）。
+    pub is_not_null: bool,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// `WITH (名 = 值, …)` 的一个选项（**合法组合在 ② 判**——表类型决定选项组）。
+/// 一个 DDL 选项（PG `DefElem`）。
+///
+/// **记档差异**：PG 的 `arg` 是任意 `Node`；我们收窄为
+/// [`DefElemArg`]（常量或**裸标识符**——`table_type = memory` 是本库写法，
+/// PG 的 reloptions 只收字面量）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct OptionItem {
-    /// 选项名（小写规范在 ②）。
-    pub name: String,
-    /// 值（原文本形态）。
-    pub value: OptionValue,
+pub struct DefElem {
+    /// 选项名（已折叠）。
+    pub defname: String,
+    /// 值。
+    pub arg: DefElemArg,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// 选项值（原文本；语义在 ②）。
+/// 选项值。
 #[derive(Debug, Clone, PartialEq)]
-pub enum OptionValue {
-    /// 标识符形态（`normal` / `config` / …）。
+pub enum DefElemArg {
+    /// 字面量。
+    Const(AConst),
+    /// 裸标识符（本库扩展；如 `memory`）。
     Ident(String),
-    /// 数字形态。
-    Number(String),
-    /// 字符串形态（如 `'7d'`）。
-    Str(Vec<u8>),
 }
 
-/// `CREATE TABLE …`。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CreateTableStmt {
-    /// 表名。
-    pub name: String,
-    /// 列定义。
-    pub columns: Vec<ColumnDef>,
-    /// `WITH (…)` 选项。
-    pub options: Vec<OptionItem>,
-    /// 位置。
-    pub span: Span,
-}
-
-/// `DROP TABLE …`。
-#[derive(Debug, Clone, PartialEq)]
-pub struct DropTableStmt {
-    /// 表名。
-    pub name: String,
-    /// 位置。
-    pub span: Span,
-}
-
-/// 索引目标（表 / 图的顶点 / 图的边）。
-#[derive(Debug, Clone, PartialEq)]
-pub enum IndexTarget {
+/// 索引目标种类（**本库扩展**：图索引的顶点/边；PG 无对应）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexTargetKind {
     /// 表。
-    Table(String),
+    Table,
     /// 图的顶点属性。
-    Vertex(String),
+    Vertex,
     /// 图的边属性。
-    Edge(String),
+    Edge,
 }
 
-/// `CREATE [UNIQUE] INDEX 名 ON 目标 (表达式, …)`。
+/// `CREATE [UNIQUE] INDEX`（PG `IndexStmt` 的裁剪）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct CreateIndexStmt {
+pub struct IndexStmt {
     /// 索引名。
-    pub name: String,
+    pub idxname: String,
+    /// 目标（表或图）。
+    pub relation: RangeVar,
+    /// 目标种类（**本库扩展**）。
+    pub target_kind: IndexTargetKind,
+    /// 键（`IndexElem` 列表）。
+    pub index_params: Vec<IndexElem>,
     /// 唯一索引。
     pub unique: bool,
-    /// 目标。
-    pub target: IndexTarget,
-    /// 键表达式（列引用 / JSON 路径表达式）。
-    pub keys: Vec<Expr>,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// `DROP INDEX …`。
+/// 一个索引键（PG `IndexElem` 的裁剪：只留 `name`/`expr`）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct DropIndexStmt {
-    /// 索引名。
-    pub name: String,
+pub struct IndexElem {
+    /// 列名（列引用形态）。
+    pub name: Option<String>,
+    /// 表达式（表达式索引形态，如 `json_get(doc, 'a.b')`）。
+    pub expr: Option<Box<Expr>>,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// `CREATE GRAPH …`。
+/// `DROP`（PG `DropStmt` 的裁剪）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct CreateGraphStmt {
-    /// 图名。
-    pub name: String,
+pub struct DropStmt {
+    /// 目标对象（`RangeVar` 列表）。
+    pub objects: Vec<RangeVar>,
+    /// 对象类型。
+    pub remove_type: ObjectType,
+    /// `IF EXISTS`（清单外；字段保留）。
+    pub missing_ok: bool,
     /// 位置。
-    pub span: Span,
+    pub location: Location,
 }
 
-/// `DROP GRAPH …`。
-#[derive(Debug, Clone, PartialEq)]
-pub struct DropGraphStmt {
-    /// 图名。
-    pub name: String,
-    /// 位置。
-    pub span: Span,
-}
-
-/// `CREATE WORKSPACE FOR USER … [NAME '…'] [CLONE OF …]`（仅 admin）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CreateWorkspaceStmt {
-    /// 主体名。
-    pub subject: String,
-    /// `NAME '…'`。
-    pub name: Option<Vec<u8>>,
-    /// `CLONE OF <workspace_id>`。
-    pub clone_of: Option<String>,
-    /// 位置。
-    pub span: Span,
-}
-
-/// `ALTER WORKSPACE …`（改名 / 配额）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct AlterWorkspaceStmt {
-    /// 工作区 id 文本。
-    pub workspace_id: String,
-    /// 动作。
-    pub action: AlterAction,
-    /// 位置。
-    pub span: Span,
-}
-
-/// `ALTER WORKSPACE` 的动作。
-#[derive(Debug, Clone, PartialEq)]
-pub enum AlterAction {
-    /// `SET NAME = '…' | NULL`。
-    SetName(Option<Vec<u8>>),
-    /// `SET QUOTA (data=…, undo=…, temp=…, asset=…)`。
-    SetQuota(Vec<OptionItem>),
-}
-
-/// `DROP WORKSPACE …`。
-#[derive(Debug, Clone, PartialEq)]
-pub struct DropWorkspaceStmt {
-    /// 工作区 id 文本。
-    pub workspace_id: String,
-    /// 位置。
-    pub span: Span,
-}
-
-/// 事务控制语句。
+/// 可 `DROP` 的对象类型（PG `ObjectType` 的子集 + **本库扩展**）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TxnStmt {
+pub enum ObjectType {
+    /// 表。
+    Table,
+    /// 索引。
+    Index,
+    /// 图（本库扩展）。
+    Graph,
+    /// 工作区（本库扩展，仅 admin）。
+    Workspace,
+}
+
+/// 事务控制（PG `TransactionStmt` 的裁剪）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransactionStmt {
+    /// 种类。
+    pub kind: TransactionStmtKind,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 事务控制种类（PG `TransactionStmtKind` 的子集；`SAVEPOINT` 在清单外）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionStmtKind {
     /// `BEGIN`
     Begin,
     /// `COMMIT`
     Commit,
     /// `ROLLBACK`
     Rollback,
+}
+
+// ─────────────────────────── 本库扩展的 DDL ───────────────────────────
+
+/// `CREATE GRAPH`（本库扩展；形状仿 PG 的 DDL 节点）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateGraphStmt {
+    /// 图名。
+    pub graph: RangeVar,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `CREATE WORKSPACE FOR USER …`（本库扩展，仅 admin）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateWorkspaceStmt {
+    /// 主体名。
+    pub subject: String,
+    /// `NAME '…'`
+    pub name: Option<Vec<u8>>,
+    /// `CLONE OF <id>`
+    pub clone_of: Option<String>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER WORKSPACE …`（本库扩展，仅 admin）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterWorkspaceStmt {
+    /// 工作区 id（文本）。
+    pub workspace_id: String,
+    /// 动作。
+    pub action: AlterWorkspaceAction,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER WORKSPACE` 的动作。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterWorkspaceAction {
+    /// `SET NAME = '…' | NULL`
+    SetName(Option<Vec<u8>>),
+    /// `SET QUOTA (…)`（`DefElem` 列表——与 `WITH` 选项同形）。
+    SetQuota(Vec<DefElem>),
 }

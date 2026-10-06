@@ -37,7 +37,8 @@
 | **不做按值窥探、不做按值重优化**（V1.0） | 参数化计划 + 规则选路；**不**看参数值选计划 | 证据 E1/E2/E3/E4：窥探"第一次值定终身"是故障源；ACS 要直方图与代价模型才成立——**我们没有**（统计切片当前只给 entries/leaf_blocks/blevel/CF） |
 | 缓存失效**靠比对不靠通知** | 键含对象/索引/配置版本；命中前比对 | REQ-SQL-009；证据 E5（"绕过正常路径改元数据 ⇒ 缓存不更新"的故障类被"唯一版本源"消掉） |
 | 两层缓存：实例级 Raw AST + 工作区级其余 | 文本→AST 与工作区无关（安全），Bound 起入工作区键 | REQ-SQL-002 / REQ-SQL-009 的同一条线 |
-| 手写词法/语法 | 递归下降 + Pratt 表达式；闭集语法 | 零依赖纪律；REQ-SQL-005/006 闭集 |
+| **语法与 AST 形状对齐 PG（简化子集）** | 文法 = PG 文法的**删减**；AST = PG 解析节点的**裁剪**（同名同形）；优先级表照抄 PG | **用户口径 2026-10-06**；取证 `evidence/sql-frontend-20261006/raw/12-pg-parser-source.txt`（REL_16_STABLE） |
+| 手写词法/语法（不用生成器） | 递归下降、每个 PG 产生式对应一个解析函数；闭集语法 | 零依赖纪律；对齐后「手写」= 按 gram.y 逐条对照，成本低 |
 | Catalog 只读、DDL 独立事务 | 目录无写接口；写走 DDL 路径 | ENG REQ-ENG-006；`arch/03` §3.1（字典表=普通表，DDL 天然事务化） |
 
 **与 Oracle/PG 的刻意不同**（记档，防"为什么不像 X"）：
@@ -78,57 +79,109 @@ ast ──✗──▶ catalog（REQ-SQL-002：AST 模块不得 import 目录接
 
 ---
 
-## 3 ① 词法与语法（Raw AST）
+## 3 ① 词法与语法（Raw AST）——**形状对齐 PostgreSQL（简化子集）**
 
-### 3.1 词法（`lexer.rs`）
+> **用户口径（2026-10-06）**：SQL 语法**从 PG 的语法中简化**、**语法树直接兼容
+> PG 语法**、解析器开发**学习 PG 的解析器与源码**——以"照抄现成文法"替代"自造
+> 文法"，简化整个开发。取证：`doc/evidence/sql-frontend-20261006/raw/12-pg-parser-source.txt`
+> （PG **REL_16_STABLE** 的 `gram.y` / `parsenodes.h` / `primnodes.h` 摘录 + 代理下载命令）。
 
-| 词素 | 规则 | 归属阶段 |
+**三条对齐规则**：
+
+1. **文法 = PG 文法的删减**：保留 REQ-SQL-005 正面清单所需的产生式，删掉清单外
+   构造（子查询/CTE/窗口/…）。**删减不改变保留下来的产生式的形状**——
+   删的是产生式，不是重新发明。
+2. **AST = PG 解析节点的裁剪**：同名同形（字段名用 Rust 命名风格，结构一一对应），
+   去掉与本库面无关的字段（`intoClause`/`windowClause`/`withClause`/
+   `returningList`/`onConflictClause`/继承与分区字段…）。**后续加构造时，
+   把 PG 的对应字段与产生式一并搬回**。
+3. **词法对齐**：`'…'`（`''` 转义）、**`"…"` 引号标识符**、数字
+   `digits[.digits][e[+-]digits]`（**只记原文本**）、`--` 与 `/* */` 注释、
+   `::` 转型。**标识符折叠照 PG**：未引号 ⇒ **小写折叠**（② 应用）；引号内 ⇒
+   **原样保留、大小写敏感**。
+
+### 3.1 节点映射表（PG → 我们）
+
+| PG 节点 | 我们的类型 | 裁剪点 |
 | --- | --- | --- |
-| 标识符 | 字母/下划线起；**只记原文本**（大小写折叠在 ②） | ① |
-| 关键字 | 闭集（`SELECT/INSERT/…/DESC`）；与标识符同形，按闭集判定 | ① |
-| 数字字面量 | **记原文本 + 位置**；解析成 `NUMBER` 在 ②（走 TYP 内核） | ①记/②解 |
-| 字符串字面量 | 单引号，`''` 转义；记原文本（编码在 ② 定） | ①记/②解 |
+| `RawStmt` | `Stmt`（枚举，每个变体带 `span`） | `stmt_location/stmt_len` ⇒ 字节区间 |
+| `SelectStmt` | `SelectStmt` | `distinctClause`（列表，含 `DISTINCT ON`）⇒ `distinct: bool`（**无 `DISTINCT ON`**）；去 `intoClause`/`windowClause`/`withClause`/`lockingClause`/`groupDistinct`/`limitOption`；**保留** `valuesLists`（`INSERT … VALUES` 走它，照 PG）、`sortClause`/`limitOffset`/`limitCount`、**集合运算的 `op/all/larg/rarg` 左深嵌套**（不设"链"——PG 的形状更通用） |
+| `InsertStmt` | `InsertStmt` | 去 `onConflictClause`/`returningList`/`withClause`/`override`；`cols`/`selectStmt` 照 PG |
+| `UpdateStmt` | `UpdateStmt` | 去 `fromClause`/`returningList`/`withClause` |
+| `DeleteStmt` | `DeleteStmt` | 去 `usingClause`/`returningList`/`withClause` |
+| `CreateStmt` | `CreateStmt` | 去 `inhRelations`/`partbound`/`partspec`/`ofTypename`/`constraints`/`oncommit`/`tablespacename`/`accessMethod`/`if_not_exists`；**保留 `options`（`WITH (...)`, `DefElem` 列表）** |
+| `ColumnDef` | `ColumnDef` | 只留 `colname`/`typeName`/`is_not_null`（+location）——default/约束/存储/压缩/排序规则在清单外 |
+| `IndexStmt` | `IndexStmt` | 只留 `idxname`/`relation`/`indexParams`/`unique` + **`target_kind`（表/图顶点/图边——本库扩展，记档）** |
+| `IndexElem` | `IndexElem` | 只留 `name`/`expr`（+location） |
+| `DropStmt` | `DropStmt` | `objects`/`removeType`/`missing_ok`；对象类型枚举加 **GRAPH / WORKSPACE（本库扩展，记档）** |
+| `RangeVar` | `RangeVar` | 只留 `relname`/`alias`/`location`（无 catalog/schema/inh/relpersistence——本库无模式层） |
+| `Alias` | `Alias` | 只留 `aliasname`（无列别名清单） |
+| `JoinExpr` | `JoinExpr` | 只留 `jointype`/`larg`/`rarg`/`quals` |
+| `ResTarget` | `ResTarget` | 只留 `name`/`val`（+location）；无 `indirection` |
+| `SortBy` | `SortBy` | `node`/`sortby_dir`/`sortby_nulls`——**`nulls` 字段留、语法暂不开 `NULLS FIRST/LAST`**（清单外；留字段使将来加入零成本） |
+| `A_Expr` | `AExpr` | `kind`/`name`/`lexpr`/`rexpr`（+location）；我们有的 kind：`OP`/`IN`/`NOT_IN`/`BETWEEN`/`NOT_BETWEEN`/`NULLIF`（**`NULLIF` 走 `A_Expr` 而非独立节点——照 PG**）。向量距离 `<->`/`<=>`/`<#>` 就是 `OP` 名字 |
+| `BoolExpr` | `BoolExpr` | `boolop`（AND/OR/NOT）/`args`（+location）——**`NOT` 是一元 `BoolExpr`，照 PG** |
+| `NullTest` | `NullTest` | `arg`/`nulltesttype`（IS_NULL/IS_NOT_NULL） |
+| `FuncCall` | `FuncCall` | `funcname`/`args`/`agg_star`/`agg_distinct`（+location）——`COALESCE` 有独立节点（见下），其余函数（`json_*` 等）走它 |
+| `TypeCast` | `TypeCast` | `arg`/`typeName`（+location）——`CAST(x AS t)` 与 **`x::t`** 同一个节点（照 PG） |
+| `CaseExpr`/`CaseWhen` | 同名 | 去 `casetype`/`casecollid` |
+| `CoalesceExpr` | `CoalesceExpr` | `args`（`COALESCE` 有独立节点——照 PG） |
+| `ColumnRef` | `ColumnRef` | `fields: Vec<ColumnRefField>`（`Name(String)` 或 `AStar`）+location |
+| `A_Const` | `AConst` | `value: ConstValue`（`Int/Float/String/Bool`）+ **`isnull`**；**数字留原文本**（PG 的 `Float` 亦存文本；本库 `NUMBER` 38 位，原文本最稳） |
+| `TypeName` | `TypeName` | `names`（列表）⇒ `name: String`（无模式限定）；`typmods` ⇒ 原文本列表；+location |
+| `DefElem` | `DefElem` | `defname`/`arg: DefElemArg`（`Const(AConst)` 或 `Ident(String)`——PG 的 `arg` 是任意 Node，我们收窄；理由：`table_type = memory` 的裸标识符值是本库写法，PG 的 reloptions 只收字面量） |
+| `TransactionStmt` | `TransactionStmt` | `kind`（BEGIN/COMMIT/ROLLBACK） |
+| `ParamRef` | `ParamRef` | **`:name`（本库规格），非 PG 的 `$n`**——**唯一的刻意偏离**，理由 = REQ-SQL-005 明定":name，类型绑定期推导" |
+| —（无 PG 对应） | `CreateGraphStmt` / `CreateWorkspaceStmt` / `AlterWorkspaceStmt` / `DropWorkspaceStmt` | 本库扩展（图/工作区 DDL）；**记档**：形状仿 PG 同类 DDL 节点（`RangeVar` + 选项列表） |
+
+### 3.2 词法（`lexer.rs`）
+
+| 词素 | 规则 | 归属 |
+| --- | --- | --- |
+| 标识符 | 字母/下划线起，后续含 `$`（保留规则在 ② 判） | ①（**原文本**；折叠在 ②） |
+| 引号标识符 | `"…"`（`""` 转义）——**大小写敏感，不折叠** | ① |
+| 关键字 | **闭集**（REQ-SQL-005 清单所需）；与标识符同形，按闭集判定 | ① |
+| 数字字面量 | `digits[.digits][e[+-]digits]`——**只记原文本** | ①记/②解（TYP 内核） |
+| 字符串字面量 | `'…'`，`''` 转义（**已解转义**的字节） | ① |
 | 参数 | `:name` | ① |
-| 操作符 | `+ - * / = <> < <= > >= <-> <=> <#>` | ① |
+| 操作符 | `+ - * / = <> < <= > >= :: <-> <=> <#>` | ① |
 | 注释 | `--` 行注释、`/* */` 块注释（不嵌套） | ① |
-| 位置 | 每个 token 记**字节偏移区间**（错误可定位） | ① |
+| 位置 | 每个 token 记**字节偏移区间**（PG 记字符偏移；我们用字节——**记档差异**） | ① |
 
 **长度上限**：语句文本、标识符、字面量各设上限（数值随 P0 数值项；超限报
 **语法错误**，不截断）。
 
-### 3.2 语法（`parser.rs`）
-
-- **手写递归下降**：每个语句一条函数；表达式用 **Pratt**（优先级表：`OR` <
-  `AND` < `NOT` < 比较/`IN`/`BETWEEN`/`IS` < 加减 < 乘除 < 一元 < 后缀）。
-- **语句闭集**（REQ-SQL-005 正面清单，逐条有产生式）：
+### 3.3 语法（`parser.rs`）——优先级照抄 PG
 
 ```text
-DDL   ：CREATE/DROP TABLE、CREATE/DROP INDEX（表/图/表达式键）、CREATE/DROP GRAPH、
-        CREATE/ALTER/DROP WORKSPACE（admin，在 public 上）
-DML   ：SELECT [DISTINCT]（FROM/JOIN/WHERE/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET/
-        集合运算链）、INSERT … VALUES、UPDATE、DELETE
-事务  ：BEGIN / COMMIT / ROLLBACK
-图语言：独立入口（GRP 域解析）→ 受控计划节点 → 同一管线
+（低 → 高；PG 的 %left/%right/%nonassoc 声明，摘取证 §1，简化到我们有的操作符）
+UNION EXCEPT  <  INTERSECT  <  OR  <  AND  <  NOT（右结合）  <
+IS / ISNULL（nonassoc）  <  < > = <= >= <>（nonassoc）  <
+BETWEEN / IN / NOT（nonassoc）  <
+多字符操作符（<-> <=> <#>）  <  + -  <  * /  <
+一元负号（UMINUS，右结合）  <  ::  <  .
 ```
 
-- **清单外即语法错误**（`REQ-SQL-006`）：`WITH`、`EXISTS`、窗口函数、`RETURNING`…
-  在词法/语法层就没有产生式——**报错文案指向"不支持该构造"**。
+**两处与旧草案的差异（照 PG 修正）**：
+- **`BETWEEN` / `IN` 比比较运算绑定更紧**（PG 的声明顺序如此，非直觉）；
+- **集合运算有自己的优先级**（`UNION`/`EXCEPT` 同级、`INTERSECT` 更紧）——
+  链式与父子形态由 `larg/rarg` 左深嵌套表达（照 PG）。
 
-### 3.3 Raw AST（`ast.rs`）
+- **手写递归下降**：每个优先级一层函数；表达式按上表；每个 PG 产生式
+  一一对应一个解析函数（便于对照 gram.y 复核）。
+- **语句闭集**（REQ-SQL-005 正面清单，逐条有产生式）：DDL（表/索引/图/工作区）、
+  DML（SELECT 家族/INSERT/UPDATE/DELETE）、事务控制；图语言独立入口（GRP 域）。
+- **清单外即语法错误**（REQ-SQL-006）：`WITH`/`EXISTS`/窗口/`RETURNING`/`RIGHT JOIN`/
+  列约束…在词法/语法层没有产生式——报错文案指向"不支持该构造"。
 
-```text
-Stmt      ：五类语句的语法形状（含 Span）
-Expr      ：Literal{文本,Span} | Ident{文本,Span} | Param{名,Span}
-          | Binary/Unary | Call{名,实参} | Case/InList/Between/IsNull/Cast…
-Select    ：select 列表 / from（表引用与 JOIN 树）/ where / group / having /
-            order / limit / offset / 集合运算链（自左向右）
-```
+### 3.4 收益（"简化整个开发"的落点）
 
-**正面清单纪律**（REQ-SQL-002，代码审查据此）：AST 里**只有**语法结构与位置；
-**没有**对象号、类型、解析结果。⇒ 三项收益随之成立：可单测、**可跨工作区复用**
-（实例级 AST 缓存）、名字探测不可能发生在解析期。
-
----
+| # | 收益 |
+| --- | --- |
+| 1 | **文法不自造**：PG 的 `gram.y` 是现成、经充分验证的产生式集合——我们的工作是**删减**而不是发明 |
+| 2 | **加构造零设计成本**：子查询/CTE/窗口/`EXPLAIN` 等在后续版本加入时，照抄 PG 的对应产生式与节点字段 |
+| 3 | **②③ 的分工照 PG**：绑定/变换阶段直接对照 `parse_*.c`（`analyze.c`/`parse_clause.c`/`parse_expr.c`/`parse_target.c`/`parse_relation.c`）的职责划分（KB 条目 `356528`） |
+| 4 | **差分对象更强**：与 PG 的树形状对齐后，"我们的解析器对不对"可以直接拿 PG 的 `nodeToString` 形状做人工对照 |
 
 ## 4 ② Binder（`bind/`）
 
@@ -361,7 +414,7 @@ cancel(执行句柄) -> 释放锁/页引用/临时空间（走 `ExecContext` 的
 
 | 片 | 内容 | 验收 |
 | --- | --- | --- |
-| **S1** ✅ **已落地（2026-10-06）** | 词法 + 语法 + Raw AST（L1 缓存随 S6——归一化规则是评审点，先不做） | ✅ `crates/sql` v0.1：`lexer`（token + 字节区间；关键字闭集；字面量只记原文本）+ `ast`（Raw AST，源码自检不 import 目录——REQ-SQL-002 验收原文）+ `parser`（手写递归下降 + 显式优先级；`parse`/`parse_many`）。**用例 18**：闭集语料 58 条全解析（DDL/DML/事务/表达式/集合运算链/参数/向量操作符）、**清单外 22 条零接受**（WITH/EXISTS/子查询/窗口/RIGHT-FULL-NATURAL-USING/INSERT…SELECT/RETURNING/列约束/LIKE/SAVEPOINT/TRUNCATE/ALTER TABLE/`FOR UPDATE`）、优先级与左结合逐点断言、字面量原文本与字节区间、错误带位置、`GRAPH_TABLE` 响亮拒绝、关键字同名标识符折叠一致 |
+| **S1** ✅ **已落地（2026-10-06；含 PG 对齐返工）** | 词法 + 语法 + Raw AST（L1 缓存随 S6） | ✅ `crates/sql` **v0.2**：`lexer`（token + 字节区间；关键字闭集；**引号标识符**；未引号名照 PG 折叠小写；数字含 `.5`/`1e3` 形态）+ `ast`（**同名同形于 PG 解析节点**的 Raw AST——`SelectStmt`/`InsertStmt`/`AExpr`/`BoolExpr`/`NullTest`/`FuncCall`/`TypeCast`/`CaseExpr`/`ColumnRef`/`AConst`/`RangeVar`/`JoinExpr`/`ResTarget`/`SortBy`/`IndexStmt`/`DropStmt`…，映射表 §3.1）+ `parser`（**照 PG 的产生式删减**、优先级表照抄 gram.y、集合运算 `op/all/larg/rarg` 左深嵌套）。**用例 21**：闭集语料 62 条全解析、**清单外 24 条零接受**（新增 `INSERT…SELECT`/`NULLS FIRST`/`DROP…IF EXISTS`）、**PG 形状逐点断言**（`*` 是 `ColumnRef[AStar]`、`IN`/`BETWEEN`/`NULLIF` 走 `A_Expr`、`::` 与 `CAST` 同节点、`VALUES` 走 `values_lists`）、优先级三例（含 `a = 1 BETWEEN 2 AND 3` ⇒ `a = (1 BETWEEN …)` 与 `INTERSECT` 更紧）、折叠两例（未引号小写/引号保留） |
 | **S2** | Catalog 只读面 + 名字解析三格 + 版本捕获 | 跨区名不可区分；保留名拒绝；`(obj#, mtime)` 被记入 Bound（断点查验） |
 | **S3** | Binder：类型推导 / 参数定型 / 写目标 / 登记点 | 类型错误全在绑定期；参数推导失败拒绝；写固定表/public 拒绝 |
 | **S4** | 逻辑表示 + 白名单变换 | 与**直译执行器**两路差分（无优化 vs 优化，逐行一致）；四条不变量各有用例 |

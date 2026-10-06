@@ -1,10 +1,16 @@
-//! **词法**（设计 `doc/SQL前端设计_v0.1.md` §3.1；切片 S1）。
+//! **词法**（设计 `doc/SQL前端设计_v0.1.md` §3.2；切片 S1）——规则对齐
+//! **PostgreSQL 的扫描器**（`scan.l`，简化子集；取证 `12-pg-parser-source.txt`）。
 //!
 //! 三条纪律：
-//! 1. **零依赖**——不查目录、不做名字折叠、不解析字面量值（`NUMBER` 文本留给
-//!    ②阶段走 `TYP` 内核；REQ-SQL-002 的正面清单）；
-//! 2. **位置齐全**——每个 token 带**字节偏移区间**（错误可定位；验收要它）；
-//! 3. **关键字是闭集**——与标识符同形，按闭集判定；闭集之外的词一律标识符。
+//! 1. **零依赖**——不查目录、不解析字面量值（`NUMBER` 文本留给 ② 走 `TYP` 内核）；
+//! 2. **位置齐全**——每个 token 带**字节偏移区间**（设计记档：PG 用字符偏移，
+//!    我们用字节——诊断更强，且与行格式的字节语义一致）；
+//! 3. **标识符折叠照 PG**（⚠️ 见下"折叠位置"）。
+//!
+//! **折叠位置（照 PG，记档差异）**：PG 在**扫描器**里把未引号标识符折叠为
+//! 小写、引号标识符原样保留；本词法器同样处理。设计规格 REQ-SQL-002 写的是
+//! "折叠规则在 ② 应用"——**本实现按 PG 提前到 ①**（对齐 PG 的直接后果，
+//! 待评审；见设计 §3.2 的记档）。
 
 use std::fmt;
 
@@ -24,7 +30,7 @@ impl Span {
         Self { start, end }
     }
 
-    /// 合并两个区间（用于把子表达式的区间并成父节点区间）。
+    /// 合并两个区间。
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -34,10 +40,8 @@ impl Span {
     }
 }
 
-/// **关键字闭集**（REQ-SQL-005 正面清单用到的一切；大小写不敏感）。
-///
-/// 闭集纪律（REQ-SQL-006）：不在本表的词（`WITH`、`EXISTS`、`OVER`、`RETURNING`…）
-/// 就是普通标识符——**语法层没有它们的产生式**，用到即语法错误。
+/// **关键字闭集**（REQ-SQL-005 正面清单所需；对齐 PG 的"保留/非保留"思想但
+/// 只留我们用得到的——清单外构造在语法层没有产生式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     // 语句起始
@@ -124,8 +128,6 @@ pub enum Keyword {
     In,
     /// `BETWEEN`
     Between,
-    /// `LIKE`（列表外；词法保留以便报"不支持"）
-    Like,
     /// `CASE`
     Case,
     /// `WHEN`
@@ -140,8 +142,6 @@ pub enum Keyword {
     Cast,
     /// `COALESCE`
     Coalesce,
-    /// `NULLIF`
-    Nullif,
     /// `TRUE`
     True,
     /// `FALSE`
@@ -175,30 +175,45 @@ pub enum Keyword {
     Quota,
     /// `WITH`
     With,
-    /// `NOT_` 之外的：`NULL` 已有；这里放 `DEFAULT`（拒绝用）
-    Default,
-    /// `PRIMARY`（拒绝用）
-    Primary,
-    /// `KEY`（拒绝用）
-    Key,
-    /// `REFERENCES`（拒绝用）
-    References,
-    /// `CHECK`（拒绝用）
-    Check,
-    /// `RETURNING`（拒绝用）
-    Returning,
-    /// `RIGHT`（拒绝用——REQ-SQL-006）
+    // 仅用于"响亮拒绝"（闭集外构造；词法保留使错误文案更准）
+    /// `LIKE`
+    Like,
+    /// `RIGHT`
     Right,
-    /// `FULL`（拒绝用）
+    /// `FULL`
     Full,
-    /// `NATURAL`（拒绝用）
+    /// `NATURAL`
     Natural,
-    /// `USING`（拒绝用）
+    /// `USING`
     Using,
-    /// `OVER`（拒绝用——窗口函数）
+    /// `OVER`
     Over,
-    /// `EXISTS`（拒绝用——子查询）
+    /// `EXISTS`
     Exists,
+    /// `RETURNING`
+    Returning,
+    /// `DEFAULT`
+    Default,
+    /// `PRIMARY`
+    Primary,
+    /// `KEY`
+    Key,
+    /// `REFERENCES`
+    References,
+    /// `CHECK`
+    Check,
+    /// `NULLS`（`NULLS FIRST/LAST`——语法暂不开，词典保留）
+    Nulls,
+    /// `FIRST`
+    First,
+    /// `LAST`
+    Last,
+    /// `SAVEPOINT`
+    Savepoint,
+    /// `TRUNCATE`
+    Truncate,
+    /// `ADD`（`ALTER TABLE ADD`）
+    Add,
 }
 
 impl Keyword {
@@ -247,7 +262,6 @@ impl Keyword {
             "NULL" => Self::Null,
             "IN" => Self::In,
             "BETWEEN" => Self::Between,
-            "LIKE" => Self::Like,
             "CASE" => Self::Case,
             "WHEN" => Self::When,
             "THEN" => Self::Then,
@@ -255,7 +269,6 @@ impl Keyword {
             "END" => Self::End,
             "CAST" => Self::Cast,
             "COALESCE" => Self::Coalesce,
-            "NULLIF" => Self::Nullif,
             "TRUE" => Self::True,
             "FALSE" => Self::False,
             "TABLE" => Self::Table,
@@ -272,18 +285,25 @@ impl Keyword {
             "OF" => Self::Of,
             "QUOTA" => Self::Quota,
             "WITH" => Self::With,
-            "DEFAULT" => Self::Default,
-            "PRIMARY" => Self::Primary,
-            "KEY" => Self::Key,
-            "REFERENCES" => Self::References,
-            "CHECK" => Self::Check,
-            "RETURNING" => Self::Returning,
+            "LIKE" => Self::Like,
             "RIGHT" => Self::Right,
             "FULL" => Self::Full,
             "NATURAL" => Self::Natural,
             "USING" => Self::Using,
             "OVER" => Self::Over,
             "EXISTS" => Self::Exists,
+            "RETURNING" => Self::Returning,
+            "DEFAULT" => Self::Default,
+            "PRIMARY" => Self::Primary,
+            "KEY" => Self::Key,
+            "REFERENCES" => Self::References,
+            "CHECK" => Self::Check,
+            "NULLS" => Self::Nulls,
+            "FIRST" => Self::First,
+            "LAST" => Self::Last,
+            "SAVEPOINT" => Self::Savepoint,
+            "TRUNCATE" => Self::Truncate,
+            "ADD" => Self::Add,
             _ => return None,
         })
     }
@@ -333,7 +353,6 @@ impl Keyword {
             Self::Null => "NULL",
             Self::In => "IN",
             Self::Between => "BETWEEN",
-            Self::Like => "LIKE",
             Self::Case => "CASE",
             Self::When => "WHEN",
             Self::Then => "THEN",
@@ -341,7 +360,6 @@ impl Keyword {
             Self::End => "END",
             Self::Cast => "CAST",
             Self::Coalesce => "COALESCE",
-            Self::Nullif => "NULLIF",
             Self::True => "TRUE",
             Self::False => "FALSE",
             Self::Table => "TABLE",
@@ -358,18 +376,25 @@ impl Keyword {
             Self::Of => "OF",
             Self::Quota => "QUOTA",
             Self::With => "WITH",
-            Self::Default => "DEFAULT",
-            Self::Primary => "PRIMARY",
-            Self::Key => "KEY",
-            Self::References => "REFERENCES",
-            Self::Check => "CHECK",
-            Self::Returning => "RETURNING",
+            Self::Like => "LIKE",
             Self::Right => "RIGHT",
             Self::Full => "FULL",
             Self::Natural => "NATURAL",
             Self::Using => "USING",
             Self::Over => "OVER",
             Self::Exists => "EXISTS",
+            Self::Returning => "RETURNING",
+            Self::Default => "DEFAULT",
+            Self::Primary => "PRIMARY",
+            Self::Key => "KEY",
+            Self::References => "REFERENCES",
+            Self::Check => "CHECK",
+            Self::Nulls => "NULLS",
+            Self::First => "FIRST",
+            Self::Last => "LAST",
+            Self::Savepoint => "SAVEPOINT",
+            Self::Truncate => "TRUNCATE",
+            Self::Add => "ADD",
         }
     }
 }
@@ -407,7 +432,9 @@ pub enum Punct {
     Gt,
     /// `>=`
     Ge,
-    /// `<->`（L2 距离；RET 的向量接口）
+    /// `::`（转型——PG 的 `TYPECAST`）
+    Cast,
+    /// `<->`（L2 距离；向量接口）
     L2,
     /// `<=>`（余弦距离）
     Cosine,
@@ -420,17 +447,19 @@ pub enum Punct {
 pub enum TokenKind {
     /// 关键字（闭集）。
     Keyword(Keyword),
-    /// 标识符（**记原文本**——大小写折叠在 ② 阶段）。
+    /// **未引号标识符**（已按 PG 折叠为小写）。
     Ident(String),
-    /// 数字字面量（**原文本**——解析成 `NUMBER` 在 ② 走 TYP 内核）。
+    /// **引号标识符**（`"…"`；原样保留、大小写敏感）。
+    QIdent(String),
+    /// 数字字面量（**原文本**——值的解析在 ② 走 TYP 内核）。
     Number(String),
-    /// 字符串字面量（**已解转义**的字节内容：SQL 的 `''` ⇒ `'`）。
+    /// 字符串字面量（已解转义的字节内容：SQL 的 `''` ⇒ `'`）。
     Str(Vec<u8>),
-    /// 参数 `:name`（记名字，不记下标——序号在 ② 定型后定）。
+    /// 参数 `:name`（PG 用 `$n`；本库规格用 `:name`——设计记档）。
     Param(String),
     /// 标点 / 操作符。
     Punct(Punct),
-    /// 语句结束（文本末尾也算一个；解析器据它收尾）。
+    /// 语句结束（文本末尾也算一个）。
     Eof,
 }
 
@@ -448,7 +477,7 @@ pub struct Token {
 pub struct LexError {
     /// 文案。
     pub message: String,
-    /// 出错位置。
+    /// 位置。
     pub span: Span,
 }
 
@@ -473,7 +502,7 @@ pub fn tokenize(text: &str) -> Result<Vec<Token>, LexError> {
         let b = bytes[i];
         match b {
             b' ' | b'\t' | b'\r' | b'\n' => i += 1,
-            // 行注释 `-- …`
+            // 行注释 `-- …`（PG 同名）
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
@@ -497,6 +526,7 @@ pub fn tokenize(text: &str) -> Result<Vec<Token>, LexError> {
                     i += 1;
                 }
             }
+            // 字符串字面量（`''` 转义；PG 的普通字符串）
             b'\'' => {
                 let start = i;
                 i += 1;
@@ -525,7 +555,46 @@ pub fn tokenize(text: &str) -> Result<Vec<Token>, LexError> {
                     span: Span::new(start, i),
                 });
             }
-            b':' => {
+            // **引号标识符**（`""` 转义；原样保留——PG 的 `"Foo"`）
+            b'"' => {
+                let start = i;
+                i += 1;
+                let mut name = Vec::new();
+                loop {
+                    if i >= bytes.len() {
+                        return Err(LexError {
+                            message: "引号标识符未闭合".to_owned(),
+                            span: Span::new(start, i),
+                        });
+                    }
+                    if bytes[i] == b'"' {
+                        if bytes.get(i + 1) == Some(&b'"') {
+                            name.push(b'"');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    name.push(bytes[i]);
+                    i += 1;
+                }
+                let name = String::from_utf8(name).map_err(|_| LexError {
+                    message: "引号标识符不是合法 UTF-8".to_owned(),
+                    span: Span::new(start, i),
+                })?;
+                if name.is_empty() {
+                    return Err(LexError {
+                        message: "引号标识符不得为空".to_owned(),
+                        span: Span::new(start, i),
+                    });
+                }
+                out.push(Token {
+                    kind: TokenKind::QIdent(name),
+                    span: Span::new(start, i),
+                });
+            }
+            b':' if bytes.get(i + 1) != Some(&b':') => {
                 let start = i;
                 i += 1;
                 let name_start = i;
@@ -538,8 +607,33 @@ pub fn tokenize(text: &str) -> Result<Vec<Token>, LexError> {
                 while i < bytes.len() && is_ident_cont(bytes[i]) {
                     i += 1;
                 }
+                // 未引号参数名折叠照 PG 的标识符规则（小写）。
                 out.push(Token {
-                    kind: TokenKind::Param(text[name_start..i].to_owned()),
+                    kind: TokenKind::Param(text[name_start..i].to_ascii_lowercase()),
+                    span: Span::new(start, i),
+                });
+            }
+            // 数字：`digits[.digits][e[+-]digits]`（含 `.5` 形态；照 PG；原文本）
+            b'.' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if matches!(bytes.get(i), Some(b'e' | b'E')) {
+                    let mut j = i + 1;
+                    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+                        j += 1;
+                    }
+                    if bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                        i = j;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
+                out.push(Token {
+                    kind: TokenKind::Number(text[start..i].to_owned()),
                     span: Span::new(start, i),
                 });
             }
@@ -548,15 +642,22 @@ pub fn tokenize(text: &str) -> Result<Vec<Token>, LexError> {
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                if i < bytes.len() && bytes[i] == b'.' {
-                    let dot = i;
+                if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
                     i += 1;
-                    if i < bytes.len() && bytes[i].is_ascii_digit() {
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                if matches!(bytes.get(i), Some(b'e' | b'E')) {
+                    let mut j = i + 1;
+                    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+                        j += 1;
+                    }
+                    if bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                        i = j;
                         while i < bytes.len() && bytes[i].is_ascii_digit() {
                             i += 1;
                         }
-                    } else {
-                        i = dot; // `1.` 里的点不是小数点的情形（如 `1 ..`）——回退
                     }
                 }
                 out.push(Token {
@@ -572,8 +673,8 @@ pub fn tokenize(text: &str) -> Result<Vec<Token>, LexError> {
                 let word = &text[start..i];
                 let kind = match Keyword::lookup(word) {
                     Some(k) => TokenKind::Keyword(k),
-                    // 标识符原文本（含 `$` 结尾名——保留规则在 ② 判，词法不管）
-                    None => TokenKind::Ident(word.to_owned()),
+                    // 未引号标识符：**照 PG 折叠为小写**（引号内的不折）。
+                    None => TokenKind::Ident(word.to_ascii_lowercase()),
                 };
                 out.push(Token {
                     kind,
@@ -612,7 +713,6 @@ fn is_ident_cont(b: u8) -> bool {
 fn read_punct(bytes: &[u8], i: usize) -> Option<(Punct, usize)> {
     let two = |k: u8| bytes.get(i + 1) == Some(&k);
     let three = |a: u8, b: u8| bytes.get(i + 1) == Some(&a) && bytes.get(i + 2) == Some(&b);
-    // 三字节操作符（向量距离接口）
     if bytes[i] == b'<' {
         if three(b'-', b'>') {
             return Some((Punct::L2, 3));
@@ -635,6 +735,7 @@ fn read_punct(bytes: &[u8], i: usize) -> Option<(Punct, usize)> {
         b'-' => (Punct::Minus, 1),
         b'/' => (Punct::Slash, 1),
         b'=' => (Punct::Eq, 1),
+        b':' if two(b':') => (Punct::Cast, 2),
         b'<' if two(b'>') => (Punct::Ne, 2),
         b'<' if two(b'=') => (Punct::Le, 2),
         b'<' => (Punct::Lt, 1),
@@ -657,23 +758,19 @@ mod tests {
     }
 
     #[test]
-    fn keywords_are_case_insensitive_and_idents_keep_text() {
+    fn keywords_are_case_insensitive_and_unquoted_idents_fold_lower() {
+        // 未引号标识符**照 PG 折叠为小写**；关键字闭集判定大小写不敏感。
         assert_eq!(
             kinds("select Foo from T"),
             vec![
                 TokenKind::Keyword(Keyword::Select),
-                TokenKind::Ident("Foo".to_owned()), // 原文本——折叠在 ②
+                TokenKind::Ident("foo".to_owned()),
                 TokenKind::Keyword(Keyword::From),
-                TokenKind::Ident("T".to_owned()),
+                TokenKind::Ident("t".to_owned()),
                 TokenKind::Eof,
             ]
         );
-        // `WITH` 是关键字但**没有产生式**（子查询/CTE 不提供）——词法保留以便报错。
-        assert_eq!(
-            kinds("with"),
-            vec![TokenKind::Keyword(Keyword::With), TokenKind::Eof]
-        );
-        // 不在闭集里的词就是标识符。
+        // 闭集外的词就是标识符（`window`）。
         assert_eq!(
             kinds("window"),
             vec![TokenKind::Ident("window".to_owned()), TokenKind::Eof]
@@ -681,17 +778,46 @@ mod tests {
     }
 
     #[test]
-    fn numbers_strings_params_and_operators() {
+    fn quoted_identifiers_preserve_case() {
         assert_eq!(
-            kinds("1 2.5 :p 'a''b' <> <= >= <-> <=> <#>"),
+            kinds("\"MyCol\" \"Sel\"\"ect\""),
+            vec![
+                TokenKind::QIdent("MyCol".to_owned()),
+                TokenKind::QIdent("Sel\"ect".to_owned()), // `""` 转义
+                TokenKind::Eof,
+            ]
+        );
+        assert!(tokenize("\"\"").is_err(), "空引号标识符拒绝");
+        assert!(tokenize("\"abc").is_err(), "未闭合拒绝");
+    }
+
+    #[test]
+    fn numbers_follow_pg_shape_and_keep_raw_text() {
+        assert_eq!(
+            kinds("1 2.5 .5x 1e3 2.5E-2"),
             vec![
                 TokenKind::Number("1".to_owned()),
                 TokenKind::Number("2.5".to_owned()),
+                TokenKind::Number(".5".to_owned()), // PG 允许 `.5`
+                TokenKind::Ident("x".to_owned()),
+                TokenKind::Number("1e3".to_owned()),
+                TokenKind::Number("2.5E-2".to_owned()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn strings_params_operators_and_cast() {
+        assert_eq!(
+            kinds(":p 'a''b' <> <= >= :: <-> <=> <#>"),
+            vec![
                 TokenKind::Param("p".to_owned()),
                 TokenKind::Str(b"a'b".to_vec()),
                 TokenKind::Punct(Punct::Ne),
                 TokenKind::Punct(Punct::Le),
                 TokenKind::Punct(Punct::Ge),
+                TokenKind::Punct(Punct::Cast),
                 TokenKind::Punct(Punct::L2),
                 TokenKind::Punct(Punct::Cosine),
                 TokenKind::Punct(Punct::NegInner),
@@ -705,25 +831,8 @@ mod tests {
         let toks = tokenize("a -- 注释\n/* 块 */ b").unwrap();
         assert_eq!(toks.len(), 3);
         assert_eq!(toks[0].span, Span::new(0, 1));
-        assert_eq!(toks[1].span, Span::new(22, 23)); // b 的字节区间（含多字节字符的注释）
-    }
-
-    #[test]
-    fn lex_errors_carry_positions() {
-        let e = tokenize("x 'unterminated").unwrap_err();
-        assert_eq!(e.span.start, 2);
-        let e2 = tokenize("/* never closed").unwrap_err();
-        assert_eq!(e2.message, "块注释未闭合");
-        let e3 = tokenize(":1").unwrap_err();
-        assert_eq!(e3.message, "`:` 之后必须是参数名");
-    }
-
-    #[test]
-    fn dollar_suffixed_names_are_plain_identifiers_at_lex_time() {
-        // 保留规则（`$` 结尾名）是**② 阶段**的事；词法只给文本。
-        assert_eq!(
-            kinds("file$"),
-            vec![TokenKind::Ident("file$".to_owned()), TokenKind::Eof]
-        );
+        assert_eq!(toks[1].span, Span::new(22, 23)); // 字节区间（含多字节注释）
+        assert!(tokenize("/* never closed").is_err());
+        assert!(tokenize("x 'unterminated").is_err());
     }
 }

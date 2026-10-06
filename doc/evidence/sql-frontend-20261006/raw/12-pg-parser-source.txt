@@ -1,0 +1,342 @@
+### PostgreSQL 解析器源码取证（REL_16_STABLE，经 HTTP 代理 127.0.0.1:7890）
+# 命令：
+#   curl -x http://127.0.0.1:7890 -o parsenodes.h  https://raw.githubusercontent.com/postgres/postgres/REL_16_STABLE/src/include/nodes/parsenodes.h
+#   curl -x http://127.0.0.1:7890 -o primnodes.h   https://raw.githubusercontent.com/postgres/postgres/REL_16_STABLE/src/include/nodes/primnodes.h
+#   curl -x http://127.0.0.1:7890 -o gram.y        https://raw.githubusercontent.com/postgres/postgres/REL_16_STABLE/src/backend/parser/gram.y
+# 用途：SQL 前端设计 §3（语法与 AST 形状对齐 PG 的取证）。行号对应 REL_16_STABLE。
+
+## 1) gram.y 操作符优先级声明（行 812–866，原样摘录）
+%nonassoc	SET				/* see relation_expr_opt_alias */
+%left		UNION EXCEPT
+%left		INTERSECT
+%left		OR
+%left		AND
+%right		NOT
+%nonassoc	IS ISNULL NOTNULL	/* IS sets precedence for IS NULL, etc */
+%nonassoc	'<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%nonassoc	BETWEEN IN_P LIKE ILIKE SIMILAR NOT_LA
+%nonassoc	ESCAPE			/* ESCAPE must be just above LIKE/ILIKE/SIMILAR */
+
+%left		Op OPERATOR		/* multi-character ops and user-defined operators */
+%left		'+' '-'
+%left		'*' '/' '%'
+%left		'^'
+/* Unary Operators */
+%left		AT				/* sets precedence for AT TIME ZONE */
+%left		COLLATE
+%right		UMINUS
+%left		'[' ']'
+%left		'(' ')'
+%left		TYPECAST
+%left		'.'
+
+## 2) 关键解析节点（parsenodes.h / primnodes.h，压缩注释）
+# —— parsenodes.h
+typedef struct SelectStmt {
+    List	   *distinctClause; /* NULL, list of DISTINCT ON exprs, or
+    IntoClause *intoClause;		/* target for SELECT INTO */
+    List	   *targetList;		/* the target list (of ResTarget) */
+    List	   *fromClause;		/* the FROM clause */
+    Node	   *whereClause;	/* WHERE qualification */
+    List	   *groupClause;	/* GROUP BY clauses */
+    bool		groupDistinct;	/* Is this GROUP BY DISTINCT? */
+    Node	   *havingClause;	/* HAVING conditional-expression */
+    List	   *windowClause;	/* WINDOW window_name AS (...), ... */
+    List	   *valuesLists;	/* untransformed list of expression lists */
+    List	   *sortClause;		/* sort clause (a list of SortBy's) */
+    Node	   *limitOffset;	/* # of result tuples to skip */
+    Node	   *limitCount;		/* # of result tuples to return */
+    LimitOption limitOption;	/* limit type */
+    List	   *lockingClause;	/* FOR UPDATE (list of LockingClause's) */
+    WithClause *withClause;		/* WITH clause */
+    SetOperation op;			/* type of set op */
+    bool		all;			/* ALL specified? */
+    struct SelectStmt *larg;	/* left child */
+    struct SelectStmt *rarg;	/* right child */
+} SelectStmt;
+typedef struct InsertStmt {
+    RangeVar   *relation;		/* relation to insert into */
+    List	   *cols;			/* optional: names of the target columns */
+    Node	   *selectStmt;		/* the source SELECT/VALUES, or NULL */
+    OnConflictClause *onConflictClause; /* ON CONFLICT clause */
+    List	   *returningList;	/* list of expressions to return */
+    WithClause *withClause;		/* WITH clause */
+    OverridingKind override;	/* OVERRIDING clause */
+} InsertStmt;
+typedef struct UpdateStmt {
+    RangeVar   *relation;		/* relation to update */
+    List	   *targetList;		/* the target list (of ResTarget) */
+    Node	   *whereClause;	/* qualifications */
+    List	   *fromClause;		/* optional from clause for more tables */
+    List	   *returningList;	/* list of expressions to return */
+    WithClause *withClause;		/* WITH clause */
+} UpdateStmt;
+typedef struct DeleteStmt {
+    RangeVar   *relation;		/* relation to delete from */
+    List	   *usingClause;	/* optional using clause for more tables */
+    Node	   *whereClause;	/* qualifications */
+    List	   *returningList;	/* list of expressions to return */
+    WithClause *withClause;		/* WITH clause */
+} DeleteStmt;
+typedef struct CreateStmt {
+    RangeVar   *relation;		/* relation to create */
+    List	   *tableElts;		/* column definitions (list of ColumnDef) */
+    List	   *inhRelations;	/* relations to inherit from (list of
+    PartitionBoundSpec *partbound;	/* FOR VALUES clause */
+    PartitionSpec *partspec;	/* PARTITION BY clause */
+    TypeName   *ofTypename;		/* OF typename */
+    List	   *constraints;	/* constraints (list of Constraint nodes) */
+    List	   *options;		/* options from WITH clause */
+    OnCommitAction oncommit;	/* what do we do at COMMIT? */
+    char	   *tablespacename; /* table space to use, or NULL */
+    char	   *accessMethod;	/* table access method */
+    bool		if_not_exists;	/* just do nothing if it already exists? */
+} CreateStmt;
+typedef struct ColumnDef {
+    char	   *colname;		/* name of column */
+    TypeName   *typeName;		/* type of column */
+    char	   *compression;	/* compression method for column */
+    int			inhcount;		/* number of times column is inherited */
+    bool		is_local;		/* column has local (non-inherited) def'n */
+    bool		is_not_null;	/* NOT NULL constraint specified? */
+    bool		is_from_type;	/* column definition came from table type */
+    char		storage;		/* attstorage setting, or 0 for default */
+    char	   *storage_name;	/* attstorage setting name or NULL for default */
+    Node	   *raw_default;	/* default value (untransformed parse tree) */
+    Node	   *cooked_default; /* default value (transformed expr tree) */
+    char		identity;		/* attidentity setting */
+    RangeVar   *identitySequence;	/* to store identity sequence name for
+    char		generated;		/* attgenerated setting */
+    CollateClause *collClause;	/* untransformed COLLATE spec, if any */
+    Oid			collOid;		/* collation OID (InvalidOid if not set) */
+    List	   *constraints;	/* other constraints on column */
+    List	   *fdwoptions;		/* per-column FDW options */
+    int			location;		/* parse location, or -1 if none/unknown */
+} ColumnDef;
+typedef struct IndexStmt {
+    char	   *idxname;		/* name of new index, or NULL for default */
+    RangeVar   *relation;		/* relation to build index on */
+    char	   *accessMethod;	/* name of access method (eg. btree) */
+    char	   *tableSpace;		/* tablespace, or NULL for default */
+    List	   *indexParams;	/* columns to index: a list of IndexElem */
+    List	   *indexIncludingParams;	/* additional columns to index: a list
+    List	   *options;		/* WITH clause options: a list of DefElem */
+    Node	   *whereClause;	/* qualification (partial-index predicate) */
+    List	   *excludeOpNames; /* exclusion operator names, or NIL if none */
+    char	   *idxcomment;		/* comment to apply to index, or NULL */
+    Oid			indexOid;		/* OID of an existing index, if any */
+    RelFileNumber oldNumber;	/* relfilenumber of existing storage, if any */
+    SubTransactionId oldCreateSubid;	/* rd_createSubid of oldNumber */
+    SubTransactionId oldFirstRelfilelocatorSubid;	/* rd_firstRelfilelocatorSubid
+    bool		unique;			/* is index unique? */
+    bool		nulls_not_distinct; /* null treatment for UNIQUE constraints */
+    bool		primary;		/* is index a primary key? */
+    bool		isconstraint;	/* is it for a pkey/unique constraint? */
+    bool		deferrable;		/* is the constraint DEFERRABLE? */
+    bool		initdeferred;	/* is the constraint INITIALLY DEFERRED? */
+    bool		transformed;	/* true when transformIndexStmt is finished */
+    bool		concurrent;		/* should this be a concurrent index build? */
+    bool		if_not_exists;	/* just do nothing if index already exists? */
+    bool		reset_default_tblspc;	/* reset default_tablespace prior to
+} IndexStmt;
+typedef struct IndexElem {
+    char	   *name;			/* name of attribute to index, or NULL */
+    Node	   *expr;			/* expression to index, or NULL */
+    char	   *indexcolname;	/* name for index column; NULL = default */
+    List	   *collation;		/* name of collation; NIL = default */
+    List	   *opclass;		/* name of desired opclass; NIL = default */
+    List	   *opclassopts;	/* opclass-specific options, or NIL */
+    SortByDir	ordering;		/* ASC/DESC/default */
+    SortByNulls nulls_ordering; /* FIRST/LAST/default */
+} IndexElem;
+typedef struct DropStmt {
+    List	   *objects;		/* list of names */
+    ObjectType	removeType;		/* object type */
+    DropBehavior behavior;		/* RESTRICT or CASCADE behavior */
+    bool		missing_ok;		/* skip error if object is missing? */
+    bool		concurrent;		/* drop index concurrently? */
+} DropStmt;
+typedef struct ResTarget {
+    char	   *name;			/* column name or NULL */
+    List	   *indirection;	/* subscripts, field names, and '*', or NIL */
+    Node	   *val;			/* the value expression to compute or assign */
+    int			location;		/* token location, or -1 if unknown */
+} ResTarget;
+typedef struct SortBy {
+    Node	   *node;			/* expression to sort on */
+    SortByDir	sortby_dir;		/* ASC/DESC/USING/default */
+    SortByNulls sortby_nulls;	/* NULLS FIRST/LAST */
+    List	   *useOp;			/* name of op to use, if SORTBY_USING */
+    int			location;		/* operator location, or -1 if none/unknown */
+} SortBy;
+typedef struct A_Expr {
+    A_Expr_Kind kind;			/* see above */
+    List	   *name;			/* possibly-qualified name of operator */
+    Node	   *lexpr;			/* left argument, or NULL if none */
+    Node	   *rexpr;			/* right argument, or NULL if none */
+    int			location;		/* token location, or -1 if unknown */
+} A_Expr;
+typedef struct FuncCall {
+    List	   *funcname;		/* qualified name of function */
+    List	   *args;			/* the arguments (list of exprs) */
+    List	   *agg_order;		/* ORDER BY (list of SortBy) */
+    Node	   *agg_filter;		/* FILTER clause, if any */
+    struct WindowDef *over;		/* OVER clause, if any */
+    bool		agg_within_group;	/* ORDER BY appeared in WITHIN GROUP */
+    bool		agg_star;		/* argument was really '*' */
+    bool		agg_distinct;	/* arguments were labeled DISTINCT */
+    bool		func_variadic;	/* last argument was labeled VARIADIC */
+    CoercionForm funcformat;	/* how to display this node */
+    int			location;		/* token location, or -1 if unknown */
+} FuncCall;
+typedef struct TypeCast {
+    Node	   *arg;			/* the expression being casted */
+    TypeName   *typeName;		/* the target type */
+    int			location;		/* token location, or -1 if unknown */
+} TypeCast;
+typedef struct ColumnRef {
+    List	   *fields;			/* field names (String nodes) or A_Star */
+    int			location;		/* token location, or -1 if unknown */
+} ColumnRef;
+typedef struct A_Const {
+    union ValUnion val;
+    bool		isnull;			/* SQL NULL constant */
+    int			location;		/* token location, or -1 if unknown */
+} A_Const;
+typedef struct TypeName {
+    List	   *names;			/* qualified name (list of String nodes) */
+    Oid			typeOid;		/* type identified by OID */
+    bool		setof;			/* is a set? */
+    bool		pct_type;		/* %TYPE specified? */
+    List	   *typmods;		/* type modifier expression(s) */
+    int32		typemod;		/* prespecified type modifier */
+    List	   *arrayBounds;	/* array bounds */
+    int			location;		/* token location, or -1 if unknown */
+} TypeName;
+typedef struct DefElem {
+    char	   *defnamespace;	/* NULL if unqualified name */
+    char	   *defname;
+    Node	   *arg;			/* typically Integer, Float, String, or
+    DefElemAction defaction;	/* unspecified action, or SET/ADD/DROP */
+    int			location;		/* token location, or -1 if unknown */
+} DefElem;
+typedef struct TransactionStmt {
+    TransactionStmtKind kind;	/* see above */
+    List	   *options;		/* for BEGIN/START commands */
+    char	   *savepoint_name; /* for savepoint commands */
+    char	   *gid;			/* for two-phase-commit related commands */
+    bool		chain;			/* AND CHAIN option */
+} TransactionStmt;
+# —— primnodes.h
+typedef struct RangeVar {
+    char	   *catalogname;
+    char	   *schemaname;
+    char	   *relname;
+    bool		inh;
+    char		relpersistence;
+    Alias	   *alias;
+    int			location;
+} RangeVar;
+typedef struct Alias {
+    char	   *aliasname;		/* aliased rel name (never qualified) */
+    List	   *colnames;		/* optional list of column aliases */
+} Alias;
+typedef struct JoinExpr {
+    JoinType	jointype;		/* type of join */
+    bool		isNatural;		/* Natural join? Will need to shape table */
+    Node	   *larg;			/* left subtree */
+    Node	   *rarg;			/* right subtree */
+    Node	   *quals;
+    int			rtindex;
+} JoinExpr;
+typedef struct BoolExpr {
+    Expr		xpr;
+    BoolExprType boolop;
+    List	   *args;			/* arguments to this expression */
+    int			location;		/* token location, or -1 if unknown */
+} BoolExpr;
+typedef struct NullTest {
+    Expr		xpr;
+    Expr	   *arg;			/* input expression */
+    NullTestType nulltesttype;	/* IS NULL, IS NOT NULL */
+    int			location;		/* token location, or -1 if unknown */
+} NullTest;
+typedef struct CaseExpr {
+    Expr		xpr;
+    Expr	   *arg;			/* implicit equality comparison argument */
+    List	   *args;			/* the arguments (list of WHEN clauses) */
+    Expr	   *defresult;		/* the default result (ELSE clause) */
+    int			location;		/* token location, or -1 if unknown */
+} CaseExpr;
+typedef struct CaseWhen {
+    Expr		xpr;
+    Expr	   *expr;			/* condition expression */
+    Expr	   *result;			/* substitution result */
+    int			location;		/* token location, or -1 if unknown */
+} CaseWhen;
+typedef struct CoalesceExpr {
+    Expr		xpr;
+    List	   *args;
+    int			location;
+} CoalesceExpr;
+
+## 3) 关键产生式（gram.y 原样摘录）
+insert_rest:
+			SelectStmt
+				{
+					$$ = makeNode(InsertStmt);
+					$$->cols = NIL;
+					$$->selectStmt = $1;
+				}
+			| OVERRIDING override_kind VALUE_P SelectStmt
+				{
+					$$ = makeNode(InsertStmt);
+					$$->cols = NIL;
+					$$->override = $2;
+					$$->selectStmt = $4;
+				}
+			| '(' insert_column_list ')' SelectStmt
+				{
+					$$ = makeNode(InsertStmt);
+					$$->cols = $2;
+					$$->selectStmt = $4;
+				}
+			| '(' insert_column_list ')' OVERRIDING override_kind VALUE_P SelectStmt
+				{
+					$$ = makeNode(InsertStmt);
+					$$->cols = $2;
+					$$->override = $5;
+					$$->selectStmt = $7;
+				}
+			| DEFAULT VALUES
+				{
+					$$ = makeNode(InsertStmt);
+					$$->cols = NIL;
+					$$->selectStmt = NULL;
+				}
+		;
+─────────
+columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList
+				{
+					ColumnDef *n = makeNode(ColumnDef);
+
+					n->colname = $1;
+					n->typeName = $2;
+					n->storage_name = $3;
+					n->compression = $4;
+					n->inhcount = 0;
+					n->is_local = true;
+					n->is_not_null = false;
+					n->is_from_type = false;
+					n->storage = 0;
+					n->raw_default = NULL;
+					n->cooked_default = NULL;
+					n->collOid = InvalidOid;
+					n->fdwoptions = $5;
+					SplitColQualList($6, &n->constraints, &n->collClause,
+									 yyscanner);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+─────────

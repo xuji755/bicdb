@@ -1,0 +1,41 @@
+### kb_graph postgresql problem '语法分析 词法分析 gram.y scan.l 解析树 分析树 节点'
+
+============================================================
+  [问题诊断] 语法分析 词法分析 gram.y scan.l 解析树 分析树 节点
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 1，摘要筛选通过 0，批次 1；本路已取尽
+  KnowledgeEntry：已取 22，摘要筛选通过 11，批次 1；本路已取尽
+  CaseStudy：已取 0，摘要筛选通过 0，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     词法/语法分析在src/backend/parser/scan.l和gram.y中完成，语义分析在analyze.c中的parse_analyze函数完成，产出Query树。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 词法语法分析与语义分析  (排序分: 10.0)
+     └ 详情：SQL文本首先经过词法分析器scan.l和语法分析器gram.y生成RawParseTree，然后通过parse_analyze进行语义分析，将抽象语法树转换为带语义信息的Query树。该Query树包含targetList、jointree、rtable等字段，是后续重写和规划阶段的输入。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2067574
+
+     [KnowledgeEntry] AI辅助PolarDB内核学习第9篇：Parser(SQL解析器)。解读PostgreSQL 15源码src/backend/parser目录。核心流程：①scan.l做词法分析(lexer)，将SQL字符串分解为token；②gram.y做语法分析，基于BNF文法构建parse tree；③parse_*.c将parse tree转为Query/SelectStmt等内部结构。关键文件：anal  (排序分: 10.0)
+     └ 摘要：本文解读PostgreSQL 15源码中src/backend/parser目录下的SQL解析器实现。核心流程三步：scan.l进行词法分析，将SQL字符串分解为token；gram.y基于BNF文法做语法分析，构建解析树；parse_*.c文件将解析树转换为Query、SelectStmt等内部数据结构。关键文件包括analyze.c处理语义分析，parse_clause.c处理FROM/WHERE子句，parse_expr.c处理表达式，parse_func.c处理函数，parse_oper.c处理操作符，parse_target.c处理SELECT列表，parse_relation.c处理表引用。该分析适用于理解KES V8R6（基于PostgreSQL 12.1内核）的解析器机制。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:356528
+
+     [KnowledgeEntry] SQL解析流水线 - 从SQL到查询树  (排序分: 9.7)
+     └ 摘要：SQL 解析流水线分三步：1）词法分析（scan.l）分解 token；2）语法分析（gram.y）构建原始解析树；3）语义分析（analyze.c 等）进行名称解析、类型检查、权限检查，生成查询树。查询树是优化器和执行器的输入。理解此流程有助于定位语法或语义错误。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:586787
+
+     [KnowledgeEntry] Mermaid图 - parser文件依赖关系  (排序分: 9.7)
+     └ 详情：Mermaid图 - parser文件依赖关系：Mermaid图描述了解析器工作流程：parser.c入口调用scan.l（词法分析）、scansup.c（词法支持）、gram.y（语法分析），然后analyze.c调用多个parse_*.c进行语义分析。
+分类：工具
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:548563
+
+     [KnowledgeEntry] 语法错误报告整链机制  (排序分: 9.7)
+     └ 摘要：从语法错误触发到客户端显示LINE+^的完整链路：scan.l/gram.y/bison错误统一经scanner_yyerror抛出ERROR，附带errposition计算列位置。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2070055
+
+     [KnowledgeEntry] postgresql_synth_21068890  (排序分: 9.7)
+     └ 摘要：PostgreSQL 解析器的核心代码位于 `src/backend/parser` 目录，主要负责将 SQL 查询转换为查询树。该过程依次经过词法分析、语法分析和语义分析等步骤，最终生成的查询树将被优化器和执行器使用。相关源文件包括 parser.c、scan.l、scansup.c、gram.y 和 analyze.c 等，共同完成从原始 SQL 到内部数据结构的转换任务。
+     详情请见：python3 kb_graph.py postgresql detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1280419
+
