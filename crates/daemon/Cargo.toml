@@ -8,3 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bicdb-workspace = { path = "../workspace" }
+
+[dev-dependencies]
+# 重绑定协议的端到端用例（Draining 用真缓冲池；详设 §7）。
+bicdb-storage = { path = "../storage" }
+bicdb-common = { path = "../common" }

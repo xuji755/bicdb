@@ -2,9 +2,109 @@
 //!
 //! 页格式、槽位堆表、跨页行片段、BufferPool、PageGuard
 //!
-//! - 设计依据：§7 Oracle风格存储与跨页记录
-//! - 对应阶段：P2
-//! - 当前状态：**未实现**（骨架占位，无可调用 API）
+//! - 设计依据：§7 Oracle风格存储与跨页记录（存储架构 §5.3–§5.9）
+//! - 对应阶段：**P2**（已启动；本片 = `页格式基础`）
+//! - 当前状态：**v0.25**——[`page`]（页格式与两层完整性检出）、[`rowid`]、
+//!   [`row`]（行格式与片段链）、[`heap`]（堆表操作与内存堆表）、
+//!   [`fragment`]（跨页行片段链）、[`pagefile`]（页文件定址读写）、
+//!   [`bitmap`]（位图页与**区分配图 LMT**：区 = 128 KB、位图区 = 8 页、
+//!   容量换算与 `own_index` 自校验）、[`controlfile`]（P3：**工作区控制文件**
+//!   ——20 页 × 16 KiB 字节布局、双副本、单区间更新协议与崩溃自愈）、
+//!   [`segment`]（P3：**段头页与区映射**——段头公共部分/类型扩展区、
+//!   区间项的**相邻合并**、逻辑页号 → 物理块、段内位图覆盖推算）。
+//!   [`datafile`]（P3：**数据文件**——文件头页、位图空间头、尾部增长的
+//!   LMT 位图区、区分配；数据区与位图区相向而行，相遇即明确报满）。
+//!   [`undo`]（P3：**Undo 段与事务表**——`txn_id` 三段式、256 槽 × 24B、
+//!   段控制、分配/释放与按 `txn_id` 定位、五类撤销记录的字节格式）。
+//!   [`itl`]（P3：**ITL 事务槽**——行锁承载、复用判据、动态扩展、
+//!   提交/回滚标记与 `ITL 覆盖` 快照）。
+//!   （续）undo 页写入与链、**回滚链回放**（五类补偿动作、事务级回滚与槽释放；
+//!   "更新"类补偿待行布局切片）。
+//!   [`cr`]（P3：**一致性读回放**——快照下逐段回溯：ITL 判定（页内序号快筛
+//!   / `txn_id` 定位事务表槽/槽复用即可见）、沿链撤销本块修改、`ITL 覆盖`
+//!   还原后重评估、轮数上限防环；重建在内存副本上，源页不动）。
+//!   （续）**分析阶段的事务表修复**——`repair_committed_slots`：日志已提交
+//!   事务的**前滚补标记**（延迟块清除 + 可见性判定的正确性前提）+ 输家槽扫描；
+//!   **补偿幂等**（插入遇"槽已空闲"、删除遇"旧值逐字节相同"= 已生效过的空
+//!   操作——恢复的撤销阶段"重走整链"依赖它）。
+//!   [`buffer`]（P3：**缓冲池**——实例级共享、键带工作区标识、LRU 淘汰 +
+//!   每工作区脏链（按首次变脏 LSN 升序）、**WAL 规则 2**（写回前 redo 先
+//!   持久化到 `page_lsn`）、steal + no-force；N=1 分区起步）。
+//!   （续）`itl::grow` 修正：**槽位目录随固定头后移**（不搬目录会把行区
+//!   字节当槽位读——端到端恢复用例抓到的实例）；补偿的"**页状态早于本记录**"
+//!   判据（槽/ITL 槽还不存在 ⇒ 空操作——PITR 有界重放的延伸）。
+//!   （续）**文件增长协议（预留式布局）**——位图区全量预留（40 区 × 8 页 =
+//!   5 MiB，块 1 起连续、永不搬移）、`DATA_AREA_FIRST_BLOCK` = 321、
+//!   `DataFile::extend` = `set_len` + 更新文件头（零复制）、`coverage_limit`
+//!   ≈ 5 TB 覆盖 4 TiB 上限。
+//!   （续）**DB Cache v2**（§5.10 完整设计落地）——哈希桶（键对桶数取模、
+//!   桶数取质数）+ 热/冷段 + LRU-AUX + **touch count 三秒规则与老化减半**
+//!   （命中合并窗口 / 减半不立即淘汰）、前台找空闲缓冲（AUX 优先 → 冷段尾）、
+//!   **Make Free 内联批处理**（写列表头按序 + WAL 规则 2 + 写完入 AUX）、
+//!   统计口径对齐 X$KCBWDS。
 //!
-//! 本 crate 在对应阶段启动前不提供任何实现。请勿在此添加推测性
-//! 接口——接口须先经 P0 冻结并完成设计评审（见设计文档）。
+//!   （续）**多页段内位图**——位图页 i 落在逻辑页 `i×65216`（i=0 在 1）、
+//!   窗口首位自指恒满、跨窗自动物化、追加位置跳过位图页。
+//!   （续）控制文件**采样环**（墙钟目标点）、`RedoGroup.member_stale`
+//!   （成员镜像位）。
+//!   （续）**区分配的计划形态**——`plan_allocate_extent`/`plan_extend`
+//!   返回受影响页镜像（写路径经池写 redo）；`extend` 保留直写形态。
+//!   （续，v0.27）**扫描 I/O**：[`scan`]（区读/批量回表的原语：`sort_rowids`、
+//!   `fetch_rows`——同块多行共享一次区读 + 一次 CR 块重建）、
+//!   `BufferPool::{copy_if_resident, load_clean, read_run}`（多块读，
+//!   §5.12）、`Segment::{hwm, plan_advance_hwm}`（§4.3.1）、
+//!   `pagefile::read_run`。
+//!   （续，v0.26，P3 审核修复）`itl::cleanout`（延迟块清除的落点——已提交条目 → `Committed` + 准确序号、锁清零）；`ITL 覆盖` 载荷加 `txn_id` + **归属守卫**（幽灵/换人记录不得覆盖他人条目）；`Segment::sync`（新页"先落盘后进 redo"次序用）；CR 终止符按 `itl_slot` 匹配；（续）`plan_materialize_bitmap_page`（**计划形态的位图页物化**：全新页先格式化 fsync、扩展页经池 + redo、段头以后像为基）、`plan_extend` 支持"窗口首位落在新增区内"、`rollback_chain` 环检测、`ExtentNo` 域校验、页访问器对损坏页降级。**P4 多写者随后。**
+//!   （续，v0.30，2026-10-06 缺陷修复）**计划器的"在飞覆盖层"**——
+//!   `plan_materialize_bitmap_page` 内的连续 `plan_extend` 曾基于**过期段头页**
+//!   重算（第二次扩展丢掉前一步的区映射）⇒ 一旦需要"多次扩展才够到窗口首位"
+//!   就死循环（实测：`coverage=4` 时第 4 个窗口；默认 coverage 下需要 8000+ 次
+//!   扩展，同样永不终止）。修复 = 函数内维护**在飞后像覆盖层**，连续计划步骤
+//!   一律以覆盖层为读-改-写基准（提供者只反映已落地内容）。回归用例
+//!   `materializes_bitmap_windows_across_repeated_extensions`（连物化 10 个窗口）。
+//!   `Segment::plan_advance_append`（推进 `append_pos` + 抬 `hwm`，池视角基准）、
+//!   `Segment::read_physical_page`（物理块不校验读；池路径判断"是否已格式化"）、
+//!   **`plan_create`**（**计划形态的建段**：区分配镜像经 redo、段头/段内位图页
+//!   作为全新页交给调用方"先格式化落盘 + fsync 再进 redo"——DDL 的
+//!   `CREATE TABLE`/`CREATE INDEX` 落点；与直写形态 `create` 共用同一套页镜像）。
+//!   （续，v0.28）**多工作集分区**（`BufferPool::with_partitions`：每分区自带
+//!   链/桶/写列表与具名闩锁，`H(工作区) mod N` 稳定哈希——§5.10 的 P4 形态）；
+//!   **NUMA 重绑定原语**——帧的页缓冲**惰性分配**（装页线程 = 首次触碰者，
+//!   "首次触碰落本地"成立；未用帧不占 16 KiB）、`drain_partition`（刷尽 +
+//!   丢净帧）/`drop_clean_frames`/`allocated_frames`（重绑定 Draining，
+//!   详设 `doc/numa绑定设计_v0.1.md` §7）。
+//!   （续，v0.29）**O2：per-frame 状态对象**（§5.10 的 P4 并发路线 ③）——
+//!   帧槽数组稳定地址、每帧 = 原子 `pins` + 内容 `RwLock`；`PageGuard`
+//!   **不持池闩锁**（“一次一个卫兵”纪律退役），新增共享 `PageReadGuard`
+//!   （同一热块并发读）；结构闩锁只护元数据/链/桶/写列表/统计。
+//!   桶分片（O3/②）仍未落。
+//!
+//! 三条纪律：
+//! 1. **字节序定死小端**（REQ-PRT-003）——磁盘格式不随主机变化；
+//! 2. **能推导的不存**（§5.2）：`free_start = 固定头末尾 + slot_count×2`、
+//!    可用空间 = 两指针之差，页头不存冗余量；
+//! 3. **每次修改必须 `seal`**（写页尾副本 → 重算校验和）——头、尾、
+//!    校验和三者在一次落盘前一致。
+
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+pub mod bitmap;
+pub mod bootstrap;
+pub mod buffer;
+pub mod controlfile;
+pub mod cr;
+pub mod datafile;
+pub mod dbwr;
+pub mod fragment;
+pub mod heap;
+pub mod itl;
+pub mod key;
+pub mod page;
+pub mod pagefile;
+pub mod row;
+pub mod rowid;
+pub mod scan;
+pub mod segment;
+pub mod temp;
+pub mod undo;

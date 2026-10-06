@@ -8,3 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bicdb-common = { path = "../common" }
+bicdb-storage = { path = "../storage" }
+
+[dev-dependencies]
+# 接入用例：真段 + 真缓冲池（§9.1.5 第 8 步的树头、§5.10 的池存取口）。
+bicdb-workspace = { path = "../workspace" }
+bicdb-common = { path = "../common" }

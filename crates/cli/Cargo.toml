@@ -1,0 +1,25 @@
+[package]
+name = "bicdb-cli"
+description = "bicdb 命令行（建区 / 执行 SQL / REPL）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bicdb_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bicdb"
+path = "src/main.rs"
+
+[dependencies]
+bicdb-catalog = { path = "../catalog" }
+bicdb-common = { path = "../common" }
+bicdb-sql = { path = "../sql" }
+bicdb-storage = { path = "../storage" }
+bicdb-txn = { path = "../txn" }
+bicdb-wal = { path = "../wal" }
+bicdb-workspace = { path = "../workspace" }

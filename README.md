@@ -26,9 +26,16 @@ It unifies five kinds of data under one transactional store:
 
 ### Status
 
-> **Design frozen (2026-10). Skeleton only — nothing is implemented yet.**
-> The V1.0 design documents are frozen; all crates remain placeholders and no
-> callable API exists yet.
+> **Design frozen (2026-10). Phases P1–P4 done; P5 in progress.**
+> Storage, WAL/recovery, transactions, the buffer pool and the B+Tree index are
+> implemented and covered by tests (`cargo test --workspace`). P5 so far: the
+> workspace **catalog** (dictionary tables `obj$`/`tab$`/`col$`/`ind$`/`icol$`/
+> `seg$`/`stat$`/`seq$`, DDL write side, row cache), the **table access service**
+> (`bicdb-access`), the **SQL front end** (lexer/parser → binder → physical plan
+> → session) and a **runnable CLI** (`bicdb init/sql/shell`) — see
+> [Quick start](#quick-start). Still open: UPDATE/DELETE, aggregates and joins,
+> the logical rewrite layer, and the daemon/protocol surface; all recorded with
+> explicit triggers in `doc/待讨论清单.md`.
 
 ### Documentation
 
@@ -38,6 +45,7 @@ It unifies five kinds of data under one transactional store:
 | [Design](docs/design.md) | Overall architecture: isolation, storage, transactions, retrieval, graph, phases |
 | [Storage design](docs/storage.md) | Storage layer: file layout, page format, ROWID, recovery. **Design frozen (2026-10) — all pending items closed** |
 | [Platform support](docs/platform-support.md) | Supported architectures and compatibility baseline |
+| [Changelog](CHANGELOG.md) | Release notes, starting with v0.1.0 |
 
 ### Core constraints
 
@@ -77,7 +85,8 @@ and is not blocked by them.**
 | `bicdb-index` | B+Tree: unique, composite, range access, concurrent splits |
 | `bicdb-types` | Oracle-compatible scalars, JSON document model, vector type |
 | `bicdb-catalog` | Catalog resolution, type descriptors, object versions |
-| `bicdb-sql` | Raw AST, binder, logical/physical plans, executor |
+| `bicdb-access` | Table access service: page selection/growth, row write, index maintenance |
+| `bicdb-sql` | Raw AST, binder, logical/physical plans, executor, session |
 | `bicdb-asset` | Asset references, streaming I/O, reference tracking and reclamation |
 | `bicdb-memory` | Memory revisions, checkpoints, TTL, derivation and delete propagation |
 | `bicdb-retrieval` | Inverted index and tokenization, exact vector, RRF fusion, HNSW/IVFFlat |
@@ -85,6 +94,7 @@ and is not blocked by them.**
 | `bicdb-net` | Versioned request protocol, ACK/reconcile, sessions, SDK/CLI plumbing |
 | `bicdb-daemon` | Worker process entry, bounded execution pool, maintenance threads |
 | `bicdb-tools` | Diagnostics: `page_dump`, `db_check` |
+| `bicdb-cli` | `bicdb` binary: instance bootstrap, SQL execution, interactive shell |
 
 ### Development phases
 
@@ -122,6 +132,26 @@ Runtime baseline: **glibc ≥ 2.34**, **kernel ≥ 5.14**, no upper bound.
 
 CI runs its gates inside a Debian 12 container on both architectures, with a
 mechanical check that no binary requires a symbol above the baseline.
+
+### Quick start
+
+```bash
+cargo build --release -p bicdb-cli
+
+./target/release/bicdb init  ./demo
+./target/release/bicdb sql   ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
+./target/release/bicdb sql   ./demo "INSERT INTO t VALUES (1, 'alpha'); INSERT INTO t VALUES (2, 'beta')"
+./target/release/bicdb sql   ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
+./target/release/bicdb sql   ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
+./target/release/bicdb shell ./demo            # interactive; `;` ends a statement
+```
+
+`init` creates a real on-disk instance (dictionary file, undo segment, WAL group
+directory, two control-file copies). Every command opens the instance through
+**crash recovery** and closes it with a **full checkpoint**, so an interrupted
+process loses nothing that was committed. Uniqueness is enforced on `INSERT`
+(including inside an open transaction); `BEGIN`/`COMMIT`/`ROLLBACK` work as
+statements of one session.
 
 ### Build
 
@@ -169,8 +199,14 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 
 ### 当前状态
 
-> **设计已冻结（2026-10）；仅有目录骨架，尚未实现任何功能。**
-> V1.0 设计文档已冻结；所有 crate 仍为占位，尚无可调用接口。
+> **设计已冻结（2026-10）；P1–P4 已实现，P5 进行中。**
+> 存储、WAL/恢复、事务、缓冲池与 B+Tree 索引均已实现并有测试覆盖
+> （`cargo test --workspace`）。P5 已落地：**目录**（字典表
+> `obj$`/`tab$`/`col$`/`ind$`/`icol$`/`seg$`/`stat$`/`seq$`、DDL 写侧、行缓存）、
+> **表访问服务**（`bicdb-access`）、**SQL 前端**（词法/语法 → 绑定 → 物理计划 →
+> 会话）与**可运行的 CLI**（`bicdb init/sql/shell`，见
+> [快速上手](#快速上手)）。仍待做：UPDATE/DELETE、聚合与连接、逻辑变换层、
+> daemon/协议面——均挂明确触发条件（见 `doc/待讨论清单.md`）。
 
 ### 文档
 
@@ -180,6 +216,7 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | [总体设计](docs/design.md) | 隔离、存储、事务、检索、图，以及研发阶段 |
 | [存储结构设计](docs/storage.md) | 文件布局、页格式、ROWID、恢复。**设计冻结（2026-10）**——全部待冻结项已关闭 |
 | [平台支持](docs/platform-support.md) | 支持的架构与兼容基线 |
+| [更新日志](CHANGELOG.md) | 版本说明，自 v0.1.0 起 |
 
 ### 核心约束
 
@@ -215,7 +252,8 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | `bicdb-index` | B+Tree：唯一键、复合键、范围访问、并发分裂 |
 | `bicdb-types` | Oracle 兼容标量、JSON 文档模型、向量类型 |
 | `bicdb-catalog` | Catalog 解析、类型描述、对象版本 |
-| `bicdb-sql` | 原始语法树、绑定、逻辑/物理计划、执行器 |
+| `bicdb-access` | 表访问服务：页选址与增长、行写、索引维护 |
+| `bicdb-sql` | 原始语法树、绑定、逻辑/物理计划、执行器、会话 |
 | `bicdb-asset` | 资产引用、流式读写、引用登记与回收 |
 | `bicdb-memory` | 记忆版本、检查点、TTL、派生依赖与删除传播 |
 | `bicdb-retrieval` | 倒排索引与分词、精确向量、RRF 融合、HNSW/IVFFlat |
@@ -223,6 +261,7 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | `bicdb-net` | 版本化请求协议、ACK/对账、会话、SDK/CLI 对接 |
 | `bicdb-daemon` | 工作进程入口、有界执行池、维护线程 |
 | `bicdb-tools` | 诊断工具：`page_dump`、`db_check` |
+| `bicdb-cli` | `bicdb` 命令行：建区、执行 SQL、交互式 shell |
 
 ### 研发阶段
 
@@ -258,6 +297,24 @@ M4 = P8–P10 多模型数据能力；M5 = P12 受控试用。
 
 CI 在 Debian 12 容器中、对两个架构分别执行门禁，并机械校验产物不引用高于
 基线的符号。
+
+### 快速上手
+
+```bash
+cargo build --release -p bicdb-cli
+
+./target/release/bicdb init  ./demo
+./target/release/bicdb sql   ./demo "CREATE TABLE t (id NUMBER NOT NULL, name VARCHAR2(32))"
+./target/release/bicdb sql   ./demo "INSERT INTO t VALUES (1, 'alpha'); INSERT INTO t VALUES (2, 'beta')"
+./target/release/bicdb sql   ./demo "CREATE UNIQUE INDEX t_pk ON t (id)"
+./target/release/bicdb sql   ./demo "SELECT id, name FROM t WHERE id >= 1 ORDER BY id DESC LIMIT 10"
+./target/release/bicdb shell ./demo            # 交互式；`;` 结尾执行
+```
+
+`init` 建出一个**真盘实例**（字典文件、撤销段、日志组目录、控制文件双副本）。
+每条命令都经**崩溃恢复**打开、以**完全检查点**关闭——进程被打断也不会丢已提交的
+数据。唯一性在 `INSERT` 上把守（显式事务内同样把守）；`BEGIN`/`COMMIT`/`ROLLBACK`
+按一个会话的语句工作。
 
 ### 构建
 
