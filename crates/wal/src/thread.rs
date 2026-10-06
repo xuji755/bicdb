@@ -62,6 +62,19 @@ impl std::fmt::Debug for Lgwr {
 impl Lgwr {
     /// **启动**（`tick` = 周期兜底间隔；`wake()` 可随时提前触发）。
     pub fn start(wal: Arc<WalShared<'static>>, tick: Duration) -> Self {
+        Self::start_scoped(wal, tick, || {})
+    }
+
+    /// **启动（带创建时钩子）**：`prestart` 在**线程体内、任何刷盘之前**
+    /// 执行一次——NUMA 阶段 B 的"LGWR 创建时入组"注入点（详设 §5；与
+    /// `storage::dbwr::Dbwr::start_scoped` 同形）。钩子在 LGWR 线程里跑
+    /// ⇒ `NumaBinder::bind_to_node` 绑的就是 LGWR 自己；**本地性是优化
+    /// 不是正确性**——钩子失败不得让线程失败（由钩子自己记诊断）。
+    pub fn start_scoped(
+        wal: Arc<WalShared<'static>>,
+        tick: Duration,
+        prestart: impl FnOnce() + Send + 'static,
+    ) -> Self {
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(StatsInner {
@@ -78,6 +91,8 @@ impl Lgwr {
         let handle = std::thread::Builder::new()
             .name("bicdb-lgwr".into())
             .spawn(move || {
+                // 创建时钩子：本线程、首次刷盘之前（NUMA 绑定注入点）。
+                prestart();
                 loop {
                     {
                         let (lock, cv) = &*sig;
@@ -331,5 +346,37 @@ mod tests {
 
         let page = pagefile::read_page_verified(io, data_handle, 1).unwrap();
         assert_eq!(page.as_bytes()[4096], 0xAB, "页已落盘");
+    }
+
+    #[test]
+    fn prestart_hook_runs_once_inside_the_lgwr_thread_before_any_flush() {
+        // NUMA 阶段 B 的"LGWR 创建时入组"注入点（详设 §5）：钩子在
+        // **LGWR 线程体内、任何刷盘之前**跑一次——绑定的是 LGWR 自己。
+        fn tid_of(path: &str) -> u32 {
+            std::fs::read_link(path)
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .parse()
+                .unwrap()
+        }
+        let (wal, _writer) = setup();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lgwr = Lgwr::start_scoped(Arc::clone(&wal), Duration::from_millis(20), move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            tx.send(tid_of("/proc/thread-self")).expect("回传 tid");
+        });
+        let hook_tid = rx.recv_timeout(Duration::from_secs(2)).expect("钩子跑过");
+        assert_ne!(
+            hook_tid,
+            tid_of("/proc/thread-self"),
+            "钩子必须在 LGWR 线程里（不是调用方线程）"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "钩子恰好一次");
+        assert_eq!(lgwr.stats().failures, 0);
+        lgwr.shutdown();
     }
 }

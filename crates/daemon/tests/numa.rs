@@ -454,3 +454,122 @@ fn writer_threads_bind_at_creation_through_the_hook() {
     group.shutdown();
     fs::remove_dir_all(&base).expect("清理测试目录");
 }
+
+#[test]
+fn partition_plan_reconciles_node_and_binds_each_writer_to_its_partition_node() {
+    // 详设 §5 阶段 B 的"同节点核对"：写线程创建方在起线程前核对
+    // "工作区 → 分区 → 节点"——**同一分区跨节点即具名拒绝**；一致的计划
+    // 交给 `dbwr_prestart` ⇒ 每条写线程落进**自己分区**的节点组
+    // （区别于上面那条"两条线程都绑 node0"的旧形态用例）。
+    use bicdb_daemon::numa::{NumaBinder, NumaError};
+    use bicdb_storage::buffer::{BufferPool, CacheConfig, SystemClock};
+    use bicdb_storage::dbwr::DbwrGroup;
+    use bicdb_workspace::io::MemFileIo;
+    use std::sync::{Arc, Mutex};
+
+    let base = unique_base("partition-plan");
+    let sysfs = fake_sysfs(&base); // node0（CPU 0-3）
+    fs::create_dir_all(sysfs.join("node1")).unwrap();
+    fs::write(sysfs.join("node1/cpulist"), "4-7\n").unwrap();
+    preprovision(&base, 0);
+    preprovision(&base, 1);
+
+    let mem = MemFileIo::new();
+    mem.add_dir("/mem");
+    let io: &'static MemFileIo = Box::leak(Box::new(mem));
+    let pool = Arc::new(
+        BufferPool::with_partitions(
+            io,
+            2,
+            4,
+            |_, _| None,
+            NoWal,
+            SystemClock,
+            CacheConfig::for_capacity(4),
+        )
+        .unwrap(),
+    );
+
+    // 工作区字节约定本测试内自洽即可（生产上由 workspace_ref 设计给出）。
+    let bytes = |id: WorkspaceId| id.as_raw().to_le_bytes();
+    let mut ws_in: [Option<WorkspaceId>; 2] = [None, None];
+    for raw in 1..1000u64 {
+        let id = WorkspaceId::from_raw(raw).unwrap();
+        let p = pool.partition_of(&bytes(id));
+        if ws_in[p].is_none() {
+            ws_in[p] = Some(id);
+        }
+        if ws_in[0].is_some() && ws_in[1].is_some() {
+            break;
+        }
+    }
+    let ws0 = ws_in[0].expect("分区 0 的工作区");
+    let ws1 = ws_in[1].expect("分区 1 的工作区");
+
+    let config = |assignments: Vec<(WorkspaceId, u32)>| NumaConfig {
+        enabled: true,
+        mode: BindMode::AttachExisting,
+        cgroup_root: base.join("cg"),
+        sysfs_root: sysfs.clone(),
+        probe: fake_probe(&base),
+        assignments,
+    };
+    let binder = Arc::new(NumaBinder::start(&config(vec![(ws0, 0), (ws1, 1)])).expect("绑定器"));
+
+    // 核对：分区 0 → node0、分区 1 → node1（各分区内部同节点）。
+    let plan = binder
+        .plan_partition_nodes(2, |ws| Some(pool.partition_of(&bytes(ws))))
+        .expect("分区计划");
+    assert_eq!(plan, vec![Some(0), Some(1)]);
+
+    // 起写线程：计划经 prestart 生效；各线程回传（分区, tid）。
+    let seen: Arc<Mutex<Vec<(usize, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    let pre = binder.dbwr_prestart(plan.clone());
+    let group = DbwrGroup::start(Arc::clone(&pool), Duration::from_secs(60), move |p| {
+        pre(p);
+        seen2.lock().unwrap().push((p, current_tid()));
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let entries = seen.lock().unwrap().clone();
+    assert_eq!(entries.len(), 2, "两条写线程各跑一次钩子");
+    for (p, tid) in entries {
+        let node = plan[p].expect("涉及的分区有计划");
+        let content =
+            fs::read_to_string(base.join(format!("cg/bicdb-node{node}/threads/cgroup.threads")))
+                .expect("绑定落点文件");
+        assert!(
+            content.contains(&tid.to_string()),
+            "分区 {p} 的写线程 {tid} 应落 node{node}（实际：{content}）"
+        );
+    }
+    assert_eq!(binder.failures(), 0);
+    group.shutdown();
+
+    // 核对失败：同一分区里的两个工作区被指派到不同节点 ⇒ 具名拒绝。
+    let mut same_part = Vec::new();
+    for raw in 1..1000u64 {
+        let id = WorkspaceId::from_raw(raw).unwrap();
+        if pool.partition_of(&bytes(id)) == pool.partition_of(&bytes(ws0)) {
+            same_part.push(id);
+            if same_part.len() == 2 {
+                break;
+            }
+        }
+    }
+    let binder2 = Arc::new(
+        NumaBinder::start(&config(vec![(same_part[0], 0), (same_part[1], 1)])).expect("绑定器"),
+    );
+    let err = binder2
+        .plan_partition_nodes(2, |ws| Some(pool.partition_of(&bytes(ws))))
+        .expect_err("同分区跨节点必须拒绝");
+    assert!(
+        matches!(err, NumaError::PartitionSpansNodes { .. }),
+        "具名错误：{err}"
+    );
+
+    fs::remove_dir_all(&base).expect("清理测试目录");
+}

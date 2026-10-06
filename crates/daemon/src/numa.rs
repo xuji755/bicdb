@@ -19,7 +19,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bicdb_workspace::WorkspaceId;
 
@@ -67,6 +67,26 @@ pub enum NumaError {
         /// 原因（缺哪个文件/不可读）。
         reason: &'static str,
     },
+    /// **分区核对失败**：同一分区内的已指派工作区分属不同节点。
+    ///
+    /// 分区的帧区间（首次触碰落位）与写线程（`DbwrGroup::prestart`）都只能
+    /// 落**一个**节点——同一分区跨节点即本地性目标不可达。调整 assignments
+    /// 或分区函数（工作区在各分区上的分布）后重试。
+    PartitionSpansNodes {
+        /// 分区号。
+        partition: usize,
+        /// 先见到的节点。
+        first: u32,
+        /// 冲突的节点。
+        second: u32,
+    },
+    /// 工作区落在池的分区数之外（分区函数与池不一致——调用方缺陷）。
+    PartitionOutOfRange {
+        /// 越界的分区号。
+        partition: usize,
+        /// 池的分区总数。
+        partitions: usize,
+    },
 }
 
 impl std::fmt::Display for NumaError {
@@ -81,6 +101,18 @@ impl std::fmt::Display for NumaError {
             NumaError::NotPrepared { node, reason } => {
                 write!(f, "节点 {node} 的 cgroup 组未预置/不可用：{reason}")
             }
+            NumaError::PartitionSpansNodes {
+                partition,
+                first,
+                second,
+            } => write!(
+                f,
+                "分区核对失败：分区 {partition} 的工作区分属节点 {first}/{second}（帧区间与写线程只能落一个节点）"
+            ),
+            NumaError::PartitionOutOfRange {
+                partition,
+                partitions,
+            } => write!(f, "分区号 {partition} 越出池的分区数 {partitions}"),
         }
     }
 }
@@ -501,6 +533,77 @@ impl NumaBinder {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
+    }
+
+    /// **分区 → 节点 的核对与绑定计划**（详设 §5 阶段 B；写线程创建方在起
+    /// 线程前调用）。
+    ///
+    /// 核对的不变量：**同一分区内的全部已指派工作区必须落在同一节点**——
+    /// 分区的帧区间只落一个节点（帧惰性分配、首次触碰 = 绑到该节点的执行
+    /// 线程），分区的写线程也只绑一个节点组（见 [`NumaBinder::dbwr_prestart`]）。
+    /// 违反 ⇒ [`NumaError::PartitionSpansNodes`]——调用方调整 assignments
+    /// 或工作区的分区分布后重试（**绝不静默择一**）。
+    ///
+    /// `partition_of`：工作区 → 池分区号（`None` = 该工作区当前无立足分区，
+    /// 跳过）；生产上即 `BufferPool::partition_of`（工作区标识字节）。
+    /// 返回长度为 `partitions` 的计划：分区号 → 节点（`None` = 该分区没有
+    /// 已指派工作区 ⇒ 写线程不绑定）。
+    ///
+    /// **日志缓冲不参与本核对**：我们的 `LogBuffer` 是**实例级**结构
+    /// （与 Oracle 同构——"实例级 log buffer 只拆 latch、不能按 NUMA 放"，
+    /// 证据包 `buffercache-mech-20261005` raw 47–52），不存在"每工作区的
+    /// 日志缓冲"这一放置对象。
+    pub fn plan_partition_nodes(
+        &self,
+        partitions: usize,
+        partition_of: impl Fn(WorkspaceId) -> Option<usize>,
+    ) -> Result<Vec<Option<u32>>, NumaError> {
+        if partitions == 0 {
+            return Err(NumaError::BadTopology("分区数为 0"));
+        }
+        let mut plan = vec![None; partitions];
+        for (ws, node) in self.assignments.read().expect("绑定的映射表").iter() {
+            let Some(p) = partition_of(*ws) else {
+                continue;
+            };
+            if p >= partitions {
+                return Err(NumaError::PartitionOutOfRange {
+                    partition: p,
+                    partitions,
+                });
+            }
+            match plan[p] {
+                None => plan[p] = Some(*node),
+                Some(prev) if prev == *node => {}
+                Some(prev) => {
+                    return Err(NumaError::PartitionSpansNodes {
+                        partition: p,
+                        first: prev,
+                        second: *node,
+                    });
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// **写线程创建方的现成 `prestart` 闭包**（详设 §5 阶段 B）：分区 `p`
+    /// ⇒ 把**创建该线程的当前线程**绑到 `plan[p]` 的节点组（`None` = 不绑；
+    /// 绑定失败只记诊断——**本地性是优化不是正确性**，不让线程失败）。
+    ///
+    /// 用法：`DbwrGroup::start(pool, tick, binder.dbwr_prestart(plan))`——
+    /// 组已在 [`NumaBinder::start`] 就绪（或经 [`NumaBinder::rebind`] 按需
+    /// 补建），此处只做绑定。
+    pub fn dbwr_prestart(
+        self: &Arc<Self>,
+        plan: Vec<Option<u32>>,
+    ) -> impl Fn(usize) + Send + Sync + 'static {
+        let binder = Arc::clone(self);
+        move |p: usize| {
+            if let Some(node) = plan.get(p).copied().flatten() {
+                binder.bind_to_node(node);
+            }
+        }
     }
 
     /// `Provision`：写控制文件建树（v2：`subtree_control` → 节点组 →
