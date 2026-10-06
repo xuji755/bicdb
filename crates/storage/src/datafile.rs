@@ -485,6 +485,12 @@ impl<'a> DataFile<'a> {
         self.head.workspace_ref
     }
 
+    /// **文件角色**（§2.2 的角色表；temp 文件不参与 `file_scn` 核对）。
+    #[must_use]
+    pub fn role(&self) -> u8 {
+        self.head.role
+    }
+
     /// **本文件的布局**（按角色取：file 0 是带式排布，其余标准——`目录详设` §2.1）。
     ///
     /// **一切"区号 → 块号"的换算都经它**，不得用全局常量硬算。
