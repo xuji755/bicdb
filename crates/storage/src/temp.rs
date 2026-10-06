@@ -342,14 +342,21 @@ mod tests {
         assert_eq!(file.file_id(), crate::datafile::TEMP_FILE_ID);
         let first = file.allocate_extent().unwrap();
         let second = file.allocate_extent().unwrap();
-        assert_ne!(first.first_block(), second.first_block());
+        assert_ne!(
+            first.first_block_in(crate::bitmap::FileLayout::standard()),
+            second.first_block_in(crate::bitmap::FileLayout::standard())
+        );
         file.sync().unwrap();
         drop(file);
 
         // 重开：位图整体清空 ⇒ 第一次分配又拿到第一个区。
         let mut again = DataFile::open_temp_reset(&io, path, WS, 512).unwrap();
         let reused = again.allocate_extent().unwrap();
-        assert_eq!(reused.first_block(), first.first_block(), "重置后从头分配");
+        assert_eq!(
+            reused.first_block_in(crate::bitmap::FileLayout::standard()),
+            first.first_block_in(crate::bitmap::FileLayout::standard()),
+            "重置后从头分配"
+        );
     }
 
     #[test]

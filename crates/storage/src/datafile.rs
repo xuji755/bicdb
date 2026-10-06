@@ -49,7 +49,9 @@ pub const BITMAP_SPACE_HEAD_OFFSET: usize = 104;
 pub const BITMAP_RUNS_OFFSET: usize = 108;
 /// 位图区上限（§5.11：4 TiB 上限下 ≤ 33，留余量到 40）。
 pub const MAX_BITMAP_RUNS: usize = 40;
-/// 建文件的最小块数：块 0 文件头 + **全量预留的位图区**（320 页）+ 至少一个数据区。
+/// 建文件的最小块数（**标准布局**）：块 0 文件头 + **全量预留的位图区**
+/// （320 页）+ 至少一个数据区。**file 0（带式排布）用
+/// [`crate::bitmap::FileLayout::min_file_blocks`]**。
 pub const MIN_FILE_BLOCKS: u64 = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64 + 8;
 
 /// 计划中的区分配（[`DataFile::plan_allocate_extent`]）。
@@ -299,19 +301,17 @@ impl<'a> DataFile<'a> {
         workspace_ref: [u8; 8],
         blocks: u64,
     ) -> Result<Self, DataFileError> {
-        if blocks < MIN_FILE_BLOCKS {
+        // 布局按角色取：file 0 是**带式排布**（核心带 + 副本带在前，见 `目录详设` §2.1）。
+        let layout = crate::bitmap::FileLayout::for_role(role);
+        if blocks < layout.min_file_blocks() {
             return Err(DataFileError::SmallFile {
                 blocks,
-                min: MIN_FILE_BLOCKS,
+                min: layout.min_file_blocks(),
             });
         }
         // 创建也受硬上限约束（块号 28 位 / 位图覆盖）——否则可建出"块号
         // 编不出来"的文件，其后每次分配区都在 `Rdba` 处失败。
-        let hard = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
-            + MAX_BITMAP_RUNS as u64
-                * crate::bitmap::BITS_PER_RUN as u64
-                * crate::bitmap::EXTENT_BLOCKS as u64;
-        let hard = hard.min(1u64 << 28);
+        let hard = layout.coverage_limit().min(1u64 << 28);
         if blocks > hard {
             return Err(DataFileError::BeyondCoverage {
                 requested: blocks,
@@ -338,9 +338,10 @@ impl<'a> DataFile<'a> {
             },
             runs: Vec::new(),
         };
-        // **位图区全量预留**：块 1 起连续 40 区 × 8 页，一次建好、永不搬移。
+        // **位图区全量预留**：自布局的位图起点起连续 40 区 × 8 页，一次建好、
+        // 永不搬移（标准布局自块 1；file 0 自块 512——副本带之后）。
         let runs: Vec<u32> = (0..MAX_BITMAP_RUNS as u32)
-            .map(|k| 1 + k * BITMAP_PAGES_PER_RUN as u32)
+            .map(|k| layout.bitmap_first_block + k * BITMAP_PAGES_PER_RUN as u32)
             .collect();
         let mut header = Page::new(PageType::FileHeader, workspace_ref, file_id, 0);
         write_file_head(&mut header, &file.head)?;
@@ -445,12 +446,14 @@ impl<'a> DataFile<'a> {
         })?;
         let head = read_file_head(&header)?;
         let runs = read_bitmap_runs(&header)?;
-        // 预留式布局的形状校验：**40 区、块 1 起连续**。
+        // 预留式布局的形状校验：**40 区、自本 role 的位图起点起连续**
+        // （file 0 的位图起点是 512——副本带之后）。
+        let layout = crate::bitmap::FileLayout::for_role(head.role);
         if runs.len() != MAX_BITMAP_RUNS {
             return Err(DataFileError::Malformed);
         }
         for (k, &run) in runs.iter().enumerate() {
-            if run != 1 + k as u32 * BITMAP_PAGES_PER_RUN as u32
+            if run != layout.bitmap_first_block + k as u32 * BITMAP_PAGES_PER_RUN as u32
                 || u64::from(run) + BITMAP_PAGES_PER_RUN as u64 > head.blocks
             {
                 return Err(DataFileError::Malformed);
@@ -482,6 +485,14 @@ impl<'a> DataFile<'a> {
         self.head.workspace_ref
     }
 
+    /// **本文件的布局**（按角色取：file 0 是带式排布，其余标准——`目录详设` §2.1）。
+    ///
+    /// **一切"区号 → 块号"的换算都经它**，不得用全局常量硬算。
+    #[must_use]
+    pub fn layout(&self) -> crate::bitmap::FileLayout {
+        crate::bitmap::FileLayout::for_role(self.head.role)
+    }
+
     /// 当前大小（块数）。
     #[must_use]
     pub fn blocks(&self) -> u64 {
@@ -500,13 +511,10 @@ impl<'a> DataFile<'a> {
         self.head.blocks.min(self.block_limit()) as u32
     }
 
-    /// 预留位图区的覆盖上限（块数）——位图能寻址的最大规模。
+    /// 预留位图区的覆盖上限（块数）——位图能寻址的最大规模（按本文件布局）。
     #[must_use]
     pub fn coverage_limit(&self) -> u64 {
-        crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
-            + MAX_BITMAP_RUNS as u64
-                * crate::bitmap::BITS_PER_RUN as u64
-                * crate::bitmap::EXTENT_BLOCKS as u64
+        self.layout().coverage_limit()
     }
 
     /// **文件块数硬上限** = min（位图覆盖上限，**块号 28 位上限**）。
@@ -640,7 +648,7 @@ impl<'a> DataFile<'a> {
             // **前像先拍**（allocate 会就地把位翻过去）。
             let before: Vec<Page> = map.pages().iter().map(clone_page).collect();
             if let Some(extent) = map.allocate() {
-                if u64::from(extent.first_block()) + u64::from(extent.blocks())
+                if u64::from(self.layout().first_block_of(extent)) + u64::from(extent.blocks())
                     > u64::from(self.data_limit())
                 {
                     map.free(extent)?; // 越出上限：不落盘、不改位图
@@ -670,7 +678,7 @@ impl<'a> DataFile<'a> {
         for idx in 0..self.runs.len() {
             let mut map = self.load_run(idx, &mut direct)?;
             if let Some(extent) = map.allocate() {
-                if u64::from(extent.first_block()) + u64::from(extent.blocks())
+                if u64::from(self.layout().first_block_of(extent)) + u64::from(extent.blocks())
                     > u64::from(self.data_limit())
                 {
                     map.free(extent)?; // 越出上限：不落盘、不改位图
@@ -776,12 +784,15 @@ mod tests {
         let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, BLOCKS).unwrap();
         let e = file.allocate_extent().unwrap();
         assert_eq!(
-            (e.as_raw(), e.first_block()),
+            (
+                e.as_raw(),
+                e.first_block_in(crate::bitmap::FileLayout::standard())
+            ),
             (0, 321),
             "区 0 从预留区之后起"
         );
         let e = file.allocate_extent().unwrap();
-        assert_eq!(e.first_block(), 329);
+        assert_eq!(e.first_block_in(crate::bitmap::FileLayout::standard()), 329);
         file.sync().unwrap();
     }
 
@@ -791,8 +802,18 @@ mod tests {
         // 预留区 + 2 个数据区（块 321..337）。
         let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 337).unwrap();
         assert_eq!(file.data_limit(), 337);
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 321);
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 329);
+        assert_eq!(
+            file.allocate_extent()
+                .unwrap()
+                .first_block_in(crate::bitmap::FileLayout::standard()),
+            321
+        );
+        assert_eq!(
+            file.allocate_extent()
+                .unwrap()
+                .first_block_in(crate::bitmap::FileLayout::standard()),
+            329
+        );
         assert!(matches!(
             file.allocate_extent(),
             Err(DataFileError::FileFull)
@@ -823,7 +844,9 @@ mod tests {
         assert_eq!(file.runs(), &runs_before[..], "位图区不搬移");
         assert_eq!(file.data_limit(), 353);
         assert_eq!(
-            file.allocate_extent().unwrap().first_block(),
+            file.allocate_extent()
+                .unwrap()
+                .first_block_in(crate::bitmap::FileLayout::standard()),
             337,
             "新块可用"
         );
@@ -859,8 +882,18 @@ mod tests {
         assert_eq!(file.file_id(), 5);
         assert_eq!(file.blocks(), 400);
         assert_eq!(file.runs().len(), MAX_BITMAP_RUNS);
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 321);
-        assert_eq!(file.allocate_extent().unwrap().first_block(), 329);
+        assert_eq!(
+            file.allocate_extent()
+                .unwrap()
+                .first_block_in(crate::bitmap::FileLayout::standard()),
+            321
+        );
+        assert_eq!(
+            file.allocate_extent()
+                .unwrap()
+                .first_block_in(crate::bitmap::FileLayout::standard()),
+            329
+        );
     }
 
     #[test]
@@ -950,6 +983,63 @@ mod tests {
         // 关盘重开：位点随头页落盘而来。
         let file2 = DataFile::open(&io, path).unwrap();
         assert_eq!(file2.file_scn(), 8192, "file_scn 随头页持久化");
+    }
+
+    #[test]
+    fn meta_role_uses_the_banded_layout() {
+        // **file 0 带式排布**（目录详设 §2.1）：位图区自块 512（= 核心带 256 +
+        // 副本带 256）、数据区自块 832；一切换算经 FileLayout，不得硬算。
+        use crate::bitmap::{FileLayout, META_ROLE};
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let layout = FileLayout::for_role(META_ROLE);
+        let blocks = layout.min_file_blocks() + 16; // 留两个数据区（两次分配）
+        let mut file =
+            DataFile::create(&io, Path::new("/mem/meta.dat"), 0, META_ROLE, WS, blocks).unwrap();
+        assert_eq!(file.layout(), FileLayout::meta());
+        assert_eq!(file.blocks(), 832 + 8 + 16);
+        let runs = file.runs().to_vec();
+        assert_eq!(runs[0], 512, "位图区自副本带之后（块 512）");
+        assert_eq!(runs[39], 512 + 39 * 8);
+        // 区 0 → 块 832；区 1 → 840（数据区自 832 起）。
+        let e0 = file.allocate_extent().unwrap();
+        assert_eq!(file.layout().first_block_of(e0), 832);
+        assert_eq!(
+            file.allocate_extent()
+                .unwrap()
+                .first_block_in(file.layout()),
+            840
+        );
+        // 覆盖上限随数据区起点平移（块域后移，**区容量不变**）。
+        use crate::bitmap::{DATA_AREA_FIRST_BLOCK, FILE0_DATA_AREA_FIRST_BLOCK};
+        assert_eq!(
+            file.coverage_limit(),
+            FileLayout::standard().coverage_limit()
+                + u64::from(FILE0_DATA_AREA_FIRST_BLOCK - DATA_AREA_FIRST_BLOCK),
+            "数据区起点后移 511 块（位图区自 512 起 vs 自 1 起）"
+        );
+        // 关盘重开：按 role=0 校验带式形状（runs 自 512 起）——通过。
+        drop(file);
+        let reopened = DataFile::open(&io, Path::new("/mem/meta.dat")).unwrap();
+        assert_eq!(reopened.layout(), FileLayout::meta());
+        assert_eq!(reopened.runs()[0], 512);
+    }
+
+    #[test]
+    fn meta_runs_in_a_data_file_are_rejected() {
+        // role 与位图基址必须自洽：数据文件（role 3）里出现"块 512 起的 runs"
+        // ⇒ 形状校验拒绝（不静默按错布局解释）。
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let path = Path::new("/mem/mixed.dat");
+        let file = DataFile::create(&io, path, 3, 3, WS, MIN_FILE_BLOCKS).unwrap();
+        let mut page = file.read_page(0).unwrap();
+        let runs: Vec<u32> = (0..40u32).map(|k| 512 + k * 8).collect();
+        write_bitmap_runs(&mut page, &runs).unwrap();
+        file.write_page(0, &mut page).unwrap();
+        drop(file);
+        let err = DataFile::open(&io, path).unwrap_err();
+        assert!(matches!(err, DataFileError::Malformed), "{err}");
     }
 
     #[test]

@@ -64,6 +64,85 @@ pub const MAX_BITMAP_RUNS: usize = 40;
 /// 预留使**位图区永不搬移**：文件增长 = 纯尾部追加数据块（`DataFile::extend`）。
 pub const DATA_AREA_FIRST_BLOCK: u32 = 1 + MAX_BITMAP_RUNS as u32 * BITMAP_PAGES_PER_RUN as u32;
 
+/// 元数据文件的角色号（file 0；`arch/02` §2.2）。
+pub const META_ROLE: u8 = 0;
+/// **file 0 的核心元数据带**（[0, 4 MiB) = 256 块；块 0 文件头、块 1 引导页，
+/// 其余**预留不写入**）。
+pub const META_CORE_BAND_BLOCKS: u32 = 256;
+/// **file 0 的副本带**（[4 MiB, 8 MiB) = 256 块；引导页副本 + **文件头副本**）。
+/// 与主副本相隔 4 MiB——同一片损坏不可能同时命中（`目录详设` §2.1）。
+pub const META_REPLICA_BAND_BLOCKS: u32 = 256;
+/// file 0 的位图区起点（副本带之后）。
+pub const FILE0_BITMAP_FIRST_BLOCK: u32 = META_CORE_BAND_BLOCKS + META_REPLICA_BAND_BLOCKS;
+/// file 0 的数据区起点（位图区全量预留之后）。
+pub const FILE0_DATA_AREA_FIRST_BLOCK: u32 =
+    FILE0_BITMAP_FIRST_BLOCK + MAX_BITMAP_RUNS as u32 * BITMAP_PAGES_PER_RUN as u32;
+/// 引导页副本带内的页（相对 `FILE0_BITMAP_FIRST_BLOCK` 之前：副本带起点起算）。
+pub const META_REPLICA_BAND_FIRST_BLOCK: u32 = META_CORE_BAND_BLOCKS;
+
+/// **文件布局**（按 role 取）：位图区起点与数据区起点。
+///
+/// **为什么要有它**：file 0 的排布是**带式**的（核心带 + 副本带在前，
+/// 位图区与数据区顺移——`目录详设` §2.1），数据文件/undo/temp 用标准排布。
+/// 一切"区号 → 块号"的换算都必须**显式带上布局**，不得再用全局常量硬算
+/// （file 0 会算错 256 或 512 块——静默错位）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileLayout {
+    /// 位图区起点块。
+    pub bitmap_first_block: u32,
+    /// 数据区起点块。
+    pub data_area_first_block: u32,
+}
+
+impl FileLayout {
+    /// 标准布局（数据/undo/temp 文件）：位图区块 1 起、数据区块 321 起。
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self {
+            bitmap_first_block: 1,
+            data_area_first_block: DATA_AREA_FIRST_BLOCK,
+        }
+    }
+
+    /// 元数据文件布局（file 0）：核心带 + 副本带在前。
+    #[must_use]
+    pub const fn meta() -> Self {
+        Self {
+            bitmap_first_block: FILE0_BITMAP_FIRST_BLOCK,
+            data_area_first_block: FILE0_DATA_AREA_FIRST_BLOCK,
+        }
+    }
+
+    /// 按文件角色取布局。
+    #[must_use]
+    pub const fn for_role(role: u8) -> Self {
+        if role == META_ROLE {
+            Self::meta()
+        } else {
+            Self::standard()
+        }
+    }
+
+    /// **区号 → 该区首个块号**（块 = 数据区起点 + 区号 × 8）。
+    #[must_use]
+    pub const fn first_block_of(self, extent: ExtentNo) -> u32 {
+        self.data_area_first_block + extent.as_raw() * EXTENT_BLOCKS
+    }
+
+    /// 预留位图区的覆盖上限（块数）——位图能寻址的最大规模。
+    #[must_use]
+    pub const fn coverage_limit(self) -> u64 {
+        self.data_area_first_block as u64
+            + (MAX_BITMAP_RUNS as u64) * (BITS_PER_RUN as u64) * (EXTENT_BLOCKS as u64)
+    }
+
+    /// 建文件的最小块数：块 0 文件头 + **全量预留的位图区** + 至少一个数据区。
+    #[must_use]
+    pub const fn min_file_blocks(self) -> u64 {
+        self.data_area_first_block as u64 + EXTENT_BLOCKS as u64
+    }
+}
+
 /// 位图种类（页体头 `kind`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitmapKind {
@@ -129,14 +208,15 @@ impl ExtentNo {
 
     /// 全局区号。
     #[must_use]
-    pub fn as_raw(self) -> u32 {
+    pub const fn as_raw(self) -> u32 {
         self.0
     }
 
-    /// 该区在数据区的首个块号（块 = 1 + 区号 × 8）。
+    /// 该区在数据区的首个块号——**必须显式给出文件布局**
+    /// （file 0 是带式排布；用全局常量硬算会静默错位，见 [`FileLayout`]）。
     #[must_use]
-    pub fn first_block(self) -> u32 {
-        DATA_AREA_FIRST_BLOCK + self.0 * EXTENT_BLOCKS
+    pub fn first_block_in(self, layout: FileLayout) -> u32 {
+        layout.first_block_of(self)
     }
 
     /// 该区覆盖的块数。
@@ -546,7 +626,7 @@ mod tests {
         let first = map.allocate().unwrap();
         assert_eq!(first, ExtentNo::from_raw(0).unwrap());
         assert_eq!(
-            first.first_block(),
+            first.first_block_in(crate::bitmap::FileLayout::standard()),
             DATA_AREA_FIRST_BLOCK,
             "区 0 从预留区之后起"
         );
@@ -584,7 +664,7 @@ mod tests {
         let crossing = map.allocate().unwrap();
         assert_eq!(crossing.as_raw(), BITS_PER_BITMAP_PAGE as u32);
         assert_eq!(
-            crossing.first_block(),
+            crossing.first_block_in(crate::bitmap::FileLayout::standard()),
             DATA_AREA_FIRST_BLOCK + BITS_PER_BITMAP_PAGE as u32 * 8
         );
 

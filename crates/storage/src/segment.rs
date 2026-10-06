@@ -641,7 +641,7 @@ impl<'io, 'f> Segment<'io, 'f> {
         table_opts: u16,
     ) -> Result<Self, SegmentSpaceError> {
         let extent = file.allocate_extent()?;
-        let page0 = extent.first_block();
+        let page0 = file.layout().first_block_of(extent);
         let header = SegmentHeader {
             seg_type,
             map_format: SEG_MAP_FORMAT,
@@ -731,8 +731,11 @@ impl<'io, 'f> Segment<'io, 'f> {
     pub fn extend(&mut self) -> Result<crate::bitmap::ExtentNo, SegmentSpaceError> {
         let first_logical = self.header.extent_count as u32 * EXTENT_BLOCKS;
         let extent = self.file.allocate_extent()?;
-        let rdba =
-            Rdba::from_parts(self.file.file_id(), extent.first_block()).expect("块号在 28 位内");
+        let rdba = Rdba::from_parts(
+            self.file.file_id(),
+            self.file.layout().first_block_of(extent),
+        )
+        .expect("块号在 28 位内");
         let mut page = self.file.read_page(self.page0)?;
         let map = append_extent(&mut page, ExtentEntry::new(rdba, 1))?;
         self.file.write_page(self.page0, &mut page)?;
@@ -832,8 +835,11 @@ impl<'io, 'f> Segment<'io, 'f> {
         current: CurrentPages<'_>,
     ) -> Result<PlannedExtend, SegmentSpaceError> {
         let planned = self.file.plan_allocate_extent(current)?;
-        let rdba = Rdba::from_parts(self.file.file_id(), planned.extent.first_block())
-            .expect("块号在 28 位内");
+        let rdba = Rdba::from_parts(
+            self.file.file_id(),
+            self.file.layout().first_block_of(planned.extent),
+        )
+        .expect("块号在 28 位内");
 
         // 段头页（前/后）：区映射 + 计数。
         let header_before = current_page(self, self.page0, current)?;
@@ -1465,7 +1471,10 @@ mod space_tests {
         let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
         let mut seg = Segment::create(&mut file, SegType::Heap, 1, 2, 4, 10, 0).unwrap();
         let e = seg.extend().unwrap();
-        assert_eq!(e.first_block(), crate::bitmap::DATA_AREA_FIRST_BLOCK + 8);
+        assert_eq!(
+            e.first_block_in(crate::bitmap::FileLayout::standard()),
+            crate::bitmap::DATA_AREA_FIRST_BLOCK + 8
+        );
         // 相邻 ⇒ 合并为一条（1 区 → 2 区）。
         assert_eq!(
             seg.extents(),
