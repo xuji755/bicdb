@@ -153,9 +153,13 @@ fn push_value(
 ) -> Result<(), RowCodecError> {
     let bad = || RowCodecError::TypeMismatch { col, name: c.name };
     match (c.type_code, v) {
-        (ColTypeCode::Number, DictValue::Num(n)) => {
-            // **NUMBER 的保序编码**（`arch/06` §6.0 原则①）——字典表的索引键
-            // 直接取行里这些列的字节 ⇒ 索引比较即字节比较。
+        // **数值与墙钟时戳同编码**：时戳在字典域里是**标量**（`CONV` §2：
+        // 墙钟只作标量、不作先后判定），按 NUMBER 的保序编码承载 ⇒ 若将来给
+        // 时戳列建索引，"索引比较即字节比较"依然成立。
+        (
+            ColTypeCode::Number | ColTypeCode::Timestamp | ColTypeCode::TimestampTz,
+            DictValue::Num(n),
+        ) => {
             let num = bicdb_types::Number::parse(&n.to_string()).map_err(|_| bad())?;
             data.extend_from_slice(&num.encode());
         }
@@ -199,7 +203,8 @@ pub fn decode_typed(bytes: &[u8], types: &[ColTypeCode]) -> Result<Vec<DictValue
 /// 解释一列的非 NULL 字节（按类型码）。
 fn read_value_typed(raw: &[u8], t: ColTypeCode) -> Result<DictValue, RowCodecError> {
     Ok(match t {
-        ColTypeCode::Number => {
+        // **数值与墙钟时戳同编码**（见 `push_value` 的注记）。
+        ColTypeCode::Number | ColTypeCode::Timestamp | ColTypeCode::TimestampTz => {
             let num = bicdb_types::Number::decode(raw)
                 .map_err(|_| RowCodecError::Format("数值列字节非法".to_owned()))?;
             DictValue::Num(
@@ -213,11 +218,11 @@ fn read_value_typed(raw: &[u8], t: ColTypeCode) -> Result<DictValue, RowCodecErr
             [1] => DictValue::Bool(true),
             _ => return Err(RowCodecError::Format("布尔列字节非法".to_owned())),
         },
-        ColTypeCode::Bytes | ColTypeCode::Uuid | ColTypeCode::AssetRef | ColTypeCode::Vector => {
+        ColTypeCode::Bytes | ColTypeCode::AssetRef | ColTypeCode::Vector => {
             DictValue::Bytes(raw.to_vec())
         }
-        // 其余（Char/Varchar2/Date/Timestamp/TimestampTz/Json）按文本承载：
-        // 字典域里这些列的出现面随 DDL 扩展，先按 UTF-8 文本解释。
+        // 其余（`Char`/`Date`/`Uuid`/`Json` 等）暂按文本承载：字典域里这些列的
+        // 出现面随 DDL 扩展。
         _ => DictValue::Text(
             String::from_utf8(raw.to_vec())
                 .map_err(|_| RowCodecError::Format("非 UTF-8 文本".to_owned()))?,
@@ -255,7 +260,7 @@ pub fn decode(bytes: &[u8], columns: &[ColDef]) -> Result<Vec<DictValue>, RowCod
 fn read_value(raw: &[u8], c: &ColDef, col: u16) -> Result<DictValue, RowCodecError> {
     let bad = || RowCodecError::TypeMismatch { col, name: c.name };
     Ok(match c.type_code {
-        ColTypeCode::Number => {
+        ColTypeCode::Number | ColTypeCode::Timestamp | ColTypeCode::TimestampTz => {
             let num = bicdb_types::Number::decode(raw).map_err(|_| bad())?;
             DictValue::Num(
                 num.to_string()

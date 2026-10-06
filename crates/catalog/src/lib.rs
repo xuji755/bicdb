@@ -31,7 +31,13 @@
 //!   字典行经**表访问服务**（ITL/锁/undo/redo）+ 索引同步维护 + `mtime` =
 //!   预约的提交序号；建段与建索引都**经 redo**。
 //!
-//! **未落地**：`Move` 失效落点（C5）与"段回收"（DROP 的区归还）。
+//! - [`ddl`]（C5）：**序列分配**（`seq$` 内存批 + 成批刷入，跳号无害）+
+//!   **`stat$` 接入** + **`Move` 失效落点**（`obj$`/`ind$` 双 status +
+//!   [`api::Catalog::usable_indexes_of`] 选路收口 + `ObjectVersion.status`）
+//!   与 `rebuild_index`。
+//!
+//! **未落地**："段回收"（DROP/Move 后的区归还）与 `Move` 的物理搬迁
+//! （`arch/02` §3.4 的存储侧路径）。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -54,9 +60,9 @@ pub use cache::{
 pub use consistency::{check_files, ConsistencyReport, FileCheck, FilePoint, FileVerdict, Finding};
 pub use create::{create_dictionary, BootstrapObject, BuiltDictionary, CreateError};
 pub use ddl::{
-    create_index, create_table, drop_index, drop_table, init_dictionary_tables, ColumnSpec,
-    CreateIndexOutcome, CreateTableOutcome, DdlError, DropOutcome, IndexSpec, TableOptions,
-    TableSpec,
+    create_index, create_table, drop_index, drop_table, init_dictionary_tables,
+    invalidate_indexes_for_move, rebuild_index, stat_obj_number, ColumnSpec, CreateIndexOutcome,
+    CreateTableOutcome, DdlError, DropOutcome, IndexSpec, TableOptions, TableSpec,
 };
 pub use dict::{
     bootstrap_entries_normal, bootstrap_entries_public, index_kind, is_public_only, namespace,

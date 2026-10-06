@@ -143,6 +143,10 @@ pub struct Catalog<'io> {
     pool: Option<&'io BufferPool<'io>>,
     /// **当前的提交序号**（装载戳；打开时 = 恢复后的最新已提交序号）。
     pub(crate) current_seq: u64,
+    /// **`object_id` 序列的内存批**（`[下一个待发, 已持久化的上界)`；
+    /// `None` = 尚未取批）。C5：序列分配 = 内存取号 + 成批刷入
+    /// （**跳号无害**——崩溃丢掉未发的批，号只前进不重复）。
+    pub(crate) obj_seq: std::cell::Cell<Option<(u64, u64)>>,
 }
 
 impl<'io> Catalog<'io> {
@@ -224,6 +228,7 @@ impl<'io> Catalog<'io> {
             cache: crate::cache::RowCache::new(0),
             pool: None,
             current_seq: 0,
+            obj_seq: std::cell::Cell::new(None),
         })
     }
 

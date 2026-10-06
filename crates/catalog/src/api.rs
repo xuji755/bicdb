@@ -177,13 +177,19 @@ pub struct IndexRef {
     pub expr_src: Option<Vec<u8>>,
 }
 
-/// **对象版本**（= `mtime`；计划缓存的比对依据，REQ-SQL-009）。
+/// **对象版本**（计划缓存的比对依据，REQ-SQL-009）。
+///
+/// 三元组 `(obj#, mtime, status)`（`目录详设` §5.5）：`Move` 引起的索引失效
+/// **只动 status**（`obj$.status` 权威 + `ind$.status` 副本）——键因此失配，
+/// 陈旧计划被重编译，而不是靠"通知"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectVersion {
     /// 对象号。
     pub obj: u32,
     /// 最后修改提交序号。
     pub mtime: u64,
+    /// 状态（1 = 有效；`Move` 后索引为 0 ⇒ 不进选路 + 计划键失配）。
+    pub status: u32,
 }
 
 impl<'io> Catalog<'io> {
@@ -311,6 +317,22 @@ impl<'io> Catalog<'io> {
 
     // ───────────────────────── 索引 ─────────────────────────
 
+    /// **可进选路的索引清单**（`目录详设` §5.5）：`status == 1` 且 `bobj#` 有效。
+    ///
+    /// **这是选路的唯一入口**——`status ≠ 1`（`Move` 失效、未建成）的索引在此
+    /// 被排除，调用方（优化器）不需要自己过滤，也就不会"忘了过滤"。
+    pub fn usable_indexes_of(
+        &mut self,
+        snapshot: CommitSeq,
+        table_obj: u32,
+    ) -> Result<Vec<IndexRef>, CatalogError> {
+        Ok(self
+            .indexes_of(snapshot, table_obj)?
+            .into_iter()
+            .filter(|i| i.status == 1)
+            .collect())
+    }
+
     /// **某表的索引清单**（§6；`ind$` 按 `bobj#` 过滤 + `icol$` 组装键列）。
     ///
     /// V1.0 无 `bobj#` 索引 ⇒ 全扫 `i_ind_pk`/`i_icol_pk`（索引数有界），
@@ -389,6 +411,7 @@ impl<'io> Catalog<'io> {
         Ok(ObjectVersion {
             obj: r.obj,
             mtime: r.mtime,
+            status: r.status,
         })
     }
 
