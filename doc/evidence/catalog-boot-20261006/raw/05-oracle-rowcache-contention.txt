@@ -1,0 +1,47 @@
+### kb_graph oracle problem '数据字典缓存 row cache lock 等待 争用 案例'
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] row cache lock 等待 争用 字典缓存 DDL 阻塞
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 56，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 56，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 64，摘要筛选通过 56，批次 1；相关证据已满足，仍有未取候选
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     ROW CACHE LOCK 表示会话在获取或修改数据字典缓存锁时发生等待，当观察到该等待持续一秒或更长时间时，通常反映数据字典争用。该等待事件用于诊断频繁 DDL 操作、Shared Pool 高负载、字典缓存行锁竞争以及 Row Cache Object 状态。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] L1：IT WAITS FOR ONE SECOND OR MORE WITH "ROW CACHE LOCK" WAIT EVENT-c3  (排序分: 15.0)
+     └ 详情：IT WAITS FOR ONE SECOND OR MORE WITH "ROW CACHE LOCK" WAIT EVENT-c3
+IT WAITS FOR ONE SECOND OR MORE WITH "ROW CACHE LOCK" WAIT EVENT
+.
+Copyright © 2006, Oracle. All rights reserved.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2045557
+
+     [KnowledgeEntry] L1：ONE INSTANCE OUT OF THREE RAC INSTANCES SHOW HIT "ROW CACHE LOCK"-c3  (排序分: 15.0)
+     └ 详情：ONE INSTANCE OUT OF THREE RAC INSTANCES SHOW HIT "ROW CACHE LOCK"-c3
+ONE INSTANCE OUT OF THREE RAC INSTANCES SHOW HIT "ROW CACHE LOCK"
+.
+Copyright © 2006, Oracle. All rights reserved.
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047189
+
+     [KnowledgeEntry] L1：ONE INSTANCE OUT OF THREE RAC INSTANCES SHOW HIT "ROW CACHE LOCK"  (排序分: 15.0)
+     └ 摘要：row cache lock 等待表示会话在访问数据字典缓存（row cache）时发生争用，通常与 DDL 操作、序列缓存、或分区表维护等频繁修改字典信息有关。本案例中 RAC 某一节点在运行创建和删除表时出现严重的 row cache lock、DFS lock handle 及。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2047188
+
+     [KnowledgeEntry] L1：Note:118527.1 RAC HANG WITH >>> WAITED TOO LONG FOR A ROW CACHE ENQUEUE LOCK!  (排序分: 15.0)
+     └ 摘要：WAITED TOO LONG FOR A ROW CACHE ENQUEUE LOCK 是 RAC 环境下因 row cache enqueue 锁等待过久而记录的进程挂起告警，通常与字典缓存竞争有关，可能由序列、DDL 等操作触发。该条目可用于诊断 RAC 实例挂起、分析行缓存锁持有者及锁链，并结。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2040821
+
+     [CaseStudy] DDL 复制完整配置案例  (排序分: 10.0)
+     └ 摘要：场景：需要在 Oracle 数据库上配置 GoldenGate 以支持 DDL（数据定义语言）复制。诊断：标准 GoldenGate 配置默认仅支持 DML 复制，需额外步骤启用 DDL 支持。处理：按照完整步骤配置，包括设置 GLOBALS 参数、启用 DDL 触发器、配置 Extract 和 Replicat 参数以包含 DDL 语句，并验证复制功能。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531798
+
+     [FaultModel] DDL语句长度超过2MB导致复制失败  (排序分: 10.0)
+     └ 摘要：现象：GoldenGate只能自动复制长度小于2MB的DDL语句，超过此长度的DDL语句需要手动处理。根因：DDL语句长度超过2MB的限制。影响：超长DDL无法自动同步到目标端，可能导致源端和目标端结构不一致，需要人工介入手动执行DDL以保持数据一致性。
+     详情请见：python3 kb_graph.py oracle detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1531726
+

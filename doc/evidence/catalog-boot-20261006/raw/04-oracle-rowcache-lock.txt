@@ -1,0 +1,30 @@
+### detail 2046707 row cache lock Q[A-Z]
+
+  📖 实体详情
+  类型: bic_agent_KnowledgeEntry,KGV2Managed,KEOpSQLReviewed
+  名称: L1：Note:34648.1 LOCK: Q[A-Z] "Row Cache"
+  ID: 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2046707
+
+  ── 描述 ──
+  LOCK: Q[A-Z] "Row Cache" Lock: Q[A-Z] "Row Cache" (QA QB QC QD QE QF QG QH QI QJ QK QL QM QN QO QP
+  QQ QR QS QT QU QV QW QX QY QZ) How Many Resources: 1/ row cache entry of any type (corresponds to
+  dc_* params) (ts$, fet$, seg$, undo$, uet$, tsq$, file$, user$, obj$, tables, views, clusters,
+  synonyms, user names, object ids, constraints, sequence cache entries, profiles, database links,
+  histograms). How Many Locks: 1 per instance. How Many Users: All processes Who Uses: All processes
+  When & How Used: Used to keep row cache entries coherent across instances. Row cache entries are
+  caches of recently used data dictionary information. The second part of the type [A-Z] is determined
+  by the type of the parent cache (0=A, 1=B ... 25=Z) eg: select 'Q'||chr(ascii('A')+cache#) ENQ,
+  cache#, parameter from v$rowcache order by 1; In 9.2 shows: ENQ CACHE# PARAMETER ---- ----------
+  -------------------------------- QA 0 dc_tablespaces QB 1 dc_free_extents QC 2 dc_segments QD 3
+  dc_rollback_segments QE 4 dc_used_extents QF 5 dc_tablespace_quotas QG 6 dc_files QH 7 dc_users QH 7
+  dc_user_grants QH 7 dc_app_role QH 7 dc_users QI 8 dc_objects QJ 9 dc_qmc_cache_entries QK 10
+  dc_usernames QL 11 dc_object_ids QM 12 dc_constraints QN 13 dc_sequences QO 14 dc_profiles QP 15
+  dc_database_links QQ 16 dc_histogram_defs QQ 16 dc_histogram_data QQ 16 dc_histogram_data_values QR
+  17 dc_global_oids QS 18 dc_outlines QT 19 dc_encrypted_objects QU 20 dc_encryption_profiles QV 21
+  dc_table_scns QV 21 dc_partition_scns QW 22 dc_qmc_ldap_cache_entries Id1, Id2 Combinations: Both
+  values are being hashed from . Lock Value Block: Scope: Global Lock. Deadlock Sensitive: No.
+  Operation: Synchronous. Parameters: <Parameter:SHARED_POOL_SIZE> Related: Acknowledgements: Thanks
+  to AKOLK.US for main info. . Copyright © 2006, Oracle. All rights reserved.
+
+  ── 摘要 ──
+  LOCK: Q[A-Z] 锁即行缓存锁，用于 RAC 环境中保持各实例数据字典缓存（row cache）一致性，类型 QA 到 QZ 对应 v$rowcache 中的不同字典缓存种类（如 dc_tablespaces、dc_segments 等），其 Id1/Id2 由行缓存条目哈希得出。每个实例仅持有一个。

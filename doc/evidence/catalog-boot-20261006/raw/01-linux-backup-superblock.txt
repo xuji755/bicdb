@@ -1,0 +1,41 @@
+### kb_graph linux problem '备份超级块 backup superblock ext4 位置 分布 恢复'
+候选覆盖有界：当前结果按召回或显示预算选取，未宣称全库穷尽。
+
+============================================================
+  [问题诊断] 备份超级块 backup superblock ext4 位置 分布 恢复
+============================================================
+  三路召回 → name/summary 重排 → 正文按需读取（绝对相关性过滤，无相对分差淘汰）
+  FaultModel：已取 64，摘要筛选通过 8，批次 1；相关证据已满足，仍有未取候选
+  KnowledgeEntry：已取 64，摘要筛选通过 64，批次 1；相关证据已满足，仍有未取候选
+  CaseStudy：已取 35，摘要筛选通过 4，批次 1；本路已取尽
+  正文核实 0 条；最终正文补读 6 条
+
+  ✅ 答案要点
+     mkfs.ext4输出列出备份超级块位置，可用于恢复主超级块损坏的情况。使用 e2fsck -b 备份块。隐含假设：备份超级块存在且未损坏。边界条件：如果磁盘损坏导致备份块也损坏，则必须使用更高级工具。
+
+  📍 诊断结果 (6条, 已过滤低相关<5分)
+
+     [KnowledgeEntry] 文件系统备份超级块的位置  (排序分: 9.4)
+     └ 详情：mkfs.ext4输出列出备份超级块位置，可用于恢复主超级块损坏的情况。使用 e2fsck -b 备份块。隐含假设：备份超级块存在且未损坏。边界条件：如果磁盘损坏导致备份块也损坏，则必须使用更高级工具。
+     详情请见：python3 kb_graph.py linux detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:335153
+
+     [KnowledgeEntry] Ext4超级块损坏恢复  (排序分: 9.4)
+     └ 摘要：超级块损坏导致无法挂载。Ext4在多个块组中备份超级块（默认或sparse_super）。恢复步骤：使用dumpe2fs /dev/sdX | grep superblock找到备份块号（如32768），然后mount -o sb=32768 /dev/sdX /mnt挂载，之后备份数据并运行fsck修复。机制：备份超级块包含文件系统基础参数，替代损坏的超级块可临时访问。应用场景：文件系统意外损坏后的紧急数据恢复。 参考指标ID:2157002(中文: 集群DUMP文件类型; 英文: SQLDUMPERDUMPFLAGS; 重要性: 重要; 采集SQL: 取自视图SYS.DM_OS_CLUSTER_PR)，参考指标ID:2157003(中文: 集群DUMP文件路径; 英文: SQLDUMPERDUMPPATH; 重要性: 重要; 采集SQL: 取自视图SYS.DM_OS_CLUSTER_PRO)，参考指标ID:2823142(PARSE_TIME PER SECONDS: 统计周期内SQL语句进行语法分析和语义检查消耗的总时间)，参考指标ID:2823146(PARSE_TIME PER SECONDS: 统计周期内SQL语句进行语法分析和语义检查消耗的总时间（重复项）) 参考指标ID:2150015(中文: 错误日志路径; 英文: LOG DIRECTORY; 描述: 获取错误日志路径信息; 重要性: 一般; 采集SQL: 取自视图 SYS.DM_OS_SE)，参考指标ID:2157002(中文: 集群DUMP文件类型; 英文: SQLDUMPERDUMPFLAGS; 重要性: 重要; 采集SQL: 取自视图SYS.DM_OS_CLUSTER_PR)，参考指标ID:2157003(中文: 集群DUMP文件路径; 英文: SQLDUMPERDUMPPATH; 重要性: 重要; 采集SQL: 取自视图SYS.DM_OS_CLUSTER_PRO)，参考指标ID:2157004(中文: 集群FAILOVER模式; 英文: FAILURECONDITIONLEVEL; 重要性: 重要; 采集SQL: 取自视图SYS.DM_OS_CLUST)，参考指标ID:2817157(每秒IO读取回调延迟,指标ID:2817081,2817082两个指标之和)，参考指标ID:2823140(EXECUTION_TIME PER SECONDS: 统计周期内SQL语句在执行引擎中实际运行逻辑消耗的总时间)，参考指标ID:2823142(PARSE_TIME PER SECONDS: 统计周期内SQL语句进行语法分析和语义检查消耗的总时间)，参考指标ID:2823146(PARSE_TIME PER SECONDS: 统计周期内SQL语句进行语法分析和语义检查消耗的总时间（重复项）)，参考指标ID:2823167(每秒硬解析次数：统计每秒数据库对SQL语句进行完整语法分析、语义检查及执行计划生成的次数)，参考指标ID:2823186(每秒分配的缓冲区数量：统计每秒从共享内存池分配出的缓冲区页面总数（重复项）)，参考指标ID:2851015(ALTER_PROCEDURE命令每秒执行次数)
+     详情请见：python3 kb_graph.py linux detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:327587
+
+     [KnowledgeEntry] 超级块（Superblock）  (排序分: 9.4)
+     └ 详情：超级块位于文件系统起始区域。如果损坏，可用备份恢复：fsck -b num 使用指定备份块。mkfs -n 可查看备份超级块列表。注意：mkfs -n不会实际创建文件系统，仅模拟输出备份位置。
+     详情请见：python3 kb_graph.py linux detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:336894
+
+     [KnowledgeEntry] ext4 超级块备份位置  (排序分: 9.4)
+     └ 详情：mke2fs 创建 ext4 文件系统时输出 Superblock backups stored on blocks 列表，这些备份块用于在超级块损坏时恢复文件系统。块号与文件系统布局有关。
+     详情请见：python3 kb_graph.py linux detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:2421468
+
+     [CaseStudy] 超级块损坏恢复  (排序分: 9.1)
+     └ 摘要：场景：mount /dev/sdc1 /mnt失败，dmesg显示“bad magic number in superblock”。诊断：超级块损坏。处理：运行mkfs -n /dev/sdc1获取备用超级块列表（如32768），执行fsck -b 32768 /dev/sdc1，基于备用块重建超级块并检查文件系统。完成后挂载成功，数据完整。
+     详情请见：python3 kb_graph.py linux detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:339039
+
+     [FaultModel] Ext4超级块损坏  (排序分: 8.6)
+     └ 摘要：Ext4超级块损坏现象：Ext4文件系统的主超级块（位于块组0）损坏，导致无法挂载文件系统或数据丢失。根因：磁盘错误、意外断电、分区表错误或测试不当导致超级块数据破坏。影响：文件系统不可用，数据可能永久丢失，需用备用超级块恢复。
+     详情请见：python3 kb_graph.py linux detail 4:8ed6c541-fe08-4ade-ae68-a79bf45316f4:1565120
+
