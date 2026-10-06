@@ -6,7 +6,7 @@
 | --- | --- |
 | 设计依据 | `doc/执行算子设计_v0.1.md`（PG 拉取模型 + Oracle 批量化技巧；证据包 `exec-ops-20261006`） |
 | 对应阶段 | P5（切片 1 已落地） |
-| 当前状态 | **v0.1**——算子契约（`Operator`/`RowCursor`）+ 执行上下文 + 值域与三值逻辑 + `SeqScan`/`Filter`/`Project`/`Limit` + 物理计划（切片 1 子集）与构建 + **直译执行器**（REQ-SQL-005 的差分参考模型） |
+| 当前状态 | **v0.2**——v0.1（契约/上下文/值域/`SeqScan`·`Filter`·`Project`·`Limit`/直译执行器）+ **表达式全集**（算术/`CAST`/`CASE`/`IN`/`BETWEEN`/`COALESCE`/`NULLIF`，三值逻辑）与 **`Sort`/`TopN`**（NULL 位置照 Oracle；Top-N 输入全读）+ **WMM 最小面**（工作内存预算 + `optimal` 计数） |
 
 ## 状态说明
 
@@ -32,7 +32,7 @@
   **LIMIT 真短路**（扫描行数可观测：`SeqScan` 统计 = LIMIT）、取消与截止
   （两路同判定）、NULL 三值逻辑。
 
-**下一步（切片 2 起）**：表达式全集（算术/CAST/CASE/IN/BETWEEN/COALESCE）+
-`Sort`/`TopN`（内存快排 → 外部归并，temp 段溢出）——见设计 §7 切片表。
+**下一步（切片 3 起）**：`IndexScan`（范围/唯一/仅索引）+ `NestedLoop` + 批量回表；
+表达式与排序已就位（切片 2b/2c ✅）；外部归并与溢出（temp 段 + 完整 WMM）随切片 6——见设计 §7 切片表。
 
 实现进度请以仓库根 `README.md` 的阶段表为准。
