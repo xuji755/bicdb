@@ -205,19 +205,134 @@ pub struct RunParams {
     pub park_ms: u64,
     /// 死锁检测阈值（毫秒）。
     pub deadlock_threshold_ms: u64,
+    /// 等锁重试次数上限（0 = 不限）。
+    pub wait_max_rounds: u64,
+    // ── buffer ──
+    /// 哈希桶数（0 = 自动）。
+    pub hash_buckets: usize,
+    /// 桶闩锁数（0 = 自动）。
+    pub bucket_latches: usize,
+    /// 热段上限 = 容量/该值。
+    pub hot_fraction: usize,
+    /// 触摸计数的最小递增间隔（毫秒）。
+    pub touch_interval_ms: u64,
+    /// 冷却值。
+    pub cool_count: u32,
+    /// 驻留值。
+    pub stay_count: u32,
+    /// 热判据。
+    pub hot_criteria: u32,
+    /// 找空帧的前台扫描上限 = 容量/该值。
+    pub max_scan_fraction: usize,
+    /// 每轮写回批大小 = 分区帧数/该值。
+    pub make_free_batch_divisor: usize,
+    // ── storage ──
+    /// 一次区读的连续页数。
+    pub multiblock_read_pages: u32,
+    /// 一致性读重建的回溯轮数上限。
+    pub cr_max_rounds: u32,
+    // ── wal ──
+    /// 日志缓冲区页数。
+    pub log_buffer_pages: usize,
+    /// 未刷出占比达此千分数即建议刷盘。
+    pub flush_trigger_permille: u64,
+    // ── catalog ──
+    /// 字典行缓存：每型行数上限。
+    pub row_cache_rows: usize,
+    /// 字典行缓存：估算字节上限。
+    pub row_cache_bytes: u64,
+    /// 行迁移转发链最大跳数。
+    pub rid_forward_max_hops: usize,
+    // ── index ──
+    /// 建索引（批量灌树）叶页填充率（%）。
+    pub bulk_fill_percent: u8,
+    // ── service（服务生命周期） ──
+    /// `start` 等就绪的默认上限（秒）。
+    pub start_wait_s: u64,
+    /// `stop` 等退出的默认上限（秒）。
+    pub stop_wait_s: u64,
+    /// 等就绪的轮询间隔（毫秒）。
+    pub ready_poll_ms: u64,
+    // ── auth（认证与口令） ──
+    /// **口令散列（PBKDF2-HMAC-SHA512）的迭代数**。
+    ///
+    /// 写进散列串（`pbkdf2-sha512$<迭代数>$…`）⇒ **调大不破旧行**（旧行按行里的数校验）。
+    /// 默认照 OWASP 2023 对 PBKDF2-HMAC-SHA512 的建议量级。
+    pub pbkdf2_iterations: u32,
+    /// 等退出的轮询间隔（毫秒）。
+    pub stop_poll_ms: u64,
+    /// 每轮就绪探测的单次读写超时（毫秒）。
+    pub probe_timeout_ms: u64,
+    /// `status` 问服务自述的超时（毫秒）。
+    pub status_timeout_ms: u64,
+    /// 启动失败时回显的日志尾行数。
+    pub log_tail_lines: u64,
+    // ── client ──
+    /// 客户端握手超时（毫秒）。
+    pub handshake_timeout_ms: u64,
+    /// 客户端请求超时（毫秒；0 = 不限）。
+    pub request_timeout_ms: u64,
 }
 
 impl Default for RunParams {
     fn default() -> Self {
+        // 全部取自 [`SPECS`] 的声明（**默认值只有一个来源**：改声明即改默认）。
+        let d = |k: &str| spec_default(k);
         Self {
-            pool_frames: 256,
+            pool_frames: d("pool_frames").parse().expect("16 位以上"),
             file_extend_blocks: bicdb_storage::segment::DEFAULT_FILE_EXTEND_BLOCKS,
             socket: crate::lock::SOCKET_FILE.to_owned(),
             log: "bicdb.log".to_owned(),
-            park_ms: 50,
-            deadlock_threshold_ms: 1000,
+            park_ms: bicdb_txn::write::WaitPolicy::default()
+                .park_timeout
+                .as_millis() as u64,
+            // **与库里的常量同源**：此前这里写 1000、`txn::lock` 写 3000，
+            // 走参数文件的库与直接调库的库行为不同（同一个参数两个默认值）。
+            deadlock_threshold_ms: bicdb_txn::write::WaitPolicy::default().deadlock_threshold_ms,
+            wait_max_rounds: json_u64(d("wait_max_rounds")),
+            hash_buckets: json_u64(d("hash_buckets")) as usize,
+            bucket_latches: json_u64(d("bucket_latches")) as usize,
+            hot_fraction: json_u64(d("hot_fraction")) as usize,
+            touch_interval_ms: json_u64(d("touch_interval_ms")),
+            cool_count: json_u64(d("cool_count")) as u32,
+            stay_count: json_u64(d("stay_count")) as u32,
+            hot_criteria: json_u64(d("hot_criteria")) as u32,
+            max_scan_fraction: json_u64(d("max_scan_fraction")) as usize,
+            make_free_batch_divisor: json_u64(d("make_free_batch_divisor")) as usize,
+            multiblock_read_pages: json_u64(d("multiblock_read_pages")) as u32,
+            cr_max_rounds: json_u64(d("cr_max_rounds")) as u32,
+            log_buffer_pages: json_u64(d("log_buffer_pages")) as usize,
+            flush_trigger_permille: json_u64(d("flush_trigger_permille")),
+            row_cache_rows: json_u64(d("row_cache_rows")) as usize,
+            row_cache_bytes: json_u64(d("row_cache_bytes")),
+            rid_forward_max_hops: json_u64(d("rid_forward_max_hops")) as usize,
+            bulk_fill_percent: json_u64(d("bulk_fill_percent")) as u8,
+            start_wait_s: json_u64(d("start_wait_s")),
+            stop_wait_s: json_u64(d("stop_wait_s")),
+            ready_poll_ms: json_u64(d("ready_poll_ms")),
+            pbkdf2_iterations: json_u64(d("pbkdf2_iterations")) as u32,
+            stop_poll_ms: json_u64(d("stop_poll_ms")),
+            probe_timeout_ms: json_u64(d("probe_timeout_ms")),
+            status_timeout_ms: json_u64(d("status_timeout_ms")),
+            log_tail_lines: json_u64(d("log_tail_lines")),
+            handshake_timeout_ms: json_u64(d("handshake_timeout_ms")),
+            request_timeout_ms: json_u64(d("request_timeout_ms")),
         }
     }
+}
+
+/// [`SPECS`] 里的默认文本（找不到即 panic——表里少一行是编码错误）。
+fn spec_default(key: &str) -> &'static str {
+    SPECS
+        .iter()
+        .find(|s| s.key == key)
+        .map(|s| s.default)
+        .unwrap_or_else(|| panic!("SPECS 里没有键 `{key}`"))
+}
+
+/// 十进制文本 → 数（`SPECS` 的默认与参数文件的取值同一条解析路径）。
+fn json_u64(text: &str) -> u64 {
+    text.parse().unwrap_or_else(|_| panic!("`{text}` 不是数"))
 }
 
 /// **一份完整的实例参数**（= 参数文件的全部内容）。
@@ -247,8 +362,350 @@ impl Default for InstanceParams {
 /// 参数清单（`节.键` → 取值 → 来源）。
 pub type ParamTable = Vec<(String, String, Source)>;
 
-/// 合法的节名（闭集）。
-pub const SECTIONS: [&str; 6] = ["instance", "init", "buffer", "storage", "service", "lock"];
+/// **参数的生效时机**（照 PG 的 GUC 分层简化而来：`PGC_POSTMASTER` = 要重启、
+/// 建库参数 = 我们独有的"建区期"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// **建区期**：`bicdb init` 读它造库；建区后控制文件是权威（改了会被拒绝启动）。
+    Creation,
+    /// **重启生效**：改完 `bicdb restart`（服务起来时读一次）。
+    Restart,
+}
+
+impl Effect {
+    /// 显示名（`bicdb params` 的"类别"列）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effect::Creation => "建区期",
+            Effect::Restart => "运行期",
+        }
+    }
+}
+
+/// **一个参数的声明**（唯一事实源：闭集校验、参数文件渲染、`bicdb params` 的
+/// 清单与说明都读它）。
+///
+/// **加一个参数的纪律**：在这里加一行 + 在 [`RunParams`]/[`InitParams`] 加字段 +
+/// 在 `set`/`value_of` 各加一个 match 臂（都在本文件），再去消费点接线。
+/// 以前是"五处各写一遍"（节集合 / set / render / all_keys / main 的打印），
+/// 加一个键要改五个地方、漏一个就出现"文件里能写但没人读"。
+pub struct Spec {
+    /// 节（闭集；渲染时按节的顺序成组）。
+    pub section: &'static str,
+    /// 键。
+    pub key: &'static str,
+    /// 生效时机。
+    pub effect: Effect,
+    /// 内置默认（文本形态；渲染与"来源=默认"用）。
+    pub default: &'static str,
+    /// 一句话说明（渲染成行尾注释、`bicdb params` 里打印）。
+    pub doc: &'static str,
+}
+
+/// **全部参数**（顺序 = 渲染顺序 = `bicdb params` 顺序）。
+pub const SPECS: &[Spec] = &[
+    Spec {
+        section: "instance",
+        key: "db_root",
+        effect: Effect::Restart,
+        default: "",
+        doc: "根区目录（权威）：实例的全部文件都在它下面",
+    },
+    Spec {
+        section: "init",
+        key: "file0_initial_blocks",
+        effect: Effect::Creation,
+        default: "4096",
+        doc: "file 0（字典/数据）初始块数（16 KiB/块）",
+    },
+    Spec {
+        section: "init",
+        key: "undo_initial_blocks",
+        effect: Effect::Creation,
+        default: "512",
+        doc: "撤销文件初始块数",
+    },
+    Spec {
+        section: "init",
+        key: "wal_groups",
+        effect: Effect::Creation,
+        default: "2",
+        doc: "日志组数（2–8，至少 2 组轮转）",
+    },
+    Spec {
+        section: "init",
+        key: "wal_members",
+        effect: Effect::Creation,
+        default: "1",
+        doc: "每组成员数（1–8）",
+    },
+    Spec {
+        section: "init",
+        key: "wal_group_pages",
+        effect: Effect::Creation,
+        default: "8192",
+        doc: "每组成员页数（512 B/页）",
+    },
+    Spec {
+        section: "buffer",
+        key: "pool_frames",
+        effect: Effect::Restart,
+        default: "256",
+        doc: "缓冲池帧数（16 KiB/帧）",
+    },
+    Spec {
+        section: "buffer",
+        key: "hash_buckets",
+        effect: Effect::Restart,
+        default: "0",
+        doc: "哈希桶数（0 = 自动 ≈ 容量/4 取质数；Oracle _DB_BLOCK_HASH_BUCKETS 口径）",
+    },
+    Spec {
+        section: "buffer",
+        key: "bucket_latches",
+        effect: Effect::Restart,
+        default: "0",
+        doc: "桶闩锁数（0 = 自动；须为 2 的幂，≤ 64）",
+    },
+    Spec {
+        section: "buffer",
+        key: "hot_fraction",
+        effect: Effect::Restart,
+        default: "4",
+        doc: "热段上限 = 容量/该值（Oracle HBMAX 口径）",
+    },
+    Spec {
+        section: "buffer",
+        key: "touch_interval_ms",
+        effect: Effect::Restart,
+        default: "3000",
+        doc: "触摸计数的最小递增间隔（三秒规则）",
+    },
+    Spec {
+        section: "buffer",
+        key: "cool_count",
+        effect: Effect::Restart,
+        default: "0",
+        doc: "冷却值：新装入/退回冷段时置的触摸计数（_COOL_COUNT 口径）",
+    },
+    Spec {
+        section: "buffer",
+        key: "stay_count",
+        effect: Effect::Restart,
+        default: "2",
+        doc: "驻留值：升热段时置的计数（_STAY_COUNT 口径）",
+    },
+    Spec {
+        section: "buffer",
+        key: "hot_criteria",
+        effect: Effect::Restart,
+        default: "2",
+        doc: "热判据：冷段计数达此值才升热段",
+    },
+    Spec {
+        section: "buffer",
+        key: "max_scan_fraction",
+        effect: Effect::Restart,
+        default: "4",
+        doc: "找空帧的前台扫描上限 = 容量/该值（db_block_max_scan_cnt 口径）",
+    },
+    Spec {
+        section: "buffer",
+        key: "make_free_batch_divisor",
+        effect: Effect::Restart,
+        default: "64",
+        doc: "每轮写回批大小 = 分区帧数/该值",
+    },
+    Spec {
+        section: "storage",
+        key: "file_extend_blocks",
+        effect: Effect::Restart,
+        default: "512",
+        doc: "段增长撞文件尾时的固定增量（块；512 = 8 MiB）",
+    },
+    Spec {
+        section: "storage",
+        key: "multiblock_read_pages",
+        effect: Effect::Restart,
+        default: "8",
+        doc: "一次区读的连续页数（8 页 = 128 KiB；db_file_multiblock_read_count 口径）",
+    },
+    Spec {
+        section: "storage",
+        key: "cr_max_rounds",
+        effect: Effect::Restart,
+        default: "64",
+        doc: "一致性读重建的回溯轮数上限（越限报「回溯轮数超限」）",
+    },
+    Spec {
+        section: "wal",
+        key: "log_buffer_pages",
+        effect: Effect::Restart,
+        default: "256",
+        doc: "日志缓冲区页数（512 B/页；Oracle LOG_BUFFER 口径）",
+    },
+    Spec {
+        section: "wal",
+        key: "flush_trigger_permille",
+        effect: Effect::Restart,
+        default: "333",
+        doc: "未刷出占比达此千分数即建议刷盘（333 ≈ 1/3）",
+    },
+    Spec {
+        section: "catalog",
+        key: "row_cache_rows",
+        effect: Effect::Restart,
+        default: "4096",
+        doc: "字典行缓存：每型行数上限",
+    },
+    Spec {
+        section: "catalog",
+        key: "row_cache_bytes",
+        effect: Effect::Restart,
+        default: "4194304",
+        doc: "字典行缓存：估算字节上限（4 MiB）",
+    },
+    Spec {
+        section: "catalog",
+        key: "rid_forward_max_hops",
+        effect: Effect::Restart,
+        default: "16",
+        doc: "行迁移转发链的最大跳数（超限报「转发链过长」）",
+    },
+    Spec {
+        section: "index",
+        key: "bulk_fill_percent",
+        effect: Effect::Restart,
+        default: "90",
+        doc: "建索引（批量灌树）叶页填充率（%）",
+    },
+    Spec {
+        section: "service",
+        key: "socket",
+        effect: Effect::Restart,
+        default: "bicdb.sock",
+        doc: "控制套接字（相对根区目录；也可给绝对路径）",
+    },
+    Spec {
+        section: "service",
+        key: "log",
+        effect: Effect::Restart,
+        default: "bicdb.log",
+        doc: "服务日志（同上）",
+    },
+    Spec {
+        section: "service",
+        key: "start_wait_s",
+        effect: Effect::Restart,
+        default: "30",
+        doc: "`bicdb start` 等就绪的默认上限（秒；`-w` 覆盖）",
+    },
+    Spec {
+        section: "service",
+        key: "stop_wait_s",
+        effect: Effect::Restart,
+        default: "300",
+        doc: "`bicdb stop` 等退出的默认上限（秒；完全检查点可能很慢）",
+    },
+    Spec {
+        section: "service",
+        key: "ready_poll_ms",
+        effect: Effect::Restart,
+        default: "100",
+        doc: "等就绪的轮询间隔（毫秒）",
+    },
+    Spec {
+        section: "service",
+        key: "stop_poll_ms",
+        effect: Effect::Restart,
+        default: "50",
+        doc: "等退出的轮询间隔（毫秒）",
+    },
+    Spec {
+        section: "service",
+        key: "probe_timeout_ms",
+        effect: Effect::Restart,
+        default: "500",
+        doc: "每轮就绪探测的单次读写超时（毫秒）",
+    },
+    Spec {
+        section: "service",
+        key: "status_timeout_ms",
+        effect: Effect::Restart,
+        default: "5000",
+        doc: "`bicdb status` 问服务自述的超时（毫秒）",
+    },
+    Spec {
+        section: "service",
+        key: "log_tail_lines",
+        effect: Effect::Restart,
+        default: "3",
+        doc: "启动失败时回显的日志尾行数",
+    },
+    Spec {
+        section: "client",
+        key: "handshake_timeout_ms",
+        effect: Effect::Restart,
+        default: "5000",
+        doc: "客户端握手超时（毫秒）——实例忙时据此报错而不是挂住",
+    },
+    Spec {
+        section: "client",
+        key: "request_timeout_ms",
+        effect: Effect::Restart,
+        default: "0",
+        doc: "客户端请求超时（毫秒；0 = 不限：长查询是正常的）",
+    },
+    Spec {
+        section: "auth",
+        key: "pbkdf2_iterations",
+        effect: Effect::Restart,
+        default: "210000",
+        doc: "口令散列的 PBKDF2-HMAC-SHA512 迭代数（写进散列串，调大不破旧行）",
+    },
+    Spec {
+        section: "lock",
+        key: "park_ms",
+        effect: Effect::Restart,
+        default: "50",
+        doc: "等锁单次挂起时长（毫秒）",
+    },
+    Spec {
+        section: "lock",
+        key: "deadlock_threshold_ms",
+        effect: Effect::Restart,
+        default: "3000",
+        doc: "死锁检测阈值（毫秒；等锁超过它才建图找环）",
+    },
+    Spec {
+        section: "lock",
+        key: "wait_max_rounds",
+        effect: Effect::Restart,
+        default: "0",
+        doc: "等锁重试次数上限（0 = 不限；Oracle LOCK_TIMEOUT 的同位物）",
+    },
+];
+
+impl InstanceParams {
+    /// **合法节名**（闭集；由 [`SPECS`] 推出，顺序 = 首次出现序）。
+    #[must_use]
+    pub fn sections() -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        for s in SPECS {
+            if !out.contains(&s.section) {
+                out.push(s.section);
+            }
+        }
+        out
+    }
+
+    /// 一个键的声明（`节.键`）。
+    #[must_use]
+    pub fn spec(section: &str, key: &str) -> Option<&'static Spec> {
+        SPECS.iter().find(|s| s.section == section && s.key == key)
+    }
+}
 
 impl InstanceParams {
     /// **解析 INI 文本**（`[节]` + `键 = 值`；`#`/`;` 起注释）。
@@ -269,7 +726,7 @@ impl InstanceParams {
                 })?;
                 section = name.trim().to_ascii_lowercase();
                 // **节头那一行就校验**（诊断直接指到 `[nope]`，而不是它下面的键）。
-                if !SECTIONS.contains(&section.as_str()) {
+                if !Self::sections().contains(&section.as_str()) {
                     return Err(ConfigError::UnknownSection { section, line });
                 }
                 continue;
@@ -346,12 +803,81 @@ impl InstanceParams {
             }
             ("service", "socket") => self.run.socket = text(value)?,
             ("service", "log") => self.run.log = text(value)?,
+            ("service", "start_wait_s") => self.run.start_wait_s = num(value, 1, 86_400)?,
+            ("service", "stop_wait_s") => self.run.stop_wait_s = num(value, 1, 86_400)?,
+            ("service", "ready_poll_ms") => self.run.ready_poll_ms = num(value, 1, 60_000)?,
+            ("service", "stop_poll_ms") => self.run.stop_poll_ms = num(value, 1, 60_000)?,
+            ("service", "probe_timeout_ms") => self.run.probe_timeout_ms = num(value, 1, 600_000)?,
+            ("service", "status_timeout_ms") => {
+                self.run.status_timeout_ms = num(value, 1, 600_000)?
+            }
+            ("service", "log_tail_lines") => self.run.log_tail_lines = num(value, 0, 1000)?,
+            ("client", "handshake_timeout_ms") => {
+                self.run.handshake_timeout_ms = num(value, 1, 600_000)?
+            }
+            // 0 = 不限（长查询是正常的；这是"服务卡住"的兜底）。
+            ("client", "request_timeout_ms") => {
+                self.run.request_timeout_ms = num(value, 0, 86_400_000)?
+            }
+            ("buffer", "hash_buckets") => {
+                self.run.hash_buckets = num(value, 0, 1_000_000)? as usize;
+                if self.run.hash_buckets == 1 {
+                    return Err(bad("桶数要么 0（自动）要么 ≥ 7（哈希表要装得下）"));
+                }
+            }
+            ("buffer", "bucket_latches") => {
+                let n = num(value, 0, 64)? as usize;
+                if n != 0 && !n.is_power_of_two() {
+                    return Err(bad("桶闩锁数要是 2 的幂（0 = 自动）"));
+                }
+                self.run.bucket_latches = n;
+            }
+            ("buffer", "hot_fraction") => self.run.hot_fraction = num(value, 1, 1024)? as usize,
+            ("buffer", "touch_interval_ms") => self.run.touch_interval_ms = num(value, 0, 600_000)?,
+            ("buffer", "cool_count") => self.run.cool_count = num(value, 0, 1000)? as u32,
+            ("buffer", "stay_count") => self.run.stay_count = num(value, 0, 1000)? as u32,
+            ("buffer", "hot_criteria") => self.run.hot_criteria = num(value, 1, 1000)? as u32,
+            ("buffer", "max_scan_fraction") => {
+                self.run.max_scan_fraction = num(value, 1, 1024)? as usize
+            }
+            ("buffer", "make_free_batch_divisor") => {
+                self.run.make_free_batch_divisor = num(value, 1, 1024)? as usize
+            }
+            ("storage", "multiblock_read_pages") => {
+                self.run.multiblock_read_pages = num(value, 1, 64)? as u32
+            }
+            ("storage", "cr_max_rounds") => self.run.cr_max_rounds = num(value, 16, 4096)? as u32,
+            ("wal", "log_buffer_pages") => {
+                // 下限 36 页 = 最坏单条记录的 footprint（改了会破"任何一条记录
+                // 必能落下"的不变式，见 `wal::buffer::MIN_CAPACITY_PAGES`）。
+                self.run.log_buffer_pages = num(value, 36, 1_048_576)? as usize
+            }
+            ("wal", "flush_trigger_permille") => {
+                self.run.flush_trigger_permille = num(value, 1, 1000)?
+            }
+            ("catalog", "row_cache_rows") => {
+                self.run.row_cache_rows = num(value, 16, 1_000_000)? as usize
+            }
+            ("catalog", "row_cache_bytes") => {
+                self.run.row_cache_bytes = num(value, 65_536, 1 << 40)?
+            }
+            ("catalog", "rid_forward_max_hops") => {
+                self.run.rid_forward_max_hops = num(value, 1, 1024)? as usize
+            }
+            ("index", "bulk_fill_percent") => {
+                self.run.bulk_fill_percent = num(value, 10, 100)? as u8
+            }
+            ("auth", "pbkdf2_iterations") => {
+                self.run.pbkdf2_iterations = num(value, 1_000, 100_000_000)? as u32
+            }
             ("lock", "park_ms") => self.run.park_ms = num(value, 1, 60_000)?,
             ("lock", "deadlock_threshold_ms") => {
                 self.run.deadlock_threshold_ms = num(value, 10, 600_000)?
             }
+            // 0 = 不限（Oracle 的默认也是无限等）；非 0 即等锁重试上限。
+            ("lock", "wait_max_rounds") => self.run.wait_max_rounds = num(value, 0, 1_000_000)?,
             _ => {
-                if !SECTIONS.contains(&section) {
+                if !Self::sections().contains(&section) {
                     return Err(ConfigError::UnknownSection {
                         section: section.to_owned(),
                         line,
@@ -408,6 +934,19 @@ impl InstanceParams {
         let mut tried: Vec<PathBuf> = Vec::new();
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(p) = explicit {
+            // **名字式兜底**：`-p public` 里 `public` 既不是文件也不是目录，但
+            // `<BICDB_HOME>/public` 是个工作区 ⇒ 用它（Oracle 的 DB_NAME 直觉）。
+            // 只作兜底：`-p` 的语义仍是"参数文件或根区目录"，名字式不改变权威链
+            // （`db_root` 仍由参数文件注册）。
+            if !p.exists() {
+                if let Some(name) = p.to_str() {
+                    if let Ok(home) = crate::home::Home::locate() {
+                        if let Some(dir) = home.resolve_workspace_ref(name) {
+                            candidates.push(dir);
+                        }
+                    }
+                }
+            }
             candidates.push(p.to_path_buf());
         }
         if let Ok(env) = std::env::var(ENV_INI) {
@@ -490,7 +1029,8 @@ impl InstanceParams {
     /// **渲染为参数文件文本**（`init` 生成默认参数文件时用）。
     #[must_use]
     pub fn render(&self) -> String {
-        format!(
+        let mut out = String::new();
+        out.push_str(&format!(
             "\
 # ============================================================
 # bicdb 实例参数文件（`bicdb init` 生成）
@@ -499,52 +1039,87 @@ impl InstanceParams {
 # 优先级：命令行 `-c 键=值` > 本文件 > 内置默认。
 # 寻址：`-p <本文件|根区目录>` > 环境变量 {ENV_INI} > 当前目录的 {FILE_NAME}
 #
-# 两类参数：
+# 两类参数（`bicdb params` 的「类别」列同此）：
 #   [init]    建区期——`bicdb init` 读取；**建区后不可改**（控制文件权威，
 #             改了 `bicdb start` 会逐项核对并拒绝启动，需重建实例）
 #   其余节    运行期——改完**重启**生效（`bicdb restart`）
 # ============================================================
+"
+        ));
+        for section in Self::sections() {
+            out.push_str(&format!("\n[{section}]\n"));
+            for spec in SPECS.iter().filter(|sp| sp.section == section) {
+                let value = self.value_of(section, spec.key).unwrap_or_default();
+                out.push_str(&format!("{:<22}= {}   # {}\n", spec.key, value, spec.doc));
+            }
+        }
+        out
+    }
 
-[instance]
-# 根区目录：实例的全部文件（字典/撤销/日志/控制文件）都在它下面。
-# 本文件就在 <db_root>/{FILE_NAME}；实例在哪儿由本项**注册**（权威）。
-db_root = {}
+    /// **建区期参数的当前值**（`bicdb params` 用；它们"当前是什么"由参数文件
+    /// 里的记录给出——建区后控制文件才是权威，见 `check_creation`）。
+    #[must_use]
+    pub fn init_fact(&self, key: &str) -> (String, Source) {
+        let v = match key {
+            "file0_initial_blocks" => self.init.file0_initial_blocks,
+            "undo_initial_blocks" => self.init.undo_initial_blocks,
+            "wal_groups" => u64::from(self.init.wal_groups),
+            "wal_members" => u64::from(self.init.wal_members),
+            "wal_group_pages" => u64::from(self.init.wal_group_pages),
+            _ => 0,
+        };
+        (v.to_string(), Source::File)
+    }
 
-[init]
-# 建区期参数（`bicdb init` 读；建区后只作记录，见上）
-file0_initial_blocks = {}   # file 0（字典/数据）初始块数（16 KiB/块）
-undo_initial_blocks  = {}   # 撤销文件初始块数
-wal_groups           = {}   # 日志组数（2–8，至少 2 组轮转）
-wal_members          = {}   # 每组成员数（1–8）
-wal_group_pages      = {}   # 每组成员页数（512 B/页）
-
-[buffer]
-pool_frames = {}   # 缓冲池帧数（16 KiB/帧）
-
-[storage]
-file_extend_blocks = {}   # 段增长撞文件尾时的固定增量（块；512 = 8 MiB）
-
-[service]
-socket = {}   # 控制套接字（相对根区目录；也可给绝对路径）
-log    = {}   # 服务日志（同上）
-
-[lock]
-park_ms               = {}   # 等锁单次挂起时长（毫秒）
-deadlock_threshold_ms = {}   # 死锁检测阈值（毫秒）
-",
-            self.db_root.display(),
-            self.init.file0_initial_blocks,
-            self.init.undo_initial_blocks,
-            self.init.wal_groups,
-            self.init.wal_members,
-            self.init.wal_group_pages,
-            self.run.pool_frames,
-            self.run.file_extend_blocks,
-            self.run.socket,
-            self.run.log,
-            self.run.park_ms,
-            self.run.deadlock_threshold_ms
-        )
+    /// **取值文本**（渲染参数文件与 `bicdb params` 共用这一份）。
+    ///
+    /// 找不到的键 ⇒ `None`（`SPECS` 里声明了却在这里漏了臂，会被渲染测试抓住）。
+    #[must_use]
+    pub fn value_of(&self, section: &str, key: &str) -> Option<String> {
+        let v = match (section, key) {
+            ("instance", "db_root") => self.db_root.display().to_string(),
+            ("init", "file0_initial_blocks") => self.init.file0_initial_blocks.to_string(),
+            ("init", "undo_initial_blocks") => self.init.undo_initial_blocks.to_string(),
+            ("init", "wal_groups") => self.init.wal_groups.to_string(),
+            ("init", "wal_members") => self.init.wal_members.to_string(),
+            ("init", "wal_group_pages") => self.init.wal_group_pages.to_string(),
+            ("buffer", "pool_frames") => self.run.pool_frames.to_string(),
+            ("buffer", "hash_buckets") => self.run.hash_buckets.to_string(),
+            ("buffer", "bucket_latches") => self.run.bucket_latches.to_string(),
+            ("buffer", "hot_fraction") => self.run.hot_fraction.to_string(),
+            ("buffer", "touch_interval_ms") => self.run.touch_interval_ms.to_string(),
+            ("buffer", "cool_count") => self.run.cool_count.to_string(),
+            ("buffer", "stay_count") => self.run.stay_count.to_string(),
+            ("buffer", "hot_criteria") => self.run.hot_criteria.to_string(),
+            ("buffer", "max_scan_fraction") => self.run.max_scan_fraction.to_string(),
+            ("buffer", "make_free_batch_divisor") => self.run.make_free_batch_divisor.to_string(),
+            ("storage", "file_extend_blocks") => self.run.file_extend_blocks.to_string(),
+            ("storage", "multiblock_read_pages") => self.run.multiblock_read_pages.to_string(),
+            ("storage", "cr_max_rounds") => self.run.cr_max_rounds.to_string(),
+            ("wal", "log_buffer_pages") => self.run.log_buffer_pages.to_string(),
+            ("wal", "flush_trigger_permille") => self.run.flush_trigger_permille.to_string(),
+            ("catalog", "row_cache_rows") => self.run.row_cache_rows.to_string(),
+            ("catalog", "row_cache_bytes") => self.run.row_cache_bytes.to_string(),
+            ("catalog", "rid_forward_max_hops") => self.run.rid_forward_max_hops.to_string(),
+            ("index", "bulk_fill_percent") => self.run.bulk_fill_percent.to_string(),
+            ("service", "socket") => self.run.socket.clone(),
+            ("service", "log") => self.run.log.clone(),
+            ("service", "start_wait_s") => self.run.start_wait_s.to_string(),
+            ("service", "stop_wait_s") => self.run.stop_wait_s.to_string(),
+            ("service", "ready_poll_ms") => self.run.ready_poll_ms.to_string(),
+            ("service", "stop_poll_ms") => self.run.stop_poll_ms.to_string(),
+            ("service", "probe_timeout_ms") => self.run.probe_timeout_ms.to_string(),
+            ("service", "status_timeout_ms") => self.run.status_timeout_ms.to_string(),
+            ("service", "log_tail_lines") => self.run.log_tail_lines.to_string(),
+            ("client", "handshake_timeout_ms") => self.run.handshake_timeout_ms.to_string(),
+            ("client", "request_timeout_ms") => self.run.request_timeout_ms.to_string(),
+            ("auth", "pbkdf2_iterations") => self.run.pbkdf2_iterations.to_string(),
+            ("lock", "park_ms") => self.run.park_ms.to_string(),
+            ("lock", "deadlock_threshold_ms") => self.run.deadlock_threshold_ms.to_string(),
+            ("lock", "wait_max_rounds") => self.run.wait_max_rounds.to_string(),
+            _ => return None,
+        };
+        Some(v)
     }
 
     /// **核对建区期参数**（控制文件/文件事实为权威）：返回逐项不符。
@@ -584,20 +1159,13 @@ deadlock_threshold_ms = {}   # 死锁检测阈值（毫秒）
     /// 全部可调项（`节`, `键`）。
     #[must_use]
     pub fn all_keys() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("instance", "db_root"),
-            ("init", "file0_initial_blocks"),
-            ("init", "undo_initial_blocks"),
-            ("init", "wal_groups"),
-            ("init", "wal_members"),
-            ("init", "wal_group_pages"),
-            ("buffer", "pool_frames"),
-            ("storage", "file_extend_blocks"),
-            ("service", "socket"),
-            ("service", "log"),
-            ("lock", "park_ms"),
-            ("lock", "deadlock_threshold_ms"),
-        ]
+        SPECS.iter().map(|s| (s.section, s.key)).collect()
+    }
+
+    /// **全部声明**（`bicdb params` 的清单与说明、渲染都读它）。
+    #[must_use]
+    pub fn specs() -> &'static [Spec] {
+        SPECS
     }
 }
 

@@ -7,21 +7,24 @@
 //! ```
 //!
 //! **两条路的语义差异（记档）**：
-//! - 直连：`Session` 在客户端进程里，语句直接落到实例；
-//! - 经服务：语句送到守护进程执行，结果按过渡协议（`bicdb_cli::wire`）回来；
+//! - 直连：`Session` 在客户端进程里，语句直接落到实例；显式事务的句柄由
+//!   **连接**保管（`Instance::txn`），语句执行时借给会话——两条路的事务
+//!   语义因此一致（`BEGIN … COMMIT` 跨语句成立）；
+//! - 经服务：语句送到守护进程执行，结果按 `bicdb-net` 的本机协议回来；
 //!   **事务语义由服务端"一个连接一个会话"保证**——`BEGIN … COMMIT` 跨语句成立。
 //!
 //! **`DESCRIBE` 只在直连可用**（要走目录的列定义）——经服务时先用直连打开
 //! 会被锁挡住，所以经服务形态下 `DESC` 明确报"需直连"（不静默给空）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bicdb_catalog::dict::{namespace, ColTypeCode};
 use bicdb_cli::boot::{self, Instance};
 use bicdb_cli::lock::LockMode;
+use bicdb_cli::proto;
 use bicdb_cli::service::{self, ServiceState};
-use bicdb_cli::wire::{self, Client};
 use bicdb_common::seq::CommitSeq;
+use bicdb_net::Client;
 use bicdb_sql::session::{QueryResult, Session};
 
 /// 连接错误。
@@ -81,14 +84,37 @@ impl Conn {
         params: &bicdb_cli::config::InstanceParams,
         force_direct: bool,
     ) -> Result<Self, ConnError> {
+        Self::open_with(params, force_direct, None)
+    }
+
+    /// 与 [`Conn::open`] 同，但可**显式给控制套接字**（`bicdbcli -s <套接字>`：
+    /// 绕过参数文件里的 `[service] socket`，用于运维/多实例排障）。
+    pub fn open_with(
+        params: &bicdb_cli::config::InstanceParams,
+        force_direct: bool,
+        socket: Option<&Path>,
+    ) -> Result<Self, ConnError> {
+        let run = &params.run;
         let dir = params.db_root.clone();
         let dir = dir.as_path();
+        if let Some(sock) = socket {
+            // 显式套接字 ⇒ 就是"经服务"（直连形态由 `--direct` 选，二者并用报错）。
+            if force_direct {
+                return Err(ConnError::State(
+                    "`-s <套接字>`（经服务）与 `--direct`（直连）不能一起给".to_owned(),
+                ));
+            }
+            let client = Self::connect_configured(sock, run)?;
+            return Ok(Conn::Remote {
+                client,
+                socket: sock.to_path_buf(),
+                dir: dir.to_path_buf(),
+            });
+        }
         if !force_direct {
             match service::state_of(dir) {
                 ServiceState::Serving(info) => {
-                    let client = Client::connect(&info.socket).map_err(|e| {
-                        ConnError::Wire(format!("连服务 {}：{e}", info.socket.display()))
-                    })?;
+                    let client = Self::connect_configured(&info.socket, run)?;
                     return Ok(Conn::Remote {
                         client,
                         socket: info.socket.clone(),
@@ -106,6 +132,48 @@ impl Conn {
         }
         let inst = boot::open_instance(params).map_err(|e| ConnError::Boot(e.to_string()))?;
         Ok(Conn::Local(Box::new(inst)))
+    }
+
+    /// **按 `[client]` 参数连接**（握手超时 / 请求超时；0 = 请求不限时）。
+    fn connect_configured(
+        socket: &Path,
+        run: &bicdb_cli::config::RunParams,
+    ) -> Result<Client, ConnError> {
+        let mut client = Client::connect_with_timeout(
+            socket,
+            std::time::Duration::from_millis(run.handshake_timeout_ms),
+        )
+        .map_err(|e| ConnError::Wire(format!("连服务 {}：{e}", socket.display())))?;
+        if run.request_timeout_ms > 0 {
+            client
+                .set_timeout(std::time::Duration::from_millis(run.request_timeout_ms))
+                .map_err(|e| ConnError::Wire(e.to_string()))?;
+        }
+        Ok(client)
+    }
+
+    /// **认证**（`-U <主体>`）：经服务的连接上做一次 `AUTH`（连上之后、语句之前）。
+    ///
+    /// 直连形态**没有这一步**（本机 = OS 身份）——给了 `-U` 就具名拒绝：
+    /// 悄悄忽略会让人以为"以 `alice` 的身份"跑了语句。
+    ///
+    /// # Errors
+    /// 服务端拒绝（主体名或口令不对 / 已暂停 / 非 PUBLIC / 已认证）或直连形态。
+    pub fn authenticate(
+        &mut self,
+        c: &bicdb_cli::clientauth::Credentials,
+    ) -> Result<bicdb_net::AuthOk, ConnError> {
+        match self {
+            Conn::Remote { client, .. } => client
+                .auth(&c.user, &c.password)
+                // 服务端的具名文案**原样透传**（错误文本是契约的一部分）。
+                .map_err(|e| ConnError::Wire(e.to_string())),
+            Conn::Local(_) => Err(ConnError::State(format!(
+                "`-U {}` 只对**经服务**的连接有效——现在是直连形态：\
+                 本机访问按控制套接字的文件权限（OS 身份）判定",
+                c.user
+            ))),
+        }
     }
 
     /// 连接形态的展示名。
@@ -145,18 +213,35 @@ impl Conn {
             Conn::Local(inst) => {
                 let seq = inst.seq();
                 let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
-                session
-                    .execute(sql)
-                    .map_err(|e| ConnError::Sql(e.to_string()))
+                // **接上管理面**（DCL 的落点：注册表在 `<BICDB_HOME>/control/`）。
+                session.set_dcl_context(
+                    bicdb_cli::home::Home::locate().ok().map(|h| h.root),
+                    Some(inst.io),
+                );
+                session.set_workspace_provisioner(Some(
+                    bicdb_cli::provision::CliProvisioner::new_static(),
+                ));
+                session.set_pbkdf2_iterations(inst.params.run.pbkdf2_iterations);
+                // **固定表的内容源**（`file$` ← 控制文件的内存映像）。
+                session.set_fixed_table_source(Some(bicdb_cli::fixed::CliFixedTables::new_static(
+                    &inst.dir, inst.io,
+                )));
+                // **事务跨语句**：直连形态每条语句新建一个会话（会话借住实例，
+                // 活不过一次调用），所以显式事务的句柄由**连接**保管——
+                // 借给这句，执行完交回。不这样做的话 `BEGIN` 会在语句收尾的
+                // `Drop` 里被回滚、`COMMIT` 只回一句"没有活动事务"（静默降级）。
+                let _ = session.adopt_txn(inst.txn.take());
+                let out = session.execute(sql);
+                inst.txn = session.release_txn();
+                out.map_err(|e| ConnError::Sql(e.to_string()))
             }
             Conn::Remote { client, .. } => {
-                // 载荷 = **参数序列 + SQL 文本**（`bicdb_cli::wire` 的请求编码；
-                // 这里没有参数，序列为空——但格式必须一致，否则服务端解不出来）。
-                let payload = wire::encode_sql_request(sql, &[]);
-                let body = client
-                    .call("SQL", &payload)
+                // 参数随请求走（这里没有参数，序列为空）；结果按 `bicdb-net`
+                // 的语句形状回来，再译回呈现层认的形状（两条路共用一份打印）。
+                let statements = client
+                    .sql(sql, &[])
                     .map_err(|e| ConnError::Sql(e.to_string()))?;
-                Ok(wire::decode_results(&body))
+                Ok(proto::results(&statements))
             }
         }
     }
@@ -165,15 +250,15 @@ impl Conn {
     pub fn describe(&mut self, name: &str) -> Result<Vec<ColumnInfo>, ConnError> {
         if let Conn::Remote { client, .. } = self {
             // 经服务：服务端只读目录回列清单（同一份 `type_name` 口径）。
-            let body = client
-                .call("DESCRIBE", name)
+            let cols = client
+                .describe(name)
                 .map_err(|e| ConnError::State(e.to_string()))?;
-            return Ok(wire::decode_columns(&body)
+            return Ok(cols
                 .into_iter()
-                .map(|(name, nullable, type_name)| ColumnInfo {
-                    name,
-                    nullable,
-                    type_name,
+                .map(|c| ColumnInfo {
+                    name: c.name,
+                    nullable: c.nullable,
+                    type_name: c.type_name,
                 })
                 .collect());
         }

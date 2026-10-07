@@ -90,7 +90,7 @@ impl TableWriter for TestWriter<'_, '_, '_, '_> {
         .map_err(|e| ExecError::Spill(format!("insert：{e}")))
     }
 
-    fn update_row(&mut self, rid: RowId, row_bytes: &[u8]) -> Result<(), ExecError> {
+    fn update_row(&mut self, rid: RowId, _old: &[u8], row_bytes: &[u8]) -> Result<(), ExecError> {
         let txn = self.txn.as_mut().expect("事务已开");
         let key = BufferKey::new(
             WS,
@@ -112,7 +112,7 @@ impl TableWriter for TestWriter<'_, '_, '_, '_> {
         .map_err(|e| ExecError::Spill(format!("update：{e}")))
     }
 
-    fn delete_row(&mut self, rid: RowId) -> Result<(), ExecError> {
+    fn delete_row(&mut self, rid: RowId, _old: &[u8]) -> Result<(), ExecError> {
         let txn = self.txn.as_mut().expect("事务已开");
         let key = BufferKey::new(
             WS,
@@ -228,7 +228,7 @@ fn read_all(env: &Env, blocks: Vec<u32>, snapshot: CommitSeq) -> Vec<Row> {
         Ok(Box::new(HeapScanner::new(
             env.pool,
             &env.chain,
-            snapshot,
+            bicdb_storage::cr::ReadView::new(snapshot),
             DATA_FID,
             blocks.clone(),
         )) as Box<dyn RowCursor>)
@@ -338,6 +338,7 @@ fn insert_update_delete_round_trip_through_the_engine() {
                     right: Box::new(lit(num("2"))),
                 },
             }),
+            shape: shape(),
         };
         // 语句 ③ 的源：更新已提交后直读捕获。
         let captured_delete = CapturedRows::capture_direct(env.pool, &blocks)

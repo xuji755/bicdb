@@ -117,6 +117,30 @@ from_err!(
     Row <- RowCodecError,
 );
 
+/// **行迁移转发链的最大跳数**（默认 16；实例参数 `catalog.rid_forward_max_hops`）。
+pub const DEFAULT_FORWARD_MAX_HOPS: usize = 16;
+
+static FORWARD_MAX_HOPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_FORWARD_MAX_HOPS);
+
+/// 当前的转发链跳数上限。
+#[must_use]
+pub fn forward_max_hops() -> usize {
+    FORWARD_MAX_HOPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **设定转发链跳数上限**（1–1024）。
+///
+/// # Errors
+/// 越界。
+pub fn set_forward_max_hops(hops: usize) -> Result<(), &'static str> {
+    if !(1..=1024).contains(&hops) {
+        return Err("rid_forward_max_hops 要落在 1–1024");
+    }
+    FORWARD_MAX_HOPS.store(hops, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 fn mismatch(why: impl Into<String>) -> OpenError {
     OpenError::PlanMismatch(why.into())
 }
@@ -227,7 +251,8 @@ impl<'io> Catalog<'io> {
             entries,
             tables,
             indexes,
-            cache: crate::cache::RowCache::new(0),
+            // 容量取实例参数（`catalog.row_cache_rows/bytes`；没设过就是默认）。
+            cache: crate::cache::RowCache::with_caps(0, crate::cache::cache_caps()),
             pool: None,
             current_seq: 0,
             obj_seq: std::cell::Cell::new(None),
@@ -554,7 +579,7 @@ impl<'io> Catalog<'io> {
     /// 有限跳（16）——环即拒。`Forwarding` 槽的 6B 载荷 = 落点 ROWID。
     pub fn resolve_rid(&mut self, rid: RowId) -> Result<RowId, OpenError> {
         let mut cur = rid;
-        for _ in 0..16 {
+        for _ in 0..crate::open::forward_max_hops() {
             let page = self.page_pooled(cur.block_id())?;
             match heap::slot_status(&page, cur.row_id()) {
                 Some(SlotStatus::Forwarding) => {
@@ -1109,19 +1134,20 @@ mod tests {
     }
 
     #[test]
-    fn public_workspace_seeds_23_entries_and_its_own_tables() {
+    fn public_workspace_seeds_27_entries_and_its_own_tables() {
         let io = MemFileIo::new();
         io.add_dir("/mem");
         let mut cat = seeded(&io, "/mem/o5.dat", true);
         assert!(cat.is_public());
-        assert_eq!(cat.entries().len(), 23);
-        // public 的三张表也在自举集里（空表——尚无主体/工作区/文件系统登记）。
+        assert_eq!(cat.entries().len(), 27);
+        // public 的四张管理表也在自举集里（空表——尚无主体/工作区/文件系统登记）。
         assert!(cat.table_names().contains(&"user$"));
         assert!(cat.table_names().contains(&"ws$"));
         assert!(cat.table_names().contains(&"fs$"));
+        assert!(cat.table_names().contains(&"wq$"));
         assert!(cat.scan("ws$").unwrap().is_empty());
-        // obj$ = 23 个对象。
-        assert_eq!(cat.scan("obj$").unwrap().len(), 23);
+        // obj$ = 27 个对象。
+        assert_eq!(cat.scan("obj$").unwrap().len(), 27);
     }
 
     #[test]

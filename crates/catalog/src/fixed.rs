@@ -117,6 +117,18 @@ pub fn file_table(records: &[DataFileRecord]) -> FixedTable {
     }
 }
 
+/// **按名取固定表的列定义**（`None` = 不认识这张固定表）。
+///
+/// 与 [`table`] 分开：**列是静态的**，而表要控制文件的内存映像才产得出行
+/// （绑定期只需要列——`sql::bind` 的 `fixed_columns` 就走这条）。
+#[must_use]
+pub fn columns(name: &str) -> Option<&'static [FixedColumn]> {
+    match name {
+        "file$" => Some(FILE_COLUMNS),
+        _ => None,
+    }
+}
+
 /// **按名取固定表**（V1.0 只有 `file$`；`session$`/`lock$` 随会话层）。
 ///
 /// `records` = 控制文件内存映像里的已用数据文件记录（[`bicdb_storage::controlfile::ControlFile::data_file_records`]）。

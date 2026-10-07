@@ -20,7 +20,10 @@
 pub mod checksum;
 pub mod error;
 pub mod latch;
+pub mod pbkdf2;
 pub mod seq;
+pub mod sha256;
+pub mod sha512;
 
 pub use checksum::{
     crc32c, page_checksum, set_page_checksum, verify_page_checksum, Crc32c, PAGE_SIZE,

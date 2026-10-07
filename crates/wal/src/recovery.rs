@@ -773,7 +773,7 @@ mod recover_tests {
 
         // 快照 ≥ 7 的一致性读：胜者的行可见（ITL 活动 + 事务表补标记救回来）。
         let snapshot = CommitSeq::from_raw(8).unwrap();
-        let cr_page = cr::reconstruct(&page, snapshot, &chain).unwrap();
+        let cr_page = cr::reconstruct(&page, cr::ReadView::new(snapshot), &chain).unwrap();
         assert_eq!(heap::row(&cr_page, winner_row), Some(&winner_bytes[..]));
 
         // ---- 重跑恢复：幂等（无输家、重做全跳过） ----

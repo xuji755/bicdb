@@ -19,8 +19,8 @@ use std::process::ExitCode;
 
 use bicdb_cli::boot;
 use bicdb_cli::config;
+use bicdb_cli::proto;
 use bicdb_cli::service::{self, ServiceError, StartOptions, StopMode};
-use bicdb_cli::wire;
 use bicdb_exec::Value;
 use bicdb_sql::session::{QueryResult, Session, SessionError};
 
@@ -28,16 +28,23 @@ const USAGE: &str = "\
 bicdb —— 带撤销/日志的页式数据库（V1.0 单工作区）
 
 用法：
-  bicdb init    <根区目录> [-p 种子参数文件] [-c 键=值]
+  bicdb init    [<工作区名|根区目录>] [-p 种子参数文件] [-c 键=值]
                                 建区（**唯一接受目录的命令**）：建库 + 生成
-                                <根区目录>/bicdb.ini（实例参数文件）
+                                <根区目录>/bicdb.ini（实例参数文件）。
+                                **不给参数** ⇒ <BICDB_HOME>/public（初始化部署）；
+                                给名字 ⇒ <BICDB_HOME>/<名字>；给路径 ⇒ 原样
+  bicdb home                    BICDB_HOME 在哪：程序/数据/日志/备份四条路径
+  bicdb list                    <BICDB_HOME> 下的工作区与状态
   bicdb start   [-p 参数文件] [-s 套接字] [-l 日志] [-w 秒] [-c 键=值]
                                 后台起服务（分离进程 + 实例锁 + 控制套接字）
-  bicdb stop    [-p 参数文件] [-m fast|immediate]    停服务（fast = 完全检查点）
+  bicdb stop    [-p 参数文件] [-m fast|immediate] [-w 秒]  停服务（fast = 完全检查点；
+                                -w 等它退出，默认 300 秒）
   bicdb status  [-p 参数文件]    服务/实例状态
   bicdb restart [-p 参数文件]    重启服务
   bicdb params  [-p 参数文件] [-c 键=值]   有效参数表（默认/文件/命令行三来源）
-  bicdb sql     [-p 参数文件] <SQL>…       执行 SQL（服务在跑时经套接字）
+  bicdb sql     [-p 参数文件] [-U 主体] <SQL>…
+                                执行 SQL（服务在跑时经套接字）；`-U` 以某个主体
+                                认证（口令取 $BICDB_PASSWORD 或终端提示）
   bicdb shell   [-p 参数文件]              交互式 shell
   bicdb version | help
 
@@ -123,29 +130,68 @@ fn run(args: &[String]) -> Result<(), Exit> {
             Ok(())
         }
         "init" => {
-            let root = args
+            let given = args
                 .get(1)
                 .filter(|a| !a.starts_with('-'))
-                .ok_or_else(|| Exit::Usage("init 缺根区目录".to_owned()))?;
+                .map(String::as_str);
+            let (target, name) = resolve_init_target(given)?;
             let seed = config::parse_ini_arg(&args[1..]);
-            let overrides =
+            let mut overrides =
                 config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
-            let params = config::InstanceParams::for_init(
-                std::path::Path::new(root),
-                seed.as_deref(),
-                &overrides,
-            )
-            .map_err(|e| Exit::Failed(e.to_string()))?;
-            let mut inst = boot::create_instance(&params)?;
+            // 名字式：**日志统一落 <BICDB_HOME>/log/**（运维不用到处找）；显式
+            // 给了 `-c service.log=…` 就听用户的。
+            if let Some(name) = &name {
+                if let Ok(home) = bicdb_cli::home::Home::locate() {
+                    std::fs::create_dir_all(home.log_dir()).map_err(|e| {
+                        Exit::Failed(format!("建日志目录 {} 失败：{e}", home.log_dir().display()))
+                    })?;
+                    std::fs::create_dir_all(home.backup_dir()).map_err(|e| {
+                        Exit::Failed(format!(
+                            "建备份目录 {} 失败：{e}",
+                            home.backup_dir().display()
+                        ))
+                    })?;
+                    if !overrides.iter().any(|(k, _)| k.ends_with("log")) {
+                        overrides.push((
+                            "service.log".to_owned(),
+                            home.workspace_log(name).display().to_string(),
+                        ));
+                    }
+                }
+            }
+            let params = config::InstanceParams::for_init(&target, seed.as_deref(), &overrides)
+                .map_err(|e| Exit::Failed(e.to_string()))?;
+            let home = bicdb_cli::home::Home::locate_for_init().ok();
+            let mut inst = boot::create_instance(&params, home.as_ref())?;
             inst.shutdown()?;
             println!("已建区：{}", params.db_root.display());
             println!("  参数文件  {}", params.ini_path().display());
-            println!("  工作区    {}", String::from_utf8_lossy(&boot::WS));
+            println!(
+                "  工作区    ref {}（标识 = SHA-256(工作区号) 前 8 字节）",
+                boot::ws_name(inst.ws_ref)
+            );
             println!(
                 "  日志组    {} 组 × {} 成员 × {} 页",
                 params.init.wal_groups, params.init.wal_members, params.init.wal_group_pages
             );
-            println!("  下一步    bicdb start -p {}", params.db_root.display());
+            println!("  日志      {}", params.run.log);
+            match (&home, name.as_deref()) {
+                (Some(h), _) => {
+                    let registered = h.global_ctl_paths().iter().all(|p| p.exists());
+                    if registered {
+                        println!("  注册表    {}（已登记）", h.control_dir().display());
+                    }
+                }
+                (None, _) => {
+                    println!(
+                        "  注册表    （无 BICDB_HOME：未登记进实例注册表，`bicdb list` 看不到它）"
+                    );
+                }
+            }
+            println!(
+                "  下一步    bicdb start -p {}",
+                name.as_deref().unwrap_or("public")
+            );
             Ok(())
         }
         "start" => {
@@ -154,14 +200,146 @@ fn run(args: &[String]) -> Result<(), Exit> {
             Ok(())
         }
         "stop" => {
-            let opts = service_opts(&args[1..])?;
+            let opts = service_opts_for(&args[1..], true)?;
             let mode = flag_value(&args[1..], &["-m", "--mode"])
                 .map(|v| {
                     StopMode::parse(&v).ok_or_else(|| Exit::Usage(format!("停止模式 `{v}` 不认识")))
                 })
                 .transpose()?
                 .unwrap_or(StopMode::Fast);
-            service::stop(&opts.dir, mode)?;
+            // **`stop` 的等待上限**：默认取 `service.stop_wait_s`（完全检查点在
+            // 大库上要几分钟），`-w` 覆盖。
+            service::stop(&opts.dir, mode, opts.timeout, &opts.params)?;
+            Ok(())
+        }
+        "home" => {
+            // **运维只记这一条命令**：程序/数据/日志/备份四件事的实际路径一次打印。
+            match bicdb_cli::home::Home::locate() {
+                Ok(home) => {
+                    println!("BICDB_HOME = {}", home.root.display());
+                    println!("  来源    {}", home.source.as_str());
+                    println!(
+                        "  程序    {}（版本 {}）",
+                        home.app_dir().display(),
+                        home.version().unwrap_or_else(|| "未写 VERSION".to_owned())
+                    );
+                    println!("  数据    {}", home.public_dir().display());
+                    println!("  日志    {}", home.log_dir().display());
+                    println!("  备份    {}", home.backup_dir().display());
+                    println!(
+                        "  注册表  {}（全局控制文件双副本）",
+                        home.control_dir().display()
+                    );
+                    println!("  （工作区一览：`bicdb list`；有效参数：`bicdb params -p public`）");
+                }
+                Err(e) => {
+                    println!("{e}");
+                    println!("  提示    装到系统里：`scripts/install.sh [--home <目录>]`；");
+                    println!(
+                        "          或 `export {}=<目录>`；路径式用法不受影响（`bicdb init <目录>`）。",
+                        bicdb_cli::home::ENV_HOME
+                    );
+                }
+            }
+            Ok(())
+        }
+        "list" => {
+            // `<BICDB_HOME>/` 下的工作区一览（`public` + 额外的；Oracle `oratab` /
+            // PG `pg_lsclusters` 的同位物）。
+            let home = bicdb_cli::home::Home::locate().map_err(|e| Exit::Failed(e.to_string()))?;
+            let list = home
+                .workspaces()
+                .map_err(|e| Exit::Failed(format!("读 {} 失败：{e}", home.root.display())))?;
+            if list.is_empty() {
+                println!(
+                    "（{} 下还没有工作区——`bicdb init` 建 PUBLIC）",
+                    home.root.display()
+                );
+                return Ok(());
+            }
+            // **注册表**（全局控制文件）：登记的才算"实例里的工作区"。
+            // 扫描只看文件面——两者不一致时如实标出来（崩在这三步中间是已知形态）。
+            let registered: Vec<(std::path::PathBuf, u64, u8)> = match boot::open_global_ctl(&home)
+            {
+                Ok(gcf) => {
+                    let recs = gcf.workspaces().unwrap_or_default();
+                    let out = recs
+                        .iter()
+                        .map(|r| {
+                            (
+                                std::path::PathBuf::from(
+                                    String::from_utf8_lossy(&r.root).into_owned(),
+                                ),
+                                r.workspace_id.as_raw(),
+                                r.status,
+                            )
+                        })
+                        .collect();
+                    let _ = gcf.close();
+                    out
+                }
+                Err(e) => {
+                    println!("（注册表读不了：{e}）");
+                    Vec::new()
+                }
+            };
+            println!(
+                "{:<20} {:<10} {:<8} {:<10} 工作区目录",
+                "工作区", "状态", "工作区号", "注册"
+            );
+            println!("{:-<20} {:-<10} {:-<8} {:-<10} {:-<40}", "", "", "", "", "");
+            for (name, dir) in &list {
+                let state = match service::state_of(dir) {
+                    service::ServiceState::Serving(_) => "运行中",
+                    service::ServiceState::Direct(_) => "直连中",
+                    service::ServiceState::Stale(_) => "陈旧锁",
+                    service::ServiceState::NotRunning => "已停",
+                };
+                let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+                let hit = registered.iter().find(|(root, _, _)| {
+                    let r = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                    r == canon
+                });
+                match hit {
+                    Some((_, id, _)) => {
+                        println!(
+                            "{:<20} {:<10} {:<8} {:<10} {}",
+                            name,
+                            state,
+                            id,
+                            "已登记",
+                            dir.display()
+                        )
+                    }
+                    None => println!(
+                        "{:<20} {:<10} {:<8} {:<10} {}",
+                        name,
+                        state,
+                        "—",
+                        "未登记",
+                        dir.display()
+                    ),
+                }
+            }
+            // 登记了但目录不在（删目录没摘登记 / 搬走了）：**如实报**，不静默。
+            let listed: Vec<std::path::PathBuf> = list.iter().map(|(_, d)| d.clone()).collect();
+            for (root, id, _) in &registered {
+                let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                if !listed
+                    .iter()
+                    .any(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()) == canon)
+                    && !canon.join("bicdb.ini").is_file()
+                {
+                    println!(
+                        "{:<20} {:<10} {:<8} {:<10} {}（登记了但目录不在——`bicdb init` 重建或手工摘除）",
+                        "(缺失)",
+                        "—",
+                        id,
+                        "已登记",
+                        root.display()
+                    );
+                }
+            }
             Ok(())
         }
         "params" => {
@@ -170,49 +348,47 @@ fn run(args: &[String]) -> Result<(), Exit> {
             let overrides =
                 config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
             let (p, table) = boot::instance_params(ini.as_deref(), &overrides)?;
-            let value_of = |section: &str, key: &str| -> String {
-                let full = format!("{section}.{key}");
-                match (section, key) {
-                    ("instance", "db_root") => p.db_root.display().to_string(),
-                    ("init", "file0_initial_blocks") => p.init.file0_initial_blocks.to_string(),
-                    ("init", "undo_initial_blocks") => p.init.undo_initial_blocks.to_string(),
-                    ("init", "wal_groups") => p.init.wal_groups.to_string(),
-                    ("init", "wal_members") => p.init.wal_members.to_string(),
-                    ("init", "wal_group_pages") => p.init.wal_group_pages.to_string(),
-                    ("buffer", "pool_frames") => p.run.pool_frames.to_string(),
-                    ("storage", "file_extend_blocks") => p.run.file_extend_blocks.to_string(),
-                    ("service", "socket") => p.run.socket.clone(),
-                    ("service", "log") => p.run.log.clone(),
-                    ("lock", "park_ms") => p.run.park_ms.to_string(),
-                    ("lock", "deadlock_threshold_ms") => p.run.deadlock_threshold_ms.to_string(),
-                    _ => table
-                        .iter()
-                        .find(|(tk, _, _)| *tk == full)
-                        .map_or_else(String::new, |(_, v, _)| v.clone()),
-                }
-            };
             println!("实例参数（{}）", p.ini_path().display());
             println!("{:<32} {:<26} {:<8} 类别", "节.键", "取值", "来源");
             println!("{:-<32} {:-<26} {:-<8} {:-<10}", "", "", "", "");
-            for (section, key) in config::InstanceParams::all_keys() {
-                let full = format!("{section}.{key}");
-                let src = table
-                    .iter()
-                    .find(|(tk, _, _)| *tk == full)
-                    .map_or(config::Source::Default, |(_, _, s)| *s);
-                let kind = if section == "init" {
-                    "建区期"
+            // 清单与说明都来自 `config::SPECS`（参数的唯一声明表）——
+            // 这里不再各写一份 match（此前加一个键要改五处，漏一处就出现
+            // "文件里能写但没人读"）。
+            for spec in config::InstanceParams::specs() {
+                let (section, key) = (spec.section, spec.key);
+                let shown = if spec.effect == config::Effect::Creation {
+                    // 建区期参数只回显当前实例的事实，不给"可改"的错觉。
+                    p.init_fact(key)
                 } else {
-                    "运行期"
+                    overrides
+                        .iter()
+                        .rev()
+                        .find(|(k, _)| k == &format!("{section}.{key}") || k == key)
+                        .map(|(_, v)| (v.clone(), config::Source::Cli))
+                        .or_else(|| {
+                            table
+                                .iter()
+                                .rev()
+                                .find(|(k, _, _)| k == &format!("{section}.{key}"))
+                                .map(|(_, v, src)| (v.clone(), *src))
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                p.value_of(section, key).unwrap_or_default(),
+                                config::Source::Default,
+                            )
+                        })
                 };
+                let (value, source) = shown;
+                let class = spec.effect.as_str();
                 println!(
-                    "{full:<32} {:<26} {:<8} {kind}",
-                    value_of(section, key),
-                    src.as_str()
+                    "{:<34} {:<14} {:<8} {class}  {}",
+                    format!("{section}.{key}"),
+                    value,
+                    source.as_str(),
+                    spec.doc
                 );
             }
-            println!();
-            println!("说明：");
             println!("  建区期参数由**控制文件**记录（权威）——`bicdb start` 会逐项核对，");
             println!("  不符即拒绝启动（改需重建实例）；运行期参数改完 `bicdb restart` 生效。");
             Ok(())
@@ -220,7 +396,7 @@ fn run(args: &[String]) -> Result<(), Exit> {
         "status" => {
             let ini = config::parse_ini_arg(&args[1..]);
             let (params, _) = boot::instance_params(ini.as_deref(), &[])?;
-            service::status(&params.db_root)?;
+            service::status(&params.db_root, &params)?;
             Ok(())
         }
         "restart" => {
@@ -239,6 +415,8 @@ fn run(args: &[String]) -> Result<(), Exit> {
             let overrides =
                 config::parse_cli_overrides(&args[1..]).map_err(|e| Exit::Failed(e.to_string()))?;
             let (params, sql_args) = split_params(&args[1..])?;
+            // **认证凭据**（`-U <主体>`；口令从 `$BICDB_PASSWORD` 或终端提示）。
+            let creds = bicdb_cli::clientauth::from_args(&args[1..]).map_err(Exit::Usage)?;
             let (inst_params, _) = boot::instance_params(ini.as_deref(), &overrides)?;
             // **服务在跑 ⇒ 走套接字**（同一条 SQL 路径，事务语义一致）。
             if let service::ServiceState::Serving(info) = service::state_of(&inst_params.db_root) {
@@ -247,7 +425,22 @@ fn run(args: &[String]) -> Result<(), Exit> {
                     .iter()
                     .map(|(n, v)| (n.as_str(), v.clone()))
                     .collect();
-                return run_over_socket(&info.socket, &text, &named);
+                return run_over_socket(
+                    &info.socket,
+                    &text,
+                    &named,
+                    &inst_params.run,
+                    creds.as_ref(),
+                );
+            }
+            // 直连形态没有"认证"这一步（本机 = OS 身份）——给了 `-U` 要**明说**，
+            // 不能悄悄忽略（那会让人以为"以 alice 的身份"跑了语句）。
+            if let Some(c) = &creds {
+                return Err(Exit::Usage(format!(
+                    "`-U {}` 只对**经服务**的连接有效——现在服务没在跑（直连形态）：\
+                     本机访问按控制套接字的文件权限（OS 身份）判定",
+                    c.user
+                )));
             }
             let mut inst = boot::open_instance(&inst_params)?;
             banner_brief(&inst);
@@ -308,7 +501,30 @@ fn with_session<R>(
 ) -> Result<R, Exit> {
     let seq = inst.seq();
     let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    attach_dcl(inst.io, inst.params.run.pbkdf2_iterations, &mut session);
+    session.set_fixed_table_source(Some(bicdb_cli::fixed::CliFixedTables::new_static(
+        &inst.dir, inst.io,
+    )));
     f(&mut session)
+}
+
+/// **给会话接上管理面上下文**（DCL 的执行落点：`BICDB_HOME` + 全局控制文件的 I/O）。
+///
+/// 没装（`Home::locate` 失败）也能跑——DCL 会以"要一个部署根"具名拒绝，不猜位置。
+fn attach_dcl(
+    io: &'static dyn bicdb_workspace::io::FileIo,
+    iterations: u32,
+    session: &mut Session<'_, '_, '_, '_>,
+) {
+    let home = bicdb_cli::home::Home::locate().ok().map(|h| h.root);
+    session.set_dcl_context(home, Some(io));
+    session.set_workspace_provisioner(Some(cli_provisioner()));
+    session.set_pbkdf2_iterations(iterations);
+}
+
+/// 供给方（无状态）——`'static` 一份就够。
+fn cli_provisioner() -> &'static bicdb_cli::provision::CliProvisioner {
+    bicdb_cli::provision::CliProvisioner::new_static()
 }
 
 /// **一句话完了吗**（`;` 结尾，**行注释不算**）。
@@ -348,24 +564,71 @@ fn flag_present(args: &[String], name: &str) -> bool {
 /// **服务类子命令的参数**：`[-p 参数文件] [-s 套接字] [-l 日志] [-w 秒] [-c 键=值]`。
 ///
 /// **不指向目录**（除 `init`）：实例在哪儿由参数文件注册（照 Oracle 的口径）。
+/// **`init` 的目标**：名字（不含 `/`）⇒ `<BICDB_HOME>/data/<名字>`；含 `/` 的路径原样。
+///
+/// 名字式要求**能定出安装根**（`BICDB_HOME` 或二进制位置推导）；定不出就报具名错误
+/// ——不偷偷建到当前目录里（那会让"实例在哪儿"变得不可预期）。
+/// **`init` 的目标**：
+/// - 不给参数 ⇒ `<BICDB_HOME>/public`（**初始化部署**，最常用）
+/// - 给名字（不含 `/`、不是保留目录名） ⇒ `<BICDB_HOME>/<名字>`（额外工作区，测试/演练）
+/// - 给路径 ⇒ 原样（安装形态**不约束**显式路径）
+///
+/// 返回 `(工作区根, 名字)`；日志默认落 `<BICDB_HOME>/log/<名字>.log`（名字式才有）。
+fn resolve_init_target(given: Option<&str>) -> Result<(std::path::PathBuf, Option<String>), Exit> {
+    // 不用 `Option::is_none_or`（stable 1.82；本仓 MSRV 1.80）。
+    let name_style = match given {
+        None => true,
+        Some(g) => !g.is_empty() && !g.contains('/'),
+    };
+    if !name_style {
+        let g = given.expect("上面已判非空");
+        return Ok((std::path::PathBuf::from(g), None));
+    }
+    match bicdb_cli::home::Home::locate_for_init() {
+        Ok(home) => {
+            let name = given.unwrap_or(bicdb_cli::home::PUBLIC);
+            let dir = home
+                .workspace_dir(name)
+                .unwrap_or_else(|| home.public_dir());
+            if dir == home.app_dir() || dir == home.log_dir() || dir == home.backup_dir() {
+                return Err(Exit::Usage(format!(
+                    "`{name}` 是保留目录名（app/log/backup）——换个名字"
+                )));
+            }
+            Ok((dir, Some(name.to_owned())))
+        }
+        Err(e) => Err(Exit::Usage(format!(
+            "名字式寻址需要先确定 BICDB_HOME：{e}\n  \
+             ——或者给路径：`bicdb init ./{}`",
+            given.unwrap_or("myws")
+        ))),
+    }
+}
+
 fn service_opts(args: &[String]) -> Result<StartOptions, Exit> {
+    service_opts_for(args, false)
+}
+
+/// `stop` 形态：等待上限的默认取 `service.stop_wait_s`（其余同 [`service_opts`]）。
+fn service_opts_for(args: &[String], stop_side: bool) -> Result<StartOptions, Exit> {
     let ini = config::parse_ini_arg(args);
     let socket = flag_value(args, &["-s", "--socket"]).map(std::path::PathBuf::from);
     let log = flag_value(args, &["-l", "--log"]).map(std::path::PathBuf::from);
-    let timeout = flag_value(args, &["-w", "--wait"])
+    // `-w` 给了就用它；没给则用参数文件里的 `service.start_wait_s`
+    // （`stop` 分支用 `stop_wait_s`——见 `service_opts_for`）。
+    let wait_s = flag_value(args, &["-w", "--wait"])
         .map(|v| {
             v.parse::<u64>()
-                .map(std::time::Duration::from_secs)
                 .map_err(|_| Exit::Usage(format!("-w 要秒数，给的是 `{v}`")))
         })
-        .transpose()?
-        .unwrap_or(std::time::Duration::from_secs(30));
+        .transpose()?;
     let overrides = config::parse_cli_overrides(args).map_err(|e| Exit::Failed(e.to_string()))?;
-    Ok(StartOptions::load(
+    Ok(StartOptions::load_with_wait(
         ini.as_deref(),
         socket,
         log,
-        timeout,
+        wait_s,
+        stop_side,
         overrides,
     )?)
 }
@@ -375,11 +638,42 @@ fn run_over_socket(
     socket: &std::path::Path,
     sql: &str,
     params: &[(&str, Value)],
+    run: &config::RunParams,
+    creds: Option<&bicdb_cli::clientauth::Credentials>,
 ) -> Result<(), Exit> {
-    let payload = wire::encode_sql_request(sql, params);
-    let body = wire::call(socket, "SQL", &payload)
+    // **握手超时**（`client.handshake_timeout_ms`）：实例忙时据此报"正忙"
+    // 而不是无声挂住。
+    let mut client = bicdb_net::Client::connect_with_timeout(
+        socket,
+        std::time::Duration::from_millis(run.handshake_timeout_ms),
+    )
+    .map_err(|e| Exit::Failed(format!("经服务执行失败：{e}")))?;
+    // **请求超时**（`client.request_timeout_ms`；0 = 不限——长查询是正常的，
+    // 但"服务卡住"需要一个能配的兜底）。
+    if run.request_timeout_ms > 0 {
+        client
+            .set_timeout(std::time::Duration::from_millis(run.request_timeout_ms))
+            .map_err(|e| Exit::Failed(format!("设置请求超时失败：{e}")))?;
+    }
+    // **认证**（给了 `-U` 才做）：连上之后、第一条语句之前（服务的准入规则）。
+    if let Some(c) = creds {
+        // 服务端文案**原文透传**（它自带 `认证失败：…` 前缀——再加一层就是重复）。
+        let id = client
+            .auth(&c.user, &c.password)
+            .map_err(|e| Exit::Failed(e.to_string()))?;
+        if id.expired {
+            eprintln!(
+                "注意：主体 `{}` 的口令已过期（`EXPIRE`）⇒ **受限会话**：\
+                 除本人改密（`ALTER USER … IDENTIFIED BY '<新>' REPLACE '<旧>'`）之外一律拒绝",
+                id.user
+            );
+        }
+    }
+    let sent = proto::wire_params(params);
+    let statements = client
+        .sql(sql, &sent)
         .map_err(|e| Exit::Failed(format!("经服务执行失败：{e}")))?;
-    let results = wire::decode_results(&body);
+    let results = proto::results(&statements);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for r in &results {
@@ -406,7 +700,7 @@ fn split_params(args: &[String]) -> Result<ParamsAndSql, Exit> {
             params.push(parse_param(kv)?);
         } else if matches!(
             a.as_str(),
-            "-p" | "--ini" | "--params-file" | "-c" | "--set"
+            "-p" | "--ini" | "--params-file" | "-c" | "--set" | "-U" | "--user"
         ) {
             let _ = it.next(); // 这两个旗标的值不是 SQL 文本
         } else {
@@ -491,7 +785,13 @@ fn print_result(out: &mut impl Write, r: &QueryResult) -> Result<(), Exit> {
     let io = |e: std::io::Error| Exit::Failed(format!("写输出失败：{e}"));
     match r {
         QueryResult::Rows { columns, rows } => {
-            print_table(out, columns, rows).map_err(io)?;
+            // 呈现：**列形态**决定右对齐（数值列），值由 `format_value` 格式化。
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let cells: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| r.iter().map(bicdb_sql::session::format_value).collect())
+                .collect();
+            print_table_with_kinds(out, &names, &cells, columns).map_err(io)?;
         }
         QueryResult::Affected(n) => writeln!(out, "影响 {n} 行").map_err(io)?,
         QueryResult::Ddl(s) => writeln!(out, "{s}").map_err(io)?,
@@ -501,11 +801,21 @@ fn print_result(out: &mut impl Write, r: &QueryResult) -> Result<(), Exit> {
 }
 
 /// 表格（列宽按内容取，`NULL` 显式写出）。
-fn print_table(
+fn print_table_with_kinds(
     out: &mut impl Write,
     columns: &[String],
     rows: &[Vec<String>],
+    meta: &[bicdb_sql::session::ColumnMeta],
 ) -> std::io::Result<()> {
+    // 数值列右对齐（形态为 NUMBER 的列）——与 SQL*Plus 的口径一致。
+    let right: Vec<bool> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            meta.get(i)
+                .is_some_and(|m| m.kind == bicdb_exec::ColKind::Number)
+        })
+        .collect();
     let mut width: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -537,7 +847,11 @@ fn print_table(
             if i > 0 {
                 write!(out, " | ")?;
             }
-            write!(out, "{cell:<width$}", width = width[i])?;
+            if right[i] {
+                write!(out, "{cell:>width$}", width = width[i])?;
+            } else {
+                write!(out, "{cell:<width$}", width = width[i])?;
+            }
         }
         writeln!(out)?;
     }
@@ -550,6 +864,10 @@ fn repl(inst: &mut boot::Instance) -> Result<(), Exit> {
     // 会话常驻整场（`Session` 借住实例；收尾在 `Drop` —— 未提交的显式事务回滚）。
     let seq = inst.seq();
     let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    attach_dcl(inst.io, inst.params.run.pbkdf2_iterations, &mut session);
+    session.set_fixed_table_source(Some(bicdb_cli::fixed::CliFixedTables::new_static(
+        &inst.dir, inst.io,
+    )));
     let stdin = std::io::stdin();
     let mut buf = String::new();
     let mut pending = String::new();

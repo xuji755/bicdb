@@ -16,7 +16,7 @@
 //!
 //! | ITL 状态 | 判定 |
 //! | --- | --- |
-//! | `Committed`（已清除） | 页内 `commit_seq` 与快照直接比较——**不必查事务表** |
+//! | `Committed`（已清除） | 页内 `commit_seq` 与快照直接比较——**不必查事务表**；**序号字段为空（0）时按"不知道"处理，回查事务表**（见 `itl::decode`） |
 //! | `Active` / `PendingRollback`（未清除） | 由 `txn_id` 三段式**直接定位**事务表槽：槽 `Committed` 取准确序号比较；槽 `Active` ⇒ 未提交 |
 //! | `RolledBack` / `Free` | 可见（回滚已把块改回去） |
 //! | **槽查不到**（`wrap` 不匹配 = 槽已复用） | **可见**——复用条件（§4.6.3）保证旧事务 `commit_seq < 最老快照 ≤ S` |
@@ -39,6 +39,17 @@
 //! 3. **条目反复**（恢复出的前像仍不可见）⇒ 轮数上限，报 [`CrError::TooManyRounds`]。
 //!
 //! **重建在内存副本上进行**（源页一个字节也不动）。
+//!
+//! # 读己所写（`own`）
+//!
+//! 判定是"事务对快照的可见性"，**不含"我自己的事务"这一维**：一个事务对
+//! 自己未提交的改动必须可见（Oracle/PG 同款：`BEGIN; INSERT; SELECT` 看得
+//! 到刚插的行）。所以视角是 [`ReadView`]——快照 **+ 本会话自己的活动事务**：
+//! `own` 命中的 ITL 条目不撤销，本会话的未提交改动因此**留在重建结果里**。
+//!
+//! 判据取 `txn_id`（ITL 里登记的所有者）**而不是**"状态看起来像我"：
+//! 只有这一个事务是自己的，`wrap` 三段式保证不会认错别人（槽复用后
+//! `txn_id` 必不同）。
 
 use bicdb_common::seq::CommitSeq;
 
@@ -111,6 +122,63 @@ impl From<RollbackError> for CrError {
     }
 }
 
+/// **一致性读的视角**：快照 + 本会话自己的活动事务。
+///
+/// - `snapshot`：提交序号（**它之前的提交可见**）；
+/// - `own`：本会话自己的活动事务（`Some` ⇒ **读己所写**：它的未提交改动
+///   对自己可见）。无活动事务（自动提交/只读会话）时是 `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadView {
+    /// 快照（提交序号）。
+    pub snapshot: CommitSeq,
+    /// 本会话自己的活动事务。
+    pub own: Option<TxnId>,
+}
+
+impl ReadView {
+    /// 只给快照（无自己的事务——自动提交/只读形态）。
+    #[must_use]
+    pub fn new(snapshot: CommitSeq) -> Self {
+        Self {
+            snapshot,
+            own: None,
+        }
+    }
+
+    /// 带上自己的活动事务（**读己所写**）。
+    #[must_use]
+    pub fn with_own(mut self, own: Option<TxnId>) -> Self {
+        self.own = own;
+        self
+    }
+}
+
+/// **回溯轮数上限**（默认）——防"条目反复恢复成同样的不可见前像"的死循环。
+pub const DEFAULT_MAX_ROUNDS: u32 = 64;
+
+/// 进程级当前值（实例打开时设定一次；实例参数 `storage.cr_max_rounds`）。
+static MAX_ROUNDS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DEFAULT_MAX_ROUNDS);
+
+/// 当前的回溯轮数上限。
+#[must_use]
+pub fn cr_max_rounds() -> u32 {
+    MAX_ROUNDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **设定回溯轮数上限**（实例参数 `storage.cr_max_rounds`；下限 16——比一轮
+/// 并发写事务还少的预算会把合法场景判成「回溯轮数超限」）。
+///
+/// # Errors
+/// 越出 16..=4096。
+pub fn set_cr_max_rounds(rounds: u32) -> Result<(), &'static str> {
+    if !(16..=4096).contains(&rounds) {
+        return Err("cr_max_rounds 要落在 16–4096");
+    }
+    MAX_ROUNDS.store(rounds, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// 一个 ITL 条目的判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -128,9 +196,10 @@ enum Verdict {
 /// **重建块在快照 `snapshot` 下的可见版本**（返回内存副本；源页不动）。
 pub fn reconstruct(
     page: &Page,
-    snapshot: CommitSeq,
+    view: ReadView,
     chain: &UndoChain<'_, '_>,
 ) -> Result<Page, CrError> {
+    let ReadView { snapshot, own } = view;
     let header = page.header().ok_or(CrError::NotDataPage)?;
     if !matches!(header.page_type, PageType::HeapTable | PageType::Temporary) {
         // **撤销页不参与 CR**：它的 ITL[0] 是"页归属"（由 `plan_append`
@@ -147,10 +216,17 @@ pub fn reconstruct(
         let count = itl::itl_count(&cr)?;
         for index in 0..count {
             let entry = itl::read_itl(&cr, index)?;
+            // **读己所写**：自己事务的条目**一条都不撤销**——未提交也要看得见。
+            // 放在状态判定之前：`Active` 既涵盖"活动"也涵盖"已提交未清除"，
+            // 由 `txn_id` 认自己最直接（见模块文档）。
+            if own.is_some_and(|mine| mine == entry.txn_id) {
+                continue;
+            }
             match entry.state {
                 ItlState::Free | ItlState::RolledBack => continue,
                 ItlState::Committed => {
                     // 已清除：页内序号即权威（快照够新 ⇒ 可见，不必查事务表）。
+                    // 序号为空 ⇒ 落下去查事务表（"不知道"不等于"可见"）。
                     if entry.commit_seq.is_some_and(|s| s <= snapshot) {
                         continue;
                     }
@@ -174,7 +250,7 @@ pub fn reconstruct(
             break;
         }
         rounds += 1;
-        if rounds > 64 {
+        if rounds > cr_max_rounds() {
             return Err(CrError::TooManyRounds);
         }
     }
@@ -371,7 +447,7 @@ mod tests {
             itl::write_itl(&mut page, 0, &e).unwrap();
         }
 
-        let cr = reconstruct(&page, seq(100), &chain).unwrap();
+        let cr = reconstruct(&page, ReadView::new(seq(100)), &chain).unwrap();
         assert_eq!(heap::row(&cr, n), None, "未提交的插入不可见");
         assert_eq!(
             itl::read_itl(&cr, 0).unwrap().state,
@@ -380,6 +456,54 @@ mod tests {
         );
         // 源页一个字节不动。
         assert_eq!(heap::row(&page, n), Some(&bytes[..]), "重建不改源页");
+    }
+
+    /// **读己所写**：同一个未提交事务，**自己**看得见（`own` 命中），
+    /// **别人**看不见（`own` 不是它）——两侧是同一个页、同一条链。
+    #[test]
+    fn own_txn_sees_its_uncommitted_row_others_do_not() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let slot = chain.allocate_slot().unwrap();
+
+        let owner = txn(slot as u8, 0);
+        let (mut page, n, bytes) = page_with_row(owner, b"alpha");
+        let rid = RowId::from_parts(3, 0, n).unwrap();
+        append_itl_acquire(&mut chain, slot, 0, None);
+        let head = chain
+            .append(slot, UndoOp::Insert, 0, rid, UndoPayload::None)
+            .unwrap();
+        {
+            let mut e = itl::read_itl(&page, 0).unwrap();
+            e.undo_ptr = Some(head);
+            itl::write_itl(&mut page, 0, &e).unwrap();
+        }
+
+        // ① 自己的视角（own = 本事务）：**看得见**未提交的行。
+        let mine =
+            reconstruct(&page, ReadView::new(seq(100)).with_own(Some(owner)), &chain).unwrap();
+        assert_eq!(
+            heap::row(&mine, n),
+            Some(&bytes[..]),
+            "自己的未提交插入要看得见（读己所写）"
+        );
+        assert_eq!(
+            itl::read_itl(&mine, 0).unwrap(),
+            active_entry(owner, Some(head))
+        );
+
+        // ② 别人的视角（own = 别的 txn / None）：看不见。
+        let other_txn = txn(9, 0);
+        for own in [None, Some(other_txn)] {
+            let theirs = reconstruct(&page, ReadView::new(seq(100)).with_own(own), &chain).unwrap();
+            assert_eq!(
+                heap::row(&theirs, n),
+                None,
+                "别人的未提交插入不该可见（own={own:?}）"
+            );
+        }
     }
 
     #[test]
@@ -403,9 +527,9 @@ mod tests {
         }
         commit_slot(&chain, slot, 10);
 
-        let before = reconstruct(&page, seq(5), &chain).unwrap();
+        let before = reconstruct(&page, ReadView::new(seq(5)), &chain).unwrap();
         assert_eq!(heap::row(&before, n), None, "快照在提交前 ⇒ 不可见");
-        let after = reconstruct(&page, seq(15), &chain).unwrap();
+        let after = reconstruct(&page, ReadView::new(seq(15)), &chain).unwrap();
         assert_eq!(
             heap::row(&after, n),
             Some(&bytes[..]),
@@ -467,7 +591,7 @@ mod tests {
         }
 
         // S=5：T2 看不见 → 撤销删除与 ITL 覆盖 → 暴露 T1（seq 3 ≤ 5，可见）。
-        let cr = reconstruct(&page, seq(5), &chain).unwrap();
+        let cr = reconstruct(&page, ReadView::new(seq(5)), &chain).unwrap();
         assert_eq!(heap::row(&cr, n), Some(&bytes[..]), "行按 T1 版本可见");
         assert_eq!(itl::read_itl(&cr, 0).unwrap(), t1_entry, "ITL 已还原成 T1");
     }
@@ -489,7 +613,7 @@ mod tests {
             chain.segment().write_page(0, &mut hdr).unwrap();
         }
         // ITL 仍显示 Active（陈旧引用），但槽查不到 ⇒ 可见。
-        let cr = reconstruct(&page, seq(1), &chain).unwrap();
+        let cr = reconstruct(&page, ReadView::new(seq(1)), &chain).unwrap();
         assert_eq!(heap::row(&cr, n), Some(&bytes[..]));
     }
 
@@ -514,7 +638,7 @@ mod tests {
             itl::write_itl(&mut page, 0, &e).unwrap();
         }
         assert!(matches!(
-            reconstruct(&page, seq(1), &chain),
+            reconstruct(&page, ReadView::new(seq(1)), &chain),
             Err(CrError::NoItlUndo { itl_slot: 0 })
         ));
     }
@@ -551,7 +675,7 @@ mod tests {
             itl::write_itl(&mut page, 0, &e).unwrap();
         }
         assert!(matches!(
-            reconstruct(&page, seq(1), &chain),
+            reconstruct(&page, ReadView::new(seq(1)), &chain),
             Err(CrError::TooManyRounds)
         ));
     }
@@ -596,7 +720,7 @@ mod tests {
         chain.segment().write_page(logical, &mut undo_page).unwrap();
 
         assert!(matches!(
-            reconstruct(&page, seq(1), &chain),
+            reconstruct(&page, ReadView::new(seq(1)), &chain),
             Err(CrError::ChainCycle)
         ));
     }
@@ -609,7 +733,7 @@ mod tests {
         let chain = UndoChain::open(segment);
         let page = Page::new(PageType::SegmentHeader, [0u8; WORKSPACE_REF_LEN], 1, 0);
         assert!(matches!(
-            reconstruct(&page, seq(1), &chain),
+            reconstruct(&page, ReadView::new(seq(1)), &chain),
             Err(CrError::NotDataPage)
         ));
         // **撤销页不参与 CR**（P3 审核修复）：它的 ITL[0] 是"页归属"、
@@ -617,7 +741,7 @@ mod tests {
         // 撤销页的内容直读（`UndoChain::read`）。
         let undo_page = Page::new(PageType::Undo, [0u8; WORKSPACE_REF_LEN], 1, 5);
         assert!(matches!(
-            reconstruct(&undo_page, seq(1), &chain),
+            reconstruct(&undo_page, ReadView::new(seq(1)), &chain),
             Err(CrError::NotDataPage)
         ));
     }

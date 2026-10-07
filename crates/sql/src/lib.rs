@@ -22,12 +22,18 @@
 //! `(obj#, mtime, status)` 进 [`bind::BoundRefs`]——计划缓存键的成分）；
 //! 目录只读面经 [`bind::CatalogView`] 端口接入（真件 = [`bind::CatalogViewImpl`]）。
 //!
-//! **D1 已落地**（2026-10-06；`doc/DCL语句设计_v0.1.md` §5——**纯解析，先于 S2**）：
-//! DCL 语句面——[`ast::Stmt::VariableSet`]（`ALTER SESSION SET/CLEAR`）、
-//! [`ast::Stmt::AlterSystem`]（F 组：文件系统池三动作）、
-//! [`ast::Stmt::AlterDatabase`]（W2 克隆双源 + T1–T3 模板四动作）、
+//! **D1 已落地**（2026-10-06；**2026-10-07 对齐 v0.2**；`doc/DCL语句设计_v0.1.md` §5
+//! ——**纯解析，先于 S2**）：DCL 语句面——[`ast::Stmt::VariableSet`]（`ALTER SESSION
+//! SET/CLEAR`）、F 组三件套（[`ast::Stmt::CreateFilesystem`] /
+//! [`ast::Stmt::AlterFilesystem`] / [`ast::Stmt::DropFilesystem`]；`CREATE FILESYSTEM
+//! <名> USING '<路径>'`）、W 组（[`ast::Stmt::CreateWorkspace`] 建**无主**容器 +
+//! [`ast::Stmt::AlterWorkspace`] W3–W7 + `DROP WORKSPACE`）、U 组
+//! （[`ast::Stmt::CreateUser`] `… IDENTIFIED BY … USING WORKSPACE …` /
+//! [`ast::Stmt::AlterUser`] U2–U6 / [`ast::Stmt::DropUser`]）、T 组
+//! （[`ast::Stmt::AlterDatabase`] 只剩 ADD/DROP TEMPLATE）、
 //! [`ast::WorkRef`]/[`ast::FsRef`] 双形态（**解析只认形态**——名字查找与唯一性
-//! 在 ② 绑定期）；`CREATE WORKSPACE` 去掉 `CLONE OF`（评审点①）。
+//! 在 ② 绑定期）。**依赖顺序 FS → WORKSPACE → USER**：`CREATE WORKSPACE FOR USER`
+//! 与 `ALTER SYSTEM … FILESYSTEM` 已删除（v0.2）。
 //!
 //! **已落地（2026-10-06）**：② Binder（`bind/`：名字解析三格、类型推导、参数
 //! 定型、写目标检查、版本捕获）、④ 物理计划（`plan.rs`，**首版直映射**）、
@@ -42,7 +48,9 @@
 #![deny(missing_docs)]
 
 pub mod ast;
+pub mod auth;
 pub mod bind;
+pub mod dcl_exec;
 pub mod dml_index;
 pub mod lexer;
 pub mod parser;
@@ -50,15 +58,18 @@ pub mod plan;
 pub mod session;
 
 pub use ast::{
-    AConst, AExpr, AExprKind, Alias, AlterDatabaseAction, AlterDatabaseStmt, AlterSystemAction,
-    AlterSystemStmt, AlterWorkspaceAction, AlterWorkspaceStmt, BoolExpr, BoolExprType, CaseExpr,
-    CaseWhen, CoalesceExpr, ColumnDef, ColumnRef, ColumnRefField, ConstValue, CreateGraphStmt,
-    CreateStmt, CreateWorkspaceStmt, DefElem, DefElemArg, DeleteStmt, DropStmt, Expr, FromItem,
-    FsRef, FuncCall, IndexElem, IndexStmt, IndexTargetKind, InsertStmt, JoinExpr, JoinType,
-    Location, NullTest, NullTestType, ObjectType, ParamRef, RangeVar, ResTarget, SelectStmt,
-    SetOperation, SortBy, SortByDir, SortByNulls, Stmt, TransactionStmt, TransactionStmtKind,
-    TypeCast, TypeName, UpdateStmt, VariableSetKind, VariableSetStmt, WorkRef, WorkspaceSource,
+    AConst, AExpr, AExprKind, Alias, AlterDatabaseAction, AlterDatabaseStmt, AlterFilesystemStmt,
+    AlterUserAction, AlterUserStmt, AlterWorkspaceAction, AlterWorkspaceStmt, BoolExpr,
+    BoolExprType, CaseExpr, CaseWhen, CoalesceExpr, ColumnDef, ColumnRef, ColumnRefField,
+    ConstValue, CreateFilesystemStmt, CreateGraphStmt, CreateStmt, CreateUserStmt,
+    CreateWorkspaceStmt, DefElem, DefElemArg, DeleteStmt, DropFilesystemStmt, DropStmt,
+    DropUserStmt, Expr, FromItem, FsQuota, FsRef, FuncCall, IndexElem, IndexStmt, IndexTargetKind,
+    InsertStmt, JoinExpr, JoinType, Location, NullTest, NullTestType, ObjectType, ParamRef,
+    QuotaAmount, RangeVar, ResTarget, SelectStmt, SetOperation, SortBy, SortByDir, SortByNulls,
+    Stmt, TransactionStmt, TransactionStmtKind, TypeCast, TypeName, UpdateStmt, VariableSetKind,
+    VariableSetStmt, WorkRef,
 };
+pub use auth::{authenticate, AuthError, Identity};
 pub use bind::{
     check_new_object_name, is_reserved_name, BindError, BoundRefs, CatalogColumn, CatalogIndex,
     CatalogObject, CatalogView, CatalogViewImpl, NameResolver, NameSpace, ResolvePolicy,

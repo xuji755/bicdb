@@ -4,7 +4,6 @@
 //! 每次执行由本模块**构建一棵新算子树**（REQ-SQL-004：执行状态单次新造）。
 
 use bicdb_storage::buffer::BufferPool;
-use bicdb_storage::rowid::RowId;
 use bicdb_storage::undo::UndoChain;
 
 use crate::error::ExecError;
@@ -84,16 +83,23 @@ pub enum PlanNode {
     IndexScan {
         /// 索引段所在文件号。
         file_id: u16,
-        /// 树头（根页 ROWID——执行器从段头扩展区读得）。
-        root: RowId,
+        /// **索引段的段头块**（`seg$.block_id`）——树头在段头页的扩展区里，
+        /// 由执行器**现读**（计划期捕获的根页可能已被分裂改过）。
+        seg_page0: u32,
         /// 键的列形态（覆盖扫描解码键用）。
         key_kind: ColKind,
         /// 回表行形状（`covered` 时忽略）。
         shape: RowShape,
-        /// 范围下界（闭区间；`None` = 无界）。
+        /// 范围下界（`None` = 无界）。
         low: Option<Expr>,
-        /// 范围上界（闭区间；`None` = 无界）。
+        /// 下界是否排除（`>` 形态）。
+        low_exclusive: bool,
+        /// 范围上界（`None` = 无界）。
         high: Option<Expr>,
+        /// 上界是否排除（`<` 形态）。
+        high_exclusive: bool,
+        /// **多点探测**（`IN (值表)`：逐点一次点查，共用一份去重集；空 = 范围形态）。
+        points: Vec<Expr>,
         /// 覆盖扫描（不回表）。
         covered: bool,
         /// 条目上限。
@@ -101,6 +107,9 @@ pub enum PlanNode {
         /// 回表批量大小（§9.4；`None` = 默认 256）。
         batch: Option<usize>,
     },
+    /// **单行源**（`SELECT 1` / `SELECT :p` 这类**无 FROM** 的投影——恰好一行、
+    /// 零列；投影表达式在它上面求值）。
+    SingleRow,
     /// **带 ROWID 的扫描**（DML 源；行 = `[ROWID 6B] ++ 各列`）。
     WithRowId {
         /// 行源标识。
@@ -128,6 +137,8 @@ pub enum PlanNode {
     Delete {
         /// 源子树（必须经 `WithRowId`）。
         input: Box<PlanNode>,
+        /// 表的行形状（旧行重编码用——索引删键要它）。
+        shape: RowShape,
     },
     /// **合并追加**（`UNION ALL`；流水）。
     Append {
@@ -240,11 +251,14 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
         } => Box::new(Limit::new(build(input, env, open_cursor)?, *limit, *offset)),
         PlanNode::IndexScan {
             file_id,
-            root,
+            seg_page0,
             key_kind,
             shape,
             low,
+            low_exclusive,
             high,
+            high_exclusive,
+            points,
             covered,
             limit,
             batch,
@@ -254,7 +268,7 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
                 env.pool,
                 chain,
                 *file_id,
-                *root,
+                *seg_page0,
                 *key_kind,
                 shape.clone(),
                 low.clone(),
@@ -262,6 +276,10 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
                 *covered,
                 *limit,
             );
+            let scan = scan
+                .low_exclusive(*low_exclusive)
+                .high_exclusive(*high_exclusive)
+                .with_points(points.clone());
             Box::new(match batch {
                 Some(n) => scan.with_batch(*n),
                 None => scan,
@@ -293,13 +311,14 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
                 shape.clone(),
             ))
         }
-        PlanNode::Delete { input } => {
+        PlanNode::Delete { input, shape } => {
             let writer = env.writer.ok_or(ExecError::NoWriter)?;
             let owns_txn = writer.borrow().owns_txn();
             Box::new(crate::dml::Delete::new(
                 build(input, env, open_cursor)?,
                 writer,
                 owns_txn,
+                shape.clone(),
             ))
         }
         PlanNode::Append { inputs } => {
@@ -309,6 +328,7 @@ pub fn build<'a, 'b: 'a, 'io: 'a, 'f: 'a, 's: 'a>(
             }
             Box::new(crate::setops::Append::new(ops))
         }
+        PlanNode::SingleRow => Box::new(crate::nodes::SingleRow::new()),
         PlanNode::Unique { input, keys, width } => {
             let keys = keys
                 .clone()

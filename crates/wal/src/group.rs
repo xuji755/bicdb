@@ -832,6 +832,23 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         self.activate(next)
     }
 
+    /// **下一次切换会不会被挡**（`None` = 不会；**只读探测**，不动任何状态）。
+    ///
+    /// 用途：**CKPT 的"组满被迫"触发条件**（`doc/arch/11-持久化与恢复.md` §11.7：
+    /// "① ~3 秒周期发布低水位；② **组满被迫**（日志要切换而下一组未降级）"）。
+    /// 写者只有真正写满当前组时才会撞上 `Blocked`（那时语句已经失败回滚了），
+    /// 所以调用方要能在**动手之前**问一句"再写下去会不会撞墙"——问完就地
+    /// 推一次检查点，写者就能一路写下去（Oracle 的"日志切换触发检查点、
+    /// 频繁切换反噬 I/O"与 PG 的 `max_wal_size` 触发检查点，都是这条）。
+    #[must_use]
+    pub fn switch_blocked(&self) -> Option<SwitchBlocked> {
+        match self.pick_reusable() {
+            Ok(_) => None,
+            Err(GroupError::Blocked(why)) => Some(why),
+            Err(_) => None, // 其余错误不是"挡"，由真正切换时报
+        }
+    }
+
     /// 从当前组的下一组起轮转，找可复用组；找不到 ⇒ 按缺的条件分类。
     fn pick_reusable(&self) -> Result<u8, GroupError> {
         let mut blocked_archive = false;
@@ -1403,7 +1420,8 @@ mod tests {
             Path::new(B),
             &ws_entry(),
             &RedoEntries::new(2, 1).unwrap(),
-            &ArchiveRecord::default(),
+            // **显式开归档**：本用例钉的是归档门控下的日志切换（默认是不归档）。
+            &ArchiveRecord::new(bicdb_storage::controlfile::ArchiveMode::ArchiveLog),
         )
         .unwrap();
         let mut w = GroupWriter::create(
@@ -1485,7 +1503,8 @@ mod tests {
             Path::new(B),
             &ws_entry(),
             &RedoEntries::new(2, 1).unwrap(),
-            &ArchiveRecord::default(), // 归档模式默认开启
+            // **显式开归档**：本用例钉的是归档门控下的日志切换（默认是不归档）。
+            &ArchiveRecord::new(bicdb_storage::controlfile::ArchiveMode::ArchiveLog), // 归档模式默认开启
         )
         .unwrap();
         let mut w = GroupWriter::create(
@@ -2198,7 +2217,8 @@ mod tests {
             Path::new(B),
             &ws_entry(),
             &RedoEntries::new(2, 1).unwrap(),
-            &ArchiveRecord::default(),
+            // **显式开归档**：本用例钉的是归档门控下的日志切换（默认是不归档）。
+            &ArchiveRecord::new(bicdb_storage::controlfile::ArchiveMode::ArchiveLog),
         )
         .unwrap();
         let spec = GroupSpec::new(2, 1, 4).unwrap();

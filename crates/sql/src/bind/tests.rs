@@ -58,8 +58,17 @@ impl CatalogView for FakeView {
     fn object_version(&mut self, _obj: u32) -> Result<(u64, u32), BindError> {
         Ok((7, 1))
     }
-    fn fixed_table(&mut self, name: &str) -> Result<bool, BindError> {
-        Ok(FIXED_TABLES.contains(&name))
+    fn fixed_columns(&mut self, name: &str) -> Result<Option<Vec<CatalogColumn>>, BindError> {
+        if !FIXED_TABLES.contains(&name) {
+            return Ok(None);
+        }
+        Ok(Some(vec![CatalogColumn {
+            col: 1,
+            name: "file#".to_owned(),
+            type_code: bicdb_catalog::ColTypeCode::Number as u32,
+            length: 0,
+            nullable: true,
+        }]))
     }
     fn is_public(&self) -> bool {
         self.public

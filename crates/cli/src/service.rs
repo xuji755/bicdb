@@ -13,7 +13,7 @@
 //! | 事 | PG | Oracle | 我们 |
 //! | --- | --- | --- | --- |
 //! | 分离 | `pg_ctl start` 里 fork + setsid | `dbstart` 走 `sqlplus / as sysdba` | `Command::process_group(0)`（std，零 unsafe；新进程组 ⇒ 不受终端 SIGHUP 影响） |
-//! | 就绪等待 | `-w` 轮询连接 | 等 `STARTUP` 返回 | 轮询控制套接字的 `STATUS`（`--timeout`，默认 30 s） |
+//! | 就绪等待 | `-w` 轮询连接 | 等 `STARTUP` 返回 | 轮询控制套接字的 `STATUS`（`-w|--wait`，默认 30 s） |
 //! | 停止 | `-m smart|fast|immediate` | `SHUTDOWN [NORMAL|IMMEDIATE|ABORT]` | `stop [-m fast|immediate]`（fast = 完全检查点；immediate = 直接退出，下次打开走崩溃恢复） |
 //! | 日志 | `-l logfile` | alert log | 默认 `<dir>/bicdb.log`（`--log` 覆盖） |
 //! | 身份 | `postmaster.pid` | 实例锁 | `<dir>/bicdb.pid`（见 `lock.rs`） |
@@ -29,9 +29,12 @@ use std::time::{Duration, Instant};
 
 use bicdb_sql::session::Session;
 
+use bicdb_net::client::{call_once, ClientError};
+use bicdb_net::{frame, AuthOk, AuthRequest, Hello, SqlRequest, WIRE_VERSION};
+
 use crate::boot::open_unlocked_with;
 use crate::lock::{self, InstanceLock, LockError, LockInfo, LockMode};
-use crate::wire::{self, WireError};
+use crate::proto;
 
 /// 服务错误。
 #[derive(Debug)]
@@ -41,7 +44,7 @@ pub enum ServiceError {
     /// 打开实例。
     Boot(crate::boot::BootError),
     /// 套接字/协议。
-    Wire(WireError),
+    Wire(ClientError),
     /// 状态非法（没在跑 / 已经在跑 / 就绪超时）。
     State(String),
     /// I/O。
@@ -74,7 +77,7 @@ from_err!(
     Config <- crate::config::ConfigError,
     Lock <- LockError,
     Boot <- crate::boot::BootError,
-    Wire <- WireError,
+    Wire <- ClientError,
     Io <- std::io::Error,
 );
 
@@ -136,6 +139,30 @@ impl StartOptions {
         overrides: Vec<(String, String)>,
     ) -> Result<Self, ServiceError> {
         let (params, _) = crate::config::InstanceParams::load_with_overrides(ini, &overrides)?;
+        Ok(Self::from_params(params, socket, log, timeout, overrides))
+    }
+
+    /// 同上，但**等待上限的默认值来自参数文件**（`service.start_wait_s` /
+    /// `service.stop_wait_s`）——命令行 `-w` 给了就用它（`None` = 没给）。
+    ///
+    /// 为什么要有这条：`start`/`stop` 的等待上限此前分别写死 30 秒（命令行
+    /// 默认）与 300 秒（代码常量），参数文件里没有对应键——**唯一一个只能走
+    /// 命令行的运行期量**，与"参数文件是实例的权威"不符。
+    pub fn load_with_wait(
+        ini: Option<&Path>,
+        socket: Option<PathBuf>,
+        log: Option<PathBuf>,
+        wait_s: Option<u64>,
+        stop_side: bool,
+        overrides: Vec<(String, String)>,
+    ) -> Result<Self, ServiceError> {
+        let (params, _) = crate::config::InstanceParams::load_with_overrides(ini, &overrides)?;
+        let default_s = if stop_side {
+            params.run.stop_wait_s
+        } else {
+            params.run.start_wait_s
+        };
+        let timeout = Duration::from_secs(wait_s.unwrap_or(default_s));
         Ok(Self::from_params(params, socket, log, timeout, overrides))
     }
 
@@ -226,77 +253,176 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
         // ——SQL*Plus 一句一发，事务语义必须绑在连接上，不能绑在单条语句上。
         let seq = inst.seq();
         let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
-        while let Ok((verb, payload)) = wire::read_frame(&mut s) {
+        // **接上管理面**（DCL 的落点：`BICDB_HOME` 的注册表 + 实例 I/O）。
+        session.set_dcl_context(
+            crate::home::Home::locate().ok().map(|h| h.root),
+            Some(inst.io),
+        );
+        session.set_workspace_provisioner(Some(provisioner_static()));
+        session.set_pbkdf2_iterations(inst.params.run.pbkdf2_iterations);
+        // **固定表的内容源**（`file$` ← 控制文件的内存映像）。
+        session.set_fixed_table_source(Some(crate::fixed::CliFixedTables::new_static(
+            &opts.dir, inst.io,
+        )));
+        // **连接态**：`AUTH` 只认"第一个业务请求"这一条（见下）；
+        // `authed` 只用于自述与诊断，**资格判据在会话里**（身份是会话的属性）。
+        let mut sql_served = false;
+        let mut authed: Option<String> = None;
+        // **帧载荷按字节读**（`bicdb-net` 的读满纪律）：SQL 里可以有换行，
+        // 结果里可以有非 UTF-8 的字节串——按行读会在第一行就断错。
+        while let Ok((verb, payload)) = frame::read_frame_bytes(&mut s) {
+            // **正忙时把第二条连接明确挡回去**（尽力而为：只在"对方已经连上
+            // 并在等"时能看见它）。本版服务一次只服务一条连接（实例是单写者，
+            // 会话又借住实例），不挡的话第二条连接会被内核排进 backlog
+            // **无声干等**——那比"具名拒绝"糟得多。
+            reject_pending(&listener);
             match verb.as_str() {
                 "HELLO" => {
-                    let _ = wire::write_frame(
-                        &mut s,
-                        "OK",
-                        &format!(
-                            "wire={} version={}",
-                            wire::WIRE_VERSION,
-                            env!("CARGO_PKG_VERSION")
-                        ),
-                    );
+                    let hello = Hello {
+                        wire: WIRE_VERSION,
+                        version: env!("CARGO_PKG_VERSION").to_owned(),
+                        instance: opts.dir.display().to_string(),
+                    };
+                    let _ = frame::write_frame_bytes(&mut s, "OK", hello.encode().as_bytes());
                 }
                 "STATUS" => {
                     let body = format!(
-                        "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\n",
+                        "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\nidentity={}\n",
                         opts.dir.display(),
                         env!("CARGO_PKG_VERSION"),
                         std::process::id(),
                         started.elapsed().as_secs(),
                         session.seq(),
-                        wire::WIRE_VERSION
+                        WIRE_VERSION,
+                        // 谁在连：管理面（本机/OS）还是某个认证过的主体。
+                        authed.as_deref().unwrap_or("管理面（本机/OS 身份）")
                     );
-                    let _ = wire::write_frame(&mut s, "OK", &body);
+                    let _ = frame::write_frame_bytes(&mut s, "OK", body.as_bytes());
+                }
+                "AUTH" => {
+                    // **AUTH 必须是本连接上的第一个业务请求**：先跑过 SQL/DESCRIBE
+                    // 的连接再"变成"某个主体，等于"先以管理面身份做事、再冒名"。
+                    if sql_served {
+                        let _ = frame::write_frame_bytes(
+                            &mut s,
+                            "ERR",
+                            "AUTH 必须是本连接上的第一个业务请求（本连接已执行过语句）\
+                             ——重连再认证"
+                                .as_bytes(),
+                        );
+                        continue;
+                    }
+                    let req = match AuthRequest::decode(&payload) {
+                        Ok(r) => r,
+                        // **不回报载荷内容**（它可能含口令）。
+                        Err(e) => {
+                            log.line(&format!("AUTH 载荷非法：{e}"));
+                            let _ = frame::write_frame_bytes(
+                                &mut s,
+                                "ERR",
+                                format!("AUTH 载荷非法：{e}（内容不回报——可能含口令）").as_bytes(),
+                            );
+                            continue;
+                        }
+                    };
+                    match session.authenticate(&req.user, &req.password) {
+                        Ok(id) => {
+                            // **口令与散列不进日志**（只记主体与结果）。
+                            log.line(&format!("认证成功：{}", id.describe()));
+                            authed = Some(id.name().to_owned());
+                            let ok = AuthOk {
+                                user: id.name().to_owned(),
+                                user_id: id.user_id(),
+                                expired: id.is_expired(),
+                            };
+                            let _ = frame::write_frame_bytes(&mut s, "OK", ok.encode().as_bytes());
+                        }
+                        Err(e) => {
+                            // 失败只记**主体名与结果**（诊断用）；口令不记录。
+                            log.line(&format!("认证失败：主体 `{}`（口令不记录）——{e}", req.user));
+                            let _ =
+                                frame::write_frame_bytes(&mut s, "ERR", e.to_string().as_bytes());
+                        }
+                    }
                 }
                 "SQL" => {
                     served += 1;
-                    let (sql, named) = wire::decode_sql_request(&payload);
+                    sql_served = true;
+                    let req = match SqlRequest::decode(&payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log.line(&format!("请求载荷非法：{e}"));
+                            let _ = frame::write_frame_bytes(
+                                &mut s,
+                                "ERR",
+                                format!("请求载荷非法：{e}").as_bytes(),
+                            );
+                            continue;
+                        }
+                    };
+                    let named = proto::engine_params(&req.params);
                     let named_ref: Vec<(&str, bicdb_exec::Value)> =
                         named.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
-                    match session.execute_with_params(&sql, &named_ref) {
+                    match session.execute_with_params(&req.sql, &named_ref) {
                         Ok(results) => {
-                            let body = wire::encode_results(&results);
-                            let _ = wire::write_frame(&mut s, "OK", &body);
+                            let body =
+                                bicdb_net::message::encode_statements(&proto::statements(&results));
+                            let _ = frame::write_frame_bytes(&mut s, "OK", &body);
                         }
                         Err(e) => {
                             log.line(&format!("语句失败：{e}"));
-                            let _ = wire::write_frame(&mut s, "ERR", &e.to_string());
+                            let _ =
+                                frame::write_frame_bytes(&mut s, "ERR", e.to_string().as_bytes());
                         }
                     }
                 }
                 "DESCRIBE" => {
+                    sql_served = true;
                     // **走会话**（它的目录借用）：不动事务状态——`DESC` 在
                     // 显式事务里也该能用，不能为此把会话丢了（那会回滚事务）。
-                    match session.describe_columns(payload.trim()) {
+                    let name = String::from_utf8_lossy(&payload).trim().to_owned();
+                    match session.describe_columns(&name) {
                         Ok(cols) => {
-                            let rows: Vec<(String, bool, String)> = cols
+                            let rows: Vec<bicdb_net::Column> = cols
                                 .into_iter()
-                                .map(|(n, nul, code, len)| (n, nul, type_name(code, len)))
+                                .map(|(n, nul, code, len)| bicdb_net::Column {
+                                    name: n,
+                                    // 形态由类型码定（与结果集同一份口径：
+                                    // 驱动拿到 `desc` 就知道该把列转成什么）。
+                                    kind: proto::kind_char(bicdb_sql::plan::kind_of(code)),
+                                    nullable: nul,
+                                    type_code: code,
+                                    length: len,
+                                    type_name: type_name(code, len),
+                                })
                                 .collect();
-                            let body = wire::encode_columns(&rows);
-                            let _ = wire::write_frame(&mut s, "OK", &body);
+                            let body = bicdb_net::message::encode_columns(&rows);
+                            let _ = frame::write_frame_bytes(&mut s, "OK", &body);
                         }
                         Err(e) => {
-                            let _ = wire::write_frame(&mut s, "ERR", &e.to_string());
+                            let _ =
+                                frame::write_frame_bytes(&mut s, "ERR", e.to_string().as_bytes());
                         }
                     }
                 }
                 "SHUTDOWN" => {
-                    let mode = StopMode::parse(&payload).unwrap_or(StopMode::Fast);
-                    let _ = wire::write_frame(
+                    let text = String::from_utf8_lossy(&payload);
+                    let mode = StopMode::parse(text.trim()).unwrap_or(StopMode::Fast);
+                    let _ = frame::write_frame_bytes(
                         &mut s,
                         "OK",
-                        &format!("shutting down（{}）", mode.as_str()),
+                        format!("shutting down（{}）", mode.as_str()).as_bytes(),
                     );
                     log.line(&format!("收到停止请求（{}）", mode.as_str()));
                     stop_after = Some(mode);
                     break 'accept;
                 }
                 other => {
-                    let _ = wire::write_frame(&mut s, "ERR", &format!("未知动词 `{other}`"));
+                    let _ = frame::write_frame_bytes(
+                        &mut s,
+                        "ERR",
+                        format!("未知动词 `{other}`").as_bytes(),
+                    );
                 }
             }
         }
@@ -386,17 +512,20 @@ impl LogFile {
     }
 }
 
+/// 工作区供给方（无状态；`'static` 一份——进程级）。
+fn provisioner_static() -> &'static crate::provision::CliProvisioner {
+    crate::provision::CliProvisioner::new_static()
+}
+
 // ───────────────────────── 客户端：start / stop / status ─────────────────────────
 
 /// **`bicdb start`**：分离起服务并等它就绪（`-w` 语义）。
 pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
     // 是不是实例：看**数据文件**在不在（`data/<ws>_meta`，见 `boot` 的文件面）。
-    let meta = crate::boot::data_meta_path(&opts.dir, crate::boot::WS);
-    if !meta.exists() {
+    if crate::boot::find_meta_file(&opts.dir).is_none() {
         return Err(ServiceError::State(format!(
-            "{} 不是 bicdb 实例（缺 {}）——先 `bicdb init`",
-            opts.dir.display(),
-            meta.display()
+            "{} 不是 bicdb 实例（`data/` 下没有 `*_meta`）——先 `bicdb init`",
+            opts.dir.display()
         )));
     }
     if let Some(info) = lock::read_lock(&opts.dir) {
@@ -441,8 +570,12 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
     // 等就绪（PG `-w`）：套接字能应答 STATUS 才算起来了。
     let deadline = Instant::now() + opts.timeout;
     loop {
-        if let Ok(body) = wire::call_timeout(&opts.socket, "STATUS", "", Duration::from_millis(500))
-        {
+        if let Ok(body) = call_once(
+            &opts.socket,
+            "STATUS",
+            "",
+            Duration::from_millis(opts.params.run.probe_timeout_ms),
+        ) {
             println!("服务已启动（pid {pid}）");
             println!("  实例    {}", opts.dir.display());
             println!("  套接字  {}", opts.socket.display());
@@ -457,7 +590,7 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
         if let Ok(Some(st)) = child.try_wait() {
             // 子进程死因在**日志**里（它的 stderr 也落那儿）——把尾几行带上来，
             // 省得用户还要去翻文件（启动失败是最常见的支持问题）。
-            let tail = log_tail(&opts.log, 3);
+            let tail = log_tail(&opts.log, opts.params.run.log_tail_lines as usize);
             return Err(ServiceError::State(format!(
                 "服务进程 {pid} 已退出（{st}）——日志 {}：\n{tail}",
                 opts.log.display()
@@ -470,12 +603,36 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
                 opts.log.display()
             )));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(opts.params.run.ready_poll_ms));
     }
 }
 
+/// **挡回一条已在等的连接**（尽力而为；没有等待者就什么都不做）。
+///
+/// 监听套接字临时切成非阻塞：有等待者就收下、回一帧 `ERR` 再关——客户端
+/// 因此拿到"实例正忙"的**具名错误**，而不是挂在那里等第一个连接结束。
+fn reject_pending(listener: &std::os::unix::net::UnixListener) {
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    if let Ok((mut extra, _)) = listener.accept() {
+        let _ = extra.set_nonblocking(false);
+        let _ = frame::write_frame_bytes(
+            &mut extra,
+            "ERR",
+            "实例正忙：服务一次只服务一条连接（V1.0 单写者）——稍后重试".as_bytes(),
+        );
+    }
+    let _ = listener.set_nonblocking(false);
+}
+
 /// **`bicdb stop`**：请服务收尾（经套接字；`-m fast|immediate`），并等它退出。
-pub fn stop(dir: &Path, mode: StopMode) -> Result<(), ServiceError> {
+pub fn stop(
+    dir: &Path,
+    mode: StopMode,
+    wait: Duration,
+    params: &crate::config::InstanceParams,
+) -> Result<(), ServiceError> {
     let info = lock::read_lock(dir).ok_or_else(|| {
         ServiceError::State(format!("{} 上没有服务在跑（无 pid 文件）", dir.display()))
     })?;
@@ -485,11 +642,11 @@ pub fn stop(dir: &Path, mode: StopMode) -> Result<(), ServiceError> {
             "pid 文件的持有者已不在（陈旧锁，已清理）".to_owned(),
         ));
     }
-    let reply = wire::call_timeout(
+    let reply = call_once(
         &info.socket,
         "SHUTDOWN",
         mode.as_str(),
-        Duration::from_secs(30),
+        Duration::from_millis(params.run.status_timeout_ms),
     )
     .map_err(|e| {
         ServiceError::State(format!(
@@ -497,16 +654,18 @@ pub fn stop(dir: &Path, mode: StopMode) -> Result<(), ServiceError> {
             info.socket.display()
         ))
     })?;
-    // 等进程真的退出（跑完全检查点要时间）。
-    let deadline = Instant::now() + Duration::from_secs(300);
+    // 等进程真的退出（跑完全检查点要时间；上限由 `-w` 给——此前写死 300 秒，
+    // 而且 `bicdb stop` 解析了 `-w` 却没往下传，用户根本调不动它）。
+    let deadline = Instant::now() + wait;
     while lock::proc_starttime(info.pid).is_some_and(|st| st == info.starttime) {
         if Instant::now() >= deadline {
             return Err(ServiceError::State(format!(
-                "服务（pid {}）在 300 秒内没退出",
-                info.pid
+                "服务（pid {}）在 {} 秒内没退出（`-w` 可加大：此时它多半正在跑完全检查点）",
+                info.pid,
+                wait.as_secs()
             )));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(params.run.stop_poll_ms));
     }
     println!("服务已停止（pid {}）——{}", info.pid, reply);
     if lock::pid_path(dir).exists() {
@@ -516,7 +675,7 @@ pub fn stop(dir: &Path, mode: StopMode) -> Result<(), ServiceError> {
 }
 
 /// **`bicdb status`**：锁事实 + 服务自述。
-pub fn status(dir: &Path) -> Result<(), ServiceError> {
+pub fn status(dir: &Path, params: &crate::config::InstanceParams) -> Result<(), ServiceError> {
     let Some(info) = lock::read_lock(dir) else {
         println!("未运行：{} 上没有 pid 文件", dir.display());
         return Ok(());
@@ -537,7 +696,12 @@ pub fn status(dir: &Path) -> Result<(), ServiceError> {
     println!("  套接字  {}", info.socket.display());
     println!("  版本    {}", info.version);
     if info.mode == LockMode::Service {
-        match wire::call_timeout(&info.socket, "STATUS", "", Duration::from_secs(5)) {
+        match call_once(
+            &info.socket,
+            "STATUS",
+            "",
+            Duration::from_millis(params.run.status_timeout_ms),
+        ) {
             Ok(body) => {
                 for line in body.lines() {
                     if let Some((k, v)) = line.split_once('=') {
@@ -559,7 +723,7 @@ pub fn status(dir: &Path) -> Result<(), ServiceError> {
 /// **`bicdb restart`**：stop（fast）后 start。
 pub fn restart(opts: &StartOptions) -> Result<(), ServiceError> {
     if lock::read_lock(&opts.dir).is_some_and(|i| lock::is_live(&i)) {
-        stop(&opts.dir, StopMode::Fast)?;
+        stop(&opts.dir, StopMode::Fast, opts.timeout, &opts.params)?;
     }
     start(opts)
 }

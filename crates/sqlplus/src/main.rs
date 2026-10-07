@@ -4,6 +4,8 @@
 //! bicdbcli [选项] <实例目录> [@脚本]
 //!   -S              静默（不出横幅）
 //!   -s <套接字>     指定控制套接字（默认 <实例目录>/bicdb.sock）
+//!   -U <主体>       以某个主体认证（口令取 `$BICDB_PASSWORD` 或终端提示；
+//!                   **只对经服务的连接有效**——本机直连 = OS 身份）
 //!   --direct        强制直连（不经服务）
 //!   -?|-h|--help    本帮助
 //! ```
@@ -34,6 +36,7 @@ bicdbcli —— bicdb 的 SQL*Plus 形态客户端
 选项：
   -S              静默（不出横幅与提示符由 SET SQLPROMPT 控制）
   -s <套接字>      控制套接字（默认 <实例目录>/bicdb.sock）
+  -U <主体>       以某个主体认证（口令取 $BICDB_PASSWORD 或终端提示；只对经服务有效）
   --direct        强制直连（服务在跑时会被实例锁挡住）
   -? -h --help    本帮助
 
@@ -70,6 +73,8 @@ struct Options {
     script: Option<PathBuf>,
     silent: bool,
     direct: bool,
+    /// 显式控制套接字（`-s`；`None` = 按参数文件/实例状态选路）。
+    socket: Option<PathBuf>,
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
@@ -84,11 +89,17 @@ fn run(args: &[String]) -> Result<i32, String> {
     let mut script: Option<PathBuf> = None;
     let mut silent = false;
     let mut direct = false;
+    let mut socket: Option<PathBuf> = None;
+    // **认证凭据**（`-U <主体>` + 口令；`bicdb sql` 与这里共用一份取法）。
+    let creds = bicdb_cli::clientauth::from_args(args)?;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-S" => silent = true,
             "--direct" => direct = true,
+            "-s" | "--socket" => {
+                socket = Some(PathBuf::from(it.next().ok_or("-s 缺套接字路径")?));
+            }
             "-p" | "--ini" | "--params-file" => {
                 ini = Some(PathBuf::from(it.next().ok_or("-p 缺参数文件路径")?));
             }
@@ -101,16 +112,41 @@ fn run(args: &[String]) -> Result<i32, String> {
     }
     // **实例寻址**：`-p` > `$BICDB_INI` > `./bicdb.ini`（照 Oracle 的口径，
     // 不指向目录——根区目录注册在参数文件里）。
-    let (params, _) =
-        bicdb_cli::config::InstanceParams::locate(ini.as_deref()).map_err(|e| e.to_string())?;
+    // **`-s <套接字>` 明确指定了连接目标**：参数文件找不到也不挡路——它这时
+    // 只剩两个用途（`[client]` 超时、直连形态的 `db_root`），取默认即可。
+    let (params, _) = match bicdb_cli::config::InstanceParams::locate(ini.as_deref()) {
+        Ok(v) => v,
+        Err(e) if socket.is_some() => {
+            let _ = e;
+            (bicdb_cli::config::InstanceParams::default(), Vec::new())
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     let opts = Options {
         script,
         silent,
         direct,
+        socket,
     };
 
-    // 连接（服务在跑 ⇒ 套接字；否则直连）。
-    let conn = conn::Conn::open(&params, opts.direct).map_err(|e| e.to_string())?;
+    // 连接（`-s` 显式套接字 > 服务在跑 ⇒ 套接字 > 直连）。
+    let mut conn = conn::Conn::open_with(&params, opts.direct, opts.socket.as_deref())
+        .map_err(|e| e.to_string())?;
+    // **认证**（给了 `-U` 才做）：连上之后、第一条语句之前（服务的准入规则）。
+    if let Some(c) = &creds {
+        let id = conn.authenticate(c).map_err(|e| e.to_string())?;
+        if !opts.silent {
+            if id.expired {
+                println!(
+                    "已认证：主体 `{}`（{}）—— **口令已过期 ⇒ 受限会话**（只许本人改密：\
+                     `ALTER USER {} IDENTIFIED BY '<新口令>' REPLACE '<旧口令>'`）",
+                    id.user, id.user_id, id.user
+                );
+            } else {
+                println!("已认证：主体 `{}`（{}）", id.user, id.user_id);
+            }
+        }
+    }
     if !opts.silent {
         println!("bicdbcli —— bicdb {}", env!("CARGO_PKG_VERSION"));
         println!("连接：{}", conn.kind());

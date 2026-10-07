@@ -4,6 +4,8 @@
 *.pdb
 
 # ── 本地开发运行目录 ────────────────────────────────────
+# 本机测试环境（`bicdb init demo` 建出的实例：含控制文件/数据/日志/套接字/pid）
+/demo/
 # 工作区运行时目录（catalog/data/index/wal/undo/assets/
 # staging/tmp/backup/audit）在运行期创建于工作区根之下，不进入仓库
 /workspaces/
@@ -24,3 +26,7 @@
 *.key
 id_ed25519*
 credentials.json
+
+# Python（驱动侧；编译产物不进仓库）
+__pycache__/
+*.py[cod]

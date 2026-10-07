@@ -20,8 +20,10 @@
 //! `(obj#, mtime, status)`（ANN 索引另加 generation——随 RET 切片）——这些就是
 //! **计划缓存键的成分**（S6），也是"失效靠比对不靠通知"的落点。
 //!
-//! **本切片不做**：类型推导（动作 3）、参数定型（动作 4）、登记点（动作 6）
-//! ——随 S3；`public` 工作区的**管理元数据过滤**已由"自举对象出局"覆盖
+//! **已落地**：类型推导（动作 3）、参数定型（动作 4）——见 `bind::expr`；
+//! **登记点（动作 6）** 的"计划缓存键"部分只保证**可观测**（`BoundRefs` 带
+//! `(obj#, mtime)`），缓存本体随 S6。`public` 工作区的**管理元数据过滤**已由
+//! "自举对象出局"覆盖
 //! （`user$`/`ws$`/`fs$` 都是自举对象），`file$` 的 admin 例外见 [`ResolvePolicy`]。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +34,10 @@ pub mod statement;
 
 pub use catalog::CatalogViewImpl;
 pub use expr::{bind_expr, kind_name, BindScope, BoundColumn, BoundParams};
-pub use statement::{bind_statement, BoundDdl, BoundInsert, BoundSelect, BoundStatement};
+pub use statement::{
+    bind_statement, BoundDdl, BoundDelete, BoundFrom, BoundInsert, BoundJoin, BoundSelect,
+    BoundSetKind, BoundSetOp, BoundStatement, BoundTable, BoundUpdate,
+};
 
 /// 命名空间（三格里的第 ① 格的两个子空间）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +108,8 @@ pub enum BindError {
     Catalog(String),
     /// 列名不在作用域里（**只针对已解析到的表**；"表不存在"是 `NotFound`）。
     UnknownColumn(String),
+    /// **列名有歧义**（两表连接时同名列没加限定名）——照 SQL 标准：拒绝，不猜。
+    AmbiguousColumn(String),
     /// **参数无类型上下文**（如 `SELECT :p`）——推导不出即拒绝（§4.3）。
     ParamWithoutContext(String),
     /// 同一参数多处使用推出**不同类型**（§4.3）。
@@ -143,6 +150,10 @@ impl std::fmt::Display for BindError {
             BindError::ReservedName(n) => write!(f, "名字 `{n}` 是保留名（`$` 结尾或预置名）"),
             BindError::Catalog(why) => write!(f, "目录读取失败：{why}"),
             BindError::UnknownColumn(n) => write!(f, "列 `{n}` 不存在"),
+            BindError::AmbiguousColumn(n) => write!(
+                f,
+                "列 `{n}` 有歧义（两张表都有这一列）——加限定名，如 `t.{n}`"
+            ),
             BindError::ParamWithoutContext(n) => {
                 write!(f, "参数 `:{n}` 无类型上下文（推导不出类型）")
             }
@@ -233,8 +244,11 @@ pub trait CatalogView {
     fn indexes_of(&mut self, obj: u32) -> Result<Vec<CatalogIndex>, BindError>;
     /// 对象版本与状态（计划缓存键的成分）。
     fn object_version(&mut self, obj: u32) -> Result<(u64, u32), BindError>;
-    /// 这张**固定表**在不在（第 ② 格；行由引擎即时产生，无版本）。
-    fn fixed_table(&mut self, name: &str) -> Result<bool, BindError>;
+    /// **固定表的列定义**（第 ② 格；`None` = 不认识这张固定表）。
+    ///
+    /// 行不在目录里——**查询时由引擎即时产生**（`file$` 的内容 = 控制文件
+    /// 内存映像），所以这里只回答"有没有这张表、有哪些列"。
+    fn fixed_columns(&mut self, name: &str) -> Result<Option<Vec<CatalogColumn>>, BindError>;
     /// 是不是 `public` 工作区（`file$` 的可见性规则之一）。
     fn is_public(&self) -> bool;
     /// **段头块**（`seg$.block_id`）——物理计划开扫描用（活路径：`obj$` → `seg$`）。
@@ -371,7 +385,7 @@ impl<'v, V: CatalogView> NameResolver<'v, V> {
                     ns: NameSpace::Table,
                 });
             }
-            if self.view.fixed_table(name)? {
+            if self.view.fixed_columns(name)?.is_some() {
                 self.refs.note_fixed_table(name);
                 return Ok(ResolvedName::FixedTable(fixed));
             }

@@ -58,7 +58,7 @@ fn two_users_and_public_have_disjoint_private_roots() {
     assert!(!bob.path().starts_with(alice.path()));
     assert!(!alice.path().starts_with(bob.path()));
 
-    // 每个根下恰好是十个固定子目录，权限同为 0700。
+    // 每个根下恰好是三个固定子目录（control/wal/data），权限同为 0700。
     for root in [&alice, &bob, &public] {
         for dir in WorkspaceDir::ALL {
             let p = dir.path_in(root.path());
@@ -105,9 +105,9 @@ fn symlinked_subdir_is_refused_and_creation_is_idempotent() {
     root.create_layout().expect("重复创建应幂等");
 
     // 把某个子目录替换成符号链接后，必须拒绝。
-    let catalog = WorkspaceDir::Catalog.path_in(root.path());
-    fs::remove_dir_all(&catalog).unwrap();
-    std::os::unix::fs::symlink(&base, &catalog).unwrap();
+    let control = WorkspaceDir::Control.path_in(root.path());
+    fs::remove_dir_all(&control).unwrap();
+    std::os::unix::fs::symlink(&base, &control).unwrap();
     let err = root.create_layout().expect_err("符号链接子目录必须拒绝");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 

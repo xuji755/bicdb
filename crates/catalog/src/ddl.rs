@@ -18,7 +18,7 @@
 //!
 //! **对象号口径（本模块冻结，随 C4 记档）**：
 //! ```text
-//! 1..N       自举集（N = 15 普通 / 23 public；建区期连号，见 create.rs）
+//! 1..N       自举集（N = 15 普通 / 27 public；建区期连号，见 create.rs）
 //! N+1, N+2   stat$ / seq$（**保留常量**——建它们时 seq$ 还不存在）
 //! ≥ 100      用户对象（`seq$` 的 object_id 序列分配；obj_kind::USER_FIRST）
 //! ```
@@ -59,6 +59,11 @@ pub enum DdlError {
     Index(bicdb_index::IndexError),
     /// 名字非法（保留名：`$` 结尾或预置名）。
     ReservedName(String),
+    /// **唯一键冲突**（DCL 的字典行：`fs$` 名字/路径、`ws$` 名字、`user$` 名字）。
+    ///
+    /// 单独一支是为了文案：`AlreadyExists` 会套上"对象 `…` 已存在"的外壳，
+    /// 而这里的载荷已经是一句完整的话（点名表、键、冲突值）。
+    UniqueViolation(String),
     /// 对象已存在（`(namespace, name)` 命中）。
     AlreadyExists(String),
     /// 对象不存在（DROP 的目标）。
@@ -83,6 +88,7 @@ impl std::fmt::Display for DdlError {
             DdlError::Index(e) => write!(f, "DDL·索引：{e}"),
             DdlError::ReservedName(n) => write!(f, "名字 `{n}` 是保留名（`$` 结尾或预置名）"),
             DdlError::AlreadyExists(n) => write!(f, "对象 `{n}` 已存在"),
+            DdlError::UniqueViolation(why) => f.write_str(why),
             DdlError::NotFound(n) => write!(f, "对象 `{n}` 不存在"),
             DdlError::BadTableDef(why) => write!(f, "表定义非法：{why}"),
             DdlError::BadIndexDef(why) => write!(f, "索引定义非法：{why}"),
@@ -275,7 +281,7 @@ pub const OBJECT_ID_SEQ: u64 = 1;
 ///
 /// 只在 [`with_ddl_txn`] 的闭包里构造——它借的是引擎的三把内部锁 +
 /// 内层事务句柄（`TxnEngine::with_write_context`）。
-struct DictWriter<'a, 'b, 'io, 'lio, 'lf> {
+pub(crate) struct DictWriter<'a, 'b, 'io, 'lio, 'lf> {
     cat: &'a mut Catalog<'io>,
     pool: &'a BufferPool<'b>,
     log: &'a mut GroupWriter<'lio, 'lf>,
@@ -347,6 +353,184 @@ impl<'a, 'b, 'io, 'lio, 'lf> DictWriter<'a, 'b, 'io, 'lio, 'lf> {
         Ok(rid)
     }
 
+    /// **DCL 用的字典行写口**：**先做唯一键预检**（在写事务内、按行字节判），
+    /// 再插行。
+    ///
+    /// **为什么要这一道**：索引层**不判唯一性**（`access/index.rs` 的既定取舍：
+    /// 索引层只看槽位死活，槽位复用会把合法插入误判成冲突）——唯一性判定放在
+    /// "行字节可见的层"。SQL 的表/索引 DDL 有各自的预检；**DCL 的字典行**
+    /// （`fs$` 名字/路径、`ws$` 名字、`user$` 名字）过去没有，这一道补上，
+    /// 判据与 SQL 侧同源：取候选行、重算键、**逐字节比**。
+    pub(crate) fn insert_dict_row(
+        &mut self,
+        table: &str,
+        values: &[DictValue],
+    ) -> Result<RowId, DdlError> {
+        self.ensure_unique_keys(table, values)?;
+        self.insert_row(table, values)
+    }
+
+    /// **唯一键预检**（每个 `unique` 键各查一次；命中即 `Duplicate`）。
+    ///
+    /// 判据链条：键列值 → 键分量字节（与行内同源）→ 该索引上取候选 ROWID →
+    /// 取候选行 → **重算键分量并逐字节比**（槽位复用留下的陈旧条目因此不会被
+    /// 误判——它的行重算出来是别的键）。
+    fn ensure_unique_keys(&mut self, table: &str, values: &[DictValue]) -> Result<(), DdlError> {
+        let (def, _seg) = self.table(table)?;
+        for key_def in def.keys {
+            if !key_def.unique {
+                continue;
+            }
+            let comps_bytes = key_components(values, def, key_def)?;
+            let comps = bicdb_storage::key::decode(&comps_bytes)
+                .map_err(|e| DdlError::BadIndexDef(e.to_string()))?;
+            let refs: Vec<Option<&[u8]>> = comps.iter().map(|c| c.as_deref()).collect();
+            let Some((rid, row)) = self
+                .cat
+                .lookup(key_def.name, &refs)
+                .map_err(|e| DdlError::BadIndexDef(e.to_string()))?
+            else {
+                continue;
+            };
+            // 候选行的键列值 **与该索引的键列** 对齐后重算（行值按表列序排）。
+            let candidate: Vec<DictValue> = def
+                .columns
+                .iter()
+                .map(|c| {
+                    row.get(usize::from(c.col) - 1)
+                        .cloned()
+                        .unwrap_or(DictValue::Null)
+                })
+                .collect();
+            let cand_bytes = key_components(&candidate, def, key_def)?;
+            if cand_bytes == comps_bytes {
+                let shown = key_def
+                    .cols
+                    .iter()
+                    .map(|c| {
+                        let v = values.get(usize::from(*c) - 1);
+                        match v {
+                            Some(DictValue::Text(t)) => t.clone(),
+                            Some(DictValue::Num(n)) => n.to_string(),
+                            _ => "?".to_owned(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(DdlError::UniqueViolation(format!(
+                    "{table} 的唯一键 {} 冲突：{shown} 已存在（ROWID {rid}）",
+                    key_def.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// **DCL 用的字典行改口**（见 [`DictWriter::update_row`] 的键列限制）。
+    pub(crate) fn update_dict_row(
+        &mut self,
+        table: &str,
+        rid: RowId,
+        values: &[DictValue],
+    ) -> Result<(), DdlError> {
+        self.update_row(table, rid, values)
+    }
+
+    /// **删一行字典行**（`DROP USER` 等：行真删——名字要能被再次使用）。
+    ///
+    /// 索引项按该表的每个键同步删除（与插入对称）。
+    pub(crate) fn delete_dict_row(&mut self, table: &str, rid: RowId) -> Result<(), DdlError> {
+        // 删行按 ROWID 定位（不经段头）——段头块在 `table()` 里校验存在即可。
+        let (def, _seg_block) = self.table(table)?;
+        let values = self
+            .cat
+            .fetch(table, rid)
+            .map_err(|e| DdlError::BadTableDef(format!("读旧行失败：{e}")))?;
+        let policy = InsertPolicy::in_place(0);
+        let ws = self.ws();
+        TableAccess::new(self.pool, ws).delete(
+            self.log,
+            self.chain,
+            self.txn,
+            self.cat.file_mut(),
+            rid,
+            &policy,
+        )?;
+        for key_def in def.keys {
+            let comps = key_components(&values, def, key_def)?;
+            let idx_block = live_index_block(self.cat, key_def.name)?;
+            let new_root = acc_index::delete_entry(
+                self.pool,
+                self.log,
+                self.cat.file_mut(),
+                ws,
+                idx_block,
+                self.txn,
+                &comps,
+                rid,
+            )?;
+            acc_index::write_tree_head_redo(
+                self.pool,
+                self.log,
+                self.cat.file_mut(),
+                ws,
+                idx_block,
+                self.txn,
+                new_root,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// **改写一行字典行**（DCL 用：`fs$` 的状态/开关、`ws$` 的属主/配额、
+    /// `user$` 的口令/状态——**都不是键列**）。
+    ///
+    /// **键列不允许改**：改了就得"删旧索引项 + 插新索引项"，那是两条路径；
+    /// 这里**当场拒绝**（`DclError` 之外的调用方也没法绕：校验在写之前）。
+    /// 要改键列 ⇒ 调用方先 `delete_row` 再 `insert_row`。
+    fn update_row(
+        &mut self,
+        table: &str,
+        rid: RowId,
+        values: &[DictValue],
+    ) -> Result<(), DdlError> {
+        let (def, seg_block) = self.table(table)?;
+        // 键列不变校验：取旧行，逐键比较键分量。
+        let old = self
+            .cat
+            .fetch(table, rid)
+            .map_err(|e| DdlError::BadTableDef(format!("读旧行失败：{e}")))?;
+        for key_def in def.keys {
+            if !key_def.unique {
+                continue;
+            }
+            for &col_no in key_def.cols {
+                let idx = usize::from(col_no) - 1;
+                if old.get(idx) != values.get(idx) {
+                    return Err(DdlError::BadTableDef(format!(
+                        "字典行改写不得动键列（{table}.{}，键 {}）——先删后插",
+                        def.columns[idx].name, key_def.name
+                    )));
+                }
+            }
+        }
+        let bytes = crate::row::encode(values, def.columns)
+            .map_err(|e| DdlError::BadTableDef(e.to_string()))?;
+        let policy = InsertPolicy::in_place(0);
+        let mut access = TableAccess::new(self.pool, self.ws());
+        access.update(
+            self.log,
+            self.chain,
+            self.txn,
+            self.cat.file_mut(),
+            seg_block,
+            rid,
+            &bytes,
+            &policy,
+        )?;
+        Ok(())
+    }
+
     /// **写穿缓存**（§4.2 纪律 4：DDL 在同一事务内改字典行时同改缓存）。
     fn write_through_obj(&mut self, values: &[DictValue]) -> Result<(), DdlError> {
         let row = ObjRow::from_values(values)?;
@@ -397,6 +581,15 @@ fn key_components(
 /// 失败路径：闭包体返回错误 ⇒ 回滚 + **缓存全清**（保守正确：写穿过的行随
 /// 事务一起消失）。
 fn with_ddl_txn<R>(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    body: impl FnOnce(&mut DictWriter<'_, '_, '_, '_, '_>) -> Result<R, DdlError>,
+) -> Result<(R, u64), DdlError> {
+    dcl_txn(cat, engine, body)
+}
+
+/// **DCL 事务壳**（`crate::dcl` 用；与 DDL 同一条路径——"没有第二条路"）。
+pub(crate) fn dcl_txn<R>(
     cat: &mut Catalog<'_>,
     engine: &Engine<'_, '_, '_, '_>,
     body: impl FnOnce(&mut DictWriter<'_, '_, '_, '_, '_>) -> Result<R, DdlError>,
@@ -857,6 +1050,14 @@ pub fn create_table(
 /// **统一路径**：自举表（引导页权威）、`stat$`/`seq$`（DDL 建）、用户表/索引
 /// 都经 `seg$` 取段头——同一份字典事实，不搞第二套映射。
 pub fn live_segment_block(cat: &mut Catalog<'_>, obj: u32) -> Result<u32, DdlError> {
+    Ok(live_segment_location(cat, obj)?.1)
+}
+
+/// **按对象取活段的（文件号, 段头块）**（`seg$.file_id` / `seg$.block_id`）。
+///
+/// 与 [`live_segment_block`] 同一趟查找，只是把文件号也带出来——**索引扫描**
+/// 要它（`IndexScan` 的 `file_id` 就是"索引段在哪个文件"）。
+pub fn live_segment_location(cat: &mut Catalog<'_>, obj: u32) -> Result<(u16, u32), DdlError> {
     let key = crate::open::comp_num(u64::from(obj));
     let obj_row = cat
         .lookup("i_obj_pk", &[Some(&key)])?
@@ -869,8 +1070,13 @@ pub fn live_segment_block(cat: &mut Catalog<'_>, obj: u32) -> Result<u32, DdlErr
     let seg_row = cat
         .lookup("i_seg_pk", &[Some(&skey)])?
         .ok_or_else(|| DdlError::NotFound(format!("seg$ 无 dataobj# {dataobj}")))?;
+    let file_id = match seg_row.1.get(1) {
+        Some(DictValue::Num(f)) => u16::try_from(*f)
+            .map_err(|_| DdlError::BadTableDef(format!("seg$.file_id {f} 超出 16 位")))?,
+        _ => return Err(DdlError::BadTableDef("seg$.file_id 形态非法".to_owned())),
+    };
     match seg_row.1.get(2) {
-        Some(DictValue::Num(b)) => Ok(*b as u32),
+        Some(DictValue::Num(b)) => Ok((file_id, *b as u32)),
         _ => Err(DdlError::BadTableDef("seg$.block_id 形态非法".to_owned())),
     }
 }
@@ -1502,7 +1708,7 @@ fn drop_table_rows(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bicdb_storage::buffer::{BufferPool, CacheConfig, SystemClock, WalGuard};
     use bicdb_storage::controlfile::{
@@ -1536,9 +1742,9 @@ mod tests {
     }
 
     /// 一台"库"：file 0（字典：自举 + 种子）+ 撤销段 + 池 + 日志 + 引擎。
-    pub(super) struct Rig {
+    pub(crate) struct Rig {
         pool: &'static BufferPool<'static>,
-        pub(super) engine: &'static Engine<'static, 'static, 'static, 'static>,
+        pub(crate) engine: &'static Engine<'static, 'static, 'static, 'static>,
         cf_a: String,
         cf_b: String,
         wal: String,
@@ -1546,6 +1752,11 @@ mod tests {
     }
 
     pub(super) fn rig(io: &'static MemFileIo, tag: &str) -> Rig {
+        rig_with(io, tag, false)
+    }
+
+    /// 同上，但可指定**是不是 `public`**（管理面：`user$`/`ws$`/`fs$`/`wq$`）。
+    pub(crate) fn rig_with(io: &'static MemFileIo, tag: &str, is_public: bool) -> Rig {
         let undo_file: &'static mut DataFile<'static> = Box::leak(Box::new(
             DataFile::create(io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap(),
         ));
@@ -1560,7 +1771,7 @@ mod tests {
             bicdb_storage::bitmap::FileLayout::meta().min_file_blocks() + 512,
         )
         .unwrap();
-        let built = crate::create::create_dictionary(&mut file0, WS, false).unwrap();
+        let built = crate::create::create_dictionary(&mut file0, WS, is_public).unwrap();
         let mut cat = Catalog::from_entries(file0, built.entries.clone()).unwrap();
         cat.seed_own_dictionary(&built).unwrap();
         drop(cat);
@@ -1620,7 +1831,7 @@ mod tests {
     }
 
     /// 打开目录（**接池**：活系统读法）。
-    pub(super) fn open_catalog(io: &'static MemFileIo, rig: &Rig) -> Catalog<'static> {
+    pub(crate) fn open_catalog(io: &'static MemFileIo, rig: &Rig) -> Catalog<'static> {
         let mut cat = Catalog::open(io, Path::new(DATA_F)).unwrap();
         cat.attach_pool(rig.pool);
         cat

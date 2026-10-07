@@ -19,5 +19,7 @@ path = "src/main.rs"
 bicdb-catalog = { path = "../catalog" }
 bicdb-cli = { path = "../cli" }
 bicdb-common = { path = "../common" }
+bicdb-exec = { path = "../exec" }
+bicdb-net = { path = "../net" }
 bicdb-sql = { path = "../sql" }
 bicdb-workspace = { path = "../workspace" }

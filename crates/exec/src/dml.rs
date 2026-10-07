@@ -41,13 +41,38 @@ pub trait TableWriter {
     /// 插入一行；返回 ROWID。
     fn insert_row(&mut self, row: &[u8]) -> Result<RowId, ExecError>;
     /// 按 ROWID 改一行（行锁/等待由实现方负责）。
-    fn update_row(&mut self, rid: RowId, row: &[u8]) -> Result<(), ExecError>;
-    /// 按 ROWID 删一行。
-    fn delete_row(&mut self, rid: RowId) -> Result<(), ExecError>;
+    ///
+    /// **带上旧行字节**：索引维护要"旧键删、新键插"——旧键只能从旧行算
+    /// （索引项本身可能是陈旧条目，不能反推）。
+    fn update_row(&mut self, rid: RowId, old: &[u8], new: &[u8]) -> Result<(), ExecError>;
+    /// 按 ROWID 删一行（同上：索引要删键，得从旧行算）。
+    fn delete_row(&mut self, rid: RowId, old: &[u8]) -> Result<(), ExecError>;
     /// 提交语句事务。
     fn commit(&mut self) -> Result<(), ExecError>;
     /// 回滚语句事务（出错路径）。
     fn rollback(&mut self) -> Result<(), ExecError>;
+}
+
+/// **出错收尾**（三个 DML 算子共用）：`owns_txn` 时回滚，**回滚失败不吞**。
+///
+/// 回滚失败意味着行锁/ITL/undo 可能没清——后续语句会撞上自己留下的残局
+/// （单写者形态下就是自锁），所以与主错一并报出。与 `bicdb_catalog::ddl` 的
+/// 收尾同一口径（2026-10-06 审计的 F14 只修了 DDL，DML 这一份漏了）。
+fn finish_error(
+    writer: &std::cell::RefCell<&mut dyn TableWriter>,
+    owns_txn: bool,
+    e: ExecError,
+) -> ExecError {
+    if !owns_txn {
+        return e;
+    }
+    match writer.borrow_mut().rollback() {
+        Ok(()) => e,
+        Err(rb) => ExecError::RollbackFailed {
+            main: e.to_string(),
+            rollback: rb.to_string(),
+        },
+    }
 }
 
 /// **索引维护口**（表访问写侧的可选增量）。
@@ -76,36 +101,36 @@ pub trait IndexMaintenance {
         row: &[u8],
     ) -> Result<(), ExecError>;
 
-    /// 行更新后（**旧键删、新键插**）。
-    ///
-    /// **首版未接**（UPDATE 的 SQL 面随 S4 之后，见 `bind` 的明确拒绝）——
-    /// 装了口却走到这里 ⇒ 明确报错，不静默漏维护。
+    /// 行更新后（**旧键删、新键插**；键没变就什么都不做）。
     #[allow(clippy::too_many_arguments)]
     fn after_update(
         &mut self,
-        _pool: &bicdb_storage::buffer::BufferPool<'_>,
-        _log: &mut bicdb_wal::group::GroupWriter<'_, '_>,
-        _file: &mut bicdb_storage::datafile::DataFile<'_>,
-        _ws: [u8; 8],
-        _txn: &bicdb_txn::write::Txn,
-        _rid: RowId,
-        _old: &[u8],
-        _new: &[u8],
+        pool: &bicdb_storage::buffer::BufferPool<'_>,
+        log: &mut bicdb_wal::group::GroupWriter<'_, '_>,
+        file: &mut bicdb_storage::datafile::DataFile<'_>,
+        ws: [u8; 8],
+        txn: &bicdb_txn::write::Txn,
+        rid: RowId,
+        old: &[u8],
+        new: &[u8],
     ) -> Result<(), ExecError> {
+        let _ = (pool, log, file, ws, txn, rid, old, new);
         Err(ExecError::NoIndexMaintenance("UPDATE"))
     }
 
-    /// 行删除后（**删键**）。首版未接，同 [`IndexMaintenance::after_update`]。
+    /// 行删除后（**删键**；键从**被删的行字节**算）。
     #[allow(clippy::too_many_arguments)]
     fn after_delete(
         &mut self,
-        _pool: &bicdb_storage::buffer::BufferPool<'_>,
-        _log: &mut bicdb_wal::group::GroupWriter<'_, '_>,
-        _file: &mut bicdb_storage::datafile::DataFile<'_>,
-        _ws: [u8; 8],
-        _txn: &bicdb_txn::write::Txn,
-        _rid: RowId,
+        pool: &bicdb_storage::buffer::BufferPool<'_>,
+        log: &mut bicdb_wal::group::GroupWriter<'_, '_>,
+        file: &mut bicdb_storage::datafile::DataFile<'_>,
+        ws: [u8; 8],
+        txn: &bicdb_txn::write::Txn,
+        rid: RowId,
+        old: &[u8],
     ) -> Result<(), ExecError> {
+        let _ = (pool, log, file, ws, txn, rid, old);
         Err(ExecError::NoIndexMaintenance("DELETE"))
     }
 }
@@ -240,12 +265,7 @@ impl Operator for Insert<'_> {
                 cx.note_affected(self.slot, n);
                 Ok(None) // DML 不产出结果行（SQL 面无 RETURNING）
             }
-            Err(e) => {
-                if self.owns_txn {
-                    let _ = self.writer.borrow_mut().rollback();
-                }
-                Err(e)
-            }
+            Err(e) => Err(finish_error(self.writer, self.owns_txn, e)),
         }
     }
 }
@@ -255,6 +275,8 @@ pub struct Delete<'a, 'w> {
     input: Box<dyn Operator + 'a>,
     writer: &'w std::cell::RefCell<&'w mut dyn TableWriter>,
     owns_txn: bool,
+    /// 表的行形状（旧行重编码用——索引删键要它）。
+    shape: RowShape,
     done: bool,
     slot: usize,
     opened: bool,
@@ -267,11 +289,13 @@ impl<'a, 'w> Delete<'a, 'w> {
         input: Box<dyn Operator + 'a>,
         writer: &'w std::cell::RefCell<&'w mut dyn TableWriter>,
         owns_txn: bool,
+        shape: RowShape,
     ) -> Self {
         Self {
             input,
             writer,
             owns_txn,
+            shape,
             done: false,
             slot: 0,
             opened: false,
@@ -298,8 +322,10 @@ impl Operator for Delete<'_, '_> {
         let result = (|| -> Result<u64, ExecError> {
             let mut affected = 0u64;
             while let Some(row) = self.input.next(cx)? {
-                let (rid, _) = rowid_of(&row)?;
-                self.writer.borrow_mut().delete_row(rid)?;
+                let (rid, values) = rowid_of(&row)?;
+                // 旧行字节 = 去掉 ROWID 前缀的列按表形状重编码（索引删键要用）。
+                let old = crate::value::encode_row(&Row::new(values.to_vec()), &self.shape)?;
+                self.writer.borrow_mut().delete_row(rid, &old)?;
                 affected += 1;
             }
             Ok(affected)
@@ -314,10 +340,10 @@ impl Operator for Delete<'_, '_> {
                 Ok(None)
             }
             Err(e) => {
-                if self.owns_txn {
-                    let _ = self.writer.borrow_mut().rollback();
-                }
-                Err(e)
+                // 出错即终结：不置 `done` 的话，再调 `next()` 会因为输入已耗尽
+                // 返回 `Ok(n)` 甚至提交——与"出错即终止"矛盾。
+                self.done = true;
+                Err(finish_error(self.writer, self.owns_txn, e))
             }
         }
     }
@@ -391,8 +417,9 @@ impl Operator for Update<'_, '_> {
                         .get_mut(*col)
                         .ok_or(ExecError::RowShapeMismatch { col: *col })? = v;
                 }
+                let old = encode_row(&original, &self.shape)?;
                 let bytes = encode_row(&Row::new(new_values), &self.shape)?;
-                self.writer.borrow_mut().update_row(rid, &bytes)?;
+                self.writer.borrow_mut().update_row(rid, &old, &bytes)?;
                 affected += 1;
             }
             Ok(affected)
@@ -407,10 +434,10 @@ impl Operator for Update<'_, '_> {
                 Ok(None)
             }
             Err(e) => {
-                if self.owns_txn {
-                    let _ = self.writer.borrow_mut().rollback();
-                }
-                Err(e)
+                // 出错即终结：不置 `done` 的话，再调 `next()` 会因为输入已耗尽
+                // 返回 `Ok(n)` 甚至提交——与"出错即终止"矛盾。
+                self.done = true;
+                Err(finish_error(self.writer, self.owns_txn, e))
             }
         }
     }

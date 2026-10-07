@@ -56,7 +56,7 @@ pub use expr::{ArithOp, CmpOp, Expr, Truth};
 pub use hash_join::HashJoin;
 pub use index_scan::{IndexScan, DEFAULT_FETCH_BATCH};
 pub use join::{JoinKind, NestedLoop};
-pub use nodes::{Filter, Limit, Project, SeqScan};
+pub use nodes::{Filter, Limit, Project, SeqScan, SingleRow};
 pub use operator::{collect, Operator, RowCursor};
 pub use plan::{build, ExecEnv, PlanNode, SourceId};
 pub use setops::{all_columns_keys, Append, SetOp, SetOpKind, Unique};

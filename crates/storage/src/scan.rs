@@ -16,17 +16,44 @@
 //!    返回 `None` 表示"该行在快照下不存在"（已删/未提交/槽复用）——与
 //!    点查的语义完全相同。
 
-use bicdb_common::seq::CommitSeq;
-
 use crate::buffer::{BufferError, BufferPool};
-use crate::cr::{self, CrError};
+use crate::cr::{self, CrError, ReadView};
 use crate::heap;
 use crate::page::Page;
 use crate::rowid::{Rdba, RowId};
 use crate::undo::UndoChain;
 
-/// 顺序扫描的**区读上限**（§5.12：一次 `pread` ≤ 8 页 = 128 KiB）。
+/// 顺序扫描的**区读上限**（§5.12：一次 `pread` ≤ 8 页 = 128 KiB）——默认值。
+///
+/// 实际取值见 [`scan_run_pages`]：实例参数 `storage.multiblock_read_pages`
+/// （Oracle `db_file_multiblock_read_count` 的同位物）在实例打开时设定一次。
 pub const SCAN_RUN_PAGES: u32 = 8;
+
+/// 进程级当前值（**实例打开时设定一次**；与 `segment::set_file_extend_blocks`
+/// 同一范式：扫描层没有实例上下文）。
+static RUN_PAGES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(SCAN_RUN_PAGES);
+
+/// 当前的区读页数（索引的 FFS 与堆扫描共用，见 `set_scan_run_pages`）。
+#[must_use]
+pub fn scan_run_pages() -> u32 {
+    RUN_PAGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **设定区读页数**（实例参数 `storage.multiblock_read_pages`；1..=64 页）。
+///
+/// 两个调用方必须是同一个值：堆扫描（本模块）与索引的全扫（`bicdb_index`）——
+/// 此前是**两个各写 8 的常量**（`SCAN_RUN_PAGES` / `FFS_RUN_PAGES`），
+/// 改一处会静默分叉。
+///
+/// # Errors
+/// 越出 1..=64。
+pub fn set_scan_run_pages(pages: u32) -> Result<(), &'static str> {
+    if !(1..=64).contains(&pages) {
+        return Err("multiblock_read_pages 要落在 1–64 页");
+    }
+    RUN_PAGES.store(pages, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
 
 /// 扫描原语错误。
 #[derive(Debug)]
@@ -99,24 +126,101 @@ pub fn sort_rowids(ids: &mut [RowId]) {
     ids.sort_unstable_by_key(|r| (r.file_id(), r.block_id(), r.row_id()));
 }
 
-/// **批量回表**：取出这批 ROWID 在 `snapshot` 下的行（§9.4）。
+/// **把一个 ROWID 解析到当前落点**（沿行迁移的转发链；只读、有限跳）。
 ///
-/// - 返回与请求**同序**的 `Vec<Option<Vec<u8>>>`；`None` = 该行在快照下不
+/// 读不到页/槽不是 Normal ⇒ 原样返回（由调用方的 `None`/判活逻辑说话——
+/// 这里**不制造错误**：解析失败与"行不在"对回表是同一种结果）。
+fn resolve_forwarding(
+    pool: &BufferPool<'_>,
+    workspace: [u8; 8],
+    rid: RowId,
+) -> Result<RowId, ScanError> {
+    let mut cur = rid;
+    for _ in 0..crate::scan::FORWARD_MAX_HOPS {
+        let rdba = match Rdba::from_parts(cur.file_id(), cur.block_id()) {
+            Some(r) => r,
+            None => return Ok(cur),
+        };
+        let mut pages = pool.read_run(workspace, rdba, 1)?;
+        let Some(page) = pages.pop() else {
+            return Ok(cur);
+        };
+        match heap::slot_status(&page, cur.row_id()) {
+            Some(crate::page::SlotStatus::Forwarding) => {
+                match heap::forwarding_target(&page, cur.row_id()) {
+                    Some(next) => cur = next,
+                    None => return Ok(cur),
+                }
+            }
+            _ => return Ok(cur),
+        }
+    }
+    Ok(cur)
+}
+
+/// 转发链跳数上限（与 `catalog` 的 `forward_max_hops` 同源口径）。
+pub const FORWARD_MAX_HOPS: usize = 16;
+
+/// **批量回表**：取出这批 ROWID 在 `view` 下的行（§9.4）。
+///
+/// - 返回与请求**同序**的 `Vec<Option<Vec<u8>>>`；`None` = 该行在视角下不
 ///   存在（已删/未提交/槽已复用）——与点查语义一致；
 /// - 同块的多行共享**一次区读（`count = 1`）**与**一次 CR 块重建**——
 ///   未按块排序时结果仍正确，但每块的重建次数会退化（见模块文档）。
+///
+/// **批量回表**（索引回表的主路径；`rows` = 索引项里记的 ROWID）。
+///
+/// **跟随转发指针**（见 [`resolve_forwarding`]）——索引项存的是稳定入口，
+/// 行迁移后要靠它落到当前页；不解析的话迁移过的行会回表落空。
+///
+/// # Errors
+/// 页读失败（I/O）、ROWID 形态非法。
 pub fn fetch_rows(
     pool: &BufferPool<'_>,
     chain: &UndoChain<'_, '_>,
-    snapshot: CommitSeq,
+    view: ReadView,
     rows: &[RowId],
 ) -> Result<Vec<Option<Vec<u8>>>, ScanError> {
+    Ok(fetch_rows_resolved(pool, chain, view, rows)?
+        .into_iter()
+        .map(|o| o.map(|(_, bytes)| bytes))
+        .collect())
+}
+
+/// 一行 + 它**解析转发之后**的物理位置（[`fetch_rows_resolved`] 的返回元素）。
+pub type ResolvedRow = Option<(RowId, Vec<u8>)>;
+
+/// 与 [`fetch_rows`] 同一条路，额外返回每行**解析转发之后**的物理 `ROWID`。
+///
+/// 为什么需要它：**同一条活行可能有多条索引项**——改键列只追加新项、不移动
+/// 旧项（索引写没有 undo，见 `arch/09` §9.1.2 的取舍）。于是范围覆盖新旧两个键
+/// 时，同一条行会被两条项各带出一次；索引扫描据此**按物理行去重**。
+/// 去重键必须是**解析后**的物理位置：行迁移过的话，旧项记的入口与
+/// 新项记的物理位置**RID 不同**，但指向同一行。
+///
+/// # Errors
+/// 页读失败（I/O）、ROWID 形态非法。
+pub fn fetch_rows_resolved(
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+    view: ReadView,
+    rows: &[RowId],
+) -> Result<Vec<ResolvedRow>, ScanError> {
     let workspace = chain.segment().workspace_ref();
-    let mut out: Vec<Option<Vec<u8>>> = vec![None; rows.len()];
+    let mut out: Vec<ResolvedRow> = vec![None; rows.len()];
+
+    // **先把 ROWID 解析到当前落点**（行迁移的转发链）：索引项里存的是**稳定入口**
+    // （写入时的位置），迁移后原槽位只剩 6B 转发指针——不回解析的话，回表会拿到
+    // `None`（转发槽不是行），于是"这一行明明在、唯一性却漏判"。
+    // 实测抓到的正是这条：改长更新（迁移）之后，同键重复插入被放行。
+    let resolved: Vec<RowId> = rows
+        .iter()
+        .map(|r| resolve_forwarding(pool, workspace, *r).unwrap_or(*r))
+        .collect();
 
     // 按块分组（保序：处理顺序 = 首次出现的块序；输出按原下标回填）。
     let mut groups: Vec<(Rdba, Vec<(usize, u16)>)> = Vec::new();
-    for (i, r) in rows.iter().enumerate() {
+    for (i, r) in resolved.iter().enumerate() {
         let rdba =
             Rdba::from_parts(r.file_id(), r.block_id()).ok_or(ScanError::BadRowId { rowid: *r })?;
         match groups.iter_mut().find(|(k, _)| *k == rdba) {
@@ -129,9 +233,10 @@ pub fn fetch_rows(
         let mut pages = pool.read_run(workspace, rdba, 1)?;
         let page = pages.pop().ok_or(ScanError::EmptyRun { rdba })?;
         // **一次 CR 块重建**服务本块全部请求行。
-        let cr_page = cr::reconstruct(&page, snapshot, chain)?;
+        let cr_page = cr::reconstruct(&page, view, chain)?;
         for (idx, row_no) in items {
-            out[idx] = heap::row(&cr_page, row_no).map(<[u8]>::to_vec);
+            let phys = resolved[idx];
+            out[idx] = heap::row(&cr_page, row_no).map(|b| (phys, b.to_vec()));
         }
     }
     Ok(out)
@@ -144,14 +249,14 @@ pub fn fetch_rows(
 pub fn fetch_block_rows(
     pool: &BufferPool<'_>,
     chain: &UndoChain<'_, '_>,
-    snapshot: CommitSeq,
+    view: ReadView,
     rdba: Rdba,
     row_nos: &[u16],
 ) -> Result<Vec<Option<Vec<u8>>>, ScanError> {
     let workspace = chain.segment().workspace_ref();
     let mut pages = pool.read_run(workspace, rdba, 1)?;
     let page = pages.pop().ok_or(ScanError::EmptyRun { rdba })?;
-    let cr_page = cr::reconstruct(&page, snapshot, chain)?;
+    let cr_page = cr::reconstruct(&page, view, chain)?;
     Ok(row_nos
         .iter()
         .map(|n| heap::row(&cr_page, *n).map(<[u8]>::to_vec))
@@ -171,7 +276,7 @@ pub fn fetch_block_rows(
 pub struct HeapScanner<'a, 'b, 'io, 'f> {
     pool: &'a BufferPool<'b>,
     chain: &'a UndoChain<'io, 'f>,
-    snapshot: CommitSeq,
+    view: ReadView,
     workspace: [u8; 8],
     file_id: u16,
     /// 待扫物理块（升序）。
@@ -208,7 +313,7 @@ impl<'a, 'b, 'io, 'f> HeapScanner<'a, 'b, 'io, 'f> {
     pub fn new(
         pool: &'a BufferPool<'b>,
         chain: &'a UndoChain<'io, 'f>,
-        snapshot: CommitSeq,
+        view: ReadView,
         file_id: u16,
         blocks: Vec<u32>,
     ) -> Self {
@@ -216,7 +321,7 @@ impl<'a, 'b, 'io, 'f> HeapScanner<'a, 'b, 'io, 'f> {
         Self {
             pool,
             chain,
-            snapshot,
+            view,
             workspace,
             file_id,
             blocks,
@@ -262,7 +367,7 @@ impl<'a, 'b, 'io, 'f> HeapScanner<'a, 'b, 'io, 'f> {
                 _ => return Err(ScanError::BadBlock { block }),
             }
             // **一次 CR 块重建**服务本块全部行（§12.3）。
-            let cr_page = cr::reconstruct(&page, self.snapshot, self.chain)?;
+            let cr_page = cr::reconstruct(&page, self.view, self.chain)?;
             self.cr_rebuilds += 1;
             let slots = cr_page.slot_count();
             for row_no in 1..=slots {
@@ -284,7 +389,7 @@ impl<'a, 'b, 'io, 'f> HeapScanner<'a, 'b, 'io, 'f> {
         let mut count = 1u32;
         while self.at + (count as usize) < self.blocks.len()
             && self.blocks[self.at + count as usize] == first + count
-            && count < SCAN_RUN_PAGES
+            && count < scan_run_pages()
         {
             count += 1;
         }
@@ -313,7 +418,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use bicdb_common::seq::Lsn;
+    use bicdb_common::seq::{CommitSeq, Lsn};
     use bicdb_workspace::io::{FileHandle, FileIo, MemFileIo, OpenOptions};
 
     use super::*;
@@ -513,7 +618,7 @@ mod tests {
 
         // 乱序请求 + 一个不存在的行号。
         let reqs = vec![rid(2, 1), rid(1, 2), rid(1, 1), rid(1, 99)];
-        let out = fetch_rows(&pool, &chain, seq(0), &reqs).unwrap();
+        let out = fetch_rows(&pool, &chain, ReadView::new(seq(0)), &reqs).unwrap();
         assert_eq!(out[0].as_deref(), Some(ra.as_slice()), "块 2 行 1");
         assert_eq!(out[1].as_deref(), Some(r2.as_slice()), "块 1 行 2");
         assert_eq!(out[2].as_deref(), Some(r1.as_slice()), "块 1 行 1");
@@ -599,7 +704,7 @@ mod tests {
         let out = fetch_rows(
             &pool,
             &chain,
-            seq(0),
+            ReadView::new(seq(0)),
             &[
                 RowId::from_parts(3, 1, 1).unwrap(),
                 RowId::from_parts(3, 1, 2).unwrap(),
@@ -613,7 +718,7 @@ mod tests {
         let out = fetch_block_rows(
             &pool,
             &chain,
-            seq(0),
+            ReadView::new(seq(0)),
             Rdba::from_parts(3, 1).unwrap(),
             &[1, 2],
         )

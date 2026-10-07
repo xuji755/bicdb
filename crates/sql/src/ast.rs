@@ -41,9 +41,19 @@ pub enum Stmt {
     AlterWorkspace(AlterWorkspaceStmt),
     /// `ALTER SESSION SET/CLEAR`（PG `VariableSetStmt`；白名单在 ② 判）。
     VariableSet(VariableSetStmt),
-    /// `ALTER SYSTEM …`（本库扩展；`DCL语句设计` §2.1 的 F 组）。
-    AlterSystem(AlterSystemStmt),
-    /// `ALTER DATABASE …`（PG `AlterDatabaseStmt` 的**无库名**形态；T 组 + W2）。
+    /// `CREATE FILESYSTEM <名> USING '<路径>'`（F1）。
+    CreateFilesystem(CreateFilesystemStmt),
+    /// `ALTER FILESYSTEM <名> SET ALLOCATE = ON | OFF`（F2）。
+    AlterFilesystem(AlterFilesystemStmt),
+    /// `DROP FILESYSTEM <名>`（F3）。
+    DropFilesystem(DropFilesystemStmt),
+    /// `CREATE USER … USING WORKSPACE …`（U1）。
+    CreateUser(CreateUserStmt),
+    /// `ALTER USER …`（U2–U6）。
+    AlterUser(AlterUserStmt),
+    /// `DROP USER <主体> [CASCADE]`（U7）。
+    DropUser(DropUserStmt),
+    /// `ALTER DATABASE …`（PG `AlterDatabaseStmt` 的**无库名**形态；T 组）。
     AlterDatabase(AlterDatabaseStmt),
 }
 
@@ -64,7 +74,12 @@ impl Stmt {
             Stmt::CreateWorkspace(s) => s.location,
             Stmt::AlterWorkspace(s) => s.location,
             Stmt::VariableSet(s) => s.location,
-            Stmt::AlterSystem(s) => s.location,
+            Stmt::CreateFilesystem(s) => s.location,
+            Stmt::AlterFilesystem(s) => s.location,
+            Stmt::DropFilesystem(s) => s.location,
+            Stmt::CreateUser(s) => s.location,
+            Stmt::AlterUser(s) => s.location,
+            Stmt::DropUser(s) => s.location,
             Stmt::AlterDatabase(s) => s.location,
         }
     }
@@ -674,40 +689,161 @@ pub struct CreateGraphStmt {
     pub location: Location,
 }
 
-/// `CREATE WORKSPACE FOR USER …`（本库扩展，仅 admin）。
+/// `CREATE WORKSPACE <名> [DEFAULT FILESYSTEM <fs>] [FROM TEMPLATE '…'] [QUOTA … ON FILESYSTEM …]…`
+/// （本库扩展，仅 admin；`DCL语句设计` §1.3 的 W1/W2）。
+///
+/// **无属主**：工作区在创建时是**无主容器**，属主由 `CREATE USER … USING WORKSPACE` 绑定
+/// （依赖顺序 `FS → WORKSPACE → USER`；旧的 `FOR USER` 形式已删除）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateWorkspaceStmt {
-    /// 主体名（标识符——折叠照 PG）。
-    pub subject: String,
-    /// `NAME '…'`（**缺省 = 跟随属主名**；`DCL语句设计` §1.2 的 W1）。
-    pub name: Option<Vec<u8>>,
+    /// 工作区名（**实例内唯一**——创建时还没有属主，没法用属主限定）。
+    pub name: String,
+    /// `DEFAULT FILESYSTEM <fs_ref>`（缺省 = 实例默认盘）。
+    pub default_fs: Option<FsRef>,
+    /// `FROM TEMPLATE '…'`（由模板克隆；W2）。
+    pub from_template: Option<Vec<u8>>,
+    /// `QUOTA <量>|UNLIMITED ON FILESYSTEM <fs_ref>`（**盘级**配额；可多个）。
+    pub quotas: Vec<FsQuota>,
     /// 位置。
     pub location: Location,
 }
 
-/// **工作区引用**（`DCL语句设计` §1.1）：`整数 | Str [ FOR USER 主体名 ]`。
+/// **盘级配额项**：`QUOTA <量>|UNLIMITED ON FILESYSTEM <fs_ref>`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FsQuota {
+    /// 目标文件系统。
+    pub fs: FsRef,
+    /// 上限。
+    pub amount: QuotaAmount,
+    /// 位置。
+    pub location: Location,
+}
+
+/// 配额的量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaAmount {
+    /// 字节数。
+    Bytes(u64),
+    /// `UNLIMITED`。
+    Unlimited,
+}
+
+/// `CREATE FILESYSTEM <名> USING '<路径>'`（F1；本库扩展）。
 ///
-/// **解析器只认形态**——名字查找与"裸名不唯一 ⇒ 拒绝"三条规则在 **② 绑定期**
-/// （REQ-SQL-002 同一条纪律：解析不 import 目录）。
+/// **名字是标识**（供 `DEFAULT FILESYSTEM <名>` 引用），**路径只是创建参数**；
+/// 路径可以是独立挂载的文件系统，**也可以只是一个目录**。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateFilesystemStmt {
+    /// 文件系统名（实例内唯一）。
+    pub name: String,
+    /// 实际路径。
+    pub path: Vec<u8>,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER FILESYSTEM <名> SET ALLOCATE = ON | OFF`（F2）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterFilesystemStmt {
+    /// 目标文件系统。
+    pub fs: FsRef,
+    /// 分配开关（退役排水阀）。
+    pub allocate: bool,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `DROP FILESYSTEM <名>`（F3）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropFilesystemStmt {
+    /// 目标文件系统。
+    pub fs: FsRef,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `CREATE USER <主体> IDENTIFIED BY '<口令>' USING WORKSPACE <work_ref>`（U1）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateUserStmt {
+    /// 主体名（实例内唯一）。
+    pub name: String,
+    /// 口令明文（**只在认证路径使用；不落库、不进日志**——落库的是散列）。
+    pub password: Vec<u8>,
+    /// 绑定的工作区（**必选**：有了工作区才能建用户）。
+    pub using_workspace: WorkRef,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER USER <主体> …`（U2–U6）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterUserStmt {
+    /// 主体名。
+    pub name: String,
+    /// 动作。
+    pub action: AlterUserAction,
+    /// 位置。
+    pub location: Location,
+}
+
+/// `ALTER USER` 的动作（闭集）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterUserAction {
+    /// `IDENTIFIED BY '<新>' [EXPIRE]`——**admin 重置口令**（遗忘找回）。
+    SetPassword {
+        /// 新口令。
+        new: Vec<u8>,
+        /// 置"下次登录必须改密"。
+        expire: bool,
+    },
+    /// `IDENTIFIED BY '<新>' REPLACE '<旧>'`——**本人改密**。
+    ReplacePassword {
+        /// 新口令。
+        new: Vec<u8>,
+        /// 旧口令。
+        old: Vec<u8>,
+    },
+    /// `PAUSE` / `RESUME`（≈ Oracle `ACCOUNT LOCK|UNLOCK`）。
+    SetPaused(bool),
+    /// `USING WORKSPACE <work_ref>`——加绑（1 用户 : N 工作区）。
+    UsingWorkspace(WorkRef),
+    /// `DROP WORKSPACE <work_ref>`——解绑（区变无主）。
+    DropWorkspace(WorkRef),
+}
+
+/// `DROP USER <主体> [CASCADE]`（U7）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropUserStmt {
+    /// 主体名。
+    pub name: String,
+    /// 连其工作区一起删（否则名下有区即拒绝）。
+    pub cascade: bool,
+    /// 位置。
+    pub location: Location,
+}
+
+/// **工作区引用**（`DCL语句设计` §1.1）：`整数 | Str`（**名字实例内唯一**——
+/// 工作区在创建时还没有属主，故**没有 `FOR USER` 限定**；名字查找在 **② 绑定期**，
+/// REQ-SQL-002：解析不 import 目录）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkRef {
     /// `workspace_id`（整数形态）。
     pub id: Option<u64>,
     /// 名字（字符串形态）。
     pub name: Option<Vec<u8>>,
-    /// `FOR USER <主体>`（名字形态的属主限定）。
-    pub user: Option<String>,
     /// 位置。
     pub location: Location,
 }
 
-/// **文件系统引用**（`DCL语句设计` §1.3）：`整数（槽位） | Str（挂载点）`。
+/// **文件系统引用**（`DCL语句设计` §1.1）：`整数（池槽位） | Str（文件系统名）`。
+///
+/// **路径不是引用位**：`USING '<路径>'` 只在创建时出现，之后一律用名字或槽位。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FsRef {
     /// 槽位号（整数形态）。
     pub slot: Option<u32>,
-    /// 挂载点（字符串形态）。
-    pub mount: Option<Vec<u8>>,
+    /// 文件系统名（字符串形态）。
+    pub name: Option<Vec<u8>>,
     /// 位置。
     pub location: Location,
 }
@@ -735,37 +871,6 @@ pub enum VariableSetKind {
     Clear,
 }
 
-/// `ALTER SYSTEM …`（本库扩展；F 组——文件系统池）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct AlterSystemStmt {
-    /// 动作。
-    pub action: AlterSystemAction,
-    /// 位置。
-    pub location: Location,
-}
-
-/// `ALTER SYSTEM` 的动作（闭集：只有 F1–F3 三个产生式）。
-#[derive(Debug, Clone, PartialEq)]
-pub enum AlterSystemAction {
-    /// `ADD FILESYSTEM '<挂载点>'`。
-    AddFilesystem {
-        /// 挂载点。
-        mount: Vec<u8>,
-    },
-    /// `ALTER FILESYSTEM <fs_ref> SET ALLOCATE = ON | OFF`。
-    AlterFilesystem {
-        /// 目标文件系统。
-        fs: FsRef,
-        /// 分配开关（退役排水阀）。
-        allocate: bool,
-    },
-    /// `DROP FILESYSTEM <fs_ref>`。
-    DropFilesystem {
-        /// 目标文件系统。
-        fs: FsRef,
-    },
-}
-
 /// `ALTER DATABASE …`（PG `AlterDatabaseStmt` 的**无库名**形态——本库实例即
 /// 一个"库"，`DCL语句设计` §2.2 记档）。
 #[derive(Debug, Clone, PartialEq)]
@@ -776,16 +881,11 @@ pub struct AlterDatabaseStmt {
     pub location: Location,
 }
 
-/// `ALTER DATABASE` 的动作（闭集：W2 克隆 + T1–T3 模板）。
+/// `ALTER DATABASE` 的动作（闭集：只剩模板两条——**克隆移到
+/// `CREATE WORKSPACE … FROM TEMPLATE`（W2），原地转模板移到
+/// `ALTER WORKSPACE … TO TEMPLATE`（W7）**：一件事不设两个入口）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterDatabaseAction {
-    /// `CLONE WORKSPACE '<新名>' FROM WORKSPACE <work_ref> | FROM TEMPLATE '<名>'`。
-    CloneWorkspace {
-        /// 新工作区名。
-        name: Vec<u8>,
-        /// 源（工作区 / 模板，同一实现）。
-        source: WorkspaceSource,
-    },
     /// `ADD TEMPLATE '<名>' FROM <work_ref>`（由源区制作模板；源区不动）。
     AddTemplate {
         /// 模板名。
@@ -793,27 +893,11 @@ pub enum AlterDatabaseAction {
         /// 源工作区。
         from: WorkRef,
     },
-    /// `ALTER WORKSPACE <work_ref> TO TEMPLATE '<名>'`（原地转换）。
-    WorkspaceToTemplate {
-        /// 源工作区。
-        ws: WorkRef,
-        /// 模板名。
-        name: Vec<u8>,
-    },
     /// `DROP TEMPLATE '<名>'`（克隆是复制、不建依赖 ⇒ 无前置）。
     DropTemplate {
         /// 模板名。
         name: Vec<u8>,
     },
-}
-
-/// 克隆/制作模板的**源**。
-#[derive(Debug, Clone, PartialEq)]
-pub enum WorkspaceSource {
-    /// `FROM WORKSPACE <work_ref>`。
-    Workspace(WorkRef),
-    /// `FROM TEMPLATE '<名>'`。
-    Template(Vec<u8>),
 }
 
 /// `ALTER WORKSPACE …`（本库扩展，仅 admin）。
@@ -827,11 +911,28 @@ pub struct AlterWorkspaceStmt {
     pub location: Location,
 }
 
-/// `ALTER WORKSPACE` 的动作。
+/// `ALTER WORKSPACE` 的动作（闭集；W3–W7）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterWorkspaceAction {
-    /// `SET NAME = '…' | NULL`
-    SetName(Option<Vec<u8>>),
+    /// `ADD FILESYSTEM <fs_ref> [QUOTA …]`——**扩盘**（W3）。
+    AddFilesystem {
+        /// 目标文件系统。
+        fs: FsRef,
+        /// 同时给的盘级配额（可选）。
+        quota: Option<FsQuota>,
+    },
+    /// `SET DEFAULT FILESYSTEM <fs_ref>`——新数据文件默认落哪块盘（W4）。
+    SetDefaultFilesystem {
+        /// 目标文件系统。
+        fs: FsRef,
+    },
+    /// `TO TEMPLATE '<名>'`——原地转模板（W7）。
+    ToTemplate {
+        /// 模板名。
+        name: Vec<u8>,
+    },
+    /// `SET NAME = '<新名>'`（W5；**无 `NULL` 形态**——v0.2 BNF 只有 `Eq Str`）。
+    SetName(Vec<u8>),
     /// `SET QUOTA (…)`（`DefElem` 列表——与 `WITH` 选项同形）。
     SetQuota(Vec<DefElem>),
 }

@@ -220,7 +220,7 @@ pub fn run_plan(
     let mut cursor = Some(HeapScanner::new(
         fx.pool,
         &fx.chain,
-        fx.snapshot,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
         DATA_FID,
         fx.blocks.clone(),
     ));
@@ -246,7 +246,13 @@ pub fn run_plan(
 /// 两路执行同一查询（无预算）。
 pub fn run_both(fx: &Fixture, query: &SelectQuery) -> RunBoth {
     // 直译路径。
-    let mut cursor = HeapScanner::new(fx.pool, &fx.chain, fx.snapshot, DATA_FID, fx.blocks.clone());
+    let mut cursor = HeapScanner::new(
+        fx.pool,
+        &fx.chain,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
+        DATA_FID,
+        fx.blocks.clone(),
+    );
     let mut cx = ExecContext::new(fx.snapshot);
     let direct_rows = execute_direct(query, &mut cursor, &mut cx).unwrap();
 
@@ -255,7 +261,7 @@ pub fn run_both(fx: &Fixture, query: &SelectQuery) -> RunBoth {
     let mut cursor2 = Some(HeapScanner::new(
         fx.pool,
         &fx.chain,
-        fx.snapshot,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
         DATA_FID,
         fx.blocks.clone(),
     ));
@@ -445,14 +451,20 @@ impl bicdb_index::IndexIo for IndexTestIo<'_, '_, '_, '_> {
 }
 
 /// 在数据文件里建一个 B+Tree 索引段并填入 `(键字节, ROWID)`；返回根页 ROWID。
-pub fn build_index(env: &mut Env, entries: &[(Vec<u8>, RowId)]) -> RowId {
+/// **建一个真索引段**：返回**段头块**（`seg$.block_id` 的同位物）。
+///
+/// **树头写进段头页的扩展区**（与 `catalog::create` 建索引时同一套）——
+/// 执行器的 `IndexScan` 就按这条路径现读树头，夹具必须照做，不能直接把
+/// 根页地址塞进计划（那会绕开被验证的那条链）。
+pub fn build_index(env: &mut Env, entries: &[(Vec<u8>, RowId)]) -> u32 {
     let mut segment = Segment::create(env.data_file, SegType::BTree, 1, 1, 8, 0, 0).unwrap();
-    let mut io = IndexTestIo {
-        pool: env.pool,
-        segment: &mut segment,
-    };
+    let seg_page0 = segment.page0_block();
     let ws = env.chain.segment().workspace_ref();
     let root = {
+        let mut io = IndexTestIo {
+            pool: env.pool,
+            segment: &mut segment,
+        };
         let mut store = bicdb_index::PoolStore::new(env.pool, &mut io, DATA_FID, ws);
         let mut tree = bicdb_index::Tree::create(&mut store, DATA_FID, ws).unwrap();
         for (key, rid) in entries {
@@ -460,5 +472,16 @@ pub fn build_index(env: &mut Env, entries: &[(Vec<u8>, RowId)]) -> RowId {
         }
         tree.root()
     };
-    root
+    // 树头 → 段头页扩展区（**逻辑页 0**）。
+    let mut header = segment.read_page(0).unwrap();
+    bicdb_storage::segment::write_tree_head(&mut header, root).unwrap();
+    segment.write_page(0, &mut header).unwrap();
+    seg_page0
+}
+
+/// **索引条目的键字节**（复合编码的**单列形态**）——与
+/// `catalog::row::key_from_row` 同一形态。
+pub fn index_key_number(n: &bicdb_types::Number) -> Vec<u8> {
+    let payload = n.encode();
+    bicdb_storage::key::encode(&[Some(&payload)])
 }

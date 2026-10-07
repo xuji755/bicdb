@@ -349,12 +349,16 @@ mod tests {
     }
 
     #[test]
-    fn public_workspace_builds_23_entries() {
+    fn public_workspace_builds_27_entries() {
         let io = MemFileIo::new();
         io.add_dir("/mem");
         let mut file = meta_file(&io, "/mem/c5.dat");
         let built = create_dictionary(&mut file, WS, true).unwrap();
-        assert_eq!(built.len(), 23, "public：15 + 3 表 + 5 索引");
+        assert_eq!(
+            built.len(),
+            27,
+            "public：15 + 4 表（user$/ws$/fs$/wq$）+ 8 索引"
+        );
         for name in ["user$", "ws$", "fs$", "i_ws_name", "i_user_name"] {
             assert!(built.object(name).is_some(), "public 应含 {name}");
         }

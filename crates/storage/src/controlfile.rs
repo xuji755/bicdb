@@ -57,6 +57,14 @@ pub const CF_FORMAT_VERSION: u16 = 1;
 pub const CF_PAGE_SIZE_FIELD: u16 = PAGE_SIZE as u16;
 /// 副本数（A / B）。
 pub const CF_COPIES: usize = 2;
+/// **控制文件种类**（页头 `flags` 字节 = 13；一份实现、两种用法）。
+///
+/// 物理格式与更新协议完全相同（见 §2.6 页布局）；只有**固定段与记录数组的
+/// 解释**不同。种类写进每一页的页头，**打开时校验**——把工作区控制文件
+/// 当全局控制文件打开（或反之）会当场失败，而不是读出一堆合理解释的字节。
+pub const CF_KIND_WORKSPACE: u8 = 0;
+/// 全局控制文件（`crates/storage/src/globalctl.rs`；`doc/全局控制文件设计_v0.1.md`）。
+pub const CF_KIND_GLOBAL: u8 = 1;
 /// 两副本的约定文件名（§2.1 的 `control/` 目录）。
 pub const CF_FILE_NAMES: [&str; CF_COPIES] = ["control01.ctl", "control02.ctl"];
 
@@ -251,38 +259,38 @@ pub fn copy_name(copy: u8) -> &'static str {
 // 小端字段读写（页内偏移访问的唯一入口）
 // ---------------------------------------------------------------------------
 
-fn get_u16(b: &[u8], off: usize) -> u16 {
+pub(crate) fn get_u16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(b[off..off + 2].try_into().expect("2 字节字段"))
 }
 
-fn get_u32(b: &[u8], off: usize) -> u32 {
+pub(crate) fn get_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().expect("4 字节字段"))
 }
 
-fn get_u64(b: &[u8], off: usize) -> u64 {
+pub(crate) fn get_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().expect("8 字节字段"))
 }
 
 /// 读 48 位域（6 字节小端）。
-fn get_u48(b: &[u8], off: usize) -> u64 {
+pub(crate) fn get_u48(b: &[u8], off: usize) -> u64 {
     let mut raw = [0u8; 8];
     raw[..6].copy_from_slice(&b[off..off + 6]);
     u64::from_le_bytes(raw)
 }
 
-fn put_u16(b: &mut [u8], off: usize, v: u16) {
+pub(crate) fn put_u16(b: &mut [u8], off: usize, v: u16) {
     b[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
 
-fn put_u32(b: &mut [u8], off: usize, v: u32) {
+pub(crate) fn put_u32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-fn put_u64(b: &mut [u8], off: usize, v: u64) {
+pub(crate) fn put_u64(b: &mut [u8], off: usize, v: u64) {
     b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-fn put_u48(b: &mut [u8], off: usize, v: u64) {
+pub(crate) fn put_u48(b: &mut [u8], off: usize, v: u64) {
     // 值域是**编码方的责任**：超出 48 位在此截断，而 decode 侧会以
     // `OutOfDomain` 拒绝——变成"写得进、读不回"。所有现存调用方的值都
     // 远在域内；这条断言让将来的误用当场暴露（debug 构建）。
@@ -300,26 +308,34 @@ pub fn page_crc(page: &[u8; PAGE_SIZE]) -> u32 {
     checksum_with_zeroed_field(page, PAGE_SIZE - CF_PAGE_TRAILER_LEN, CF_PAGE_TRAILER_LEN)
 }
 
-fn seal_page(page: &mut [u8; PAGE_SIZE]) {
+pub(crate) fn seal_page(page: &mut [u8; PAGE_SIZE]) {
     let crc = page_crc(page);
     page[PAGE_SIZE - CF_PAGE_TRAILER_LEN..].copy_from_slice(&crc.to_le_bytes());
 }
 
-fn page_body(page: &[u8; PAGE_SIZE]) -> &[u8] {
+pub(crate) fn page_body(page: &[u8; PAGE_SIZE]) -> &[u8] {
     &page[CF_PAGE_HEADER_LEN..CF_PAGE_HEADER_LEN + CF_PAGE_BODY_LEN]
 }
 
-fn page_body_mut(page: &mut [u8; PAGE_SIZE]) -> &mut [u8] {
+pub(crate) fn page_body_mut(page: &mut [u8; PAGE_SIZE]) -> &mut [u8] {
     &mut page[CF_PAGE_HEADER_LEN..CF_PAGE_HEADER_LEN + CF_PAGE_BODY_LEN]
 }
 
-/// 校验一页的结构：magic、副本号、页号、页尾校验。
-fn validate_page(page: &[u8; PAGE_SIZE], copy: u8, page_no: u8) -> Result<(), &'static str> {
+/// 校验一页的结构：magic、副本号、**种类**、页号、页尾校验。
+fn validate_page(
+    page: &[u8; PAGE_SIZE],
+    copy: u8,
+    page_no: u8,
+    kind: u8,
+) -> Result<(), &'static str> {
     if page[0..4] != CF_MAGIC {
         return Err("magic 不符（非控制文件页）");
     }
     if page[12] != copy {
         return Err("副本号不符");
+    }
+    if page[13] != kind {
+        return Err("控制文件种类不符（工作区 ↔ 全局 搞混）");
     }
     if get_u16(page, 8) != u16::from(page_no) {
         return Err("页号不符");
@@ -331,12 +347,18 @@ fn validate_page(page: &[u8; PAGE_SIZE], copy: u8, page_no: u8) -> Result<(), &'
 }
 
 /// 新建一页（页体全零；`seq` 仅页 0 使用，其余页恒 0）。
-fn blank_page(copy: u8, page_no: u8, payload_len: u16) -> Box<[u8; PAGE_SIZE]> {
+pub(crate) fn blank_page(
+    copy: u8,
+    page_no: u8,
+    payload_len: u16,
+    kind: u8,
+) -> Box<[u8; PAGE_SIZE]> {
     let mut page = Box::new([0u8; PAGE_SIZE]);
     page[0..4].copy_from_slice(&CF_MAGIC);
     put_u16(page.as_mut_slice(), 8, u16::from(page_no));
     put_u16(page.as_mut_slice(), 10, payload_len);
     page[12] = copy;
+    page[13] = kind;
     seal_page(&mut page);
     page
 }
@@ -828,9 +850,15 @@ pub struct ArchiveRecord {
 }
 
 impl Default for ArchiveRecord {
-    /// 默认 = 归档模式开启（§11.9 的默认值），目标路径为空（由建工作区时落定）。
+    /// 默认 = **不归档**，目标路径为空——**与 `bicdb init` 的建区行为一致**
+    /// （`cli::boot` 用 `NoArchive` 建记录）。
+    ///
+    /// 此前这里默认 `ArchiveLog`，与建区实际写下的值相反：谁要是先
+    /// `ArchiveRecord::default()` 再落控制文件，就会得到一个"以为不归档、
+    /// 实际开归档"的库；反过来也会让 `pick_reusable` 在日志切换时
+    /// 意外停在"等归档"上（§11.9）。默认值必须只有一个口径。
     fn default() -> Self {
-        Self::new(ArchiveMode::ArchiveLog)
+        Self::new(ArchiveMode::NoArchive)
     }
 }
 
@@ -1025,7 +1053,7 @@ fn segment_entry(seg: u8, start_page: u16, pages: u16, item_size: u16, count: u1
 }
 
 /// 页内固定字段的**文件偏移**（更新协议的目标偏移）。
-const fn file_offset(page_no: usize, body_off: usize) -> u32 {
+pub(crate) const fn file_offset(page_no: usize, body_off: usize) -> u32 {
     (page_no * PAGE_SIZE + CF_PAGE_HEADER_LEN + body_off) as u32
 }
 
@@ -1035,12 +1063,220 @@ const fn file_offset(page_no: usize, body_off: usize) -> u32 {
 
 /// 打开（或新建）后的控制文件：绑定一个 [`FileIo`] 与两个副本句柄。
 pub struct ControlFile<'a> {
+    core: CfCore<'a>,
+}
+
+/// **控制文件核心**（物理格式 + 双副本 + 单区间更新协议）——**一份实现、两种用法**：
+/// 工作区控制文件（本模块）与全局控制文件（[`crate::globalctl`]）。
+///
+/// 分界：核心只管"页怎么读写、副本怎么选、区间怎么发布"；
+/// **固定段与记录数组的解释**留给各自的 schema 层。
+pub(crate) struct CfCore<'a> {
     io: &'a dyn FileIo,
     handles: [FileHandle; CF_COPIES],
     /// 当前生效副本（0 = A、1 = B）：读取与诊断以它为准。
     active: usize,
     /// 各副本的页 0 `seq`（内存镜像；发布成功即更新）。
     seqs: [u32; CF_COPIES],
+    /// 控制文件种类（[`CF_KIND_WORKSPACE`] / [`CF_KIND_GLOBAL`]；每页页头都带）。
+    kind: u8,
+}
+
+impl<'a> CfCore<'a> {
+    /// **新建两副本**（文件长度预置、页体全零）；调用方接着写初始内容。
+    pub(crate) fn create(
+        io: &'a dyn FileIo,
+        path_a: &Path,
+        path_b: &Path,
+        kind: u8,
+    ) -> Result<Self, ControlFileError> {
+        let handles = [create_file(io, path_a)?, create_file(io, path_b)?];
+        Ok(Self {
+            io,
+            handles,
+            active: 0,
+            seqs: [0; CF_COPIES],
+            kind,
+        })
+    }
+
+    /// 打开既有两副本：逐副本校验 + **undo 回滚**，取"有效且 `seq` 较大"者；
+    /// 另一副本损坏/落后时由有效副本**整份重建**；两份都不可用 ⇒ 拒绝启动。
+    pub(crate) fn open(
+        io: &'a dyn FileIo,
+        path_a: &Path,
+        path_b: &Path,
+        kind: u8,
+    ) -> Result<Self, ControlFileError> {
+        let opts = OpenOptions::new().read(true).write(true);
+        let handles = [io.open(path_a, opts)?, io.open(path_b, opts)?];
+        let mut seqs = [0u32; CF_COPIES];
+        let mut fails: [Option<String>; CF_COPIES] = [None, None];
+        for copy in 0..CF_COPIES {
+            match heal_copy(io, handles[copy], copy as u8, kind) {
+                Ok(seq) => seqs[copy] = seq,
+                Err(reason) => fails[copy] = Some(reason),
+            }
+        }
+        let active = match (&fails[0], &fails[1]) {
+            (None, None) => usize::from(seqs[1] > seqs[0]),
+            (None, Some(_)) => {
+                rebuild_copy(io, handles[0], 0, handles[1], 1, kind)?;
+                seqs[1] = seqs[0];
+                0
+            }
+            (Some(_), None) => {
+                rebuild_copy(io, handles[1], 1, handles[0], 0, kind)?;
+                seqs[0] = seqs[1];
+                1
+            }
+            (Some(a), Some(b)) => {
+                return Err(ControlFileError::BothCopiesInvalid {
+                    a: a.clone(),
+                    b: b.clone(),
+                })
+            }
+        };
+        Ok(Self {
+            io,
+            handles,
+            active,
+            seqs,
+            kind,
+        })
+    }
+
+    /// 当前生效副本的页 0 `seq`（副本内更新序号；每次更新 +1）。
+    #[must_use]
+    pub(crate) fn sequence(&self) -> u32 {
+        self.seqs[self.active]
+    }
+
+    /// 当前生效副本号（0 = A、1 = B）。
+    #[must_use]
+    pub(crate) fn active_copy(&self) -> u8 {
+        self.active as u8
+    }
+
+    /// 持久性点：两副本 `fdatasync`。
+    pub(crate) fn sync(&self) -> Result<(), ControlFileError> {
+        for h in self.handles {
+            self.io.sync_data(h)?;
+        }
+        Ok(())
+    }
+
+    /// 关闭两副本句柄。
+    pub(crate) fn close(self) -> Result<(), ControlFileError> {
+        for h in self.handles {
+            self.io.close(h)?;
+        }
+        Ok(())
+    }
+
+    /// 读并校验一页（以指定副本为准）。
+    pub(crate) fn read_page(
+        &self,
+        copy: usize,
+        page_no: u8,
+    ) -> Result<Box<[u8; PAGE_SIZE]>, ControlFileError> {
+        read_raw(self.io, self.handles[copy], copy as u8, page_no, self.kind)
+    }
+
+    /// 写一页（重新封校验尾）。
+    pub(crate) fn write_page(
+        &self,
+        copy: usize,
+        page_no: u8,
+        page: &mut [u8; PAGE_SIZE],
+    ) -> Result<(), ControlFileError> {
+        seal_page(page);
+        self.io.write_at(
+            self.handles[copy],
+            page.as_slice(),
+            u64::from(page_no) * PAGE_SIZE as u64,
+        )?;
+        Ok(())
+    }
+
+    /// 读固定段字段（以生效副本为准）。
+    pub(crate) fn read_fixed<const N: usize>(
+        &self,
+        page_no: u8,
+        body_off: usize,
+    ) -> Result<[u8; N], ControlFileError> {
+        let page = self.read_page(self.active, page_no)?;
+        let body = page_body(&page);
+        let mut out = [0u8; N];
+        out.copy_from_slice(&body[body_off..body_off + N]);
+        Ok(out)
+    }
+
+    /// 单区间更新：两副本依次走 ①②③④（先 A 成功后 B）。
+    pub(crate) fn update_interval(
+        &mut self,
+        target_off: u32,
+        new: &[u8],
+    ) -> Result<(), ControlFileError> {
+        if new.is_empty() {
+            return Err(ControlFileError::IntervalOutOfBody);
+        }
+        if new.len() > MAX_UPDATE_LEN {
+            return Err(ControlFileError::IntervalTooLarge { len: new.len() });
+        }
+        let start = target_off as usize;
+        let end = start + new.len();
+        let page_start = start / PAGE_SIZE * PAGE_SIZE;
+        if end > CF_SIZE
+            || end - page_start > PAGE_SIZE - CF_PAGE_TRAILER_LEN
+            || start - page_start < CF_PAGE_HEADER_LEN
+        {
+            return Err(ControlFileError::IntervalOutOfBody);
+        }
+        for copy in 0..CF_COPIES {
+            self.update_on_copy(copy, target_off, new)?;
+        }
+        Ok(())
+    }
+
+    /// 一个副本上的完整更新协议（§2.6）：
+    /// ① undo（旧值）→ ② 目标字节 → ③ 页 0 `seq` +1（发布）→ ④ 清 undo。
+    pub(crate) fn update_on_copy(
+        &mut self,
+        copy: usize,
+        target_off: u32,
+        new: &[u8],
+    ) -> Result<(), ControlFileError> {
+        let page_no = (target_off as usize / PAGE_SIZE) as u8;
+        let in_off = target_off as usize % PAGE_SIZE;
+
+        // ① 写 undo 记录（旧值）。
+        let mut page0 = self.read_page(copy, 0)?;
+        let old = {
+            let target = self.read_page(copy, page_no)?;
+            target[in_off..in_off + new.len()].to_vec()
+        };
+        write_undo(&mut page0, target_off, &old);
+        self.write_page(copy, 0, &mut page0)?;
+
+        // ② 写目标字节（原地覆盖）。
+        let mut target = self.read_page(copy, page_no)?;
+        target[in_off..in_off + new.len()].copy_from_slice(new);
+        self.write_page(copy, page_no, &mut target)?;
+
+        // ③ 发布：页 0 `seq` +1。
+        let mut page0 = self.read_page(copy, 0)?;
+        let seq = get_u32(page0.as_slice(), 4).wrapping_add(1);
+        put_u32(page0.as_mut_slice(), 4, seq);
+        self.write_page(copy, 0, &mut page0)?;
+        self.seqs[copy] = seq;
+
+        // ④ 清 undo 记录。
+        let mut page0 = self.read_page(copy, 0)?;
+        clear_undo(&mut page0);
+        self.write_page(copy, 0, &mut page0)?;
+        Ok(())
+    }
 }
 
 impl<'a> ControlFile<'a> {
@@ -1057,12 +1293,8 @@ impl<'a> ControlFile<'a> {
         archive: &ArchiveRecord,
     ) -> Result<Self, ControlFileError> {
         redo.validate()?;
-        let handles = [create_file(io, path_a)?, create_file(io, path_b)?];
         let mut cf = Self {
-            io,
-            handles,
-            active: 0,
-            seqs: [0; CF_COPIES],
+            core: CfCore::create(io, path_a, path_b, CF_KIND_WORKSPACE)?,
         };
         for copy in 0..CF_COPIES {
             cf.write_initial_pages(copy, workspace, redo, archive)?;
@@ -1070,76 +1302,37 @@ impl<'a> ControlFile<'a> {
         Ok(cf)
     }
 
-    /// 打开既有控制文件：逐副本校验 + **undo 回滚**，取"有效且 `seq` 较大"者；
-    /// 另一副本损坏/落后时由有效副本**整份重建**；两份都不可用 ⇒ 拒绝启动。
+    /// 打开既有控制文件（见 [`CfCore::open`] 的副本选择规则）。
     pub fn open(
         io: &'a dyn FileIo,
         path_a: &Path,
         path_b: &Path,
     ) -> Result<Self, ControlFileError> {
-        let opts = OpenOptions::new().read(true).write(true);
-        let handles = [io.open(path_a, opts)?, io.open(path_b, opts)?];
-        let mut seqs = [0u32; CF_COPIES];
-        let mut fails: [Option<String>; CF_COPIES] = [None, None];
-        for copy in 0..CF_COPIES {
-            match heal_copy(io, handles[copy], copy as u8) {
-                Ok(seq) => seqs[copy] = seq,
-                Err(reason) => fails[copy] = Some(reason),
-            }
-        }
-        let active = match (&fails[0], &fails[1]) {
-            (None, None) => usize::from(seqs[1] > seqs[0]),
-            (None, Some(_)) => {
-                rebuild_copy(io, handles[0], 0, handles[1], 1)?;
-                seqs[1] = seqs[0];
-                0
-            }
-            (Some(_), None) => {
-                rebuild_copy(io, handles[1], 1, handles[0], 0)?;
-                seqs[0] = seqs[1];
-                1
-            }
-            (Some(a), Some(b)) => {
-                return Err(ControlFileError::BothCopiesInvalid {
-                    a: a.clone(),
-                    b: b.clone(),
-                })
-            }
-        };
         Ok(Self {
-            io,
-            handles,
-            active,
-            seqs,
+            core: CfCore::open(io, path_a, path_b, CF_KIND_WORKSPACE)?,
         })
     }
 
-    /// 当前生效副本的页 0 `seq`（副本内更新序号；每次更新 +1）。
+    /// 当前生效副本的页 0 `seq`。
     #[must_use]
     pub fn sequence(&self) -> u32 {
-        self.seqs[self.active]
+        self.core.sequence()
     }
 
     /// 当前生效副本号（0 = A、1 = B）。
     #[must_use]
     pub fn active_copy(&self) -> u8 {
-        self.active as u8
+        self.core.active_copy()
     }
 
     /// 持久性点：两副本 `fdatasync`。
     pub fn sync(&self) -> Result<(), ControlFileError> {
-        for h in self.handles {
-            self.io.sync_data(h)?;
-        }
-        Ok(())
+        self.core.sync()
     }
 
     /// 关闭两副本句柄。
     pub fn close(self) -> Result<(), ControlFileError> {
-        for h in self.handles {
-            self.io.close(h)?;
-        }
-        Ok(())
+        self.core.close()
     }
 
     // -- 读取（以生效副本为准）------------------------------------------------
@@ -1320,7 +1513,7 @@ impl<'a> ControlFile<'a> {
         copy: usize,
         page_no: u8,
     ) -> Result<Box<[u8; PAGE_SIZE]>, ControlFileError> {
-        read_raw(self.io, self.handles[copy], copy as u8, page_no)
+        self.core.read_page(copy, page_no)
     }
 
     fn write_page(
@@ -1329,13 +1522,7 @@ impl<'a> ControlFile<'a> {
         page_no: u8,
         page: &mut [u8; PAGE_SIZE],
     ) -> Result<(), ControlFileError> {
-        seal_page(page);
-        self.io.write_at(
-            self.handles[copy],
-            page.as_slice(),
-            u64::from(page_no) * PAGE_SIZE as u64,
-        )?;
-        Ok(())
+        self.core.write_page(copy, page_no, page)
     }
 
     fn read_fixed<const N: usize>(
@@ -1343,76 +1530,14 @@ impl<'a> ControlFile<'a> {
         page_no: u8,
         body_off: usize,
     ) -> Result<[u8; N], ControlFileError> {
-        let page = self.read_page(self.active, page_no)?;
-        let body = page_body(&page);
-        let mut out = [0u8; N];
-        out.copy_from_slice(&body[body_off..body_off + N]);
-        Ok(out)
+        self.core.read_fixed(page_no, body_off)
     }
 
-    /// 单区间更新：两副本依次走 ①②③④（先 A 成功后 B）。
+    /// 单区间更新（本控制文件的副本协议见 [`CfCore`]）。
     fn update_interval(&mut self, target_off: u32, new: &[u8]) -> Result<(), ControlFileError> {
-        if new.is_empty() {
-            return Err(ControlFileError::IntervalOutOfBody);
-        }
-        if new.len() > MAX_UPDATE_LEN {
-            return Err(ControlFileError::IntervalTooLarge { len: new.len() });
-        }
-        let start = target_off as usize;
-        let end = start + new.len();
-        let page_start = start / PAGE_SIZE * PAGE_SIZE;
-        if end > CF_SIZE
-            || end - page_start > PAGE_SIZE - CF_PAGE_TRAILER_LEN
-            || start - page_start < CF_PAGE_HEADER_LEN
-        {
-            return Err(ControlFileError::IntervalOutOfBody);
-        }
-        for copy in 0..CF_COPIES {
-            self.update_on_copy(copy, target_off, new)?;
-        }
-        Ok(())
+        self.core.update_interval(target_off, new)
     }
 
-    /// 一个副本上的完整更新协议（§2.6）：
-    /// ① undo（旧值）→ ② 目标字节 → ③ 页 0 `seq` +1（发布）→ ④ 清 undo。
-    fn update_on_copy(
-        &mut self,
-        copy: usize,
-        target_off: u32,
-        new: &[u8],
-    ) -> Result<(), ControlFileError> {
-        let page_no = (target_off as usize / PAGE_SIZE) as u8;
-        let in_off = target_off as usize % PAGE_SIZE;
-
-        // ① 写 undo 记录（旧值）。
-        let mut page0 = self.read_page(copy, 0)?;
-        let old = {
-            let target = self.read_page(copy, page_no)?;
-            target[in_off..in_off + new.len()].to_vec()
-        };
-        write_undo(&mut page0, target_off, &old);
-        self.write_page(copy, 0, &mut page0)?;
-
-        // ② 写目标字节（原地覆盖）。
-        let mut target = self.read_page(copy, page_no)?;
-        target[in_off..in_off + new.len()].copy_from_slice(new);
-        self.write_page(copy, page_no, &mut target)?;
-
-        // ③ 发布：页 0 `seq` +1。
-        let mut page0 = self.read_page(copy, 0)?;
-        let seq = get_u32(page0.as_slice(), 4).wrapping_add(1);
-        put_u32(page0.as_mut_slice(), 4, seq);
-        self.write_page(copy, 0, &mut page0)?;
-        self.seqs[copy] = seq;
-
-        // ④ 清 undo 记录。
-        let mut page0 = self.read_page(copy, 0)?;
-        clear_undo(&mut page0);
-        self.write_page(copy, 0, &mut page0)?;
-        Ok(())
-    }
-
-    /// 新建时的整份写入（一个副本的全部 20 页）。
     fn write_initial_pages(
         &mut self,
         copy: usize,
@@ -1425,6 +1550,7 @@ impl<'a> ControlFile<'a> {
             copy as u8,
             0,
             (4 + SEGMENT_TABLE_ITEMS * SEGMENT_ITEM_LEN + UNDO_RECORD_LEN) as u16,
+            CF_KIND_WORKSPACE,
         );
         {
             let body = page_body_mut(&mut page0);
@@ -1455,7 +1581,7 @@ impl<'a> ControlFile<'a> {
         self.write_page(copy, 0, &mut page0)?;
 
         // 页 1：固定段。
-        let mut page1 = blank_page(copy as u8, 1, FIXED_SEGMENT_LEN as u16);
+        let mut page1 = blank_page(copy as u8, 1, FIXED_SEGMENT_LEN as u16, CF_KIND_WORKSPACE);
         {
             let body = page_body_mut(&mut page1);
             workspace.encode(
@@ -1474,7 +1600,12 @@ impl<'a> ControlFile<'a> {
 
         // 页 2–19：数据文件记录数组（全零 = 全部空闲槽位）。
         for page_no in 2..CF_PAGES {
-            let mut page = blank_page(copy as u8, page_no as u8, data_page_payload(page_no));
+            let mut page = blank_page(
+                copy as u8,
+                page_no as u8,
+                data_page_payload(page_no),
+                CF_KIND_WORKSPACE,
+            );
             self.write_page(copy, page_no as u8, &mut page)?;
         }
         Ok(())
@@ -1484,7 +1615,7 @@ impl<'a> ControlFile<'a> {
 impl std::fmt::Debug for ControlFile<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlFile")
-            .field("active", &copy_name(self.active as u8))
+            .field("active", &copy_name(self.core.active as u8))
             .field("sequence", &self.sequence())
             .finish_non_exhaustive()
     }
@@ -1496,6 +1627,7 @@ fn read_raw(
     handle: FileHandle,
     copy: u8,
     page_no: u8,
+    kind: u8,
 ) -> Result<Box<[u8; PAGE_SIZE]>, ControlFileError> {
     let mut buf = Box::new([0u8; PAGE_SIZE]);
     io.read_exact_at(
@@ -1503,7 +1635,7 @@ fn read_raw(
         buf.as_mut_slice(),
         u64::from(page_no) * PAGE_SIZE as u64,
     )?;
-    validate_page(&buf, copy, page_no).map_err(|reason| ControlFileError::Damaged {
+    validate_page(&buf, copy, page_no, kind).map_err(|reason| ControlFileError::Damaged {
         copy,
         page: page_no,
         reason,
@@ -1524,8 +1656,8 @@ fn create_file(io: &dyn FileIo, path: &Path) -> io::Result<FileHandle> {
 /// 打开一个副本：校验页 0 → 校验格式版本 → **undo 回滚**（若有）。
 ///
 /// 返回该副本的 `seq`；任何一步失败 ⇒ `Err(原因)`（副本不可用）。
-fn heal_copy(io: &dyn FileIo, handle: FileHandle, copy: u8) -> Result<u32, String> {
-    let mut page0 = read_raw(io, handle, copy, 0).map_err(|e| e.to_string())?;
+fn heal_copy(io: &dyn FileIo, handle: FileHandle, copy: u8, kind: u8) -> Result<u32, String> {
+    let mut page0 = read_raw(io, handle, copy, 0, kind).map_err(|e| e.to_string())?;
     let version = get_u16(page_body(&page0), 0);
     if version != CF_FORMAT_VERSION {
         return Err(format!("格式版本 {version} 不受支持"));
@@ -1539,7 +1671,8 @@ fn heal_copy(io: &dyn FileIo, handle: FileHandle, copy: u8) -> Result<u32, Strin
         let target_page = (undo.target_off as usize / PAGE_SIZE) as u8;
         let in_page = undo.target_off as usize % PAGE_SIZE;
         let len = usize::from(undo.old_len);
-        let mut target = read_raw(io, handle, copy, target_page).map_err(|e| e.to_string())?;
+        let mut target =
+            read_raw(io, handle, copy, target_page, kind).map_err(|e| e.to_string())?;
         target[in_page..in_page + len].copy_from_slice(&undo.old_data[..len]);
         seal_page(&mut target);
         io.write_at(
@@ -1563,9 +1696,10 @@ fn rebuild_copy(
     from_copy: u8,
     to: FileHandle,
     to_copy: u8,
+    kind: u8,
 ) -> Result<(), ControlFileError> {
     for page_no in 0..CF_PAGES {
-        let mut page = read_raw(io, from, from_copy, page_no as u8)?;
+        let mut page = read_raw(io, from, from_copy, page_no as u8, kind)?;
         page[12] = to_copy;
         seal_page(&mut page);
         io.write_at(to, page.as_slice(), page_no as u64 * PAGE_SIZE as u64)?;
@@ -1728,7 +1862,7 @@ mod tests {
         format_cf(&io);
         let h = open_rw(&io, A);
 
-        let p0 = read_raw(&io, h, 0, 0).unwrap();
+        let p0 = read_raw(&io, h, 0, 0, CF_KIND_WORKSPACE).unwrap();
         assert_eq!(&p0[0..4], b"BICF", "magic 按字符字节序落盘");
         assert_eq!(get_u16(p0.as_slice(), 8), 0, "页号");
         assert_eq!(get_u16(p0.as_slice(), 10), 654, "页 0 payload_len");
@@ -1754,15 +1888,15 @@ mod tests {
             assert_eq!(get_u16(seg(i), 1), 0, "段 {i} 保留");
         }
         // 页 1 与记录页的 payload_len。
-        let p1 = read_raw(&io, h, 0, 1).unwrap();
+        let p1 = read_raw(&io, h, 0, 1, CF_KIND_WORKSPACE).unwrap();
         assert_eq!(get_u16(p1.as_slice(), 10), 560);
-        let p2 = read_raw(&io, h, 0, 2).unwrap();
+        let p2 = read_raw(&io, h, 0, 2, CF_KIND_WORKSPACE).unwrap();
         assert_eq!(get_u16(p2.as_slice(), 10), 58 * 280);
-        let p19 = read_raw(&io, h, 0, 19).unwrap();
+        let p19 = read_raw(&io, h, 0, 19, CF_KIND_WORKSPACE).unwrap();
         assert_eq!(get_u16(p19.as_slice(), 10), 38 * 280);
         // B 副本的副本号字段。
         let hb = open_rw(&io, B);
-        let pb = read_raw(&io, hb, 1, 0).unwrap();
+        let pb = read_raw(&io, hb, 1, 0, CF_KIND_WORKSPACE).unwrap();
         assert_eq!(pb[12], 1);
     }
 
@@ -1781,7 +1915,7 @@ mod tests {
         // 原始页：undo 已清、seq = 1，两副本一致。
         for (path, copy) in [(A, 0u8), (B, 1u8)] {
             let h = open_rw(&io, path);
-            let p0 = read_raw(&io, h, copy, 0).unwrap();
+            let p0 = read_raw(&io, h, copy, 0, CF_KIND_WORKSPACE).unwrap();
             assert_eq!(get_u32(p0.as_slice(), 4), 1, "副本 {copy} seq");
             assert_eq!(read_undo(&p0).unwrap(), Undo::FREE, "副本 {copy} undo 已清");
         }
@@ -1876,8 +2010,8 @@ mod tests {
         cf.write_checkpoint_progress(&progress(9, 4096)).unwrap();
         let cf = reopen(&fio);
         assert_eq!(cf.checkpoint_progress().unwrap(), progress(9, 4096));
-        let p0a = read_raw(&fio, open_rw(&fio, A), 0, 0).unwrap();
-        let p0b = read_raw(&fio, open_rw(&fio, B), 1, 0).unwrap();
+        let p0a = read_raw(&fio, open_rw(&fio, A), 0, 0, CF_KIND_WORKSPACE).unwrap();
+        let p0b = read_raw(&fio, open_rw(&fio, B), 1, 0, CF_KIND_WORKSPACE).unwrap();
         assert_eq!(
             get_u32(p0a.as_slice(), 4),
             get_u32(p0b.as_slice(), 4),
@@ -1923,7 +2057,7 @@ mod tests {
         format_cf(&io);
         for (path, copy) in [(A, 0u8), (B, 1u8)] {
             let h = open_rw(&io, path);
-            let mut p0 = read_raw(&io, h, copy, 0).unwrap();
+            let mut p0 = read_raw(&io, h, copy, 0, CF_KIND_WORKSPACE).unwrap();
             put_u16(page_body_mut(&mut p0), 0, 99);
             seal_page(&mut p0);
             io.write_at(h, p0.as_slice(), 0).unwrap();
@@ -1942,7 +2076,7 @@ mod tests {
         let io = new_mem();
         format_cf(&io);
         let h = open_rw(&io, A);
-        let mut p0 = read_raw(&io, h, 0, 0).unwrap();
+        let mut p0 = read_raw(&io, h, 0, 0, CF_KIND_WORKSPACE).unwrap();
         write_undo(
             &mut p0,
             file_offset(1, CHECKPOINT_PROGRESS_OFFSET),

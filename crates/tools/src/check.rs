@@ -79,39 +79,78 @@ pub enum Verdict {
 }
 
 /// 检查报告（每条发现一行 + 按类计数汇总）。
-#[derive(Debug, Default)]
+///
+/// **容量纪律**：`findings` 只保留前 `finding_cap` 条（默认不限），但
+/// `errors_seen`/`warnings_seen` **照全量计**——判定与汇总永远基于全量，
+/// 不会因为"报告太长截断了"把坏库判成好库（一个几千页的坏镜像能产出
+/// 上万条发现，把诊断工具自己先撑死；这不是"少报"，是**报得下**）。
+#[derive(Debug)]
 pub struct CheckReport {
-    /// 发现列表。
+    /// 发现列表（最多 `finding_cap` 条）。
     pub findings: Vec<Finding>,
+    /// 保留上限（超出只计数不保留；`usize::MAX` = 不限）。
+    pub finding_cap: usize,
+    /// **全量**错误条数（不受 `finding_cap` 影响）。
+    pub errors_seen: usize,
+    /// **全量**警告条数。
+    pub warnings_seen: usize,
     /// 已检查页数。
     pub pages_checked: usize,
     /// 已检查记录数。
     pub rows_checked: usize,
     /// 已检查片段链数。
     pub chains_checked: usize,
+    /// 按代码的全量计数（`push` 时累加）。
+    code_counts: Vec<(&'static str, usize)>,
+}
+
+impl Default for CheckReport {
+    fn default() -> Self {
+        Self {
+            findings: Vec::new(),
+            finding_cap: usize::MAX,
+            errors_seen: 0,
+            warnings_seen: 0,
+            pages_checked: 0,
+            rows_checked: 0,
+            chains_checked: 0,
+            code_counts: Vec::new(),
+        }
+    }
 }
 
 impl CheckReport {
     /// 汇总判定：无 `Error` → 可用（警告不改变判定）。
+    ///
+    /// 判据是**全量计数**（不是保留下来的那份列表）——截断报告不该改变结论。
     #[must_use]
     pub fn verdict(&self) -> Verdict {
-        if self.findings.iter().any(|f| f.severity == Severity::Error) {
+        if self.errors_seen > 0 {
             Verdict::Unrecoverable
         } else {
             Verdict::Usable
         }
     }
 
-    /// 按代码计数（报告汇总段）。
+    /// 建一份**限量保留**的报告（诊断工具用：发现的条数不设限，报告的长度设限）。
+    #[must_use]
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            finding_cap: cap.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// 被截掉的发现条数（保留列表之外的）。
+    #[must_use]
+    pub fn dropped(&self) -> usize {
+        (self.errors_seen + self.warnings_seen).saturating_sub(self.findings.len())
+    }
+
+    /// 按代码计数（报告汇总段）——**全量**：在 `push` 时累加，与截断无关。
     #[must_use]
     pub fn counts(&self) -> Vec<(&'static str, usize)> {
-        let mut out: Vec<(&'static str, usize)> = Vec::new();
-        for f in &self.findings {
-            match out.iter_mut().find(|(c, _)| *c == f.code) {
-                Some((_, n)) => *n += 1,
-                None => out.push((f.code, 1)),
-            }
-        }
+        let mut out = self.code_counts.clone();
         out.sort_unstable();
         out
     }
@@ -123,6 +162,18 @@ impl CheckReport {
         location: impl Into<String>,
         detail: impl Into<String>,
     ) {
+        // **计数照全量**（判定与汇总读它），列表按上限保留。
+        match severity {
+            Severity::Error => self.errors_seen += 1,
+            Severity::Warning => self.warnings_seen += 1,
+        }
+        match self.code_counts.iter_mut().find(|(c, _)| *c == code) {
+            Some((_, n)) => *n += 1,
+            None => self.code_counts.push((code, 1)),
+        }
+        if self.findings.len() >= self.finding_cap {
+            return;
+        }
         self.findings.push(Finding {
             severity,
             code,
@@ -139,18 +190,21 @@ impl CheckReport {
             s.push_str(&f.to_string());
             s.push('\n');
         }
-        let errors = self
-            .findings
-            .iter()
-            .filter(|f| f.severity == Severity::Error)
-            .count();
-        let warnings = self.findings.len() - errors;
+        let errors = self.errors_seen;
+        let warnings = self.warnings_seen;
+        if self.dropped() > 0 {
+            s.push_str(&format!(
+                "…（另有 {} 条发现未列出：报告上限 {} 条——`--max-findings` 可加大）\n",
+                self.dropped(),
+                self.finding_cap
+            ));
+        }
         s.push_str(&format!(
             "汇总：页 {} / 记录 {} / 片段链 {}；发现 {}（错误 {errors} / 警告 {warnings}）→ 判定 {:?}\n",
             self.pages_checked,
             self.rows_checked,
             self.chains_checked,
-            self.findings.len(),
+            errors + warnings,
             self.verdict()
         ));
         for (code, n) in self.counts() {
@@ -546,29 +600,64 @@ fn fmt_rowid(id: RowId) -> String {
 }
 
 /// 对一段**页镜像字节**（N × 16 KiB）做检查；末尾不足一页即报截断。
+#[must_use]
 pub fn check_page_image(bytes: &[u8]) -> CheckReport {
-    let mut report = CheckReport::default();
-    if bytes.is_empty() {
-        report.push(Severity::Error, "IMAGE_EMPTY", "", "镜像为空");
-        return report;
-    }
-    if bytes.len() % PAGE_SIZE != 0 {
-        report.push(
-            Severity::Error,
-            "IMAGE_TRUNCATED",
-            "",
-            format!("末页不足 {PAGE_SIZE} 字节（文件截断）"),
-        );
-    }
-    for (i, chunk) in bytes.chunks(PAGE_SIZE).enumerate() {
-        if chunk.len() < PAGE_SIZE {
+    let mut cursor = std::io::Cursor::new(bytes);
+    check_page_image_stream(&mut cursor, usize::MAX).unwrap_or_else(|_| {
+        // `Cursor<&[u8]>` 不会出 IO 错；真出错也只可能是这里，防御性兜底。
+        let mut r = CheckReport::default();
+        r.push(Severity::Error, "IMAGE_READ", "", "读镜像失败");
+        r
+    })
+}
+
+/// **流式**页镜像检查：一次读一页，**不在内存里放整个镜像**。
+///
+/// （`db_check` 原先 `fs::read` 整个文件——它的用处正是"库出问题时"，
+/// 而一个几 GB 的镜像会先把这个诊断工具自己撑死。）
+///
+/// `max_findings` 只限制**报告长度**，判定与计数仍是全量（见 [`CheckReport`]）。
+///
+/// # Errors
+/// 底层读失败。
+pub fn check_page_image_stream(
+    reader: &mut impl std::io::Read,
+    max_findings: usize,
+) -> std::io::Result<CheckReport> {
+    let mut report = CheckReport::with_cap(max_findings);
+    let mut buf = Box::new([0u8; PAGE_SIZE]);
+    let mut index = 0usize;
+    loop {
+        let mut filled = 0usize;
+        while filled < PAGE_SIZE {
+            match reader.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled == 0 {
             break;
         }
-        let mut buf = Box::new([0u8; PAGE_SIZE]);
-        buf.copy_from_slice(chunk);
-        check_page(&Page::from_bytes(buf), &mut report, &format!("页{i}"));
+        if filled < PAGE_SIZE {
+            report.push(
+                Severity::Error,
+                "IMAGE_TRUNCATED",
+                format!("页{index}"),
+                format!("末页不足 {PAGE_SIZE} 字节（文件截断）"),
+            );
+            break;
+        }
+        check_page(
+            &Page::from_bytes(Box::new(*buf)),
+            &mut report,
+            &format!("页{index}"),
+        );
+        index += 1;
     }
-    report
+    if index == 0 && report.errors_seen == 0 && report.warnings_seen == 0 {
+        report.push(Severity::Error, "IMAGE_EMPTY", "", "镜像为空");
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

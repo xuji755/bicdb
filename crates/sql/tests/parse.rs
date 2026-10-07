@@ -6,9 +6,9 @@
 //! AST 不 import 目录接口（REQ-SQL-002 验收原文，源码自检）。
 
 use bicdb_sql::ast::{
-    AExprKind, AlterDatabaseAction, AlterSystemAction, AlterWorkspaceAction, BoolExprType,
-    ColumnRefField, ConstValue, Expr, FromItem, ObjectType, SetOperation, SortByDir, Stmt,
-    TransactionStmtKind, VariableSetKind, WorkspaceSource,
+    AExprKind, AlterDatabaseAction, AlterUserAction, AlterWorkspaceAction, BoolExprType,
+    ColumnRefField, ConstValue, Expr, FromItem, ObjectType, QuotaAmount, SetOperation, SortByDir,
+    Stmt, TransactionStmtKind, VariableSetKind,
 };
 use bicdb_sql::parser::{parse, parse_many};
 
@@ -26,26 +26,48 @@ const CORPUS: &[&str] = &[
     "DROP INDEX ix",
     "CREATE GRAPH g",
     "DROP GRAPH g",
-    // ── DCL（`DCL语句设计` §1/§2；本库扩展组）──
-    "CREATE WORKSPACE FOR USER alice",
-    "CREATE WORKSPACE FOR USER alice NAME 'a1'",
+    // ── DCL（`DCL语句设计` v0.2 §1/§2；本库扩展组）──
+    // F 组：三件套（名字是标识，路径只是创建参数）
+    "CREATE FILESYSTEM data1 USING '/mnt/d1'",
+    "CREATE FILESYSTEM 'data 1' USING '/mnt/d1'",
+    "ALTER FILESYSTEM 'data1' SET ALLOCATE = OFF",
+    "ALTER FILESYSTEM data1 SET ALLOCATE = OFF",
+    "ALTER FILESYSTEM 3 SET ALLOCATE = ON",
+    "DROP FILESYSTEM 3",
+    "DROP FILESYSTEM 'data1'",
+    "DROP FILESYSTEM data1",
+    // W 组：无主容器 + DEFAULT FILESYSTEM / FROM TEMPLATE / 盘级配额
+    "CREATE WORKSPACE prod",
+    "CREATE WORKSPACE prod DEFAULT FILESYSTEM 'data1'",
+    "CREATE WORKSPACE prod FROM TEMPLATE 'base'",
+    "CREATE WORKSPACE prod QUOTA 1073741824 ON FILESYSTEM 'data1'",
+    "CREATE WORKSPACE prod FROM TEMPLATE 'base' DEFAULT FILESYSTEM 3",
+    "CREATE WORKSPACE prod QUOTA UNLIMITED ON FILESYSTEM 3 QUOTA 1024 ON FILESYSTEM 'data1'",
     "ALTER WORKSPACE 7 SET NAME = 'x'",
-    "ALTER WORKSPACE 7 SET NAME = NULL",
-    "ALTER WORKSPACE 'prod' FOR USER alice SET NAME = 'p2'",
     "ALTER WORKSPACE 7 SET QUOTA (data = 1024, undo = 512, temp = 4096, asset = 2048)",
+    "ALTER WORKSPACE prod ADD FILESYSTEM 3",
+    "ALTER WORKSPACE 'prod' ADD FILESYSTEM 'data1' QUOTA 1024 ON FILESYSTEM 'data1'",
+    "ALTER WORKSPACE 'prod' SET DEFAULT FILESYSTEM 'data1'",
+    "ALTER WORKSPACE 7 TO TEMPLATE 'base'",
     "DROP WORKSPACE 7",
-    "DROP WORKSPACE 'prod' FOR USER alice",
-    "ALTER DATABASE CLONE WORKSPACE 'new' FROM WORKSPACE 7",
-    "ALTER DATABASE CLONE WORKSPACE 'new' FROM WORKSPACE 'prod' FOR USER alice",
-    "ALTER DATABASE CLONE WORKSPACE 'new' FROM TEMPLATE 'base'",
+    "DROP WORKSPACE 'prod', 9",
+    // U 组：绑定的落点（USING WORKSPACE 必选）
+    "CREATE USER alice IDENTIFIED BY 's3cr3t' USING WORKSPACE 'prod'",
+    "CREATE USER alice IDENTIFIED BY 's3cr3t' USING WORKSPACE 7",
+    "CREATE USER alice IDENTIFIED BY 's3cr3t' USING WORKSPACE alice_ws",
+    "ALTER USER alice IDENTIFIED BY 'new'",
+    "ALTER USER alice IDENTIFIED BY 'new' EXPIRE",
+    "ALTER USER alice IDENTIFIED BY 'new' REPLACE 'old'",
+    "ALTER USER alice PAUSE",
+    "ALTER USER alice RESUME",
+    "ALTER USER alice USING WORKSPACE 'prod'",
+    "ALTER USER alice DROP WORKSPACE 7",
+    "DROP USER alice",
+    "DROP USER alice CASCADE",
+    // T 组：模板（克隆/原地固化各自只有一条路）
     "ALTER DATABASE ADD TEMPLATE 'base' FROM 7",
-    "ALTER DATABASE ADD TEMPLATE 'base' FROM 'prod' FOR USER alice",
-    "ALTER DATABASE ALTER WORKSPACE 7 TO TEMPLATE 'base'",
+    "ALTER DATABASE ADD TEMPLATE 'base' FROM 'prod'",
     "ALTER DATABASE DROP TEMPLATE 'base'",
-    "ALTER SYSTEM ADD FILESYSTEM '/mnt/d1'",
-    "ALTER SYSTEM ALTER FILESYSTEM '/mnt/d1' SET ALLOCATE = OFF",
-    "ALTER SYSTEM ALTER FILESYSTEM 3 SET ALLOCATE = ON",
-    "ALTER SYSTEM DROP FILESYSTEM 3",
     "ALTER SESSION SET work_area_size = '64MB'",
     "ALTER SESSION SET max_query_memory = 4294967296",
     "ALTER SESSION CLEAR work_area_size",
@@ -119,17 +141,26 @@ const REJECTED: &[&str] = &[
     "ALTER TABLE t ADD COLUMN c NUMBER",
     "SELECT * FROM t LIMIT 1 OFFSET 2 OFFSET 3",
     "DROP TABLE IF EXISTS t",
-    "INSERT INTO t SELECT * FROM u",
-    // ── DCL 闭集外（`DCL语句设计` §2.3：没有产生式就是没有）──
+    // ── DCL 闭集外（`DCL语句设计` v0.2 §2：没有产生式就是没有；含 v0.2 删掉的老形式）──
+    "CREATE WORKSPACE FOR USER alice",
     "CREATE WORKSPACE FOR USER alice CLONE OF 7",
     "SET work_area_size = '64MB'",
     "ALTER SYSTEM SET work_memory_target = '4GiB'",
     "ALTER SYSTEM SWITCH LOGFILE",
+    "ALTER SYSTEM ADD FILESYSTEM '/mnt/d1'",
     "ALTER DATABASE RENAME TO x",
     "ALTER DATABASE CLONE WORKSPACE 'new' FROM TABLE t",
+    "ALTER DATABASE ALTER WORKSPACE 7 TO TEMPLATE 'b'",
     "ALTER WORKSPACE 7 SET QUOTA (foo = 1)",
     "ALTER WORKSPACE 7 SET OWNER = 'x'",
-    "ALTER SYSTEM ALTER FILESYSTEM 3 SET ALLOCATE = MAYBE",
+    "ALTER WORKSPACE 7 SET NAME = NULL",
+    "ALTER FILESYSTEM 3 SET ALLOCATE = MAYBE",
+    "ALTER FILESYSTEM 3 SET ALLOCATE OFF",
+    "CREATE FILESYSTEM d1 '/mnt/d1'",
+    "CREATE FILESYSTEM d1 USING /mnt/d1",
+    "CREATE USER alice IDENTIFIED BY 'x'",
+    "ALTER USER alice IDENTIFIED BY 'x' REPLACE",
+    "DROP USER",
     "ALTER SESSION SET work_area_size",
     "DROP WORKSPACE",
 ];
@@ -526,42 +557,121 @@ fn ast_module_does_not_reference_catalog() {
 
 #[test]
 fn dcl_shapes_follow_the_frozen_design() {
-    // ── W1：NAME 缺省 ⇒ None（"跟随属主名"由绑定/DDL 侧展开）──
-    let Stmt::CreateWorkspace(cw) = parse("CREATE WORKSPACE FOR USER alice").unwrap() else {
-        panic!("不是 CREATE WORKSPACE")
-    };
-    assert_eq!(cw.subject, "alice");
-    assert!(cw.name.is_none(), "NAME 可缺省");
-    let Stmt::CreateWorkspace(cw2) = parse("CREATE WORKSPACE FOR USER Alice NAME 'a1'").unwrap()
+    // ── F 组三件套：`CREATE FILESYSTEM <名> USING '<路径>'`——**名字是标识，路径只是创建参数** ──
+    let Stmt::CreateFilesystem(f1) = parse("CREATE FILESYSTEM data1 USING '/mnt/d1'").unwrap()
     else {
+        panic!("不是 CREATE FILESYSTEM")
+    };
+    assert_eq!(f1.name, "data1", "名字（引用位）");
+    assert_eq!(f1.path.as_slice(), b"/mnt/d1", "路径（创建参数）");
+    // `名 := 标识符 | Str`（两者等价；字符串形态容纳带空格的名字）
+    let Stmt::CreateFilesystem(f1b) = parse("CREATE FILESYSTEM 'data 1' USING '/mnt/d1'").unwrap()
+    else {
+        panic!("不是 CREATE FILESYSTEM")
+    };
+    assert_eq!(f1b.name, "data 1");
+    let Stmt::AlterFilesystem(f2) = parse("ALTER FILESYSTEM 'data1' SET ALLOCATE = OFF").unwrap()
+    else {
+        panic!("不是 ALTER FILESYSTEM")
+    };
+    assert_eq!(f2.fs.name.as_deref(), Some(&b"data1"[..]), "引用位是名字");
+    assert!(!f2.allocate);
+    let Stmt::DropFilesystem(f3) = parse("DROP FILESYSTEM 3").unwrap() else {
+        panic!("不是 DROP FILESYSTEM")
+    };
+    assert_eq!(f3.fs.slot, Some(3), "引用位也可以给池槽位");
+
+    // ── W1：**无主容器** + 三个可选项（DEFAULT FILESYSTEM / FROM TEMPLATE / 盘级配额）──
+    let Stmt::CreateWorkspace(cw) = parse("CREATE WORKSPACE prod").unwrap() else {
         panic!("不是 CREATE WORKSPACE")
     };
-    assert_eq!(cw2.subject, "alice", "主体名是标识符 ⇒ 折叠照 PG");
-    assert_eq!(cw2.name.as_deref(), Some(&b"a1"[..]));
+    assert_eq!(cw.name, "prod", "名字是标识符 ⇒ 折叠照 PG");
+    assert!(
+        cw.default_fs.is_none() && cw.from_template.is_none() && cw.quotas.is_empty(),
+        "三个可选项都可缺省"
+    );
+    let Stmt::CreateWorkspace(cw2) = parse(
+        "CREATE WORKSPACE Prod DEFAULT FILESYSTEM 'data1' FROM TEMPLATE 'base' \
+         QUOTA 1073741824 ON FILESYSTEM 'data1' QUOTA UNLIMITED ON FILESYSTEM 3",
+    )
+    .unwrap() else {
+        panic!("不是 CREATE WORKSPACE")
+    };
+    assert_eq!(cw2.name, "prod");
+    assert_eq!(
+        cw2.default_fs.as_ref().and_then(|f| f.name.as_deref()),
+        Some(&b"data1"[..])
+    );
+    assert_eq!(cw2.from_template.as_deref(), Some(&b"base"[..]));
+    assert_eq!(cw2.quotas.len(), 2, "盘级配额可多个");
+    assert_eq!(cw2.quotas[0].amount, QuotaAmount::Bytes(1073741824));
+    assert_eq!(cw2.quotas[1].amount, QuotaAmount::Unlimited);
+    assert_eq!(cw2.quotas[1].fs.slot, Some(3));
 
-    // ── WorkRef 双形态：id 与 名字[FOR USER]（解析只认形态）──
-    let Stmt::AlterWorkspace(aw) = parse("ALTER WORKSPACE 7 SET NAME = NULL").unwrap() else {
+    // ── WorkRef 双形态：id / 名字（**没有 `FOR USER`**——名字实例内唯一）──
+    let Stmt::AlterWorkspace(aw) =
+        parse("ALTER WORKSPACE 7 SET QUOTA (data = 1, undo = 2, temp = 3, asset = 4)").unwrap()
+    else {
         panic!("不是 ALTER WORKSPACE")
     };
     assert_eq!(aw.workspace.id, Some(7));
-    assert!(aw.workspace.name.is_none() && aw.workspace.user.is_none());
-    let Stmt::AlterWorkspace(aw2) = parse(
-        "ALTER WORKSPACE 'prod' FOR USER alice SET QUOTA (data = 1, undo = 2, temp = 3, asset = 4)",
-    )
-    .unwrap() else {
-        panic!("不是 ALTER WORKSPACE")
-    };
-    assert_eq!(aw2.workspace.name.as_deref(), Some(&b"prod"[..]));
-    assert_eq!(aw2.workspace.user.as_deref(), Some("alice"));
-    assert_eq!(aw2.workspace.id, None);
-    let AlterWorkspaceAction::SetQuota(items) = &aw2.action else {
+    assert!(aw.workspace.name.is_none());
+    let AlterWorkspaceAction::SetQuota(items) = &aw.action else {
         panic!("不是配额")
     };
     assert_eq!(items.len(), 4);
     assert_eq!(items[0].defname, "data");
 
-    // ── DROP WORKSPACE 走同一条引用位 ──
-    let Stmt::Drop(d) = parse("DROP WORKSPACE 'prod' FOR USER alice, 9").unwrap() else {
+    // ── W3/W4/W5/W7 ──
+    let Stmt::AlterWorkspace(w3) =
+        parse("ALTER WORKSPACE 'prod' ADD FILESYSTEM 3 QUOTA 1024 ON FILESYSTEM 3").unwrap()
+    else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        &w3.action,
+        AlterWorkspaceAction::AddFilesystem { fs, quota: Some(q) }
+            if fs.slot == Some(3) && q.amount == QuotaAmount::Bytes(1024)
+    ));
+    let Stmt::AlterWorkspace(w4) =
+        parse("ALTER WORKSPACE 'prod' SET DEFAULT FILESYSTEM 'data1'").unwrap()
+    else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        &w4.action,
+        AlterWorkspaceAction::SetDefaultFilesystem { fs }
+            if fs.name.as_deref() == Some(&b"data1"[..])
+    ));
+    let Stmt::AlterWorkspace(w5) = parse("ALTER WORKSPACE 'prod' SET NAME = 'p2'").unwrap() else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(&w5.action, AlterWorkspaceAction::SetName(n) if n.as_slice() == b"p2"));
+    let Stmt::AlterWorkspace(w7) = parse("ALTER WORKSPACE 7 TO TEMPLATE 'base'").unwrap() else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        &w7.action,
+        AlterWorkspaceAction::ToTemplate { name } if name.as_slice() == b"base"
+    ));
+
+    // ── 引用位的两种写法等价：`名 := 标识符 | Str`（`prod` = `'prod'`）──
+    let Stmt::AlterFilesystem(bare) = parse("ALTER FILESYSTEM data2 SET ALLOCATE = OFF").unwrap()
+    else {
+        panic!("不是 ALTER FILESYSTEM")
+    };
+    assert_eq!(
+        bare.fs.name.as_deref(),
+        Some(&b"data2"[..]),
+        "裸标识符也能引用"
+    );
+    let Stmt::Drop(dbare) = parse("DROP WORKSPACE prod").unwrap() else {
+        panic!("不是 DROP")
+    };
+    assert_eq!(dbare.workspaces[0].name.as_deref(), Some(&b"prod"[..]));
+
+    // ── DROP WORKSPACE 走同一条引用位（可多个）──
+    let Stmt::Drop(d) = parse("DROP WORKSPACE 'prod', 9").unwrap() else {
         panic!("不是 DROP")
     };
     assert_eq!(d.remove_type, ObjectType::Workspace);
@@ -570,83 +680,75 @@ fn dcl_shapes_follow_the_frozen_design() {
     assert_eq!(d.workspaces[0].name.as_deref(), Some(&b"prod"[..]));
     assert_eq!(d.workspaces[1].id, Some(9));
 
-    // ── W2 克隆：两种源同一节点 ──
-    let Stmt::AlterDatabase(ad) =
-        parse("ALTER DATABASE CLONE WORKSPACE 'new' FROM WORKSPACE 7").unwrap()
+    // ── U 组：**有了工作区才能建用户**（`USING WORKSPACE` 在产生式里是必选）──
+    let Stmt::CreateUser(u1) =
+        parse("CREATE USER alice IDENTIFIED BY 's3cr3t' USING WORKSPACE 'prod'").unwrap()
     else {
-        panic!("不是 ALTER DATABASE")
+        panic!("不是 CREATE USER")
     };
-    let AlterDatabaseAction::CloneWorkspace { name, source } = &ad.action else {
-        panic!("不是克隆")
-    };
-    assert_eq!(name.as_slice(), b"new");
-    assert!(matches!(source, WorkspaceSource::Workspace(w) if w.id == Some(7)));
-    let Stmt::AlterDatabase(ad2) =
-        parse("ALTER DATABASE CLONE WORKSPACE 'new' FROM TEMPLATE 'base'").unwrap()
-    else {
-        panic!("不是 ALTER DATABASE")
+    assert_eq!(u1.name, "alice");
+    assert_eq!(u1.password.as_slice(), b"s3cr3t", "口令只在认证路径用");
+    assert_eq!(u1.using_workspace.name.as_deref(), Some(&b"prod"[..]));
+    let Stmt::AlterUser(u2) = parse("ALTER USER alice IDENTIFIED BY 'new' EXPIRE").unwrap() else {
+        panic!("不是 ALTER USER")
     };
     assert!(matches!(
-        &ad2.action,
-        AlterDatabaseAction::CloneWorkspace {
-            source: WorkspaceSource::Template(t),
-            ..
-        } if t.as_slice() == b"base"
+        &u2.action,
+        AlterUserAction::SetPassword { new, expire: true } if new.as_slice() == b"new"
     ));
-
-    // ── T1/T2/T3 ──
-    let Stmt::AlterDatabase(t1) =
-        parse("ALTER DATABASE ADD TEMPLATE 'b' FROM 'prod' FOR USER alice").unwrap()
+    let Stmt::AlterUser(u3) = parse("ALTER USER alice IDENTIFIED BY 'new' REPLACE 'old'").unwrap()
     else {
+        panic!("不是 ALTER USER")
+    };
+    assert!(matches!(
+        &u3.action,
+        AlterUserAction::ReplacePassword { new, old }
+            if new.as_slice() == b"new" && old.as_slice() == b"old"
+    ));
+    let Stmt::AlterUser(u4) = parse("ALTER USER alice PAUSE").unwrap() else {
+        panic!("不是 ALTER USER")
+    };
+    assert_eq!(u4.action, AlterUserAction::SetPaused(true));
+    let Stmt::AlterUser(u4b) = parse("ALTER USER alice RESUME").unwrap() else {
+        panic!("不是 ALTER USER")
+    };
+    assert_eq!(u4b.action, AlterUserAction::SetPaused(false));
+    let Stmt::AlterUser(u5) = parse("ALTER USER alice USING WORKSPACE 7").unwrap() else {
+        panic!("不是 ALTER USER")
+    };
+    assert!(matches!(&u5.action, AlterUserAction::UsingWorkspace(w) if w.id == Some(7)));
+    let Stmt::AlterUser(u6) = parse("ALTER USER alice DROP WORKSPACE 'prod'").unwrap() else {
+        panic!("不是 ALTER USER")
+    };
+    assert!(matches!(
+        &u6.action,
+        AlterUserAction::DropWorkspace(w) if w.name.as_deref() == Some(&b"prod"[..])
+    ));
+    let Stmt::DropUser(u7) = parse("DROP USER alice").unwrap() else {
+        panic!("不是 DROP USER")
+    };
+    assert!(!u7.cascade, "默认不连工作区一起删");
+    let Stmt::DropUser(u7b) = parse("DROP USER Alice CASCADE").unwrap() else {
+        panic!("不是 DROP USER")
+    };
+    assert_eq!(u7b.name, "alice", "主体名折叠照 PG");
+    assert!(u7b.cascade);
+
+    // ── T 组：只剩两条（克隆是 W2、原地固化是 W7——一件事不设两个入口）──
+    let Stmt::AlterDatabase(t1) = parse("ALTER DATABASE ADD TEMPLATE 'b' FROM 7").unwrap() else {
         panic!("不是 ALTER DATABASE")
     };
     assert!(matches!(
         &t1.action,
         AlterDatabaseAction::AddTemplate { name, from }
-            if name.as_slice() == b"b" && from.user.as_deref() == Some("alice")
+            if name.as_slice() == b"b" && from.id == Some(7)
     ));
-    let Stmt::AlterDatabase(t2) =
-        parse("ALTER DATABASE ALTER WORKSPACE 7 TO TEMPLATE 'b'").unwrap()
-    else {
+    let Stmt::AlterDatabase(t2) = parse("ALTER DATABASE DROP TEMPLATE 'b'").unwrap() else {
         panic!("不是 ALTER DATABASE")
     };
     assert!(matches!(
         &t2.action,
-        AlterDatabaseAction::WorkspaceToTemplate { ws, name }
-            if ws.id == Some(7) && name.as_slice() == b"b"
-    ));
-    let Stmt::AlterDatabase(t3) = parse("ALTER DATABASE DROP TEMPLATE 'b'").unwrap() else {
-        panic!("不是 ALTER DATABASE")
-    };
-    assert!(matches!(
-        &t3.action,
         AlterDatabaseAction::DropTemplate { name } if name.as_slice() == b"b"
-    ));
-
-    // ── F 组：三种动作 + FsRef 双形态 ──
-    let Stmt::AlterSystem(f1) = parse("ALTER SYSTEM ADD FILESYSTEM '/mnt/d1'").unwrap() else {
-        panic!("不是 ALTER SYSTEM")
-    };
-    assert!(matches!(
-        &f1.action,
-        AlterSystemAction::AddFilesystem { mount } if mount.as_slice() == b"/mnt/d1"
-    ));
-    let Stmt::AlterSystem(f2) =
-        parse("ALTER SYSTEM ALTER FILESYSTEM '/mnt/d1' SET ALLOCATE = OFF").unwrap()
-    else {
-        panic!("不是 ALTER SYSTEM")
-    };
-    assert!(matches!(
-        &f2.action,
-        AlterSystemAction::AlterFilesystem { fs, allocate: false }
-            if fs.mount.as_deref() == Some(&b"/mnt/d1"[..]) && fs.slot.is_none()
-    ));
-    let Stmt::AlterSystem(f3) = parse("ALTER SYSTEM DROP FILESYSTEM 3").unwrap() else {
-        panic!("不是 ALTER SYSTEM")
-    };
-    assert!(matches!(
-        &f3.action,
-        AlterSystemAction::DropFilesystem { fs } if fs.slot == Some(3)
     ));
 
     // ── S 组：SET 带值 / CLEAR 无值（白名单在 ② 判——解析照收）──
@@ -675,18 +777,44 @@ fn dcl_shapes_follow_the_frozen_design() {
 }
 
 #[test]
-fn clone_of_is_gone_with_a_pointed_message() {
-    let e = parse("CREATE WORKSPACE FOR USER alice CLONE OF 7").unwrap_err();
-    assert!(e.message.contains("CLONE"), "{e}");
+fn removed_forms_are_rejected_with_pointed_messages() {
+    // v0.2 删掉 `CREATE WORKSPACE FOR USER`：名字位上来的是关键字 ⇒ 点名"标识符或字符串"。
+    let e = parse("CREATE WORKSPACE FOR USER alice").unwrap_err();
     assert!(
-        e.message.contains("ALTER DATABASE"),
-        "错误文案指向替代语句：{e}"
+        e.message.contains("标识符") || e.message.contains("名字"),
+        "{e}"
     );
-    // 闭集外动作的文案同样响亮。
+    // 旧的 `ALTER SYSTEM …FILESYSTEM` 三件套 ⇒ 指向 `CREATE/ALTER/DROP FILESYSTEM`。
+    let e = parse("ALTER SYSTEM ADD FILESYSTEM '/mnt/d1'").unwrap_err();
+    assert!(
+        e.message.contains("CREATE / ALTER / DROP FILESYSTEM"),
+        "{e}"
+    );
     let e2 = parse("ALTER SYSTEM SWITCH LOGFILE").unwrap_err();
     assert!(e2.message.contains("FILESYSTEM"), "{e2}");
+    // 克隆与原地固化在 `ALTER DATABASE` 下的两条老路 ⇒ 各自指向 W2 / W7。
+    let e = parse("ALTER DATABASE CLONE WORKSPACE 'new' FROM 7").unwrap_err();
+    assert!(e.message.contains("CREATE WORKSPACE"), "{e}");
+    let e = parse("ALTER DATABASE ALTER WORKSPACE 7 TO TEMPLATE 'b'").unwrap_err();
+    assert!(e.message.contains("ALTER WORKSPACE"), "{e}");
     let e3 = parse("ALTER DATABASE RENAME TO x").unwrap_err();
     assert!(e3.message.contains("TEMPLATE"), "{e3}");
+    // `FOR USER` 限定没了：`SET` 位置上来的是 `FOR` ⇒ 点出期望。
+    let e = parse("ALTER WORKSPACE 'prod' FOR USER alice SET NAME = 'p2'").unwrap_err();
+    assert!(e.message.contains("SET"), "{e}");
+    // `SET NAME = NULL` 不再提供（v0.2 的 BNF 只有 `Eq Str`）。
+    let e = parse("ALTER WORKSPACE 7 SET NAME = NULL").unwrap_err();
+    assert!(
+        e.message.contains("标识符") || e.message.contains("名字"),
+        "{e}"
+    );
+    // 闭集外动作的文案同样响亮。
     let e4 = parse("ALTER WORKSPACE 7 SET QUOTA (foo = 1)").unwrap_err();
     assert!(e4.message.contains("foo"), "点出非法配额键：{e4}");
+    // `CREATE USER` 缺 `USING WORKSPACE` ⇒ 点出必选。
+    let e5 = parse("CREATE USER alice IDENTIFIED BY 'x'").unwrap_err();
+    assert!(e5.message.contains("USING"), "{e5}");
+    // 配额只能是整数或 `UNLIMITED`。
+    let e6 = parse("CREATE WORKSPACE p QUOTA '10G' ON FILESYSTEM 3").unwrap_err();
+    assert!(e6.message.contains("UNLIMITED"), "{e6}");
 }

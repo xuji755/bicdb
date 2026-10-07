@@ -169,6 +169,46 @@ impl<'a, 'b, 'io, 'f> TableAccessWriter<'a, 'b, 'io, 'f> {
         self.indexes = Some(idx);
         out
     }
+
+    /// **行更新后的索引维护**（旧键删、新键插；键没变就什么都不做）。
+    fn maintain_update(&mut self, rid: RowId, old: &[u8], new: &[u8]) -> Result<(), ExecError> {
+        let Some(idx) = self.indexes.take() else {
+            return Ok(());
+        };
+        let out = {
+            let txn: &Txn = match (self.txn.as_ref(), self.borrowed.as_deref()) {
+                (Some(t), _) => t,
+                (_, Some(t)) => t,
+                _ => {
+                    self.indexes = Some(idx);
+                    return Err(ExecError::NoWriter);
+                }
+            };
+            idx.after_update(self.pool, self.log, self.file, self.ws, txn, rid, old, new)
+        };
+        self.indexes = Some(idx);
+        out
+    }
+
+    /// **行删除后的索引维护**（删键；键从被删的行算）。
+    fn maintain_delete(&mut self, rid: RowId, old: &[u8]) -> Result<(), ExecError> {
+        let Some(idx) = self.indexes.take() else {
+            return Ok(());
+        };
+        let out = {
+            let txn: &Txn = match (self.txn.as_ref(), self.borrowed.as_deref()) {
+                (Some(t), _) => t,
+                (_, Some(t)) => t,
+                _ => {
+                    self.indexes = Some(idx);
+                    return Err(ExecError::NoWriter);
+                }
+            };
+            idx.after_delete(self.pool, self.log, self.file, self.ws, txn, rid, old)
+        };
+        self.indexes = Some(idx);
+        out
+    }
 }
 
 impl TableWriter for TableAccessWriter<'_, '_, '_, '_> {
@@ -202,30 +242,27 @@ impl TableWriter for TableAccessWriter<'_, '_, '_, '_> {
         Ok(rid)
     }
 
-    fn update_row(&mut self, rid: RowId, row: &[u8]) -> Result<(), ExecError> {
-        // 装了索引维护口却走 UPDATE ⇒ 明确拒绝（索引维护随 UPDATE 的 SQL 面落地）。
-        if self.indexes.is_some() {
-            return Err(ExecError::NoIndexMaintenance("UPDATE"));
-        }
+    fn update_row(&mut self, rid: RowId, old: &[u8], new: &[u8]) -> Result<(), ExecError> {
         let policy = self.policy;
         let heap_seg = self.heap_seg;
+        // **先堆后索引**（与插入同序）：堆写真成功过才动索引。
         self.use_txn(|s, txn| {
             s.table
-                .update(s.log, s.chain, txn, s.file, heap_seg, rid, row, &policy)
+                .update(s.log, s.chain, txn, s.file, heap_seg, rid, new, &policy)
                 .map_err(ExecError::TableAccess)
-        })
+        })?;
+        self.maintain_update(rid, old, new)
     }
 
-    fn delete_row(&mut self, rid: RowId) -> Result<(), ExecError> {
-        if self.indexes.is_some() {
-            return Err(ExecError::NoIndexMaintenance("DELETE"));
-        }
+    fn delete_row(&mut self, rid: RowId, old: &[u8]) -> Result<(), ExecError> {
+        // 删行按 ROWID 定位（不经段头）——段头由 `TableAccessWriter::with_txn` 持有。
         let policy = self.policy;
         self.use_txn(|s, txn| {
             s.table
                 .delete(s.log, s.chain, txn, s.file, rid, &policy)
                 .map_err(ExecError::TableAccess)
-        })
+        })?;
+        self.maintain_delete(rid, old)
     }
 
     fn commit(&mut self) -> Result<(), ExecError> {

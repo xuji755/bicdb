@@ -159,18 +159,42 @@ fn hex(bytes: &[u8]) -> String {
 /// 页镜像字节（N × 16 KiB）的转储。
 #[must_use]
 pub fn page_image_dump(bytes: &[u8]) -> String {
-    let mut s = String::new();
-    for (i, chunk) in bytes.chunks(PAGE_SIZE).enumerate() {
-        let _ = writeln!(s, "--- 镜像页 {i}（{} 字节）---", chunk.len());
-        if chunk.len() < PAGE_SIZE {
-            let _ = writeln!(s, "（末页截断，不足 {PAGE_SIZE} 字节）");
-            continue;
+    let mut out = Vec::new();
+    let mut cursor = std::io::Cursor::new(bytes);
+    // `Cursor<&[u8]>` 不出 IO 错；真出错也只是少打一页——转储是给人看的。
+    let _ = page_image_dump_stream(&mut cursor, &mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// **流式**页镜像转储：一次一页，边转边写（**不在内存里放整个镜像**）。
+///
+/// # Errors
+/// 读或写失败。
+pub fn page_image_dump_stream(
+    reader: &mut impl std::io::Read,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let mut buf = Box::new([0u8; PAGE_SIZE]);
+    let mut index = 0usize;
+    loop {
+        let mut filled = 0usize;
+        while filled < PAGE_SIZE {
+            match reader.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
         }
-        let mut buf = Box::new([0u8; PAGE_SIZE]);
-        buf.copy_from_slice(chunk);
-        s.push_str(&page_dump(&Page::from_bytes(buf)));
+        if filled == 0 {
+            return Ok(());
+        }
+        writeln!(out, "--- 镜像页 {index}（{filled} 字节）---")?;
+        if filled < PAGE_SIZE {
+            writeln!(out, "（末页截断，不足 {PAGE_SIZE} 字节）")?;
+            return Ok(());
+        }
+        out.write_all(page_dump(&Page::from_bytes(Box::new(*buf))).as_bytes())?;
+        index += 1;
     }
-    s
 }
 
 #[cfg(test)]

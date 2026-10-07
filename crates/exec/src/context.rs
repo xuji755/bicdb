@@ -57,6 +57,8 @@ pub struct WorkAreaStats {
 #[derive(Debug)]
 pub struct ExecContext<'a> {
     snapshot: CommitSeq,
+    /// **本会话自己的活动事务**（`Some` ⇒ **读己所写**；见 `storage::cr::ReadView`）。
+    own: Option<bicdb_storage::undo::TxnId>,
     params: Vec<Value>,
     deadline: Option<Instant>,
     cancel: Option<&'a AtomicBool>,
@@ -75,6 +77,7 @@ impl<'a> ExecContext<'a> {
     pub fn new(snapshot: CommitSeq) -> Self {
         Self {
             snapshot,
+            own: None,
             params: Vec::new(),
             deadline: None,
             cancel: None,
@@ -83,6 +86,25 @@ impl<'a> ExecContext<'a> {
             pool: None,
             work_areas: WorkAreaStats::default(),
         }
+    }
+
+    /// **带上本会话自己的活动事务**（读己所写：未提交的改动对自己可见）。
+    #[must_use]
+    pub fn with_own(mut self, own: Option<bicdb_storage::undo::TxnId>) -> Self {
+        self.own = own;
+        self
+    }
+
+    /// 本会话自己的活动事务（`None` = 自动提交/只读形态）。
+    #[must_use]
+    pub fn own(&self) -> Option<bicdb_storage::undo::TxnId> {
+        self.own
+    }
+
+    /// **读视角**（快照 + 自己的事务）——扫描/CR 用这一个入口。
+    #[must_use]
+    pub fn read_view(&self) -> bicdb_storage::cr::ReadView {
+        bicdb_storage::cr::ReadView::new(self.snapshot).with_own(self.own)
     }
 
     /// 带参数（会话级类型化参数——绑定期已定型）。

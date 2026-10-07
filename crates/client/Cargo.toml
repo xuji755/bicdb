@@ -1,0 +1,17 @@
+[package]
+name = "bicdb-client"
+description = "bicdb 的 Rust 驱动（本机协议 v0.1 的客户端面）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bicdb_client"
+path = "src/lib.rs"
+
+[dependencies]
+bicdb-net = { path = "../net" }
+
+[dev-dependencies]

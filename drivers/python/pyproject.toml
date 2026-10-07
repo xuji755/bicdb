@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bicdb"
+version = "0.2.0"
+description = "bicdb 的 Python 驱动（DB-API 2.0 子集；本机协议 v0.1）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+keywords = ["database", "dbapi", "bicdb"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Database",
+]
+# **零依赖**：只用标准库（socket/struct/decimal）。
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/xuji755/bicdb"
+
+[tool.setuptools]
+packages = ["bicdb"]

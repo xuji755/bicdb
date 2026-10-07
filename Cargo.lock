@@ -40,12 +40,21 @@ dependencies = [
  "bicdb-catalog",
  "bicdb-common",
  "bicdb-exec",
+ "bicdb-index",
+ "bicdb-net",
  "bicdb-sql",
  "bicdb-storage",
  "bicdb-txn",
  "bicdb-types",
  "bicdb-wal",
  "bicdb-workspace",
+]
+
+[[package]]
+name = "bicdb-client"
+version = "0.2.0"
+dependencies = [
+ "bicdb-net",
 ]
 
 [[package]]
@@ -123,6 +132,8 @@ dependencies = [
  "bicdb-catalog",
  "bicdb-cli",
  "bicdb-common",
+ "bicdb-exec",
+ "bicdb-net",
  "bicdb-sql",
  "bicdb-workspace",
 ]
@@ -170,3 +181,6 @@ dependencies = [
 [[package]]
 name = "bicdb-workspace"
 version = "0.2.0"
+dependencies = [
+ "bicdb-common",
+]

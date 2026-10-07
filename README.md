@@ -28,14 +28,21 @@ It unifies five kinds of data under one transactional store:
 
 > **Design frozen (2026-10). Phases P1–P4 done; P5 in progress.**
 > Storage, WAL/recovery, transactions, the buffer pool and the B+Tree index are
-> implemented and covered by tests (`cargo test --workspace`). P5 so far: the
-> workspace **catalog** (dictionary tables `obj$`/`tab$`/`col$`/`ind$`/`icol$`/
-> `seg$`/`stat$`/`seq$`, DDL write side, row cache), the **table access service**
-> (`bicdb-access`), the **SQL front end** (lexer/parser → binder → physical plan
-> → session) and a **runnable CLI** (`bicdb init/sql/shell`) — see
-> [Quick start](#quick-start). Still open: UPDATE/DELETE, aggregates and joins,
-> the logical rewrite layer, and the daemon/protocol surface; all recorded with
-> explicit triggers in `doc/待讨论清单.md`.
+> implemented and covered by tests (`cargo test --workspace`). Also landed: the
+> workspace **catalog** (dictionary tables, DDL write side, row cache), the
+> **table access service**, the **SQL front end** (lexer/parser → binder →
+> physical plan → session) with `SELECT` (filters, aggregates, `GROUP BY`/
+> `HAVING`/`DISTINCT`, two-table joins, set operations, `ORDER BY` expressions),
+> `INSERT`/`UPDATE`/`DELETE`, **rule-based index access paths** (equality,
+> `IN`, bounded ranges, index nested-loop joins), the **management plane**
+> (`CREATE FILESYSTEM` / `CREATE WORKSPACE` / `CREATE USER`, password hashing),
+> **local password authentication**, the read-only fixed table `file$`, and a
+> runnable CLI (`bicdb init/sql/shell`) — see [Quick start](#quick-start).
+> Still open: templates (reflink snapshots), routing an authenticated session to
+> the subject's own workspace, the daemon process model, the remote (TCP) protocol
+> and its authentication, plus the documented backlog.
+> The internal design notes, roadmap and evidence packs live in `doc/` and are
+> **not** part of this mirror.
 
 ### Documentation
 
@@ -45,7 +52,7 @@ It unifies five kinds of data under one transactional store:
 | [Design](docs/design.md) | Overall architecture: isolation, storage, transactions, retrieval, graph, phases |
 | [Storage design](docs/storage.md) | Storage layer: file layout, page format, ROWID, recovery. **Design frozen (2026-10) — all pending items closed** |
 | [Platform support](docs/platform-support.md) | Supported architectures and compatibility baseline |
-| [Manual](docs/使用手册.md) | **User manual** (Chinese): quick start, parameter file, command reference, SQL surface, operations |
+| [Manual](docs/使用手册.md) | **User manual** (Chinese): capability table, install, create database, storage, users & workspaces, connecting, tables, SQL syntax, parameters, commands, operations, drivers |
 | [Changelog](CHANGELOG.md) | Release notes, starting with v0.1.0 |
 
 ### Core constraints
@@ -92,11 +99,13 @@ and is not blocked by them.**
 | `bicdb-memory` | Memory revisions, checkpoints, TTL, derivation and delete propagation |
 | `bicdb-retrieval` | Inverted index and tokenization, exact vector, RRF fusion, HNSW/IVFFlat |
 | `bicdb-graph` | Named graphs, vertex/edge storage, Cypher subset, bounded traversal |
-| `bicdb-net` | Versioned request protocol, ACK/reconcile, sessions, SDK/CLI plumbing |
+| `bicdb-net` | **Local client protocol v0.1** (frames, verbs, wire values, drivers); the full versioned request protocol (envelope/ACK/reconcile, TCP+auth, server cursors) is a later slice — see `docs/客户端协议_v0.1.md` §0 |
 | `bicdb-daemon` | Worker process entry, bounded execution pool, maintenance threads |
 | `bicdb-tools` | Diagnostics: `page_dump`, `db_check` |
 | `bicdb-cli` | `bicdb` binary: instance bootstrap, service lifecycle, SQL execution, shell |
 | `bicdb-sqlplus` | `bicdbcli`: standalone SQL*Plus-style client (buffer, slash commands, SPOOL, scripts) |
+| `bicdb-client` | Rust driver on top of `bicdb-net` (`Connection`, `ResultSet`, `Row`, `Value`) |
+| `bicdb` (Python, `drivers/python`) | Python driver: DB-API 2.0 subset, stdlib only |
 
 ### Development phases
 
@@ -155,12 +164,64 @@ cargo build --release
 ./target/release/bicdb stop  -p ./demo         # clean shutdown (full checkpoint)
 ```
 
+From your own program, connect with a driver over the control socket (the
+service must be running) — spec: [docs/客户端协议_v0.1.md](docs/客户端协议_v0.1.md):
+
+```rust
+// Rust: crates/client (package `bicdb-client`)
+let mut conn = bicdb_client::Connection::connect("./demo")?;
+let rs = conn.query("SELECT id, name FROM t WHERE id = :id", &[("id", 1_i64.into())])?;
+```
+
+```python
+# Python: drivers/python (package `bicdb`, DB-API 2.0 subset, stdlib only)
+import bicdb
+conn = bicdb.connect("./demo")
+cur = conn.cursor()
+cur.execute("SELECT id, name FROM t WHERE id = :id", {"id": 1})
+print(cur.fetchall())
+```
+
+There is a **local test environment** at `~/bicdb/demo` (created by
+[`scripts/demo.sh`](scripts/demo.sh)) — a fixed instance with seeded data
+(`t`/`emp`/`big`), for hands-on testing and driver work:
+
+```bash
+scripts/demo.sh create    # 建区 + 起服务 + 灌测试数据（幂等）
+scripts/demo.sh cli       # SQL*Plus-shaped client against it
+scripts/demo.sh py        # connect with the Python driver
+scripts/demo.sh reset     # 回到初始数据
+```
+
 `init` creates a real on-disk instance (dictionary file, undo segment, WAL group
 directory, two control-file copies). Every command opens the instance through
 **crash recovery** and closes it with a **full checkpoint**, so an interrupted
 process loses nothing that was committed. Uniqueness is enforced on `INSERT`
 (including inside an open transaction); `BEGIN`/`COMMIT`/`ROLLBACK` work as
 statements of one session.
+
+### Install
+
+```bash
+scripts/install.sh                  # picks a writable, visible root and says which
+export BICDB_HOME=$HOME/bicdb-home && export PATH="$BICDB_HOME/app/bin:$PATH"
+bicdb home                          # program / data / log / backup — one command
+bicdb init && bicdb start -p public && bicdb list
+```
+
+**One root, four directories** — so nobody has to go looking for logs or data:
+
+```text
+<BICDB_HOME>/app/      programs (read-only; upgrading replaces this one)
+             /public/  the PUBLIC workspace (control/ · wal/ · data/)
+             /log/     all database logs (public.log)
+             /backup/  default backup destination
+```
+
+Reinstalling never touches `public/`; `scripts/uninstall.sh` keeps data by
+default (`--purge` removes it) and refuses while a workspace is running.
+Design: the layout is documented in the [manual](docs/使用手册.md) §2
+(the internal design note is not part of this mirror).
 
 ### Build
 
@@ -210,12 +271,16 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 
 > **设计已冻结（2026-10）；P1–P4 已实现，P5 进行中。**
 > 存储、WAL/恢复、事务、缓冲池与 B+Tree 索引均已实现并有测试覆盖
-> （`cargo test --workspace`）。P5 已落地：**目录**（字典表
-> `obj$`/`tab$`/`col$`/`ind$`/`icol$`/`seg$`/`stat$`/`seq$`、DDL 写侧、行缓存）、
-> **表访问服务**（`bicdb-access`）、**SQL 前端**（词法/语法 → 绑定 → 物理计划 →
-> 会话）与**可运行的 CLI**（`bicdb init/sql/shell`，见
-> [快速上手](#快速上手)）。仍待做：UPDATE/DELETE、聚合与连接、逻辑变换层、
-> daemon/协议面——均挂明确触发条件（见 `doc/待讨论清单.md`）。
+> （`cargo test --workspace`）。**已落地**还有：**目录**（字典表、DDL 写侧、行缓存）、
+> **表访问服务**（`bicdb-access`）、**SQL 前端**（词法/语法 → 绑定 → 物理计划 → 会话：
+> `SELECT` 的过滤/聚合/`GROUP BY`·`HAVING`·`DISTINCT`/两表连接/集合运算/`ORDER BY`
+> 表达式，以及 `INSERT`·`UPDATE`·`DELETE`）、**规则式索引访问路径**（等值 / `IN` /
+> 有界范围 / 连接的内表探测）、**管理面**（`CREATE FILESYSTEM`·`CREATE WORKSPACE`·
+> `CREATE USER` 与口令散列）、**本机口令认证**、只读固定表 `file$`，以及
+> **可运行的 CLI**（`bicdb init/sql/shell`，见 [快速上手](#快速上手)）。
+> 仍待做：模板（reflink 快照）、认证后路由到主体自己的工作区、daemon 进程模型、
+> 对外（TCP）协议与其认证，以及已登记的后备清单。内部设计/路线/证据包在 `doc/`，
+> **不随本镜像发布**。
 
 ### 文档
 
@@ -225,7 +290,7 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | [总体设计](docs/design.md) | 隔离、存储、事务、检索、图，以及研发阶段 |
 | [存储结构设计](docs/storage.md) | 文件布局、页格式、ROWID、恢复。**设计冻结（2026-10）**——全部待冻结项已关闭 |
 | [平台支持](docs/platform-support.md) | 支持的架构与兼容基线 |
-| [使用手册](docs/使用手册.md) | **使用手册**：五分钟上手、参数文件、命令参考、SQL 面清单、运维与排错 |
+| [使用手册](docs/使用手册.md) | **使用手册**：能力现状表、安装、建库、存储与登记 FS、用户与工作区、连接、表、SQL 语法参考、参数、命令、运维、驱动 |
 | [更新日志](CHANGELOG.md) | 版本说明，自 v0.1.0 起 |
 
 ### 核心约束
@@ -268,11 +333,13 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | `bicdb-memory` | 记忆版本、检查点、TTL、派生依赖与删除传播 |
 | `bicdb-retrieval` | 倒排索引与分词、精确向量、RRF 融合、HNSW/IVFFlat |
 | `bicdb-graph` | 命名图、顶点/边存储、Cypher 子集、有界遍历 |
-| `bicdb-net` | 版本化请求协议、ACK/对账、会话、SDK/CLI 对接 |
+| `bicdb-net` | **本机客户端协议 v0.1**（帧/动词/线上值模型/驱动）；版本化请求协议全量（封套与 ACK 对账、TCP+认证、服务端游标）是后续切片——见 `docs/客户端协议_v0.1.md` §0 |
 | `bicdb-daemon` | 工作进程入口、有界执行池、维护线程 |
 | `bicdb-tools` | 诊断工具：`page_dump`、`db_check` |
 | `bicdb-cli` | `bicdb` 命令行：建区、服务生命周期、执行 SQL、交互式 shell |
 | `bicdb-sqlplus` | `bicdbcli`：SQL*Plus 形态的独立客户端（缓冲、斜杠命令、SPOOL、脚本） |
+| `bicdb-client` | Rust 驱动（建在 `bicdb-net` 上：`Connection`/`ResultSet`/`Row`/`Value`） |
+| `bicdb`（Python，`drivers/python`） | Python 驱动：DB-API 2.0 子集，只用标准库 |
 
 ### 研发阶段
 
@@ -329,10 +396,59 @@ cargo build --release
 ./target/release/bicdb stop  -p ./demo         # 干净关闭（完全检查点）
 ```
 
+在自己的程序里连：起服务后用驱动（规格 [docs/客户端协议_v0.1.md](docs/客户端协议_v0.1.md)，
+Rust 与 Python 实现同一份）：
+
+```rust
+// Rust：crates/client（包名 `bicdb-client`）
+let mut conn = bicdb_client::Connection::connect("./demo")?;
+let rs = conn.query("SELECT id, name FROM t WHERE id = :id", &[("id", 1_i64.into())])?;
+```
+
+```python
+# Python：drivers/python（包名 `bicdb`，DB-API 2.0 子集，只用标准库）
+import bicdb
+conn = bicdb.connect("./demo")
+cur = conn.cursor()
+cur.execute("SELECT id, name FROM t WHERE id = :id", {"id": 1})
+print(cur.fetchall())
+```
+
+本机有一处**固定的测试环境** `~/bicdb/demo`（由 [`scripts/demo.sh`](scripts/demo.sh) 建）：
+带测试数据（`t`/`emp`/`big`）的实例，手测与驱动联调都用它：
+
+```bash
+scripts/demo.sh create    # 建区 + 起服务 + 灌测试数据（幂等）
+scripts/demo.sh cli       # 连它进 SQL*Plus 形态客户端
+scripts/demo.sh py        # 用 Python 驱动连一下（自检）
+scripts/demo.sh reset     # 回到初始数据
+```
+
 `init` 建出一个**真盘实例**（字典文件、撤销段、日志组目录、控制文件双副本）。
 每条命令都经**崩溃恢复**打开、以**完全检查点**关闭——进程被打断也不会丢已提交的
 数据。唯一性在 `INSERT` 上把守（显式事务内同样把守）；`BEGIN`/`COMMIT`/`ROLLBACK`
 按一个会话的语句工作。
+
+### 安装
+
+```bash
+scripts/install.sh                  # 挑一个可写、可见的根并打印是哪个
+export BICDB_HOME=$HOME/bicdb-home && export PATH="$BICDB_HOME/app/bin:$PATH"
+bicdb home                          # 程序/数据/日志/备份——一条命令看全
+bicdb init && bicdb start -p public && bicdb list
+```
+
+**一个根，四个目录**——运维不用到处找日志、找数据：
+
+```text
+<BICDB_HOME>/app/      程序（只读；升级 = 换这一目录）
+             /public/  PUBLIC 工作区（control/ · wal/ · data/）
+             /log/     数据库日志（public.log）
+             /backup/  默认的备份包落地处
+```
+
+重装永不碰 `public/`；卸载默认保数据（`--purge` 才删），有工作区在跑时拒绝卸载。
+设计见[使用手册](docs/使用手册.md) §2（内部设计文档不随本镜像发布）。
 
 ### 构建
 

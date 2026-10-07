@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use bicdb_exec::{ArithOp, CmpOp, Expr as PlanExpr, Value};
+use bicdb_exec::{ArithOp, CmpOp, ColKind, Expr as PlanExpr, Value};
 use bicdb_types::Number;
 
 use super::{BindError, CatalogColumn};
@@ -29,6 +29,10 @@ use crate::ast::{self, AConst, AExprKind, BoolExprType, ConstValue, Expr, NullTe
 /// 绑定期的一列（表列或输出列的形态）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundColumn {
+    /// **来源限定名**（表名或别名；两表连接时 `t.x` 引用靠它消歧）。
+    ///
+    /// 单表查询也填（表名）——它同时是"这一段列从哪来"的说明。
+    pub source: Option<String>,
     /// 列名（输出名/表列名）。
     pub name: String,
     /// 值形态。
@@ -105,11 +109,37 @@ pub struct BindScope<'a> {
 }
 
 impl BindScope<'_> {
-    fn lookup_table_column(&self, name: &str) -> Option<(usize, &BoundColumn)> {
-        self.table_columns
-            .iter()
-            .enumerate()
-            .find(|(_, c)| c.name == name)
+    /// 按（可选限定名, 列名）查列：**两段引用**按限定名匹配；**一段引用**在所有
+    /// 表里找，**多于一个候选 ⇒ 歧义**（`AmbiguousColumn`——照 SQL 标准，
+    /// 不猜"大概是哪一个"）。
+    fn lookup_column(
+        &self,
+        qual: Option<&str>,
+        name: &str,
+    ) -> Result<(usize, &BoundColumn), BindError> {
+        let mut hit: Option<(usize, &BoundColumn)> = None;
+        for (i, c) in self.table_columns.iter().enumerate() {
+            if c.name != name {
+                continue;
+            }
+            if let Some(q) = qual {
+                if c.source.as_deref() != Some(q) {
+                    continue;
+                }
+            }
+            if hit.is_some() && qual.is_none() {
+                return Err(BindError::AmbiguousColumn(name.to_owned()));
+            }
+            if hit.is_none() {
+                hit = Some((i, c));
+            }
+        }
+        hit.ok_or_else(|| {
+            BindError::UnknownColumn(match qual {
+                Some(q) => format!("{q}.{name}"),
+                None => name.to_owned(),
+            })
+        })
     }
 }
 
@@ -122,10 +152,8 @@ pub fn bind_expr(
 ) -> Result<(PlanExpr, bicdb_exec::ColKind), BindError> {
     match raw {
         Expr::ColumnRef(cr) => {
-            let name = column_ref_name(cr)?;
-            let (i, col) = scope
-                .lookup_table_column(&name)
-                .ok_or_else(|| BindError::UnknownColumn(name.clone()))?;
+            let (qual, name) = column_ref_name(cr)?;
+            let (i, col) = scope.lookup_column(qual.as_deref(), &name)?;
             // 表列（`table_col` 有值）⇒ 序号即表列序；纯输出列在 WHERE 里不可用
             // （MVP：委托给调用方保证 scope 只装可用列）。
             let _ = col;
@@ -184,9 +212,103 @@ pub fn bind_expr(
                 to,
             ))
         }
-        Expr::CaseExpr(_) | Expr::CoalesceExpr(_) | Expr::FuncCall(_) => Err(
-            BindError::Unsupported("S3 首版的表达式面不含 CASE/COALESCE/函数调用".to_owned()),
-        ),
+        // **`CASE`**（搜索式与简单式两种形态；简单式先脱糖成等值比较）。
+        Expr::CaseExpr(c) => {
+            let mut whens = Vec::with_capacity(c.args.len());
+            let mut kind: Option<ColKind> = None;
+            for w in &c.args {
+                let cond = match &c.arg {
+                    // 搜索式：`WHEN 条件`。
+                    None => {
+                        let (e, k) = bind_expr(&w.expr, scope, params, Some(ColKind::Bool))?;
+                        if k != ColKind::Bool {
+                            return Err(BindError::TypeMismatch {
+                                what: "CASE WHEN".to_owned(),
+                                want: "BOOLEAN",
+                                got: kind_name(k),
+                            });
+                        }
+                        e
+                    }
+                    // 简单式：`CASE 表达式 WHEN 值` ⇒ `表达式 = 值`。
+                    Some(arg) => {
+                        let (lhs, lk) = bind_expr(arg, scope, params, None)?;
+                        let (rhs, _) = bind_expr(&w.expr, scope, params, Some(lk))?;
+                        PlanExpr::Compare {
+                            op: bicdb_exec::CmpOp::Eq,
+                            left: Box::new(lhs),
+                            right: Box::new(rhs),
+                        }
+                    }
+                };
+                let (result, rk) = bind_expr(&w.result, scope, params, kind)?;
+                kind = Some(unify_kind(kind, rk)?);
+                whens.push((cond, result));
+            }
+            let else_ = match &c.defresult {
+                None => None,
+                Some(e) => {
+                    let (e, ek) = bind_expr(e, scope, params, kind)?;
+                    kind = Some(unify_kind(kind, ek)?);
+                    Some(Box::new(e))
+                }
+            };
+            let kind = kind.ok_or_else(|| BindError::Unsupported("CASE 没有分支".to_owned()))?;
+            Ok((PlanExpr::Case { whens, else_ }, kind))
+        }
+        // **`COALESCE(a, b, …)`**：参数类型必须能统一（结果形态取统一后的）。
+        Expr::CoalesceExpr(c) => {
+            if c.args.is_empty() {
+                return Err(BindError::Unsupported("COALESCE 没有实参".to_owned()));
+            }
+            let mut kind: Option<ColKind> = None;
+            let mut args = Vec::with_capacity(c.args.len());
+            for a in &c.args {
+                let (e, k) = bind_expr(a, scope, params, kind)?;
+                kind = Some(unify_kind(kind, k)?);
+                args.push(e);
+            }
+            Ok((PlanExpr::Coalesce(args), kind.unwrap_or(ColKind::Bytes)))
+        }
+        // **`NULLIF(a, b)`** 在 `bind_aexpr` 里（它以 `AExpr` 形态出现）；
+        // **函数调用**：
+        // - 聚合函数（COUNT/SUM/AVG/MIN/MAX）**不在这一层**——它们由 SELECT 的
+        //   聚合提取器处理（`bind_select` 的 `extract_aggregates`）：出现在
+        //   表达式里说明位置不对（比如 `WHERE SUM(x) > 1`）；
+        // - 其余函数：本版没有函数目录 ⇒ 具名拒绝（点出"没有函数目录"，
+        //   免得用户以为是拼写问题）。
+        Expr::FuncCall(f) => {
+            if is_aggregate_name(&f.funcname) {
+                Err(BindError::Unsupported(format!(
+                    "聚合函数 `{}` 只能出现在 SELECT 列表或 HAVING 里（不能进 WHERE/表达式）",
+                    f.funcname.to_uppercase()
+                )))
+            } else {
+                Err(BindError::Unsupported(format!(
+                    "函数 `{}`：本版没有函数目录（聚合 COUNT/SUM/AVG/MIN/MAX 除外）",
+                    f.funcname
+                )))
+            }
+        }
+    }
+}
+
+/// **是不是聚合函数名**（小写已折叠）。
+#[must_use]
+pub fn is_aggregate_name(name: &str) -> bool {
+    matches!(name, "count" | "sum" | "avg" | "min" | "max")
+}
+
+/// 两个形态**统一**成一个（不同即拒——本版不做隐式数值/文本互转）。
+fn unify_kind(have: Option<ColKind>, got: ColKind) -> Result<ColKind, BindError> {
+    match have {
+        None => Ok(got),
+        Some(k) if k == got => Ok(k),
+        Some(k) => Err(BindError::TypeMismatch {
+            what: "分支/实参".to_owned(),
+            want: kind_name(k),
+            got: kind_name(got),
+        }),
     }
 }
 
@@ -196,7 +318,6 @@ fn bind_aexpr(
     params: &mut BoundParams,
     expect: Option<bicdb_exec::ColKind>,
 ) -> Result<(PlanExpr, bicdb_exec::ColKind), BindError> {
-    use bicdb_exec::ColKind;
     // **一元 `+`/`-`**（PG 形态：`lexpr = NULL`）。本引擎**没有运算符目录**
     // （运算符是闭集，见 §3.1 的节点映射），故在绑定期脱糖：
     // `+x` ⇒ `x`；`-x` ⇒ `0 - x`。数值字面量的一元负号已在**语法期折叠**
@@ -324,7 +445,20 @@ fn bind_aexpr(
             op => return Err(BindError::Unsupported(format!("运算符 `{op}`"))),
         },
         AExprKind::Between | AExprKind::NotBetween => unreachable!("上面已处理"),
-        AExprKind::NullIf => return Err(BindError::Unsupported("NULLIF（S3 首版）".to_owned())),
+        // **`NULLIF(a, b)`**：`a = b` 为真 ⇒ NULL；否则 `a`（比较 UNKNOWN ⇒ `a`）。
+        // 结果形态 = `a` 的形态（`b` 只参与比较）。
+        AExprKind::NullIf => {
+            // 左侧已经在上面绑好（`left`），右侧用同一形态再绑一次。
+            let rk = lk;
+            let (r, _) = bind_expr(right, scope, params, Some(rk))?;
+            return Ok((
+                PlanExpr::NullIf {
+                    left: Box::new(left),
+                    right: Box::new(r),
+                },
+                lk,
+            ));
+        }
         AExprKind::In | AExprKind::NotIn => unreachable!("上面已处理"),
     };
     let out_kind = if matches!(ae.kind, AExprKind::Op)
@@ -342,7 +476,6 @@ fn const_value(
     v: Option<&ConstValue>,
     expect: Option<bicdb_exec::ColKind>,
 ) -> Result<(Value, bicdb_exec::ColKind), BindError> {
-    use bicdb_exec::ColKind;
     let Some(v) = v else {
         let k = expect.unwrap_or(ColKind::Bytes);
         return Ok((Value::Null, k));
@@ -387,13 +520,17 @@ fn cast_target(name: &str) -> Result<bicdb_exec::ColKind, BindError> {
 }
 
 /// 列引用的单段名字（多段/`*` 在 S3 首版拒绝）。
-fn column_ref_name(cr: &ast::ColumnRef) -> Result<String, BindError> {
-    match (cr.fields.len(), cr.fields.first()) {
-        (1, Some(ast::ColumnRefField::Name(n))) => Ok(n.clone()),
-        (1, Some(ast::ColumnRefField::AStar)) => {
+fn column_ref_name(cr: &ast::ColumnRef) -> Result<(Option<String>, String), BindError> {
+    match (cr.fields.len(), cr.fields.first(), cr.fields.get(1)) {
+        (1, Some(ast::ColumnRefField::Name(n)), _) => Ok((None, n.clone())),
+        (1, Some(ast::ColumnRefField::AStar), _) => {
             Err(BindError::Unsupported("`*` 在表达式里".to_owned()))
         }
-        _ => Err(BindError::Unsupported("多段列引用".to_owned())),
+        // **两段**：`表/别名.列`（连接查询的主力形态）。
+        (2, Some(ast::ColumnRefField::Name(q)), Some(ast::ColumnRefField::Name(n))) => {
+            Ok((Some(q.clone()), n.clone()))
+        }
+        _ => Err(BindError::Unsupported("三段以上的列引用".to_owned())),
     }
 }
 
@@ -404,7 +541,7 @@ pub fn nullable_of(expr: &Expr, cols: &[CatalogColumn]) -> bool {
         Expr::AConst(a) => a.value.is_none(),
         Expr::ColumnRef(cr) => column_ref_name(cr)
             .ok()
-            .and_then(|n| cols.iter().find(|c| c.name == n).map(|c| c.nullable))
+            .and_then(|(_, n)| cols.iter().find(|c| c.name == n).map(|c| c.nullable))
             .unwrap_or(true),
         Expr::ParamRef(_) => true,
         _ => true,

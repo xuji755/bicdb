@@ -540,11 +540,16 @@ impl Page {
         ) as usize
     }
 
-    /// 设置 `free_end`（**release 下夹取到页内**——debug_assert 仍抓程序员错误；
-    /// 夹取是为了让"损坏输入驱动的状态"不会变成越页写）。
+    /// 设置 `free_end`（**release 下夹取到"行区下界"**——debug_assert 仍抓程序员
+    /// 错误；夹取是为了让"损坏输入驱动的状态"不会变成越页写）。
+    ///
+    /// 夹取上限是 [`Page::row_area_floor`]（= 页尾区之前），**不是 `PAGE_SIZE-1`**：
+    /// 后者落在页尾副本/链区里，`free_end > row_area_floor` 会让后续插入
+    /// 从行区下界往下写，覆盖页尾链与副本（`free_start` 的夹取口径也是页内
+    /// 而不是页尾之前，两处口径此前不一致）。
     pub fn set_free_end(&mut self, end: usize) {
-        debug_assert!(end <= PAGE_SIZE, "free_end 必须落在页内");
-        let end = end.min(PAGE_SIZE - 1);
+        debug_assert!(end <= self.row_area_floor(), "free_end 必须落在行区内");
+        let end = end.min(self.row_area_floor());
         self.bytes[FREE_END_OFFSET..FREE_END_OFFSET + 2]
             .copy_from_slice(&(end as u16).to_le_bytes());
     }
@@ -585,6 +590,11 @@ impl Page {
             return false;
         }
         let at = self.fixed_header_end() + index * SLOT_ENTRY_LEN;
+        // 与 [`Page::slot`] 同一道防线：`slot_count` 从**损坏页**读出来可能是
+        // 65535，只按它判界会让这里的切片越出页尾 panic。
+        if at + SLOT_ENTRY_LEN > PAGE_SIZE {
+            return false;
+        }
         self.bytes[at..at + SLOT_ENTRY_LEN].copy_from_slice(&entry.as_raw().to_le_bytes());
         true
     }

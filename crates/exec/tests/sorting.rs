@@ -202,7 +202,7 @@ fn work_memory_budget_is_enforced_and_counted() {
     let mut cursor = Some(HeapScanner::new(
         fx.pool,
         &fx.chain,
-        fx.snapshot,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
         DATA_FID,
         fx.blocks.clone(),
     ));

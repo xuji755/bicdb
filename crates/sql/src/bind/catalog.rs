@@ -110,10 +110,28 @@ impl CatalogView for CatalogViewImpl<'_, '_> {
         Ok((v.mtime, v.status))
     }
 
-    fn fixed_table(&mut self, name: &str) -> Result<bool, BindError> {
+    fn fixed_columns(&mut self, name: &str) -> Result<Option<Vec<CatalogColumn>>, BindError> {
         // **不查字典**（`arch/03` §3.1.4）：固定表的存在性由清单本身回答；
         // 行的产生在查询期（`file$` 的内容 = 控制文件内存映像）。
-        Ok(super::FIXED_TABLES.contains(&name))
+        if !super::FIXED_TABLES.contains(&name) {
+            return Ok(None);
+        }
+        // V1.0 只有 `file$` 有列形状（`session$`/`lock$` 随会话层）。
+        let Some(cols) = bicdb_catalog::fixed::columns(name) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            cols.iter()
+                .enumerate()
+                .map(|(i, c)| CatalogColumn {
+                    col: i as u32 + 1,
+                    name: c.name.to_owned(),
+                    type_code: c.type_code as u32,
+                    length: 0,
+                    nullable: true,
+                })
+                .collect(),
+        ))
     }
 
     fn is_public(&self) -> bool {
@@ -123,5 +141,24 @@ impl CatalogView for CatalogViewImpl<'_, '_> {
     fn segment_block(&mut self, obj: u32) -> Result<u32, BindError> {
         bicdb_catalog::ddl::live_segment_block(self.catalog, obj)
             .map_err(|e| BindError::Catalog(e.to_string()))
+    }
+}
+
+/// **给物理计划层同一个目录口**（[`crate::plan::PlanCatalog`]）。
+///
+/// 为什么不让计划层直接用 [`CatalogView`]：计划层的取数面**只有**段/索引三件事，
+/// 用窄口能挡住"计划期顺手查了别的东西"（也便于用例给假件）。
+impl crate::plan::PlanCatalog for CatalogViewImpl<'_, '_> {
+    fn segment_block(&mut self, obj: u32) -> Result<u32, BindError> {
+        CatalogView::segment_block(self, obj)
+    }
+
+    fn index_segment(&mut self, obj: u32) -> Result<(u16, u32), BindError> {
+        bicdb_catalog::ddl::live_segment_location(self.catalog, obj)
+            .map_err(|e| BindError::Catalog(e.to_string()))
+    }
+
+    fn indexes_of(&mut self, obj: u32) -> Result<Vec<CatalogIndex>, BindError> {
+        CatalogView::indexes_of(self, obj)
     }
 }

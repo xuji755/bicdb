@@ -412,19 +412,26 @@ pub static USER_KEYS: &[KeyDef] = &[
     },
 ];
 
-/// `ws$` —— 工作区登记。
+/// `ws$` —— 工作区登记（**v0.2 形态**：`DCL语句设计` v0.2 §4 的格式变更）。
+///
+/// 两处与旧形态不同，都是**依赖顺序 `FS → WORKSPACE → USER` 的推论**：
+/// - `user_id` **可空**：建区时**无主**（属主只在 `CREATE USER … USING WORKSPACE`
+///   一处落定）；`NULL` = 无主容器（不可打开，等待绑定）；
+/// - `name` **NOT NULL + 实例内唯一**：建区那一刻还没有属主，名字没法用属主限定。
 pub static WS_COLS: &[ColDef] = &[
     col(1, "workspace_id", ColTypeCode::Number, 0, false),
-    col(2, "user_id", ColTypeCode::Number, 0, false),
-    col(3, "name", ColTypeCode::Varchar2, 128, true), // NULL = 跟随属主名
+    col(2, "user_id", ColTypeCode::Number, 0, true), // NULL = 无主（等待 CREATE USER 绑定）
+    col(3, "name", ColTypeCode::Varchar2, 128, false),
     col(4, "status", ColTypeCode::Number, 0, false),
     col(5, "ctime", ColTypeCode::Timestamp, 0, false),
     col(6, "quota_data", ColTypeCode::Number, 0, false),
     col(7, "quota_undo", ColTypeCode::Number, 0, false),
     col(8, "quota_temp", ColTypeCode::Number, 0, false),
     col(9, "quota_asset", ColTypeCode::Number, 0, false),
+    // W4：新数据文件默认落哪块盘（`fs$` 的槽位号；NULL = 实例默认盘）。
+    col(10, "default_fs", ColTypeCode::Number, 0, true),
 ];
-/// `ws$` 的键：主键 + **同属主内名字唯一**（跨属主可同名——安全要求）。
+/// `ws$` 的键：主键 + **名字实例内唯一**（v0.2：不是"属主内唯一"——见上）。
 pub static WS_KEYS: &[KeyDef] = &[
     KeyDef {
         name: "i_ws_pk",
@@ -433,23 +440,57 @@ pub static WS_KEYS: &[KeyDef] = &[
     },
     KeyDef {
         name: "i_ws_name",
-        cols: &[2, 3],
+        cols: &[3],
         unique: true,
     },
 ];
 
-/// `fs$` —— 文件系统池（实例级资源；权威在全局控制文件，这里供查询/审计）。
+/// `fs$` —— 文件系统池（实例级资源；**位置权威在全局控制文件**，这里供查询/审计）。
+///
+/// **v0.2 形态**（`DCL语句设计` v0.2 §4）：**名字是标识**（`CREATE FILESYSTEM <名>
+/// USING '<路径>'` 给的名字，实例内唯一）、**路径只是创建参数**（`mount_path`
+/// 因此改名 `path`，并可只是一个目录）。
 pub static FS_COLS: &[ColDef] = &[
     col(1, "fs_slot", ColTypeCode::Number, 0, false),
-    col(2, "mount_path", ColTypeCode::Varchar2, 256, false),
-    col(3, "status", ColTypeCode::Number, 0, false),
-    col(4, "total_bytes", ColTypeCode::Number, 0, false),
-    col(5, "free_bytes", ColTypeCode::Number, 0, true), // 缓存值，权威是文件系统本身
+    col(2, "name", ColTypeCode::Varchar2, 128, false),
+    col(3, "path", ColTypeCode::Varchar2, 256, false),
+    col(4, "status", ColTypeCode::Number, 0, false),
+    col(5, "total_bytes", ColTypeCode::Number, 0, false),
+    col(6, "free_bytes", ColTypeCode::Number, 0, true), // 缓存值，权威是文件系统本身
+    col(7, "allocate", ColTypeCode::Number, 0, false),  // 1 = ON / 0 = OFF（F2 的排水阀）
 ];
-/// `fs$` 的键。
-pub static FS_KEYS: &[KeyDef] = &[KeyDef {
-    name: "i_fs_pk",
-    cols: &[1],
+/// `fs$` 的键：主键 + **名字唯一** + **路径唯一**（同一目录登记两次没有意义）。
+pub static FS_KEYS: &[KeyDef] = &[
+    KeyDef {
+        name: "i_fs_pk",
+        cols: &[1],
+        unique: true,
+    },
+    KeyDef {
+        name: "i_fs_name",
+        cols: &[2],
+        unique: true,
+    },
+    KeyDef {
+        name: "i_fs_path",
+        cols: &[3],
+        unique: true,
+    },
+];
+
+/// `wq$` —— **盘级配额**（工作区 × 文件系统 × 上限；`DCL语句设计` v0.2 §4）。
+///
+/// 与 `ws$` 的四列（**角色级**：data/undo/temp/asset）构成两级配额。
+/// 键 = `(workspace_id, fs_slot)`：一个区在一块盘上至多一条。
+pub static WQ_COLS: &[ColDef] = &[
+    col(1, "workspace_id", ColTypeCode::Number, 0, false),
+    col(2, "fs_slot", ColTypeCode::Number, 0, false),
+    col(3, "quota_bytes", ColTypeCode::Number, 0, false),
+];
+/// `wq$` 的键：主键 = `(工作区, 盘槽位)`。
+pub static WQ_KEYS: &[KeyDef] = &[KeyDef {
+    name: "i_wq_pk",
+    cols: &[1, 2],
     unique: true,
 }];
 
@@ -528,9 +569,17 @@ pub static DICT_TABLES: &[DictTable] = &[
         keys: FS_KEYS,
         bootstrap: true,
     },
+    DictTable {
+        name: "wq$",
+        columns: WQ_COLS,
+        keys: WQ_KEYS,
+        bootstrap: true,
+    },
 ];
 
 /// **普通工作区的自举条目数**：7 张表 + 8 个索引 = **15**（`目录详设` §2.2）。
+///
+/// `public`（管理面）另加 4 表 + 8 索引 = 12 ⇒ **27**（v0.2：`user$`/`ws$`/`fs$`/`wq$`）。
 #[must_use]
 pub fn bootstrap_entries_normal() -> usize {
     DICT_TABLES
@@ -553,7 +602,7 @@ pub fn bootstrap_entries_public() -> usize {
 /// `public` 独有的三张（普通工作区不建）。
 #[must_use]
 pub fn is_public_only(name: &str) -> bool {
-    matches!(name, "user$" | "ws$" | "fs$")
+    matches!(name, "user$" | "ws$" | "fs$" | "wq$")
 }
 
 /// **自举计划**（按建区顺序展开）：`(表, 其每个键)`——**表先、索引后**。
@@ -645,9 +694,9 @@ pub fn self_check() -> Result<(), String> {
             bootstrap_entries_normal()
         ));
     }
-    if bootstrap_entries_public() != 23 {
+    if bootstrap_entries_public() != 27 {
         return Err(format!(
-            "public 自举条目数应为 23，实为 {}",
+            "public 自举条目数应为 27，实为 {}",
             bootstrap_entries_public()
         ));
     }
@@ -665,9 +714,10 @@ mod tests {
 
     #[test]
     fn bootstrap_set_sizes_match_the_design() {
-        // 普通 15 = 7 表 + 8 索引；public 23 = 15 + 3 表 + 5 索引（目录详设 §2.2）。
+        // 普通 15 = 7 表 + 8 索引；
+        // public 27 = 15 + 4 表（user$/ws$/fs$/wq$）+ 8 索引（目录详设 §2.2 + v0.2）。
         assert_eq!(bootstrap_entries_normal(), 15);
-        assert_eq!(bootstrap_entries_public(), 23);
+        assert_eq!(bootstrap_entries_public(), 27);
         assert_eq!(OBJ_KEYS.len(), 2, "obj$ 两个键：按号 + 按名");
         assert!(OBJ_KEYS.iter().any(|k| k.cols == [1]));
         assert!(
@@ -762,13 +812,13 @@ mod tests {
     }
 
     #[test]
-    fn public_only_tables_are_exactly_three() {
+    fn public_only_tables_are_exactly_four() {
         let names: Vec<&str> = DICT_TABLES
             .iter()
             .filter(|t| is_public_only(t.name))
             .map(|t| t.name)
             .collect();
-        assert_eq!(names, vec!["user$", "ws$", "fs$"]);
+        assert_eq!(names, vec!["user$", "ws$", "fs$", "wq$"]);
     }
 
     #[test]

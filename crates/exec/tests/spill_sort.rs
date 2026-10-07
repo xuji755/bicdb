@@ -50,7 +50,7 @@ fn run_sort(
         Ok(Box::new(HeapScanner::new(
             fx.pool,
             &fx.chain,
-            fx.snapshot,
+            bicdb_storage::cr::ReadView::new(fx.snapshot),
             DATA_FID,
             fx.blocks.clone(),
         )) as Box<dyn RowCursor>)
@@ -78,7 +78,7 @@ fn run_sort_pool(
         Ok(Box::new(HeapScanner::new(
             fx.pool,
             &fx.chain,
-            fx.snapshot,
+            bicdb_storage::cr::ReadView::new(fx.snapshot),
             DATA_FID,
             fx.blocks.clone(),
         )) as Box<dyn RowCursor>)

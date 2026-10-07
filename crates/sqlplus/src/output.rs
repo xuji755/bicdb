@@ -10,14 +10,16 @@
 //! ```
 //!
 //! 三条 SQL*Plus 口径：
-//! 1. **数值列右对齐、文本列左对齐**（按该列取值是否全是数判定）；
+//! 1. **数值列右对齐、文本列左对齐**（按列的**形态**判定——引擎给的 `ColKind`，
+//!    不靠"字面像不像数"猜：`VARCHAR2` 里存的 `'123'` 仍是文本列）；
 //! 2. 表头一行 + 虚线一行，列宽 = max(表头, 取值) 且受 `LINESIZE` 约束；
 //! 3. `PAGESIZE` 行一页：翻页时空一行、**重打表头**（`PAGESIZE = 0` 不分页）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use bicdb_sql::session::QueryResult;
+use bicdb_exec::{ColKind, Value};
+use bicdb_sql::session::{format_value, ColumnMeta, QueryResult};
 
 use crate::settings::Settings;
 
@@ -110,24 +112,23 @@ impl Output {
     }
 
     /// 结果集表格（含分页）。
-    fn table(&mut self, s: &Settings, columns: &[String], rows: &[Vec<String>], to_term: bool) {
+    fn table(&mut self, s: &Settings, columns: &[ColumnMeta], rows: &[Vec<Value>], to_term: bool) {
         if columns.is_empty() {
             return;
         }
-        // 取值形态：NULL 按 NULL 文本显示；宽度按**显示后**的字符数算。
-        let cell = |v: &str| -> String {
-            if v == "NULL" {
+        // 取值形态：NULL 按 `SET NULL` 的文本显示（**按值判空**，不是按字面
+        // `"NULL"`——那样内容恰为 `NULL` 的文本列会被换掉）；宽度按**显示后**
+        // 的字符数算。
+        let cell = |v: &Value| -> String {
+            if v.is_null() {
                 s.null_text.clone()
             } else {
-                v.to_owned()
+                format_value(v)
             }
         };
-        let shown: Vec<Vec<String>> = rows
-            .iter()
-            .map(|r| r.iter().map(|c| cell(c)).collect())
-            .collect();
+        let shown: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(&cell).collect()).collect();
         // 列宽：表头与取值取大，受 LINESIZE 约束（超出按比例收窄）。
-        let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+        let mut widths: Vec<usize> = columns.iter().map(|c| c.name.chars().count()).collect();
         for r in &shown {
             for (i, c) in r.iter().enumerate() {
                 if i < widths.len() {
@@ -135,24 +136,15 @@ impl Output {
                 }
             }
         }
-        // 数值列右对齐（该列全部取值都是数）。
-        let numeric: Vec<bool> = (0..columns.len())
-            .map(|i| {
-                !shown.is_empty()
-                    && shown.iter().all(|r| {
-                        r.get(i).map_or(true, |c| {
-                            c.is_empty() || c.parse::<f64>().is_ok() || c == &s.null_text
-                        })
-                    })
-            })
-            .collect();
+        // 数值列右对齐（**列的形态**说了算；空列不右对齐）。
+        let numeric: Vec<bool> = columns.iter().map(|c| c.kind == ColKind::Number).collect();
         shrink_to(&mut widths, s.linesize, columns.len());
 
         let header = |o: &mut Self, to_term: bool| {
             let h: Vec<String> = columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| pad(c, widths[i], false))
+                .map(|(i, c)| pad(&c.name, widths[i], false))
                 .collect();
             o.line(to_term, h.join(" ").trim_end());
             let d: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
@@ -228,12 +220,23 @@ pub fn format_elapsed(d: std::time::Duration) -> String {
 mod tests {
     use super::*;
 
+    /// 造一个结果集（列按**字节串**形态——文本列；数值列见 `rows_typed`）。
     fn rows(names: &[&str], data: &[&[&str]]) -> QueryResult {
         QueryResult::Rows {
-            columns: names.iter().map(|s| (*s).to_owned()).collect(),
+            columns: names
+                .iter()
+                .map(|n| ColumnMeta {
+                    name: (*n).to_owned(),
+                    kind: ColKind::Bytes,
+                })
+                .collect(),
             rows: data
                 .iter()
-                .map(|r| r.iter().map(|s| (*s).to_owned()).collect())
+                .map(|r| {
+                    r.iter()
+                        .map(|s| Value::Bytes(s.as_bytes().to_vec()))
+                        .collect()
+                })
                 .collect(),
         }
     }

@@ -64,7 +64,7 @@ fn run(fx: &Fixture, plan: &PlanNode) -> Vec<Row> {
         Ok(Box::new(HeapScanner::new(
             fx.pool,
             &fx.chain,
-            fx.snapshot,
+            bicdb_storage::cr::ReadView::new(fx.snapshot),
             DATA_FID,
             fx.blocks.clone(),
         )) as Box<dyn RowCursor>)

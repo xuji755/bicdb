@@ -79,8 +79,15 @@ impl InsertPolicy {
 }
 
 impl Default for InsertPolicy {
+    /// **与建表默认一致**：`pctfree = 0`（`catalog::ddl` 的 `TableOptions`
+    /// 默认、`exec::writer` 的兜底策略同值）。
+    ///
+    /// 此前这里默认 10——而生产路径（会话设表选项 / 写侧兜底 / 建表）全是 0，
+    /// 于是"未指定"在库里有两个含义。Oracle 的默认 PCTFREE 是 10，但那是
+    /// **建表层**的口径；本库建表默认 0，策略默认就必须跟它走。
+    /// 想预留的用户显式给 `WITH (pctfree = n)`。
     fn default() -> Self {
-        Self::in_place(10)
+        Self::in_place(0)
     }
 }
 

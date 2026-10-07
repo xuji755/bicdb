@@ -35,7 +35,7 @@ pub mod page;
 pub mod store;
 pub mod tree;
 
-pub use bulk::{BulkLoadReport, DEFAULT_FILL_PERCENT};
+pub use bulk::{bulk_fill_percent, set_bulk_fill_percent, BulkLoadReport, DEFAULT_FILL_PERCENT};
 pub use page::{Entry, IndexPage, IndexPageMut, KEY_LEN_INFINITY, MAX_ENTRY_LEN, MAX_KEY_LEN};
 pub use store::{IndexIo, MemStore, PageStore, PoolStore, ReadOnlyStore, SegmentStore};
 pub use tree::{IndexStats, InsertOutcome, SplitKind, Tree, FFS_RUN_PAGES};

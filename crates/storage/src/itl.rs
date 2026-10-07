@@ -115,13 +115,15 @@ impl ItlEntry {
         seq[..6].copy_from_slice(&b[12..18]);
         let state = ItlState::from_u8(b[20]).ok_or(ItlError::Malformed)?;
         let raw_seq = u64::from_le_bytes(seq);
-        let commit_seq = CommitSeq::from_raw(raw_seq)
-            .filter(|_| state == ItlState::Committed)
-            .or(if state == ItlState::Committed {
-                Some(CommitSeq::from_raw(0).expect("0 在 48 位域内"))
-            } else {
-                None
-            });
+        // **已提交但序号字段为空（0）⇒ "不知道"，不是"零号提交"**：
+        // 序号从 1 起，0 是"未落位"的哨兵（半写页、回放未补标记）。
+        // 此前的写法给这种条目补 `Some(0)`——CR 的判据是 `commit_seq <= snapshot`，
+        // 于是**任何快照都觉得它可见**：未提交的数据对着老快照露出来。
+        // 解码成 `None` 后，CR 会照 `Active` 那条路去查事务表（唯一权威）。
+        let commit_seq = match state {
+            ItlState::Committed if raw_seq != 0 => CommitSeq::from_raw(raw_seq),
+            _ => None,
+        };
         Ok(Self {
             txn_id: TxnId::from_bytes(&id),
             undo_ptr: (ptr != [0u8; 6]).then(|| RowId::from_bytes(&ptr)),

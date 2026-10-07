@@ -145,9 +145,78 @@ pub struct CacheConfig {
     /// **桶闩锁数**（O3 桶分片：一组桶一把闩锁——`kcbz.h` 的"桶在 latch 间轮转"）。
     /// 默认 ≈ 桶数/8（夹取 1..=64）；= 1 即退回"单闩锁"形态（对照/测试可用）。
     pub bucket_latches: usize,
+    /// **每轮 Make Free 的写回批大小** = 分区帧数/该值（下限 1）。
+    /// 太小 ⇒ 一次分配反复触发写回（写放大）；太大 ⇒ 前台单次延迟尖刺。
+    pub make_free_batch_divisor: usize,
+}
+
+/// **缓存策略的可调面**（实例参数 `[buffer]` 的口；`0` = 自动）。
+///
+/// 为什么单列一个结构：`CacheConfig` 的 8 个字段在 `for_capacity` 里全是
+/// 字面量（文档自述"证据未展开的取值标『自定』——全部可调"），而生产只有
+/// `for_capacity` 一个入口 ⇒ 谁也没法调。这里把"能调什么"显式化，取值由
+/// 调用方（`bicdb-cli`）从参数文件给。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTuning {
+    /// 哈希桶数（0 = 自动）。
+    pub hash_buckets: usize,
+    /// 桶闩锁数（0 = 自动；须为 2 的幂）。
+    pub bucket_latches: usize,
+    /// 热段上限 = 容量/该值。
+    pub hot_fraction: usize,
+    /// 触摸计数的最小递增间隔（毫秒）。
+    pub touch_interval_ms: u64,
+    /// 冷却值。
+    pub cool_count: u32,
+    /// 驻留值。
+    pub stay_count: u32,
+    /// 热判据。
+    pub hot_criteria: u32,
+    /// 找空帧的前台扫描上限 = 容量/该值。
+    pub max_scan_fraction: usize,
+    /// 每轮写回批大小 = 分区帧数/该值。
+    pub make_free_batch_divisor: usize,
+}
+
+impl Default for CacheTuning {
+    /// 全部取 [`CacheConfig::for_capacity`] 的历史取值（0 = 自动）。
+    fn default() -> Self {
+        Self {
+            hash_buckets: 0,
+            bucket_latches: 0,
+            hot_fraction: 4,
+            touch_interval_ms: 3_000,
+            cool_count: 0,
+            stay_count: 2,
+            hot_criteria: 2,
+            max_scan_fraction: 4,
+            make_free_batch_divisor: 64,
+        }
+    }
 }
 
 impl CacheConfig {
+    /// 按容量给默认，再按 [`CacheTuning`] 覆盖（实例参数的口）。
+    #[must_use]
+    pub fn for_capacity_tuned(capacity: usize, t: CacheTuning) -> Self {
+        let mut cfg = Self::for_capacity(capacity);
+        if t.hash_buckets > 0 {
+            cfg.buckets = prime_at_least(t.hash_buckets);
+        }
+        if t.bucket_latches > 0 {
+            // 已是 2 的幂（参数解析处校验；这里再兜一次，取 ≤ 64）。
+            cfg.bucket_latches = t.bucket_latches.clamp(1, 64).next_power_of_two();
+        }
+        cfg.hot_fraction = t.hot_fraction.max(1);
+        cfg.touch_interval_ms = t.touch_interval_ms;
+        cfg.cool_count = t.cool_count;
+        cfg.stay_count = t.stay_count;
+        cfg.hot_criteria = t.hot_criteria.max(1);
+        cfg.max_scan_fraction = t.max_scan_fraction.max(1);
+        cfg.make_free_batch_divisor = t.make_free_batch_divisor.max(1);
+        cfg
+    }
+
     /// 按容量给默认（自定取值见 §5.10）。
     #[must_use]
     pub fn for_capacity(capacity: usize) -> Self {
@@ -161,6 +230,7 @@ impl CacheConfig {
             max_scan_fraction: 4,
             // **2 的幂**：桶→分片的换算退化为位运算（热路径不背除法）。
             bucket_latches: ((capacity / 4).max(1) / 8).clamp(1, 64).next_power_of_two(),
+            make_free_batch_divisor: 64,
         }
     }
 }
@@ -1626,7 +1696,8 @@ impl<'io> BufferPool<'io> {
     fn make_free(&self, partition: usize) -> Result<bool, BufferError> {
         let batch = {
             let st = self.lock(partition);
-            (st.meta.len() / 64).max(1)
+            // 配置在**分区**里（`Partition::cfg` 与 `structure.cfg` 同源）。
+            (st.meta.len() / st.cfg.make_free_batch_divisor).max(1)
         };
         let mut steps = 0usize;
         let mut wrote_any = false;

@@ -88,7 +88,117 @@ impl IndexMaintenance for TableIndexes {
         }
         Ok(())
     }
+
+    fn after_update(
+        &mut self,
+        pool: &BufferPool<'_>,
+        log: &mut GroupWriter<'_, '_>,
+        file: &mut DataFile<'_>,
+        ws: [u8; 8],
+        txn: &Txn,
+        rid: RowId,
+        old_bytes: &[u8],
+        new_bytes: &[u8],
+    ) -> Result<(), ExecError> {
+        if self.indexes.is_empty() {
+            return Ok(());
+        }
+        for idx in &self.indexes {
+            let old_key = row::key_from_row(old_bytes, &idx.cols)
+                .map_err(|e| ExecError::BadStoredRow(format!("旧索引键 {}：{e}", idx.name)))?;
+            let new_key = row::key_from_row(new_bytes, &idx.cols)
+                .map_err(|e| ExecError::BadStoredRow(format!("新索引键 {}：{e}", idx.name)))?;
+            // **键没变就什么都不做**（改非键列的常态路径零索引开销）。
+            if old_key == new_key {
+                continue;
+            }
+            // **只插新项，不删旧项**（同上：索引写没有 undo ⇒ 删了回滚就丢）。
+            // 旧项留着由"读侧判活"过滤；新项用**当前物理位置**（行迁移过的话，
+            // 入口已不在原处）——lookup 一步直达，不必沿转发链走。
+            let entry_rid = resolve_physical_rid(pool, file, ws, rid)?;
+            let after_insert = acc_index::insert_entry(
+                pool,
+                log,
+                file,
+                ws,
+                idx.seg_page0,
+                txn,
+                &new_key,
+                entry_rid,
+            )
+            .map_err(ExecError::TableAccess)?;
+            acc_index::write_tree_head_redo(pool, log, file, ws, idx.seg_page0, txn, after_insert)
+                .map_err(ExecError::TableAccess)?;
+        }
+        Ok(())
+    }
+
+    fn after_delete(
+        &mut self,
+        _pool: &BufferPool<'_>,
+        _log: &mut GroupWriter<'_, '_>,
+        _file: &mut DataFile<'_>,
+        _ws: [u8; 8],
+        _txn: &Txn,
+        _rid: RowId,
+        _old: &[u8],
+    ) -> Result<(), ExecError> {
+        // **不物理删索引项**（**设计缺口，已记档**）：
+        //
+        // `arch/09` §9.1.2 写的是"索引项随删除事务移除"——但**索引页的写只有
+        // redo、没有 undo**（`txn::index_io` 的既定形态）⇒ 事务回滚时行被撤销
+        // 恢复了，索引项却回不来：**索引会丢一条活行的项**（查不到、唯一性也漏判）。
+        // 两种走法里选了**与 PG 同模型**的那条：**索引项只插不删**，
+        // "这一项还作不作数"由**行**说话——读侧一律"取该 ROWID 的行、重算键、
+        // 逐字节比"（`check_unique` 与索引读路径本来就是这么判的，槽位复用留下的
+        // 陈旧项因此不会被误判）。**实测抓到的正是这条**：删项版本下
+        // `BEGIN; DELETE; ROLLBACK` 之后唯一索引里少了一条活行的项。
+        //
+        // 代价：删除不回收索引空间（陈旧项留到 `DROP INDEX`/重建）。
+        // 要"删除即移除"，先给索引项写配 undo——那是一条独立切片（记档）。
+        Ok(())
+    }
 }
+
+/// **把一个 ROWID 解析到当前物理位置**（沿行迁移的转发链；跳数有上限）。
+///
+/// **为什么索引路径需要它**：行迁移（改长）把行挪到新位置、原槽位只剩
+/// **转发指针**——索引项里记的仍是**写入时**的位置。删除/更新索引项时要
+/// 顺着链找到"这条项现在到底是哪一行"，否则 `Tree::delete` 静默返回"没删到"。
+///
+/// 跳数上限用 `catalog` 的 `rid_forward_max_hops` 同源常量（本模块没有目录借用，
+/// 故取进程级值；超上限 ⇒ 具名错误，不静默当作"没有迁移"）。
+fn resolve_physical_rid(
+    pool: &BufferPool<'_>,
+    file: &mut DataFile<'_>,
+    ws: [u8; 8],
+    rid: RowId,
+) -> Result<RowId, ExecError> {
+    let fid = file.file_id();
+    let mut cur = rid;
+    for _ in 0..MAX_FORWARD_HOPS {
+        let key = bicdb_storage::buffer::BufferKey::new(
+            ws,
+            bicdb_storage::rowid::Rdba::from_parts(cur.file_id(), cur.block_id())
+                .ok_or(ExecError::RowShapeMismatch { col: 0 })?,
+        );
+        debug_assert_eq!(cur.file_id(), fid, "迁移不跨文件");
+        let page = pool
+            .pin(key)
+            .map_err(|e| ExecError::Spill(format!("读行迁移链：{e}")))?;
+        match bicdb_storage::heap::forwarding_target(&page, cur.row_id()) {
+            Some(next) => cur = next,
+            None => return Ok(cur),
+        }
+    }
+    Err(ExecError::BadStoredRow(format!(
+        "行迁移转发链超过 {MAX_FORWARD_HOPS} 跳（ROWID {rid:?}）"
+    )))
+}
+
+/// 转发链跳数上限（与 `catalog` 的 `rid_forward_max_hops` 同值；改一处要改两处
+/// ——有测试钉住两者一致）。
+pub const MAX_FORWARD_HOPS: usize = 8;
 
 /// **已见键集合**（语句内/事务内的重复检测）——键 = `(索引对象号, 键字节)`。
 pub type SeenKeys = HashSet<(u32, Vec<u8>)>;
@@ -101,7 +211,7 @@ pub fn check_unique(
     cat: &mut Catalog<'_>,
     pool: &BufferPool<'_>,
     chain: &UndoChain<'_, '_>,
-    snapshot: CommitSeq,
+    view: bicdb_storage::cr::ReadView,
     indexes: &TableIndexes,
     rows: &[Vec<u8>],
     seen: &mut SeenKeys,
@@ -125,7 +235,7 @@ pub fn check_unique(
                 continue;
             }
             let rids: Vec<RowId> = entries.iter().map(|(_, rid)| *rid).collect();
-            let found = scan::fetch_rows(pool, chain, snapshot, &rids)
+            let found = scan::fetch_rows(pool, chain, view, &rids)
                 .map_err(|e| ExecError::BadStoredRow(format!("索引 {} 回表：{e}", idx.name)))?;
             for live in found.iter().flatten() {
                 let hit = row::key_from_row(live, &idx.cols)

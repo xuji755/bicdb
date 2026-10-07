@@ -627,6 +627,26 @@ pub struct CacheCaps {
     pub max_bytes: usize,
 }
 
+/// 进程级行缓存上限（实例打开时设定一次；实例参数 `catalog.row_cache_*`）。
+static CAPS: std::sync::Mutex<Option<CacheCaps>> = std::sync::Mutex::new(None);
+
+/// **设定行缓存上限**（实例参数 `catalog.row_cache_rows` / `row_cache_bytes`）。
+#[must_use]
+pub fn set_cache_caps(caps: CacheCaps) -> CacheCaps {
+    let mut cur = CAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let old = cur.unwrap_or_default();
+    *cur = Some(caps);
+    old
+}
+
+/// 当前的行缓存上限（没人设过 ⇒ [`CacheCaps::default`]）。
+#[must_use]
+pub fn cache_caps() -> CacheCaps {
+    CAPS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_default()
+}
+
 impl Default for CacheCaps {
     fn default() -> Self {
         Self {

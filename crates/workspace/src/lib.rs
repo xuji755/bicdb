@@ -32,7 +32,7 @@ pub mod registry;
 pub mod root;
 
 pub use context::WorkspaceContext;
-pub use id::{UserId, WorkspaceId, WORKSPACE_ID_MAX};
+pub use id::{workspace_ref, UserId, WorkspaceId, WORKSPACE_ID_MAX};
 pub use identity::AuthenticatedSubject;
 pub use layout::WorkspaceDir;
 pub use quota::Quota;

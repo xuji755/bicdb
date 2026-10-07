@@ -231,8 +231,22 @@ pub enum Keyword {
     Off,
     /// `CLEAR`
     Clear,
-    /// `TO`（`ALTER DATABASE ALTER WORKSPACE … TO TEMPLATE`）
+    /// `TO`（`ALTER WORKSPACE … TO TEMPLATE`）
     To,
+    /// `PAUSE`（`ALTER USER … PAUSE`——≈ Oracle `ACCOUNT LOCK`）
+    Pause,
+    /// `RESUME`
+    Resume,
+    /// `EXPIRE`（`IDENTIFIED BY '…' EXPIRE`）
+    Expire,
+    /// `REPLACE`（`IDENTIFIED BY '<新>' REPLACE '<旧>'`）
+    Replace,
+    /// `CASCADE`（`DROP USER … CASCADE`）
+    Cascade,
+    /// `UNLIMITED`（配额无上限）
+    Unlimited,
+    /// `IDENTIFIED`（`IDENTIFIED BY '<口令>'`）
+    Identified,
 }
 
 impl Keyword {
@@ -333,6 +347,13 @@ impl Keyword {
             "OFF" => Self::Off,
             "CLEAR" => Self::Clear,
             "TO" => Self::To,
+            "PAUSE" => Self::Pause,
+            "RESUME" => Self::Resume,
+            "EXPIRE" => Self::Expire,
+            "REPLACE" => Self::Replace,
+            "CASCADE" => Self::Cascade,
+            "UNLIMITED" => Self::Unlimited,
+            "IDENTIFIED" => Self::Identified,
             _ => return None,
         })
     }
@@ -433,6 +454,13 @@ impl Keyword {
             Self::Off => "OFF",
             Self::Clear => "CLEAR",
             Self::To => "TO",
+            Self::Pause => "PAUSE",
+            Self::Resume => "RESUME",
+            Self::Expire => "EXPIRE",
+            Self::Replace => "REPLACE",
+            Self::Cascade => "CASCADE",
+            Self::Unlimited => "UNLIMITED",
+            Self::Identified => "IDENTIFIED",
         }
     }
 }

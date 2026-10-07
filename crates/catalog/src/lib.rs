@@ -12,7 +12,7 @@
 //! **已落地**：
 //! - [`dict`]（C1c）：**字典表的内核常量**——表/列/键/类型码/选项码（建区时
 //!   据此写字典行，打开时据此自检 `self_check`）；自举条目数的定量
-//!   （普通 **15** = 7 表 + 8 索引；`public` **23**）+ 自检；
+//!   （普通 **15** = 7 表 + 8 索引；`public` **27** = 15 + 4 表 + 8 索引）+ 自检；
 //! - [`create`]（C2a）：**建区期自举集**——7 个堆段 + 8 个空 B+Tree 段 +
 //!   引导页三件套（直写、无 redo，见模块文档的可见性分界）；
 //! - [`row`]（C2b）：**字典行的值域与编解码**（全变长 + NULL 位图；NUMBER
@@ -46,6 +46,7 @@ pub mod api;
 pub mod cache;
 pub mod consistency;
 pub mod create;
+pub mod dcl;
 pub mod ddl;
 pub mod dict;
 pub mod fixed;

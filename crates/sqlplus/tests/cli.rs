@@ -247,7 +247,17 @@ EXIT
     let (out, err, code) = feed(dir.path(), input, &[]);
     assert_eq!(code, 0, "stderr={err}");
     // BEGIN 之后、COMMIT 之前也能查到自己的行（同会话可见）。
-    assert!(out.contains('2'), "事务里应看到自己的插入：\n{out}");
+    //
+    // **断言要落在行上，不是"输出里有个 2"**：这条断言此前用
+    // `out.contains('2')`，而 `ROLLBACK（撤销 2 条）` 里也有个 2——
+    // 于是它**一直假通过**，把"读己所写"没了这件事盖了过去（真踩到）。
+    // 现在按"表体里出现了 id=2 那一行"判：先取 SELECT 那段输出。
+    let after_begin = out.split("BEGIN").nth(1).unwrap_or("");
+    let table = after_begin.split("rows selected").next().unwrap_or("");
+    assert!(
+        table.lines().any(|l| l.trim_start().starts_with("2 ")),
+        "事务里应看到自己的插入（表体里要有 id=2 那一行）：\n{out}"
+    );
     // **`DESC` 走会话**（不丢事务状态）：显式事务里也能 DESC，且事务照旧。
     let input = "\
 BEGIN;

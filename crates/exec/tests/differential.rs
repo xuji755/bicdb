@@ -150,7 +150,13 @@ fn cancel_and_deadline_are_honoured_on_both_paths() {
 
     // 取消：两路都在首个检查点返回 Cancelled。
     let cancel = AtomicBool::new(true);
-    let mut cursor = HeapScanner::new(fx.pool, &fx.chain, fx.snapshot, DATA_FID, fx.blocks.clone());
+    let mut cursor = HeapScanner::new(
+        fx.pool,
+        &fx.chain,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
+        DATA_FID,
+        fx.blocks.clone(),
+    );
     let mut cx = ExecContext::new(fx.snapshot).with_cancel(&cancel);
     let err = execute_direct(&full_query(), &mut cursor, &mut cx).unwrap_err();
     assert!(matches!(err, ExecError::Cancelled), "{err}");
@@ -159,7 +165,7 @@ fn cancel_and_deadline_are_honoured_on_both_paths() {
     let mut cursor2 = Some(HeapScanner::new(
         fx.pool,
         &fx.chain,
-        fx.snapshot,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
         DATA_FID,
         fx.blocks.clone(),
     ));
@@ -177,8 +183,13 @@ fn cancel_and_deadline_are_honoured_on_both_paths() {
 
     // 运行中置位取消（检查点在每个 next 开头）。
     let cancel2 = AtomicBool::new(false);
-    let mut cursor3 =
-        HeapScanner::new(fx.pool, &fx.chain, fx.snapshot, DATA_FID, fx.blocks.clone());
+    let mut cursor3 = HeapScanner::new(
+        fx.pool,
+        &fx.chain,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
+        DATA_FID,
+        fx.blocks.clone(),
+    );
     let mut cx3 = ExecContext::new(fx.snapshot).with_cancel(&cancel2);
     cancel2.store(true, Ordering::Relaxed);
     let err = execute_direct(&full_query(), &mut cursor3, &mut cx3).unwrap_err();
@@ -186,8 +197,13 @@ fn cancel_and_deadline_are_honoured_on_both_paths() {
 
     // 截止时间：已过 ⇒ Deadline（与取消同路径、判定分开）。
     let deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
-    let mut cursor4 =
-        HeapScanner::new(fx.pool, &fx.chain, fx.snapshot, DATA_FID, fx.blocks.clone());
+    let mut cursor4 = HeapScanner::new(
+        fx.pool,
+        &fx.chain,
+        bicdb_storage::cr::ReadView::new(fx.snapshot),
+        DATA_FID,
+        fx.blocks.clone(),
+    );
     let mut cx4 = ExecContext::new(fx.snapshot).with_deadline(deadline);
     let err = execute_direct(&full_query(), &mut cursor4, &mut cx4).unwrap_err();
     assert!(matches!(err, ExecError::Deadline), "{err}");

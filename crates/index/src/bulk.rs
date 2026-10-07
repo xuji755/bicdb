@@ -39,6 +39,28 @@ pub struct BulkLoadReport {
 /// 100 = 装到放不下为止；默认 90（`arch/09` 的建索引留白口径）。
 pub const DEFAULT_FILL_PERCENT: u8 = 90;
 
+/// 进程级当前值（实例打开时设定一次；实例参数 `index.bulk_fill_percent`）。
+static FILL_PERCENT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(DEFAULT_FILL_PERCENT);
+
+/// 当前的建索引填充率（`CREATE INDEX`/重建走它——调用方不必各自传常量）。
+#[must_use]
+pub fn bulk_fill_percent() -> u8 {
+    FILL_PERCENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **设定建索引填充率**（10–100%）。
+///
+/// # Errors
+/// 越出 10..=100。
+pub fn set_bulk_fill_percent(percent: u8) -> Result<(), &'static str> {
+    if !(10..=100).contains(&percent) {
+        return Err("bulk_fill_percent 要落在 10–100");
+    }
+    FILL_PERCENT.store(percent, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 impl<'s, S: PageStore> Tree<'s, S> {
     /// **批量灌树**（自底向上；见模块文档的输入契约）。
     ///

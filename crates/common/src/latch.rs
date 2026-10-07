@@ -16,8 +16,9 @@
 //! - PG：`LWLockAttemptLock` 的无竞争路径 = **单次原子 CAS，wait-free**；
 //!   竞争才入等待队列——本实现的 ①② 对应其快速路径，③ 交给 std 的 futex；
 //! - **自旋是参数化权衡**：自旋过高在无 CAS 平台/高争用下烧 CPU（Note 433631.1）
-//!   ——默认 **40**（≈1 µs 量级的 try_lock 轮次），`with_spin(0)` 即纯睡眠；
-//!   先用统计量化，再调参数。
+//!   ——默认取 [`DEFAULT_SPIN`]（**8**；Oracle `_LATCH_SPIN_COUNT` 口径，
+//!   实测表见下），`with_spin(0)` 即纯睡眠；先用统计量化，再调参数。
+//!   （本节此前写"默认 40"，与代码里的 `DEFAULT_SPIN = 8` 不符——文档漂移。）
 //! - **退避形状照 PG**（《Oracle Latch 与 PostgreSQL LWLock 算法对照》§3.1：
 //!   `perform_spin_delay` 的"每段自旋次数指数增长"）：自旋预算按 1,2,4,8,… 分段，
 //!   **段间 `yield_now()`**——把大量短暂争用吸收在用户态，同时降低 N 个自旋者对

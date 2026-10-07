@@ -57,6 +57,15 @@ pub enum ExecError {
     /// **行游标不可复位**（重扫路径要求可复位来源——`SeqScan` 重扫 /
     /// `HashAgg` 改档重来；缺省的 [`crate::operator::RowCursor::rewind`]）。
     NoRescan,
+    /// **出错路径的回滚也失败了**：行锁/ITL/undo 可能没清，后续语句会撞上
+    /// 自己留下的残局——所以**与主错一并报出**（不吞；与 DDL 同一口径，
+    /// 见 `bicdb_catalog::ddl` 的收尾）。
+    RollbackFailed {
+        /// 主错（原文）。
+        main: String,
+        /// 回滚错（原文）。
+        rollback: String,
+    },
     /// **工作内存超预算**（切片 2c 的临时形态：外部归并/分区随切片 6 的
     /// WMM + temp 段接入——届时本错误在正常路径不可达）。
     WorkMemoryExceeded {
@@ -79,6 +88,9 @@ impl std::fmt::Display for ExecError {
             ExecError::BadStoredRow(why) => write!(f, "存储行解码失败：{why}"),
             ExecError::ParamOutOfRange { index, count } => {
                 write!(f, "参数下标 {index} 越界（共 {count} 个参数）")
+            }
+            ExecError::RollbackFailed { main, rollback } => {
+                write!(f, "语句失败且回滚也失败：{main} / {rollback}")
             }
             ExecError::NoWriter => f.write_str("计划含写算子，但执行环境未提供写通道"),
             ExecError::NoIndexMaintenance(op) => {

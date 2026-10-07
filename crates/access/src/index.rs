@@ -81,6 +81,27 @@ pub fn delete_entry(
     key: &[u8],
     rid: RowId,
 ) -> Result<RowId, TableAccessError> {
+    let (new_root, _found) = delete_entry_found(pool, log, file, ws, seg_page0, txn, key, rid)?;
+    Ok(new_root)
+}
+
+/// **删除一个索引项，并如实报"删到了没有"**。
+///
+/// `Tree::delete` 对"键/ROWID 不匹配"**静默返回 false**——调用方拿不到"没删到"这个
+/// 事实。DML 的删除路径需要它：**行迁移会让索引项里的 ROWID 与当前物理位置不同**
+/// （项里记的是写入时的位置，迁移后原槽位只剩转发指针）——按解析后的位置删，
+/// 删不到就是"这条项根本不在这里"，要报出来而不是留一条陈旧项。
+#[allow(clippy::too_many_arguments)]
+pub fn delete_entry_found(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    file: &mut DataFile<'_>,
+    ws: [u8; 8],
+    seg_page0: u32,
+    txn: &Txn,
+    key: &[u8],
+    rid: RowId,
+) -> Result<(RowId, bool), TableAccessError> {
     let root = read_tree_head_live(pool, file, ws, seg_page0)?;
     let file_id = file.file_id();
     let mut seg = open_seg(pool, file, seg_page0, ws)?;
@@ -88,8 +109,8 @@ pub fn delete_entry(
         let mut io = TxnIndexIo::new(pool, log, &mut seg, txn);
         let mut store = bicdb_index::PoolStore::new(pool, &mut io, file_id, ws);
         let mut tree = bicdb_index::Tree::open(&mut store, file_id, root)?;
-        tree.delete(key, rid)?;
-        tree.root()
+        let found = tree.delete(key, rid)?;
+        (tree.root(), found)
     };
     Ok(new_root)
 }
@@ -153,7 +174,7 @@ pub fn build_index(
             ws,
             entries,
             unique,
-            bicdb_index::DEFAULT_FILL_PERCENT,
+            bicdb_index::bulk_fill_percent(), // 实例参数 `index.bulk_fill_percent`
         )?;
         (tree.root(), report)
     };

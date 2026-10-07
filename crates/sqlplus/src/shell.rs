@@ -47,7 +47,13 @@ pub struct Shell {
     interactive: bool,
     /// 当前脚本目录（`@@` 相对它解析）。
     script_dir: Option<PathBuf>,
+    /// **脚本嵌套深度**（`@`/`@@`/`START` 自引用会无限递归 ⇒ 栈溢出——
+    /// 这里按上限具名拒绝，与仓内"环即报错"的口径一致）。
+    script_depth: usize,
 }
+
+/// 脚本嵌套深度上限（自引用脚本报错而不是栈溢出）。
+pub const MAX_SCRIPT_DEPTH: usize = 32;
 
 impl Shell {
     /// 建壳（连接已就绪）。
@@ -63,6 +69,7 @@ impl Shell {
             defines: Vec::new(),
             interactive,
             script_dir: None,
+            script_depth: 0,
         }
     }
 
@@ -86,10 +93,17 @@ impl Shell {
 
     /// **跑一个脚本文件**（`@file` / `START file` / 命令行 `@file`）。
     pub fn run_script(&mut self, path: &Path) -> Result<i32, ConnError> {
+        if self.script_depth >= MAX_SCRIPT_DEPTH {
+            return Err(ConnError::State(format!(
+                "脚本嵌套超过 {MAX_SCRIPT_DEPTH} 层（{}）——自引用的脚本会无限递归",
+                path.display()
+            )));
+        }
         let text = std::fs::read_to_string(path)
             .map_err(|e| ConnError::State(format!("读脚本 {}：{e}", path.display())))?;
         let saved = self.interactive;
         self.interactive = false; // 脚本里不出提示符
+        self.script_depth += 1;
         let mut code = 0;
         for line in text.lines() {
             match self.handle_line(line) {
@@ -108,6 +122,7 @@ impl Shell {
             }
         }
         self.interactive = saved;
+        self.script_depth -= 1;
         Ok(code)
     }
 

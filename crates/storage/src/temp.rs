@@ -25,6 +25,12 @@ use crate::datafile::DataFile;
 use crate::segment::{SegType, Segment, SegmentSpaceError};
 
 /// 临时段的**初始区数**（N ≥ 1——多数溢出很小，起步给多个区是浪费）。
+/// 临时段初始区数（设计 §"初始 1 区"）。
+///
+/// **记档**：本常量当前**没有消费者**——"建段先给 1 区"是 `Segment::create`
+/// 自己做的（`segment.rs`，创建时分配一个区）。这里保留它只为把设计口径写在
+/// 代码里；临时段接进生产路径（`exec` 的溢出）时，要么让 `Segment::create`
+/// 读它，要么删掉它——别让它继续当僵尸。
 pub const TEMP_INITIAL_EXTENTS: u32 = 1;
 
 /// 临时段的**区数上限**（倍增封顶；§14 第 37 项）。

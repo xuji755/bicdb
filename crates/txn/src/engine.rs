@@ -216,6 +216,21 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         )
     }
 
+    /// **下一次日志切换会不会被挡**（CKPT 的"组满被迫"触发条件，§11.7）。
+    ///
+    /// 为什么要有这个探测：写者只有**真正写满当前组**时才会撞上 `Blocked`
+    /// ——那时语句已经失败回滚了。调用方（会话）在**动手之前**问一句，
+    /// 就地推一次检查点，写者就能一路写下去（Oracle 的"日志切换触发检查点"、
+    /// PG 的 `max_wal_size` 触发检查点，都是这条）。
+    #[must_use]
+    pub fn log_switch_blocked(&self) -> bool {
+        let wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            wal.switch_blocked(),
+            Some(bicdb_wal::group::SwitchBlocked::AwaitingCheckpoint)
+        )
+    }
+
     /// **最老活跃快照**（undo 回收的唯一输入；`None` = 无活跃快照）。
     pub fn oldest_snapshot(&self) -> Option<CommitSeq> {
         let reg = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());

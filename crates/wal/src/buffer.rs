@@ -97,6 +97,50 @@ impl From<std::io::Error> for WalError {
 pub const MIN_CAPACITY_PAGES: usize = 36;
 /// 默认容量（页）：256 × 512B = 128 KiB（本库画像；§11.5.5 的容量规则）。
 pub const DEFAULT_CAPACITY_PAGES: usize = 256;
+
+/// 进程级当前值（实例打开时设定一次；实例参数 `wal.log_buffer_pages`）。
+static CAPACITY_PAGES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_CAPACITY_PAGES);
+
+/// 当前的日志缓冲页数（`LogBuffer::new` 读它；`with_capacity_pages` 可显式覆盖）。
+#[must_use]
+pub fn log_buffer_pages() -> usize {
+    CAPACITY_PAGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **设定日志缓冲页数**（下限 [`MIN_CAPACITY_PAGES`]——比最坏单条记录还小的
+/// 缓冲区会破"任何一条记录必能落下"的不变式）。
+///
+/// # Errors
+/// 小于 [`MIN_CAPACITY_PAGES`]。
+pub fn set_log_buffer_pages(pages: usize) -> Result<(), &'static str> {
+    if pages < MIN_CAPACITY_PAGES {
+        return Err("log_buffer_pages 不能小于最坏单条记录的页数（36 页）");
+    }
+    CAPACITY_PAGES.store(pages, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// 进程级刷盘水位（千分数；实例参数 `wal.flush_trigger_permille`）。
+static FLUSH_PERMILLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(333);
+
+/// 当前的刷盘水位（千分数）。
+#[must_use]
+pub fn flush_trigger_permille() -> u64 {
+    FLUSH_PERMILLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **设定刷盘水位**（千分数；1–1000）。
+///
+/// # Errors
+/// 越界。
+pub fn set_flush_trigger_permille(permille: u64) -> Result<(), &'static str> {
+    if !(1..=1000).contains(&permille) {
+        return Err("flush_trigger_permille 要落在 1–1000");
+    }
+    FLUSH_PERMILLE.store(permille, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
 /// 1/3 触发阈值（刷盘建议的比例）。
 pub const FLUSH_TRIGGER_NUM: usize = 1;
 /// 1/3 触发阈值（分母）。
@@ -188,7 +232,8 @@ impl LogBuffer {
     /// 以 `start_lsn` 为日志流起点新建（**默认容量** = 256 页 = 128 KiB）。
     #[must_use]
     pub fn new(start_lsn: Lsn) -> Self {
-        Self::with_capacity_pages(start_lsn, DEFAULT_CAPACITY_PAGES).expect("默认容量不低于下限")
+        // 容量取**实例参数**（`wal.log_buffer_pages`）；没设过就是默认 256 页。
+        Self::with_capacity_pages(start_lsn, log_buffer_pages()).expect("参数解析保证不低于下限")
     }
 
     /// 以指定**容量**（页）新建；低于 [`MIN_CAPACITY_PAGES`] 即拒绝。
@@ -245,10 +290,13 @@ impl LogBuffer {
     pub fn flush_recommended(&self) -> bool {
         let state = self.state.lock();
         let used = state.appended_lsn - state.synced_lsn.load(Ordering::SeqCst);
-        used * FLUSH_TRIGGER_DEN as u64
+        // 水位 = 实例参数 `wal.flush_trigger_permille`（默认 333‰ ≈ 1/3）。
+        // 判据用千分数表达（不再拆成 NUM/DEN 两个键）；`FLUSH_TRIGGER_NUM/DEN`
+        // 仍是默认值的来源与文档口径。
+        used * 1000
             >= state.capacity_pages as u64
                 * crate::logpage::LOG_PAGE_SIZE as u64
-                * FLUSH_TRIGGER_NUM as u64
+                * flush_trigger_permille()
     }
 
     /// 追加位置（下一字节 LSN）。

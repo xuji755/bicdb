@@ -234,3 +234,58 @@ impl Operator for Limit<'_> {
         self.input.close(cx);
     }
 }
+
+/// **单行源**（无 `FROM` 的投影：恰好一行、零列）。
+///
+/// `SELECT 1`、`SELECT :p + 1` 这类语句没有表——但 SQL 语义是"一行、一列"，
+/// 不是"零行"。本算子就把这一行给出来（空值行），投影在它上面求值。
+pub struct SingleRow {
+    done: bool,
+    slot: usize,
+    opened: bool,
+}
+
+impl SingleRow {
+    /// 新建。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            done: false,
+            slot: 0,
+            opened: false,
+        }
+    }
+}
+
+impl Default for SingleRow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Operator for SingleRow {
+    fn open(&mut self, cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
+        if !self.opened {
+            self.slot = cx.register_op("SingleRow");
+            self.opened = true;
+        }
+        Ok(())
+    }
+
+    fn next(&mut self, cx: &mut ExecContext<'_>) -> Result<Option<Row>, ExecError> {
+        cx.check()?;
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        cx.note_row(self.slot);
+        Ok(Some(Row::new(Vec::new())))
+    }
+
+    fn rescan(&mut self, _cx: &mut ExecContext<'_>) -> Result<(), ExecError> {
+        self.done = false;
+        Ok(())
+    }
+
+    fn close(&mut self, _cx: &mut ExecContext<'_>) {}
+}

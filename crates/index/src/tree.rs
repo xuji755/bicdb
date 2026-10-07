@@ -48,7 +48,11 @@ pub struct InsertOutcome {
     pub grew: bool,
 }
 
-/// **FFS 的区读上限**（§5.12：一次 `pread` ≤ 8 页 = 128 KiB）。
+/// **FFS 的区读上限**（§5.12：一次 `pread` ≤ 8 页 = 128 KiB）——默认值。
+///
+/// 实际取值走 [`bicdb_storage::scan::scan_run_pages`]：**与堆扫描同一个实例
+/// 参数**（`storage.multiblock_read_pages`）。此前本常量与
+/// `storage::scan::SCAN_RUN_PAGES` 是两个各写 8 的同义孪生——改一处会静默分叉。
 pub const FFS_RUN_PAGES: u32 = 8;
 
 /// **索引统计量**（[`Tree::statistics`] 的产物；持久化随目录域 `stat$`，
@@ -299,7 +303,7 @@ impl<'s, S: PageStore> Tree<'s, S> {
             let mut count = 1u32;
             while at + (count as usize) < blocks.len()
                 && blocks[at + count as usize] == first + count
-                && count < FFS_RUN_PAGES
+                && count < bicdb_storage::scan::scan_run_pages()
             {
                 count += 1;
             }

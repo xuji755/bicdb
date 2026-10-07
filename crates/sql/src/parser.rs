@@ -176,7 +176,28 @@ impl Parser<'_> {
         }
     }
 
-    /// **工作区引用**（`DCL语句设计` §1.1）：`整数 | Str [ FOR USER <主体> ]`。
+    /// **一个"名字"**（`DCL语句设计` §2.1：`名 := 标识符 | Str`——两者等价，
+    /// 照 PG 的 `CREATE DATABASE foo` / `'foo'` 同形）。
+    fn name_text(&mut self, what: &str) -> Result<(String, Span), ParseError> {
+        let t = self.advance();
+        match t.kind {
+            TokenKind::Ident(name) => Ok((name, t.span)),
+            TokenKind::Str(bytes) => match String::from_utf8(bytes) {
+                Ok(name) => Ok((name, t.span)),
+                Err(_) => Err(ParseError {
+                    message: format!("{what}必须是有效的 UTF-8（标识符或字符串）"),
+                    span: t.span,
+                }),
+            },
+            _ => Err(ParseError {
+                message: format!("期望{what}：标识符或字符串"),
+                span: t.span,
+            }),
+        }
+    }
+
+    /// **工作区引用**（`DCL语句设计` §1.1）：`整数 | 名`（`名 := 标识符 | Str`；
+    /// **名字实例内唯一 ⇒ 没有 `FOR USER` 限定**——操作者/属主从会话来，不从引用位来）。
     ///
     /// 解析器**只认形态**：不做名字查找、不判唯一性（绑定期的事）。
     fn work_ref(&mut self) -> Result<WorkRef, ParseError> {
@@ -190,33 +211,29 @@ impl Parser<'_> {
                 Ok(WorkRef {
                     id: Some(id),
                     name: None,
-                    user: None,
                     location: t.span,
                 })
             }
-            TokenKind::Str(name) => {
-                let user = if self.eat_kw(Keyword::For) {
-                    self.expect_kw(Keyword::User)?;
-                    Some(self.col_id()?.0)
-                } else {
-                    None
-                };
-                Ok(WorkRef {
-                    id: None,
-                    name: Some(name),
-                    user,
-                    location: t.span,
-                })
-            }
+            TokenKind::Ident(name) => Ok(WorkRef {
+                id: None,
+                name: Some(name.into_bytes()),
+                location: t.span,
+            }),
+            TokenKind::Str(name) => Ok(WorkRef {
+                id: None,
+                name: Some(name),
+                location: t.span,
+            }),
             _ => Err(ParseError {
-                message: "期望工作区**引用**：id（整数）或名字（字符串 [FOR USER <主体>]）"
-                    .to_owned(),
+                message: "期望工作区**引用**：id（整数）或名字（标识符 / 字符串）".to_owned(),
                 span: t.span,
             }),
         }
     }
 
-    /// **文件系统引用**（§1.3）：`整数（槽位） | Str（挂载点）`。
+    /// **文件系统引用**（§1.1）：`整数（池槽位） | 名（文件系统名）`。
+    ///
+    /// **路径不是引用位**：`USING '<路径>'` 只在 `CREATE FILESYSTEM` 出现。
     fn fs_ref(&mut self) -> Result<FsRef, ParseError> {
         let t = self.advance();
         match t.kind {
@@ -227,17 +244,23 @@ impl Parser<'_> {
                 })?;
                 Ok(FsRef {
                     slot: Some(slot),
-                    mount: None,
+                    name: None,
                     location: t.span,
                 })
             }
-            TokenKind::Str(mount) => Ok(FsRef {
+            TokenKind::Ident(name) => Ok(FsRef {
                 slot: None,
-                mount: Some(mount),
+                name: Some(name.into_bytes()),
+                location: t.span,
+            }),
+            TokenKind::Str(name) => Ok(FsRef {
+                slot: None,
+                name: Some(name),
                 location: t.span,
             }),
             _ => Err(ParseError {
-                message: "期望文件系统**引用**：槽位（整数）或挂载点（字符串）".to_owned(),
+                message: "期望文件系统**引用**：槽位（整数）或文件系统名（标识符 / 字符串）"
+                    .to_owned(),
                 span: t.span,
             }),
         }
@@ -345,11 +368,41 @@ impl Parser<'_> {
         if self.eat_kw(Keyword::Workspace) {
             return Ok(Stmt::CreateWorkspace(self.create_workspace(location)?));
         }
-        Err(self.err_here("`CREATE` 之后只能是 TABLE / [UNIQUE] INDEX / GRAPH / WORKSPACE"))
+        if self.eat_kw(Keyword::Filesystem) {
+            let (name, _) = self.name_text("文件系统名")?;
+            self.expect_kw(Keyword::Using)?;
+            let path = self.expect_string()?.0;
+            return Ok(Stmt::CreateFilesystem(CreateFilesystemStmt {
+                name,
+                path,
+                location,
+            }));
+        }
+        if self.eat_kw(Keyword::User) {
+            return Ok(Stmt::CreateUser(self.create_user(location)?));
+        }
+        Err(self.err_here(
+            "`CREATE` 之后只能是 TABLE / [UNIQUE] INDEX / GRAPH / WORKSPACE / FILESYSTEM / USER",
+        ))
     }
 
     fn drop_stmt(&mut self) -> Result<Stmt, ParseError> {
         let location = self.expect_kw(Keyword::Drop)?.span;
+        if self.eat_kw(Keyword::User) {
+            let (name, _) = self.name_text("主体名")?;
+            let cascade = self.eat_kw(Keyword::Cascade);
+            return Ok(Stmt::DropUser(DropUserStmt {
+                name,
+                cascade,
+                location,
+            }));
+        }
+        if self.eat_kw(Keyword::Filesystem) {
+            return Ok(Stmt::DropFilesystem(DropFilesystemStmt {
+                fs: self.fs_ref()?,
+                location,
+            }));
+        }
         let remove_type = if self.eat_kw(Keyword::Table) {
             ObjectType::Table
         } else if self.eat_kw(Keyword::Index) {
@@ -359,7 +412,9 @@ impl Parser<'_> {
         } else if self.eat_kw(Keyword::Workspace) {
             ObjectType::Workspace
         } else {
-            return Err(self.err_here("`DROP` 之后只能是 TABLE / INDEX / GRAPH / WORKSPACE"));
+            return Err(self.err_here(
+                "`DROP` 之后只能是 TABLE / INDEX / GRAPH / WORKSPACE / FILESYSTEM / USER",
+            ));
         };
         let missing_ok = false;
         let mut objects = Vec::new();
@@ -394,41 +449,81 @@ impl Parser<'_> {
             return self.variable_set(location);
         }
         if self.eat_kw(Keyword::System) {
-            return self.alter_system(location);
+            return Err(self.err_here(
+                "`ALTER SYSTEM …` 不再提供——文件系统语句是 `CREATE / ALTER / DROP FILESYSTEM` \
+                 三件套（`DCL语句设计` v0.2 的 F 组：与 WORKSPACE / USER 同构）",
+            ));
         }
         if self.eat_kw(Keyword::Database) {
             return self.alter_database(location);
         }
+        if self.eat_kw(Keyword::Filesystem) {
+            let fs = self.fs_ref()?;
+            self.expect_kw(Keyword::Set)?;
+            self.expect_kw(Keyword::Allocate)?;
+            self.expect_punct(Punct::Eq)?;
+            let allocate = if self.eat_kw(Keyword::On) {
+                true
+            } else if self.eat_kw(Keyword::Off) {
+                false
+            } else {
+                return Err(self.err_here("`ALLOCATE` 的值只能是 `ON` 或 `OFF`"));
+            };
+            return Ok(Stmt::AlterFilesystem(AlterFilesystemStmt {
+                fs,
+                allocate,
+                location,
+            }));
+        }
+        if self.eat_kw(Keyword::User) {
+            return self.alter_user(location);
+        }
         if !self.eat_kw(Keyword::Workspace) {
             return Err(self.err_here(
-                "不支持该构造：`ALTER` 只提供 WORKSPACE / SESSION / SYSTEM / DATABASE 四类 \
-                 （`DCL语句设计` §1 的闭集）",
+                "不支持该构造：`ALTER` 只提供 WORKSPACE / USER / FILESYSTEM / SESSION / DATABASE \
+                 五类（`DCL语句设计` v0.2 §1 的闭集）",
             ));
         }
         let workspace = self.work_ref()?;
-        self.expect_kw(Keyword::Set)?;
-        if self.eat_kw(Keyword::Name) {
-            self.expect_punct(Punct::Eq)?;
-            let name = if self.eat_kw(Keyword::Null) {
-                None
+        let action = if self.eat_kw(Keyword::Add) {
+            self.expect_kw(Keyword::Filesystem)?;
+            let fs = self.fs_ref()?;
+            // `ADD FILESYSTEM … [QUOTA <量> ON FILESYSTEM <fs_ref>]`（W3）
+            let quota = if self.at_kw(Keyword::Quota) {
+                Some(self.quota_on_fs()?)
             } else {
-                Some(self.expect_string()?.0)
+                None
             };
-            Ok(Stmt::AlterWorkspace(AlterWorkspaceStmt {
-                workspace,
-                action: AlterWorkspaceAction::SetName(name),
-                location,
-            }))
-        } else if self.eat_kw(Keyword::Quota) {
-            let items = self.quota_list()?;
-            Ok(Stmt::AlterWorkspace(AlterWorkspaceStmt {
-                workspace,
-                action: AlterWorkspaceAction::SetQuota(items),
-                location,
-            }))
+            AlterWorkspaceAction::AddFilesystem { fs, quota }
+        } else if self.eat_kw(Keyword::To) {
+            self.expect_kw(Keyword::Template)?;
+            let (name, _) = self.name_text("模板名")?;
+            AlterWorkspaceAction::ToTemplate {
+                name: name.into_bytes(),
+            }
         } else {
-            Err(self.err_here("`ALTER WORKSPACE … SET` 之后只能是 `NAME` 或 `QUOTA`"))
-        }
+            self.expect_kw(Keyword::Set)?;
+            if self.eat_kw(Keyword::Default) {
+                self.expect_kw(Keyword::Filesystem)?;
+                AlterWorkspaceAction::SetDefaultFilesystem { fs: self.fs_ref()? }
+            } else if self.eat_kw(Keyword::Name) {
+                self.expect_punct(Punct::Eq)?;
+                let (name, _) = self.name_text("新名字")?;
+                AlterWorkspaceAction::SetName(name.into_bytes())
+            } else if self.eat_kw(Keyword::Quota) {
+                AlterWorkspaceAction::SetQuota(self.quota_list()?)
+            } else {
+                return Err(self.err_here(
+                    "`ALTER WORKSPACE` 只提供 `ADD FILESYSTEM` / `SET DEFAULT FILESYSTEM` / \
+                     `SET NAME = …` / `SET QUOTA (…)` / `TO TEMPLATE …`（W3–W7——闭集）",
+                ));
+            }
+        };
+        Ok(Stmt::AlterWorkspace(AlterWorkspaceStmt {
+            workspace,
+            action,
+            location,
+        }))
     }
 
     /// **`ALTER SESSION SET/CLEAR <参数>`**（S 组；白名单在 ② 判）。
@@ -469,84 +564,76 @@ impl Parser<'_> {
         }))
     }
 
-    /// **`ALTER SYSTEM …`**（F 组：文件系统池；闭集三个产生式）。
-    fn alter_system(&mut self, location: Span) -> Result<Stmt, ParseError> {
-        let action = if self.eat_kw(Keyword::Add) {
-            self.expect_kw(Keyword::Filesystem)?;
-            AlterSystemAction::AddFilesystem {
-                mount: self.expect_string()?.0,
-            }
-        } else if self.eat_kw(Keyword::Alter) {
-            self.expect_kw(Keyword::Filesystem)?;
-            let fs = self.fs_ref()?;
-            self.expect_kw(Keyword::Set)?;
-            self.expect_kw(Keyword::Allocate)?;
-            self.expect_punct(Punct::Eq)?;
-            let allocate = if self.eat_kw(Keyword::On) {
-                true
-            } else if self.eat_kw(Keyword::Off) {
-                false
-            } else {
-                return Err(self.err_here("`ALLOCATE` 的值只能是 `ON` 或 `OFF`"));
-            };
-            AlterSystemAction::AlterFilesystem { fs, allocate }
-        } else if self.eat_kw(Keyword::Drop) {
-            self.expect_kw(Keyword::Filesystem)?;
-            AlterSystemAction::DropFilesystem { fs: self.fs_ref()? }
-        } else {
-            return Err(self.err_here(
-                "`ALTER SYSTEM` 只提供 ADD / ALTER / DROP FILESYSTEM 三个动作 \
-                 （`DCL语句设计` §2.1 的 F 组——闭集）",
-            ));
-        };
-        Ok(Stmt::AlterSystem(AlterSystemStmt { action, location }))
-    }
-
-    /// **`ALTER DATABASE …`**（W2 克隆 + T1–T3 模板；**不带库名**——记档）。
+    /// **`ALTER DATABASE …`**（T 组：模板；**不带库名**——本库实例即一个"库"，记档）。
+    ///
+    /// **克隆与原地转模板都不在这里**（v0.2）：克隆是 `CREATE WORKSPACE … FROM TEMPLATE`（W2），
+    /// 原地固化是 `ALTER WORKSPACE … TO TEMPLATE`（W7）——**一件事不设两个入口**。
     fn alter_database(&mut self, location: Span) -> Result<Stmt, ParseError> {
-        let action = if self.eat_kw(Keyword::Clone) {
-            self.expect_kw(Keyword::Workspace)?;
-            let name = self.expect_string()?.0;
-            self.expect_kw(Keyword::From)?;
-            let source = if self.eat_kw(Keyword::Workspace) {
-                WorkspaceSource::Workspace(self.work_ref()?)
-            } else if self.eat_kw(Keyword::Template) {
-                WorkspaceSource::Template(self.expect_string()?.0)
-            } else {
-                return Err(
-                    self.err_here("克隆源：`FROM WORKSPACE <引用>` 或 `FROM TEMPLATE '<名>'`")
-                );
-            };
-            AlterDatabaseAction::CloneWorkspace { name, source }
-        } else if self.eat_kw(Keyword::Add) {
+        let action = if self.eat_kw(Keyword::Add) {
             self.expect_kw(Keyword::Template)?;
-            let name = self.expect_string()?.0;
+            let (name, _) = self.name_text("模板名")?;
             self.expect_kw(Keyword::From)?;
             AlterDatabaseAction::AddTemplate {
-                name,
+                name: name.into_bytes(),
                 from: self.work_ref()?,
-            }
-        } else if self.eat_kw(Keyword::Alter) {
-            self.expect_kw(Keyword::Workspace)?;
-            let ws = self.work_ref()?;
-            self.expect_kw(Keyword::To)?;
-            self.expect_kw(Keyword::Template)?;
-            AlterDatabaseAction::WorkspaceToTemplate {
-                ws,
-                name: self.expect_string()?.0,
             }
         } else if self.eat_kw(Keyword::Drop) {
             self.expect_kw(Keyword::Template)?;
+            let (name, _) = self.name_text("模板名")?;
             AlterDatabaseAction::DropTemplate {
-                name: self.expect_string()?.0,
+                name: name.into_bytes(),
             }
+        } else if self.eat_kw(Keyword::Clone) {
+            return Err(self.err_here(
+                "`ALTER DATABASE CLONE WORKSPACE …` 不再提供——克隆由**目标**发起：\
+                 `CREATE WORKSPACE '<新名>' FROM TEMPLATE '<模板名>'`（W2）",
+            ));
+        } else if self.eat_kw(Keyword::Alter) {
+            return Err(self.err_here(
+                "`ALTER DATABASE ALTER WORKSPACE … TO TEMPLATE` 不再提供——原地转模板是\
+                 `ALTER WORKSPACE <引用> TO TEMPLATE '<名>'`（W7）",
+            ));
         } else {
             return Err(self.err_here(
-                "`ALTER DATABASE` 只提供 CLONE / ADD TEMPLATE / ALTER WORKSPACE … TO TEMPLATE / \
-                 DROP TEMPLATE 四个动作（`DCL语句设计` §2.1 的 W2 与 T 组——闭集）",
+                "`ALTER DATABASE` 只提供 ADD TEMPLATE / DROP TEMPLATE 两个动作（T1–T2——闭集）",
             ));
         };
         Ok(Stmt::AlterDatabase(AlterDatabaseStmt { action, location }))
+    }
+
+    /// **盘级配额项**（`QUOTA <量> ON FILESYSTEM <fs_ref>`；F/W/U 三组共用）。
+    ///
+    /// **`量` 有两种**（BNF）：整数（字节）或 `UNLIMITED`。
+    fn quota_on_fs(&mut self) -> Result<FsQuota, ParseError> {
+        let location = self.expect_kw(Keyword::Quota)?.span;
+        let amount = self.quota_amount()?;
+        self.expect_kw(Keyword::On)?;
+        self.expect_kw(Keyword::Filesystem)?;
+        Ok(FsQuota {
+            fs: self.fs_ref()?,
+            amount,
+            location,
+        })
+    }
+
+    /// `量 := 整数 | UNLIMITED`。
+    fn quota_amount(&mut self) -> Result<QuotaAmount, ParseError> {
+        let t = self.advance();
+        match t.kind {
+            TokenKind::Number(text) => {
+                text.parse::<u64>()
+                    .map(QuotaAmount::Bytes)
+                    .map_err(|_| ParseError {
+                        message: format!("配额必须是 0..2^64-1 的整数（字节）：`{text}`"),
+                        span: t.span,
+                    })
+            }
+            TokenKind::Keyword(Keyword::Unlimited) => Ok(QuotaAmount::Unlimited),
+            _ => Err(ParseError {
+                message: "配额只能是整数（字节）或 `UNLIMITED`".to_owned(),
+                span: t.span,
+            }),
+        }
     }
 
     /// **配额项**（`QuotaItem` 的产生式只有四个键——闭集；见 §2.3）。
@@ -784,30 +871,105 @@ impl Parser<'_> {
         })
     }
 
-    /// `CREATE WORKSPACE FOR USER <主体> [NAME '<名>']`（W1）。
+    /// **`CREATE WORKSPACE <名> [DEFAULT FILESYSTEM <fs_ref>] [FROM TEMPLATE '<名>']
+    /// [QUOTA <量> ON FILESYSTEM <fs_ref>]…`**（W1/W2）。
     ///
-    /// **`CLONE OF` 已删除**（`DCL语句设计` 评审点①：克隆独立成句 W2——
-    /// 一件事不设两个入口）。
+    /// **建的是无主容器**：属主由 `CREATE USER … USING WORKSPACE` 绑定
+    /// （依赖顺序 **FS → WORKSPACE → USER**；旧的 `FOR USER` 形式已删除——
+    /// 一条语句只做一件事，`DCL语句设计` v0.2 §0）。
     fn create_workspace(&mut self, location: Span) -> Result<CreateWorkspaceStmt, ParseError> {
-        self.expect_kw(Keyword::For)?;
-        self.expect_kw(Keyword::User)?;
-        let (subject, _) = self.col_id()?;
-        let name = if self.eat_kw(Keyword::Name) {
-            Some(self.expect_string()?.0)
-        } else {
-            None
-        };
-        if self.at_kw(Keyword::Clone) {
-            return Err(self.err_here(
-                "`CLONE OF` 不再提供——克隆独立成句：`ALTER DATABASE CLONE WORKSPACE '<新名>' \
-                 FROM WORKSPACE <引用>`（`DCL语句设计` 评审点①）",
-            ));
+        let (name, _) = self.name_text("工作区名")?;
+        let mut default_fs = None;
+        let mut from_template = None;
+        let mut quotas = Vec::new();
+        // 三个可选项**任意顺序**（各自最多一次——重复即具名拒绝）。
+        loop {
+            if self.at_kw(Keyword::Default) {
+                self.advance();
+                self.expect_kw(Keyword::Filesystem)?;
+                if default_fs.is_some() {
+                    return Err(self.err_here("`DEFAULT FILESYSTEM` 只能给一次"));
+                }
+                default_fs = Some(self.fs_ref()?);
+            } else if self.at_kw(Keyword::From) {
+                self.advance();
+                self.expect_kw(Keyword::Template)?;
+                if from_template.is_some() {
+                    return Err(self.err_here("`FROM TEMPLATE` 只能给一次"));
+                }
+                from_template = Some(self.expect_string()?.0);
+            } else if self.at_kw(Keyword::Quota) {
+                quotas.push(self.quota_on_fs()?);
+            } else {
+                break;
+            }
         }
         Ok(CreateWorkspaceStmt {
-            subject,
             name,
+            default_fs,
+            from_template,
+            quotas,
             location,
         })
+    }
+
+    /// **`CREATE USER <主体> IDENTIFIED BY '<口令>' USING WORKSPACE <work_ref>`**（U1）。
+    ///
+    /// **`USING WORKSPACE` 是必选**（有了工作区才能建用户——依赖顺序的落点）。
+    fn create_user(&mut self, location: Span) -> Result<CreateUserStmt, ParseError> {
+        let (name, _) = self.name_text("主体名")?;
+        self.expect_kw(Keyword::Identified)?;
+        self.expect_kw(Keyword::By)?;
+        let password = self.expect_string()?.0;
+        self.expect_kw(Keyword::Using)?;
+        self.expect_kw(Keyword::Workspace)?;
+        Ok(CreateUserStmt {
+            name,
+            password,
+            using_workspace: self.work_ref()?,
+            location,
+        })
+    }
+
+    /// **`ALTER USER <主体> …`**（U2–U6；五种动作）。
+    fn alter_user(&mut self, location: Span) -> Result<Stmt, ParseError> {
+        let (name, _) = self.name_text("主体名")?;
+        let action = if self.eat_kw(Keyword::Identified) {
+            self.expect_kw(Keyword::By)?;
+            let new = self.expect_string()?.0;
+            if self.eat_kw(Keyword::Replace) {
+                // 本人改密（U3；要求旧口令）
+                AlterUserAction::ReplacePassword {
+                    new,
+                    old: self.expect_string()?.0,
+                }
+            } else {
+                // admin 重置（U2；可带 EXPIRE）
+                let expire = self.eat_kw(Keyword::Expire);
+                AlterUserAction::SetPassword { new, expire }
+            }
+        } else if self.eat_kw(Keyword::Pause) {
+            AlterUserAction::SetPaused(true)
+        } else if self.eat_kw(Keyword::Resume) {
+            AlterUserAction::SetPaused(false)
+        } else if self.eat_kw(Keyword::Using) {
+            self.expect_kw(Keyword::Workspace)?;
+            AlterUserAction::UsingWorkspace(self.work_ref()?)
+        } else if self.eat_kw(Keyword::Drop) {
+            self.expect_kw(Keyword::Workspace)?;
+            AlterUserAction::DropWorkspace(self.work_ref()?)
+        } else {
+            return Err(self.err_here(
+                "`ALTER USER` 只提供 `IDENTIFIED BY '<口令>' [EXPIRE]`（admin 重置）/ \
+                 `IDENTIFIED BY '<新>' REPLACE '<旧>'`（本人改密）/ `PAUSE` / `RESUME` / \
+                 `USING WORKSPACE` / `DROP WORKSPACE`（U2–U6——闭集）",
+            ));
+        };
+        Ok(Stmt::AlterUser(AlterUserStmt {
+            name,
+            action,
+            location,
+        }))
     }
 
     /// `relation_expr`（PG 的裁剪：单名 + 可选别名）。
@@ -858,10 +1020,15 @@ impl Parser<'_> {
             }
             self.expect_punct(Punct::RParen)?;
         }
-        // 来源只提供 `VALUES`（PG 的 `insert_rest` 里 `SelectStmt` 的另一半
-        // ——`INSERT … SELECT`——**产生式已删**，REQ-SQL-006）。
-        if !self.at_kw(Keyword::Values) {
-            return Err(self.err_here("不支持 `INSERT … SELECT` / `DEFAULT VALUES`（REQ-SQL-006）"));
+        // **来源两种**（PG 的 `insert_rest`）：`VALUES` 与 `SELECT`（含集合运算）。
+        // `DEFAULT VALUES` 仍不给（本版没有列默认值，记档）。
+        if self.at_kw(Keyword::Default) {
+            return Err(self.err_here(
+                "不支持 `INSERT … DEFAULT VALUES`（本版列没有默认值——每个 NOT NULL 列都要给）",
+            ));
+        }
+        if !self.at_kw(Keyword::Values) && !self.at_kw(Keyword::Select) {
+            return Err(self.err_here("`INSERT` 的来源只能是 `VALUES` 或 `SELECT`"));
         }
         let select_stmt = self.select_no_parens()?;
         Ok(InsertStmt {

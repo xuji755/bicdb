@@ -13,18 +13,30 @@
 //! **本切片的会话面**：`SELECT` / `INSERT … VALUES` / `CREATE TABLE` /
 //! `CREATE [UNIQUE] INDEX` / `DROP TABLE|INDEX` / `BEGIN|COMMIT|ROLLBACK`。
 //! 清单外语句在**绑定期**具名拒绝（绝不静默）。
+//!
+//! **身份（D6）**：会话带一个**身份**——`None` = **管理面身份**（本机/OS：
+//! 控制套接字的文件权限允许谁连），`Some(Identity)` = 经 `AUTH` 认证的**具名主体**。
+//! 身份只从 [`Session::authenticate`] 进（`REQ-ISO-002` 的结构保证：语句载荷里
+//! 没有"用户号"这个字段）；它对语句面的作用是三条**具名拒绝**：
+//! ① 具名主体在 `public` 上**只读**（`public` 是共享内容，对主体只读）；
+//! ② 管理面语句（DCL）要**管理面身份**，主体只能对自己用
+//!    `ALTER USER … IDENTIFIED BY … REPLACE '<旧口令>'`（Oracle 的"本人改密"口径）；
+//! ③ `EXPIRE` 的**受限会话**：除本人改密之外一律拒绝（MySQL 的同位形态）。
+//! 资格检查**先于**绑定与对象查找（REQ-SQL-005 口径）。
 
 use bicdb_catalog::ddl::{self, create_index, create_table, drop_index, drop_table};
 use bicdb_common::seq::CommitSeq;
 use bicdb_exec::{
-    build, collect, ExecContext, ExecEnv, Row, RowCursor, TableAccessWriter, TableWriter, Value,
+    build, collect, ColKind, ExecContext, ExecEnv, Row, RowCursor, RowShape, TableAccessWriter,
+    TableWriter, Value,
 };
 use bicdb_storage::buffer::BufferPool;
 use bicdb_storage::scan::HeapScanner;
 use bicdb_storage::segment::Segment;
 use bicdb_txn::engine::{Engine, TxnHandle};
 
-use crate::bind::{bind_statement, BindError, CatalogView, CatalogViewImpl, NameResolver};
+use crate::auth::{self, Identity};
+use crate::bind::{bind_statement, BindError, CatalogViewImpl, NameResolver};
 use crate::parser::parse_many as parse;
 use crate::plan::{ddl_summary, plan_statement, PhysicalPlan, PlanKind};
 
@@ -47,6 +59,10 @@ pub enum SessionError {
     State(String),
     /// **参数面**（缺值 / 多给 / 形态不符）——语句声明了参数却没配对。
     Params(String),
+    /// **管理面（DCL）**：资格/上下文/对象/路径——各条都有具名文案。
+    Dcl(String),
+    /// **身份/认证（D6）**：认证不通过与身份资格（各条都有具名文案）。
+    Auth(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -60,6 +76,8 @@ impl std::fmt::Display for SessionError {
             SessionError::Segment(e) => write!(f, "段：{e}"),
             SessionError::State(why) => f.write_str(why),
             SessionError::Params(why) => write!(f, "参数：{why}"),
+            SessionError::Dcl(why) => write!(f, "{why}"),
+            SessionError::Auth(why) => write!(f, "{why}"),
         }
     }
 }
@@ -80,15 +98,36 @@ from_err!(
     Segment <- bicdb_storage::segment::SegmentSpaceError,
 );
 
-/// 一条语句的结果（协议层/CLI 的呈现形态）。
+/// **固定表的内容源**（`file$` 的行 = **控制文件的内存映像**）。
+///
+/// 为什么是端口：目录层（`bicdb-catalog`）**不持有控制文件**——它的生命周期在
+/// 实例/工作区打开链（`catalog::api::fixed_table` 的两参形态就是这个理由）；
+/// 所以"谁来读控制文件"由外层决定（CLI/服务用 `<工作区>/control/`）。
+///
+/// `None` = 这张固定表不认识（或没有内容源 ⇒ 查询具名拒绝，不静默空集）。
+pub trait FixedTableSource {
+    /// 按名取固定表（行 + 列形状）。
+    fn fixed_table(&self, name: &str) -> Option<bicdb_catalog::fixed::FixedTable>;
+}
+
+/// 结果集的一列：名 + **形态**（驱动据此把文本/字节转成原生类型；CLI 据此对齐）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnMeta {
+    /// 列名。
+    pub name: String,
+    /// 形态（数值/字节串/布尔）。
+    pub kind: ColKind,
+}
+
+/// 一条语句的结果（协议层/CLI/驱动共用的形状）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
-    /// 结果集。
+    /// 结果集（**值保持原样**——呈现/转换交给调用方：CLI 格式化、驱动转原生类型）。
     Rows {
-        /// 列名。
-        columns: Vec<String>,
-        /// 行（值已是显示形态）。
-        rows: Vec<Vec<String>>,
+        /// 列（名 + 形态）。
+        columns: Vec<ColumnMeta>,
+        /// 行（`bicdb-exec` 的值形态；`NULL` 是一等值）。
+        rows: Vec<Vec<Value>>,
     },
     /// 影响行数（DML）。
     Affected(u64),
@@ -123,6 +162,22 @@ pub struct Session<'a, 'b, 'io, 'f> {
     seen_keys: crate::dml_index::SeenKeys,
     /// **本语句的参数值**（按绑定期给出的**出现序**摆好；空 = 无参数）。
     exec_params: Vec<Value>,
+    /// **管理面（DCL）的实例根**（`BICDB_HOME`；`None` = 没配 ⇒ DCL 具名拒绝）。
+    dcl_home: Option<std::path::PathBuf>,
+    /// **管理面（DCL）的 I/O**（全局控制文件走它；默认 OS 文件，测试注入内存）。
+    dcl_io: Option<&'a dyn bicdb_workspace::io::FileIo>,
+    /// **工作区文件面的供给方**（`CREATE/DROP WORKSPACE` 用；CLI 实现）。
+    dcl_provisioner: Option<&'a dyn crate::dcl_exec::WorkspaceProvisioner>,
+    /// **口令散列的迭代数**（`[auth] pbkdf2_iterations`；默认见
+    /// `bicdb_common::pbkdf2::DEFAULT_ITERATIONS`）。写进存储串，故可调。
+    dcl_pbkdf2_iterations: u32,
+    /// **本会话的身份**（D6）：`None` = 管理面身份（本机/OS），`Some` = 认证过的主体。
+    /// **私有 + 唯一的写口是 [`Session::authenticate`]**——身份不可能来自语句载荷。
+    identity: Option<Identity>,
+    /// **因日志压力推过的完全检查点次数**（诊断/用例观测：CKPT 触发 ② 是否生效）。
+    log_checkpoints: u64,
+    /// **固定表的内容源**（`file$`；`None` ⇒ 查询具名拒绝——不静默给空集）。
+    fixed_source: Option<&'a dyn FixedTableSource>,
 }
 
 impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
@@ -144,6 +199,249 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             seq,
             seen_keys: crate::dml_index::SeenKeys::new(),
             exec_params: Vec::new(),
+            dcl_home: None,
+            dcl_io: None,
+            dcl_provisioner: None,
+            dcl_pbkdf2_iterations: bicdb_common::pbkdf2::DEFAULT_ITERATIONS,
+            identity: None,
+            log_checkpoints: 0,
+            fixed_source: None,
+        }
+    }
+
+    /// **配管理面上下文**（DCL 的执行落点：实例根 + 全局控制文件的 I/O）。
+    ///
+    /// 不配也能跑——只是 DCL 语句会以"要一个部署根"具名拒绝（不猜位置）。
+    pub fn set_dcl_context(
+        &mut self,
+        home_root: Option<std::path::PathBuf>,
+        io: Option<&'a dyn bicdb_workspace::io::FileIo>,
+    ) {
+        self.dcl_home = home_root;
+        self.dcl_io = io;
+    }
+
+    /// **给会话配固定表的内容源**（`file$`：控制文件的内存映像）。
+    ///
+    /// 不配也能跑——只是 `SELECT … FROM file$` 会以"没有内容源"具名拒绝
+    /// （不猜位置：控制文件在哪是实例装配层的事）。
+    pub fn set_fixed_table_source(&mut self, s: Option<&'a dyn FixedTableSource>) {
+        self.fixed_source = s;
+    }
+
+    /// **给会话配工作区供给方**（`CREATE/DROP WORKSPACE` 的文件面）。
+    pub fn set_workspace_provisioner(
+        &mut self,
+        p: Option<&'a dyn crate::dcl_exec::WorkspaceProvisioner>,
+    ) {
+        self.dcl_provisioner = p;
+    }
+
+    /// 工作区供给方（`dcl_exec` 用）。
+    #[must_use]
+    pub(crate) fn dcl_provisioner(&self) -> Option<&'a dyn crate::dcl_exec::WorkspaceProvisioner> {
+        self.dcl_provisioner
+    }
+
+    /// **配口令散列的迭代数**（实例参数 `[auth] pbkdf2_iterations`）。
+    pub fn set_pbkdf2_iterations(&mut self, iterations: u32) {
+        if iterations > 0 {
+            self.dcl_pbkdf2_iterations = iterations;
+        }
+    }
+
+    /// 口令散列迭代数（`dcl_exec` 用）。
+    #[must_use]
+    pub(crate) fn pbkdf2_iterations(&self) -> u32 {
+        self.dcl_pbkdf2_iterations
+    }
+
+    /// 管理面实例根（诊断用）。
+    #[must_use]
+    pub fn dcl_home_root(&self) -> Option<&std::path::Path> {
+        self.dcl_home.as_deref()
+    }
+
+    /// 管理面 I/O。
+    #[must_use]
+    pub(crate) fn dcl_io(&self) -> Option<&'a dyn bicdb_workspace::io::FileIo> {
+        self.dcl_io
+    }
+
+    /// 事务引擎（DCL 的字典写侧要它开 DDL 事务）。
+    #[must_use]
+    pub(crate) fn engine_ref(&self) -> &'a Engine<'io, 'f, 'io, 'f> {
+        self.engine
+    }
+
+    /// 目录（DCL 的字典写侧要它；**本工作区的**那个）。
+    #[must_use]
+    pub(crate) fn catalog_mut(&mut self) -> &mut bicdb_catalog::Catalog<'io> {
+        self.catalog
+    }
+
+    /// 本会话是不是在**管理面工作区**（`public`）上。
+    #[must_use]
+    pub(crate) fn on_public_workspace(&self) -> bool {
+        self.catalog.is_public()
+    }
+
+    // ───────────────────────── 身份（D6） ─────────────────────────
+
+    /// **认证**（`AUTH` 的落点）：主体名 + 口令 ⇒ 身份。
+    ///
+    /// 三条前提都是**具名拒绝**：
+    /// - 只在 `PUBLIC` 工作区上提供（`user$` 在那里；普通工作区实例按
+    ///   控制套接字的文件权限判身份——本机 = OS 身份）；
+    /// - 一条连接只认证一次（重认证请重连——身份是会话的属性，不是请求的属性）；
+    /// - 校验与状态检查的次序、失败文案、时序口径见 [`crate::auth`]。
+    ///
+    /// # Errors
+    /// 认证不通过（[`crate::auth::AuthError`]）或前提不满足（[`SessionError::Auth`]）。
+    pub fn authenticate(&mut self, name: &str, password: &str) -> Result<Identity, SessionError> {
+        if !self.on_public_workspace() {
+            return Err(SessionError::Auth(
+                "本实例不是 PUBLIC 工作区 ⇒ 不做口令认证（`user$` 在 PUBLIC 里）——\
+                 普通工作区的本机访问按控制套接字的文件权限（OS 身份）判定"
+                    .to_owned(),
+            ));
+        }
+        if let Some(id) = &self.identity {
+            return Err(SessionError::Auth(format!(
+                "本连接已认证为{}——重认证请重连（身份是连接的属性，不是请求的）",
+                id.describe()
+            )));
+        }
+        let id = auth::authenticate(self.catalog, name, password, self.dcl_pbkdf2_iterations)
+            .map_err(|e| SessionError::Auth(e.to_string()))?;
+        self.identity = Some(id.clone());
+        Ok(id)
+    }
+
+    /// **日志要切换而下一组未降级 ⇒ 推一次完全检查点**（CKPT 的"组满被迫"）。
+    ///
+    /// 为什么要在这里做：写者只有**真正写满当前组**时才撞上 `Blocked`——那时
+    /// 语句已失败回滚（报"日志切换等待检查点（无可复用组）"）。会话在**执行之前**
+    /// 问一句"再写下去会不会撞墙"（[`Engine::log_switch_blocked`]，只读探测），
+    /// 是挡就地推一次检查点：组降级 ⇒ 写者继续。Oracle 的"日志切换触发检查点"
+    /// 与 PG 的 `max_wal_size` 触发检查点都是这条（证据包 `checkpoint-on-demand-*`）。
+    ///
+    /// **只在没有显式事务时做**（与 `Instance::shutdown` 同一纪律：它也是先把
+    /// 未结束的事务回滚，再完全检查点）。显式事务里日志满了 ⇒ 语句照旧具名报错，
+    /// `COMMIT` 之后的下一条语句会把检查点补上。
+    ///
+    /// # Errors
+    /// 检查点失败（写回/控制文件/日志）——**如实报出**，不吞。
+    fn checkpoint_on_log_pressure(&mut self) -> Result<(), SessionError> {
+        if self.txn.is_some() || !self.engine.log_switch_blocked() {
+            return Ok(());
+        }
+        self.engine
+            .checkpoint_full(self.ws)
+            .map_err(|e| SessionError::State(format!("日志压力触发的检查点失败：{e}")))?;
+        self.log_checkpoints += 1;
+        Ok(())
+    }
+
+    /// 本会话因日志压力推过的完全检查点次数（诊断/用例）。
+    #[must_use]
+    pub fn log_checkpoints(&self) -> u64 {
+        self.log_checkpoints
+    }
+
+    /// 本会话的身份（`None` = 管理面身份）。
+    #[must_use]
+    pub fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
+    }
+
+    /// 是不是**管理面身份**（本机/OS；DCL 的资格）。
+    #[must_use]
+    pub fn is_management_identity(&self) -> bool {
+        self.identity.is_none()
+    }
+
+    /// **身份资格**（在绑定与对象查找**之前**判；`REQ-SQL-005` 口径）。
+    ///
+    /// 管理面身份不受限；具名主体按 [`crate::auth`] 与模块头的三条规则判。
+    fn check_identity(&self, stmt: &crate::ast::Stmt) -> Result<(), SessionError> {
+        use crate::ast::Stmt as S;
+        let Some(id) = &self.identity else {
+            return Ok(()); // 管理面身份：不设限（本机 = OS 身份）
+        };
+        // ① `EXPIRE` 的受限会话：只留"本人改密"这一条路。
+        if id.is_expired() {
+            return if crate::dcl_exec::is_self_password_change(stmt, id.name()) {
+                Ok(())
+            } else {
+                Err(SessionError::Auth(format!(
+                    "口令已过期（`EXPIRE`）⇒ **受限会话**：只允许本人改密——\
+                     ALTER USER {} IDENTIFIED BY '<新口令>' REPLACE '<旧口令>'\
+                     （改完即解除限制）",
+                    id.name()
+                )))
+            };
+        }
+        // ② 管理面语句：主体只能对自己改密（Oracle 的"本人改密"口径）。
+        if crate::dcl_exec::is_management(stmt) {
+            return if crate::dcl_exec::is_self_password_change(stmt, id.name()) {
+                Ok(())
+            } else {
+                Err(SessionError::Auth(format!(
+                    "管理面语句需要**管理面身份**（本机 = 控制套接字的文件权限）——\
+                     主体 `{}` 只能对自己用 `ALTER USER … IDENTIFIED BY … REPLACE …`",
+                    id.name()
+                )))
+            };
+        }
+        // ③ 其余语句按类判：`public` 是共享内容，**对主体只读**（SELECT/事务随便）。
+        match stmt {
+            S::Select(_) | S::Transaction(_) => Ok(()),
+            S::VariableSet(_) => Ok(()), // 会话变量（白名单在绑定期判）
+            S::Insert(_) | S::Update(_) | S::Delete(_) => Err(SessionError::Auth(format!(
+                "PUBLIC 工作区对所有主体**只读**——主体 `{}` 不能写它的数据\
+                 （写自己的数据要在自己的会话/工作区里；见 `doc/用户与配额管理设计_v0.1.md` §4）",
+                id.name()
+            ))),
+            // `DROP WORKSPACE` 是管理面动作（`is_management` 不收 `Drop`——
+            // 它同时管表/索引/图；按对象类型分派，与 `execute_dcl` 同一判据）。
+            S::Drop(d) if d.remove_type == crate::ast::ObjectType::Workspace => {
+                Err(SessionError::Auth(format!(
+                    "管理面语句需要**管理面身份**——主体 `{}` 不能执行",
+                    id.name()
+                )))
+            }
+            // 建表/建索引/删表删索引/建图：都是写（含改字典）。
+            S::CreateTable(_) | S::Index(_) | S::Drop(_) | S::CreateGraph(_) => {
+                Err(SessionError::Auth(format!(
+                    "PUBLIC 工作区对所有主体**只读**——主体 `{}` 不能改它的结构",
+                    id.name()
+                )))
+            }
+            // 其余管理面语句（上面 `is_management` 已拦）。**穷尽匹配**：新语句
+            // 必须在这里表态，不能"默认放行"。
+            S::CreateWorkspace(_)
+            | S::AlterWorkspace(_)
+            | S::CreateFilesystem(_)
+            | S::AlterFilesystem(_)
+            | S::DropFilesystem(_)
+            | S::CreateUser(_)
+            | S::AlterUser(_)
+            | S::DropUser(_)
+            | S::AlterDatabase(_) => Err(SessionError::Auth(format!(
+                "管理面语句需要**管理面身份**——主体 `{}` 不能执行",
+                id.name()
+            ))),
+        }
+    }
+
+    /// **解除本会话的过期限制**（本人改密成功后：`user$` 的状态已转 `ACTIVE`）。
+    ///
+    /// 为什么会话里也要解：受限是**会话**的属性——字典改了而会话还拦着，
+    /// 用户就得"改完密再重连一次"，那不是 MySQL 的形态（它改完即放行）。
+    pub(crate) fn clear_identity_expiry(&mut self) {
+        if let Some(id) = self.identity.as_mut() {
+            id.clear_expired();
         }
     }
 
@@ -173,6 +471,28 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             .into_iter()
             .map(|c| (c.name, c.nullable, c.type_code, c.length))
             .collect())
+    }
+
+    /// **接管一个既有的显式事务**（直连模式：连接 = 进程，事务要跨语句）。
+    ///
+    /// 为什么需要：`Session` 借住实例（池/引擎/目录都是借来的），
+    /// 长连接的**事务状态**因此不能住在 `Session` 里——`bicdbcli --direct`
+    /// 每执行一句就新建一个会话的话，`BEGIN` 建的事务会在语句收尾的
+    /// `Drop` 里被回滚，`COMMIT` 只回一句"没有活动事务"（**静默降级**）。
+    /// 做法：事务句柄由**连接**保管，语句执行时借给会话
+    /// （[`Session::adopt_txn`]），执行完交回（[`Session::release_txn`]）。
+    #[must_use]
+    pub fn adopt_txn(
+        &mut self,
+        txn: Option<bicdb_txn::engine::TxnHandle>,
+    ) -> Option<bicdb_txn::engine::TxnHandle> {
+        std::mem::replace(&mut self.txn, txn)
+    }
+
+    /// **交回显式事务**（语句结束；`None` = 该语句把事务收尾了）。
+    #[must_use]
+    pub fn release_txn(&mut self) -> Option<bicdb_txn::engine::TxnHandle> {
+        self.txn.take()
     }
 
     /// 有没有未收尾的显式事务。
@@ -226,11 +546,22 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         named: &'c [(&'c str, Value)],
         used: &mut std::collections::HashSet<&'c str>,
     ) -> Result<QueryResult, SessionError> {
+        // ⓪ **身份资格先于绑定与对象查找**（REQ-SQL-005 口径）：
+        //    具名主体的只读/自助规则、过期会话的受限规则都在这里拦。
+        self.check_identity(stmt)?;
+        // ⓪.5 **日志要被挡就先推一次检查点**（§11.7 的 CKPT 触发 ②"组满被迫"；
+        //      触发 ①"周期发布"随后台角色切片——`crates/daemon` 尚未接电）。
+        self.checkpoint_on_log_pressure()?;
         // ① 解析已完成（调用方）；② 绑定。
         let snapshot = self.snapshot();
+        // **解析策略随会话身份**（先取出来：下面借 `self.catalog` 时不能再借 `self`）：
+        // 管理面身份（本机/OS）= admin——`public` 的管理元数据 `file$` 只有它看得见
+        // （`spec/SQL.md` 待冻结项 47）。
+        let is_admin = self.is_management_identity();
         let bound = {
             let mut view = CatalogViewImpl::new(self.catalog, snapshot);
-            let mut resolver = NameResolver::new(&mut view);
+            let mut resolver =
+                NameResolver::with_policy(&mut view, crate::bind::ResolvePolicy { is_admin });
             bind_statement(&mut resolver, stmt)?
         };
         // **参数摆位**（绑定期的清单 + 调用方按名给的值）。
@@ -238,12 +569,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
 
         match bound {
             crate::bind::BoundStatement::Transaction(kind) => self.transaction(kind),
-            crate::bind::BoundStatement::CreateWorkspace { subject, .. } => {
-                // 工作区 DDL 在管理面（`public` 实例 + DCL）；本会话面不做。
-                Err(SessionError::State(format!(
-                    "`CREATE WORKSPACE FOR USER {subject}` 走管理面（DCL，随 D2 切片）"
-                )))
-            }
+            // **DCL**：语义全在执行层（`dcl_exec`：资格 → 对象 → 两处写）。
+            crate::bind::BoundStatement::Dcl(stmt) => self.execute_dcl(&stmt),
             crate::bind::BoundStatement::Ddl(d) => {
                 if self.in_transaction() {
                     return Err(SessionError::State(
@@ -269,15 +596,42 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 self.seq = self.catalog.current_seq();
                 Ok(QueryResult::Ddl(summary))
             }
-            crate::bind::BoundStatement::Select(_) | crate::bind::BoundStatement::Insert(_) => {
+            crate::bind::BoundStatement::Select(_)
+            | crate::bind::BoundStatement::SetOp(_)
+            | crate::bind::BoundStatement::Insert(_) => {
                 let plan = {
                     let mut view = CatalogViewImpl::new(self.catalog, snapshot);
-                    plan_statement(&bound, &mut |obj| view.segment_block(obj))?
+                    plan_statement(&bound, &mut view)?
                 };
                 let Some(plan) = plan else {
                     return Err(SessionError::State("该语句无物理计划".to_owned()));
                 };
                 self.execute_plan(&plan, snapshot)
+            }
+            // **DML（UPDATE/DELETE）**：谓词按**表行坐标**给 `run_dml`（物化时判——
+            // 计划里不挂 `Filter`，见 `run_dml` 的模块注释；**值不能忘**：
+            // 忘掉谓词就是"WHERE 不生效"，那是静默错）。
+            crate::bind::BoundStatement::Update(ref u) => {
+                let filter = u.filter.clone();
+                let plan = {
+                    let mut view = CatalogViewImpl::new(self.catalog, snapshot);
+                    plan_statement(&bound, &mut view)?
+                };
+                let Some(plan) = plan else {
+                    return Err(SessionError::State("该语句无物理计划".to_owned()));
+                };
+                self.run_dml(&plan, snapshot, DmlKind::Update, filter)
+            }
+            crate::bind::BoundStatement::Delete(ref d) => {
+                let filter = d.filter.clone();
+                let plan = {
+                    let mut view = CatalogViewImpl::new(self.catalog, snapshot);
+                    plan_statement(&bound, &mut view)?
+                };
+                let Some(plan) = plan else {
+                    return Err(SessionError::State("该语句无物理计划".to_owned()));
+                };
+                self.run_dml(&plan, snapshot, DmlKind::Delete, filter)
             }
         }
     }
@@ -330,6 +684,11 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         match plan.kind {
             PlanKind::Select => self.run_select(plan, snapshot),
             PlanKind::Insert => self.run_insert(plan, snapshot),
+            // UPDATE/DELETE 不走这条（`execute_one` 直接调 `run_dml` 带谓词）；
+            // 真走到这里说明有人新开了口子——具名拒绝，不给"WHERE 丢了"的机会。
+            PlanKind::Update | PlanKind::Delete => Err(SessionError::State(
+                "DML 计划必须经 `run_dml`（带谓词）执行——`execute_plan` 不处理它".to_owned(),
+            )),
         }
     }
 
@@ -338,52 +697,358 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         plan: &PhysicalPlan,
         snapshot: CommitSeq,
     ) -> Result<QueryResult, SessionError> {
-        let source = plan
-            .sources
-            .first()
-            .ok_or_else(|| SessionError::State("SELECT 缺行源".to_owned()))?;
-        // 扫描边界：段头（池优先）+ 数据页清单。
-        let (file_id, blocks) = {
-            let seg = Segment::open_pooled(
-                self.pool,
-                self.catalog.file_mut(),
-                source.seg_block,
-                self.ws,
-            )?;
-            let fid = seg.file_id();
-            let hwm = seg.hwm();
-            (fid, seg.data_blocks(hwm))
-        };
+        // **空 sources 是合法的**（`SELECT 1` 走 `SingleRow`——没有表要扫；
+        // `open_cursor` 只在有 `SeqScan` 的树里被调，越界即具名错误）。
+        // **每个行源各一份扫描边界**（段头经池 + 数据页清单）——两表连接就是两份；
+        // `open_cursor` 按 `SourceId` 分派（此前忽略 id、任何源都开第一个）。
+        // **固定表没有段**（行即时产生）⇒ 它的那一格是 `None`，开游标时走内存路。
+        let mut per_source: Vec<Option<(u16, Vec<u32>)>> = Vec::with_capacity(plan.sources.len());
+        for src in &plan.sources {
+            if src.fixed.is_some() {
+                per_source.push(None);
+                continue;
+            }
+            let (file_id, blocks) = {
+                let seg = Segment::open_pooled(
+                    self.pool,
+                    self.catalog.file_mut(),
+                    src.seg_block,
+                    self.ws,
+                )?;
+                let fid = seg.file_id();
+                let hwm = seg.hwm();
+                (fid, seg.data_blocks(hwm))
+            };
+            per_source.push(Some((file_id, blocks)));
+        }
         let node = plan.node.clone();
-        let columns = plan.output_names.clone();
+        // 列形态来自计划输出（`RowShape`），列名来自计划元数据。
+        let columns: Vec<ColumnMeta> = plan
+            .output_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ColumnMeta {
+                name: name.clone(),
+                kind: plan.output.cols.get(i).copied().unwrap_or(ColKind::Bytes),
+            })
+            .collect();
         let params_in = self.exec_params.clone();
         let pool = self.pool;
+        // **读己所写**：本会话若有活动事务，它的未提交改动要看得见
+        // （`BEGIN; INSERT; SELECT` 看得到刚插的行）——视角里带上它。
+        let own = self.txn.as_ref().map(TxnHandle::id);
+        let view = bicdb_storage::cr::ReadView::new(snapshot).with_own(own);
+        // **固定表的内容源**（借用拷出来——闭包里再借 `self` 会与下面的 `self.engine` 冲突）。
+        let fixed_src = self.fixed_source;
         // 扫描期与 CR 共持撤销链（**读上下文**；语句内完成，不做长事务）。
         let rows = self.engine.with_read_context(|pool_ref, chain| {
-            let mut open = |_src: bicdb_exec::SourceId| {
+            let mut open = |src: bicdb_exec::SourceId| {
+                let idx = src as usize;
+                let entry = per_source.get(idx).ok_or_else(|| {
+                    bicdb_exec::ExecError::Spill(format!("行源 {src} 不在计划里"))
+                })?;
+                // **固定表**：行由引擎即时产生（内存游标，没有段、没有 RID）。
+                if let Some(name) = plan.sources.get(idx).and_then(|s| s.fixed) {
+                    let shape = plan
+                        .sources
+                        .get(idx)
+                        .map(|s| s.shape.clone())
+                        .unwrap_or_else(|| RowShape::new(Vec::new()));
+                    return Ok(
+                        Box::new(fixed_cursor(fixed_src, name, &shape)?) as Box<dyn RowCursor>
+                    );
+                }
+                let (file_id, blocks) = entry
+                    .as_ref()
+                    .ok_or_else(|| bicdb_exec::ExecError::Spill(format!("行源 {src} 没有段")))?;
                 Ok(Box::new(HeapScanner::new(
                     pool_ref,
                     chain,
-                    snapshot,
-                    file_id,
+                    view,
+                    *file_id,
                     blocks.clone(),
                 )) as Box<dyn RowCursor>)
             };
             let envx = ExecEnv {
                 pool: pool_ref,
-                chain: None,
+                // **索引扫描要用撤销链**（回表 + CR 重建）——从前只有 `SeqScan`
+                // 时才经 `open` 闭包拿链，故这里是 `None`；接了 `IndexScan` 之后
+                // 计划里可能根本没有行源，链必须从环境走。
+                chain: Some(chain),
                 spill: None,
                 writer: None,
             };
             let mut op = build(&node, &envx, &mut open)?;
-            let mut cx = ExecContext::new(snapshot).with_params(&params_in);
+            let mut cx = ExecContext::new(snapshot)
+                .with_own(own)
+                .with_params(&params_in);
             collect(op.as_mut(), &mut cx)
         })?;
         let _ = pool;
         Ok(QueryResult::Rows {
             columns,
-            rows: rows.iter().map(format_row).collect(),
+            rows: rows.into_iter().map(|r| r.values).collect(),
         })
+    }
+
+    /// 会话侧：**跑一棵只读子树并收齐行**（`INSERT … SELECT` 的来源；本版物化）。
+    ///
+    /// 行源定位表用**外层计划**的 `sources`（来源的 id 已在计划期平移）。
+    fn materialize(
+        &mut self,
+        node: &bicdb_exec::PlanNode,
+        plan: &PhysicalPlan,
+        snapshot: CommitSeq,
+    ) -> Result<Vec<Vec<Value>>, SessionError> {
+        // **固定表没有段**（行即时产生）⇒ 它的那一格是 `None`，开游标时走内存路。
+        let mut per_source: Vec<Option<(u16, Vec<u32>)>> = Vec::with_capacity(plan.sources.len());
+        for src in &plan.sources {
+            if src.fixed.is_some() {
+                per_source.push(None);
+                continue;
+            }
+            let (file_id, blocks) = {
+                let seg = Segment::open_pooled(
+                    self.pool,
+                    self.catalog.file_mut(),
+                    src.seg_block,
+                    self.ws,
+                )?;
+                let fid = seg.file_id();
+                let hwm = seg.hwm();
+                (fid, seg.data_blocks(hwm))
+            };
+            per_source.push(Some((file_id, blocks)));
+        }
+        let params_in = self.exec_params.clone();
+        let own = self.txn.as_ref().map(TxnHandle::id);
+        let view = bicdb_storage::cr::ReadView::new(snapshot).with_own(own);
+        let fixed_src = self.fixed_source;
+        let node = node.clone();
+        let rows = self.engine.with_read_context(|pool_ref, chain| {
+            let mut open = |src: bicdb_exec::SourceId| {
+                let idx = src as usize;
+                let entry = per_source.get(idx).ok_or_else(|| {
+                    bicdb_exec::ExecError::Spill(format!("行源 {src} 不在计划里"))
+                })?;
+                // **固定表**：行由引擎即时产生（内存游标，没有段、没有 RID）。
+                if let Some(name) = plan.sources.get(idx).and_then(|s| s.fixed) {
+                    let shape = plan
+                        .sources
+                        .get(idx)
+                        .map(|s| s.shape.clone())
+                        .unwrap_or_else(|| RowShape::new(Vec::new()));
+                    return Ok(
+                        Box::new(fixed_cursor(fixed_src, name, &shape)?) as Box<dyn RowCursor>
+                    );
+                }
+                let (file_id, blocks) = entry
+                    .as_ref()
+                    .ok_or_else(|| bicdb_exec::ExecError::Spill(format!("行源 {src} 没有段")))?;
+                Ok(Box::new(HeapScanner::new(
+                    pool_ref,
+                    chain,
+                    view,
+                    *file_id,
+                    blocks.clone(),
+                )) as Box<dyn RowCursor>)
+            };
+            let envx = ExecEnv {
+                pool: pool_ref,
+                // **索引扫描要用撤销链**（回表 + CR 重建）——从前只有 `SeqScan`
+                // 时才经 `open` 闭包拿链，故这里是 `None`；接了 `IndexScan` 之后
+                // 计划里可能根本没有行源，链必须从环境走。
+                chain: Some(chain),
+                spill: None,
+                writer: None,
+            };
+            let mut op = build(&node, &envx, &mut open)?;
+            let mut cx = ExecContext::new(snapshot)
+                .with_own(own)
+                .with_params(&params_in);
+            collect(op.as_mut(), &mut cx)
+        })?;
+        Ok(rows.into_iter().map(|r| r.values).collect())
+    }
+
+    /// **`UPDATE` / `DELETE` 的执行**（DML 的写路径；与 INSERT 同一套收尾）。
+    ///
+    /// **为什么先物化再写**（`dml_exec` 的 `materialize`）：边扫边改会让同一个
+    /// 游标看见自己刚写的行——行迁移到尚未扫到的页就**可能被改第二次**。
+    /// 物化（按语句快照把命中行收齐）把"读什么"与"写什么"分开，语义确定；
+    /// 代价是命中行集驻留内存，V1 直说这条边界（`V1` 的表都不大）。
+    fn run_dml(
+        &mut self,
+        plan: &PhysicalPlan,
+        snapshot: CommitSeq,
+        kind: DmlKind,
+        filter: Option<bicdb_exec::Expr>,
+    ) -> Result<QueryResult, SessionError> {
+        let source = plan
+            .sources
+            .first()
+            .ok_or_else(|| SessionError::State("DML 缺目标表".to_owned()))?;
+        let node = plan.node.clone();
+        let params_in = self.exec_params.clone();
+        let seg_block = source.seg_block;
+        let table_obj = source.table_obj;
+        let own = self.txn.as_ref().map(TxnHandle::id);
+        // **物化目标行**（按语句快照 + 本会话未提交改动；命中行 = WHERE 放行）。
+        let view = bicdb_storage::cr::ReadView::new(snapshot).with_own(own);
+        let (file_id, blocks) = {
+            let seg = Segment::open_pooled(self.pool, self.catalog.file_mut(), seg_block, self.ws)?;
+            let fid = seg.file_id();
+            let hwm = seg.hwm();
+            (fid, seg.data_blocks(hwm))
+        };
+        let targets: Vec<(bicdb_storage::rowid::RowId, Vec<u8>)> =
+            self.engine.with_read_context(|pool_ref, chain| {
+                let mut scanner = HeapScanner::new(pool_ref, chain, view, file_id, blocks.clone());
+                let mut out = Vec::new();
+                loop {
+                    match scanner.next_row() {
+                        Ok(Some((rid, bytes))) => out.push((rid, bytes)),
+                        Ok(None) => break,
+                        // 扫描出错：**不吞**——包成会话错误返回（物化阶段没有写，
+                        // 此时中止是干净的）。
+                        Err(e) => {
+                            return Err(SessionError::State(format!("DML 物化扫描失败：{e}")))
+                        }
+                    }
+                }
+                Ok::<_, SessionError>(out)
+            })?;
+        // WHERE 在物化之后、写之前判（谓词按**表行**坐标：无 ROWID 偏移）。
+        let shape_of = |n: &bicdb_exec::PlanNode| match n {
+            bicdb_exec::PlanNode::Update { shape, .. }
+            | bicdb_exec::PlanNode::Delete { shape, .. } => Some(shape.clone()),
+            _ => None,
+        };
+        let shape =
+            shape_of(&node).ok_or_else(|| SessionError::State("DML 计划形态不符".to_owned()))?;
+        let mut rows: Vec<(bicdb_storage::rowid::RowId, Vec<u8>)> =
+            Vec::with_capacity(targets.len());
+        {
+            let cx_params = params_in.clone();
+            let mut cx = ExecContext::new(snapshot)
+                .with_own(own)
+                .with_params(&cx_params);
+            for (rid, bytes) in targets {
+                if let Some(pred) = &filter {
+                    let row = bicdb_exec::value::decode_row(&bytes, &shape)?;
+                    match bicdb_exec::expr::eval(pred, &row, cx.params())? {
+                        Value::Bool(true) => {}
+                        _ => continue,
+                    }
+                }
+                rows.push((rid, bytes));
+            }
+            let _ = &mut cx;
+        }
+        // 索引清单（写前一次）。
+        let ws = self.ws;
+        let mut indexes = crate::dml_index::table_indexes(self.catalog, snapshot, table_obj)?;
+        let has_indexes = !indexes.is_empty();
+        let opts = self
+            .catalog
+            .table_options(snapshot, table_obj)
+            .map_err(|e| SessionError::State(format!("读表选项：{e}")))?;
+        // **唯一键被改** ⇒ 本版具名拒绝（唯一性预检是"写前看旧行"的形态，
+        // UPDATE 的新键要逐一与"别处已有的键"比——那套随 S4 的后续切片）。
+        if kind == DmlKind::Update && indexes.has_unique() {
+            if let bicdb_exec::PlanNode::Update { sets, .. } = &node {
+                for idx in &indexes.indexes {
+                    if !idx.unique {
+                        continue;
+                    }
+                    if sets.iter().any(|(col, _)| idx.cols.contains(col)) {
+                        return Err(SessionError::State(format!(
+                            "UPDATE 改唯一索引 `{}` 的键列：本版未实现（写前预检只覆盖 INSERT）——\
+                             改用 `DELETE` + `INSERT`，或先 `DROP INDEX`",
+                            idx.name
+                        )));
+                    }
+                }
+            }
+        }
+        let own_txn = self.txn.is_none();
+        let mut txn = match self.txn.take() {
+            Some(t) => t,
+            None => self.engine.begin()?,
+        };
+        let mark = self.engine.statement_mark(&txn)?;
+        // 物化后喂给算子：**内存游标**（行 = (RID, 存储行字节)）。
+        let cursor_rows = rows.clone();
+        let outcome = self
+            .engine
+            .with_write_context(&mut txn, |pool, log, chain, t| {
+                let mut writer = TableAccessWriter::with_txn(
+                    pool,
+                    chain,
+                    log,
+                    self.catalog.file_mut(),
+                    seg_block,
+                    ws,
+                    t,
+                );
+                writer.set_table_options(opts.pctfree as u8, opts.itl_max as u16);
+                if has_indexes {
+                    writer.set_indexes(&mut indexes);
+                }
+                let cell = std::cell::RefCell::new(&mut writer as &mut dyn TableWriter);
+                let mut open = |_src: bicdb_exec::SourceId| {
+                    Ok(Box::new(MemoryCursor::new(cursor_rows.clone()))
+                        as Box<dyn bicdb_exec::RowCursor>)
+                };
+                let envx = ExecEnv {
+                    pool,
+                    // 写上下文里链是**可变借用**（在 `TableAccessWriter` 手里）；
+                    // 本路径的源只有 `SeqScan`（`INSERT … SELECT` 的来源在
+                    // `materialize` 里用读上下文跑），故不给链。
+                    chain: None,
+                    spill: None,
+                    writer: Some(&cell),
+                };
+                let mut op = build(&node, &envx, &mut open)?;
+                let mut cx = ExecContext::new(snapshot)
+                    .with_own(own)
+                    .with_params(&params_in);
+                collect(op.as_mut(), &mut cx)?;
+                let what = match kind {
+                    DmlKind::Update => "Update",
+                    DmlKind::Delete => "Delete",
+                };
+                Ok::<u64, bicdb_exec::ExecError>(cx.rows_affected_of(what))
+            });
+        match outcome {
+            Ok(affected) => {
+                if own_txn {
+                    let committed = self.engine.commit(&mut txn)?;
+                    self.seq = committed.as_raw();
+                    self.seen_keys.clear();
+                } else {
+                    self.txn = Some(txn);
+                }
+                Ok(QueryResult::Affected(affected))
+            }
+            Err(e) => {
+                self.seen_keys.clear();
+                let rolled = if own_txn {
+                    self.engine.rollback(&mut txn).map(|_| ())
+                } else {
+                    let r = self.engine.rollback_statement(&mut txn, mark).map(|_| ());
+                    self.txn = Some(txn);
+                    r
+                };
+                match rolled {
+                    Ok(()) => Err(SessionError::Exec(e)),
+                    Err(rb) => Err(SessionError::Exec(bicdb_exec::ExecError::RollbackFailed {
+                        main: e.to_string(),
+                        rollback: rb.to_string(),
+                    })),
+                }
+            }
+        }
     }
 
     /// **INSERT … VALUES**（写路径）。
@@ -401,10 +1066,16 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             .sources
             .first()
             .ok_or_else(|| SessionError::State("INSERT 缺目标表".to_owned()))?;
-        let node = plan.node.clone();
+        let mut node = plan.node.clone();
         let params_in = self.exec_params.clone();
         let seg_block = source.seg_block;
         let table_obj = source.table_obj;
+        // **`INSERT … SELECT`**：先跑一趟来源（物化），把结果行变成字面量再插入——
+        // 复用唯一性预检与索引维护的整条路（来源是只读的，先跑不影响正确性）。
+        if let Some(sub) = &plan.insert_source {
+            let rows = self.materialize(&sub.node, plan, snapshot)?;
+            node = insert_node_with_rows(&node, &rows)?;
+        }
         // 索引清单（写前一次；空清单 = 不装口，写侧零开销）。
         let ws = self.ws;
         let mut indexes = crate::dml_index::table_indexes(self.catalog, snapshot, table_obj)?;
@@ -416,14 +1087,18 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             .map_err(|e| SessionError::State(format!("读表选项：{e}")))?;
         // **唯一性预检**（写前；同键活行 ⇒ 冲突，语句整体不写）。
         if indexes.has_unique() {
-            let rows = plan_row_bytes(&plan.node, &self.exec_params)?;
+            // **用物化后的节点**（`INSERT … SELECT` 的行在 `node` 里，不在 `plan.node` 里
+            // ——读错一个变量，唯一性预检就会看到"零行"而放行重复键。实测抓到的正是这条）。
+            let rows = plan_row_bytes(&node, &self.exec_params)?;
             let mut seen = std::mem::take(&mut self.seen_keys);
+            let view = bicdb_storage::cr::ReadView::new(snapshot)
+                .with_own(self.txn.as_ref().map(TxnHandle::id));
             let checked = self.engine.with_read_context(|pool, chain| {
                 crate::dml_index::check_unique(
                     self.catalog,
                     pool,
                     chain,
-                    snapshot,
+                    view,
                     &indexes,
                     &rows,
                     &mut seen,
@@ -434,10 +1109,17 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         }
         let has_indexes = !indexes.is_empty();
         let own_txn = self.txn.is_none();
+        // 视角与读路径同一份（语句里若有求值读，也照"读己所写"）。
+        let own = self.txn.as_ref().map(TxnHandle::id);
         let mut txn = match self.txn.take() {
             Some(t) => t,
             None => self.engine.begin()?,
         };
+        // **语句回滚点**（出错时按形态用）：显式事务里语句失败只回滚**本语句**
+        // （Oracle 口径；`rollback_statement` 不释锁、不动此前语句）——整事务
+        // 回滚会把用户前面已成功的语句一起毁掉，还把手里的锁全丢了。
+        // 无改动时它是幂等空操作，取一次的成本可以忽略。
+        let mark = self.engine.statement_mark(&txn)?;
         let outcome = self
             .engine
             .with_write_context(&mut txn, |pool, log, chain, t| {
@@ -461,12 +1143,17 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     };
                 let envx = ExecEnv {
                     pool,
+                    // 写上下文里链是**可变借用**（在 `TableAccessWriter` 手里）；
+                    // 本路径的源只有 `SeqScan`（`INSERT … SELECT` 的来源在
+                    // `materialize` 里用读上下文跑），故不给链。
                     chain: None,
                     spill: None,
                     writer: Some(&cell),
                 };
                 let mut op = build(&node, &envx, &mut open)?;
-                let mut cx = ExecContext::new(snapshot).with_params(&params_in);
+                let mut cx = ExecContext::new(snapshot)
+                .with_own(own)
+                .with_params(&params_in);
                 collect(op.as_mut(), &mut cx)?;
                 Ok::<u64, bicdb_exec::ExecError>(cx.rows_affected_of("Insert"))
             });
@@ -475,6 +1162,9 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 if own_txn {
                     let committed = self.engine.commit(&mut txn)?;
                     self.seq = committed.as_raw();
+                    // 键集随语句收尾清空：唯一性不再依赖它兜底——CR 的
+                    // "读己所写"让写前预检看得到本事务未提交的行（`check_unique`
+                    // 走同一视角）。
                     self.seen_keys.clear();
                 } else {
                     // 显式事务：语句不提交（写侧 owns_txn = false 已挡住算子提交）。
@@ -483,12 +1173,145 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 Ok(QueryResult::Affected(affected))
             }
             Err(e) => {
-                let _ = self.engine.rollback(&mut txn);
+                // **回滚失败不吞**（与 DDL/DML 同一口径）：行锁/undo 可能没清，
+                // 后续语句会撞上——与主错一并报出。
+                //
+                // 两种形态：
+                // - 自动提交（`own_txn`）：整回滚——这个事务只含本语句；
+                // - **显式事务：语句级回滚**，事务与锁留着（`COMMIT` 照旧可用，
+                //   此前已成功的语句照旧生效）。整事务回滚是错的（会连坐）。
                 self.seen_keys.clear();
-                Err(SessionError::Exec(e))
+                let rolled = if own_txn {
+                    self.engine.rollback(&mut txn).map(|_| ())
+                } else {
+                    let r = self.engine.rollback_statement(&mut txn, mark).map(|_| ());
+                    self.txn = Some(txn); // 事务放回：锁与前面语句的工作都还在
+                    r
+                };
+                match rolled {
+                    Ok(()) => Err(SessionError::Exec(e)),
+                    Err(rb) => Err(SessionError::Exec(bicdb_exec::ExecError::RollbackFailed {
+                        main: e.to_string(),
+                        rollback: rb.to_string(),
+                    })),
+                }
             }
         }
     }
+}
+
+/// DML 种类（`run_dml` 共用一套收尾）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmlKind {
+    /// `UPDATE`。
+    Update,
+    /// `DELETE`。
+    Delete,
+}
+
+/// **内存行游标**（物化后的 DML 源；`rewind` 也支持——算子重开不致命）。
+struct MemoryCursor {
+    rows: Vec<(bicdb_storage::rowid::RowId, Vec<u8>)>,
+    at: usize,
+}
+
+impl MemoryCursor {
+    fn new(rows: Vec<(bicdb_storage::rowid::RowId, Vec<u8>)>) -> Self {
+        Self { rows, at: 0 }
+    }
+}
+
+impl bicdb_exec::RowCursor for MemoryCursor {
+    fn next_row(
+        &mut self,
+    ) -> Result<Option<(bicdb_storage::rowid::RowId, Vec<u8>)>, bicdb_exec::ExecError> {
+        if self.at >= self.rows.len() {
+            return Ok(None);
+        }
+        let r = self.rows[self.at].clone();
+        self.at += 1;
+        Ok(Some(r))
+    }
+
+    fn rewind(&mut self) -> Result<(), bicdb_exec::ExecError> {
+        self.at = 0;
+        Ok(())
+    }
+}
+
+/// **固定表 → 内存游标**（行由引擎即时产生：`file$` 的内容 = 控制文件内存映像）。
+///
+/// **形态**：字典值 → `bicdb-exec::Value` → 按行形状**编码成行字节**（与堆行同一
+/// 编码，下游算子（Filter/Project/Sort/聚合）不必知道来源不同）。**没有 RID**
+/// （固定表没有段/槽位）——给一个全零 ROWID（`WithRowId` 只用于 DML，不会碰到它）。
+fn fixed_cursor(
+    source: Option<&dyn FixedTableSource>,
+    name: &str,
+    shape: &RowShape,
+) -> Result<MemoryCursor, bicdb_exec::ExecError> {
+    // 没有内容源 ⇒ **具名拒绝**（不静默给空集）：控制文件在哪是装配层的事。
+    let src = source.ok_or(bicdb_exec::ExecError::NoSuchSource { id: 0 })?;
+    let table = src.fixed_table(name).ok_or_else(|| {
+        bicdb_exec::ExecError::BadStoredRow(format!("固定表 `{name}` 没有内容源"))
+    })?;
+    let zero = bicdb_storage::rowid::RowId::from_bytes(&[0u8; 6]);
+    let mut rows = Vec::with_capacity(table.rows.len());
+    for row in &table.rows {
+        let values: Vec<Value> = row.iter().map(dict_to_value).collect();
+        let bytes = bicdb_exec::encode_row(&Row::new(values), shape)?;
+        rows.push((zero, bytes));
+    }
+    Ok(MemoryCursor::new(rows))
+}
+
+/// 字典值 → 执行器值（固定表的行来自目录层）。
+fn dict_to_value(v: &bicdb_catalog::row::DictValue) -> Value {
+    use bicdb_catalog::row::DictValue as D;
+    match v {
+        D::Null => Value::Null,
+        D::Num(n) => Value::Number(
+            bicdb_types::Number::parse(&n.to_string())
+                .unwrap_or_else(|_| bicdb_types::Number::parse("0").expect("0 是合法 NUMBER")),
+        ),
+        D::Text(t) => Value::Bytes(t.as_bytes().to_vec()),
+        D::Bytes(b) => Value::Bytes(b.clone()),
+        D::Bool(b) => Value::Bool(*b),
+    }
+}
+
+/// **把 `Insert` 计划节点的行换成字面量**（`INSERT … SELECT` 物化之后用）。
+///
+/// 物化出来的每一行按**目标列序**（`target_cols`）展开成列宽的行——与
+/// `INSERT … VALUES` 的计划形态完全一致，因此后面的唯一性预检、写侧、索引维护
+/// 一行都不用改。
+fn insert_node_with_rows(
+    node: &bicdb_exec::PlanNode,
+    rows: &[Vec<Value>],
+) -> Result<bicdb_exec::PlanNode, SessionError> {
+    let bicdb_exec::PlanNode::Insert { shape, .. } = node else {
+        return Err(SessionError::State(
+            "INSERT 的计划节点不是 Insert".to_owned(),
+        ));
+    };
+    let mut literal_rows = Vec::with_capacity(rows.len());
+    for r in rows {
+        if r.len() != shape.len() {
+            return Err(SessionError::State(format!(
+                "INSERT … SELECT 的行有 {} 列、目标表 {} 列",
+                r.len(),
+                shape.len()
+            )));
+        }
+        literal_rows.push(
+            r.iter()
+                .map(|v| bicdb_exec::Expr::Literal(v.clone()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(bicdb_exec::PlanNode::Insert {
+        shape: shape.clone(),
+        rows: literal_rows,
+    })
 }
 
 /// **计划里的行字面量 → 行字节**（唯一性预检用；与写侧的编码同一份）。
@@ -593,11 +1416,6 @@ impl Drop for Session<'_, '_, '_, '_> {
             let _ = self.engine.rollback(&mut txn);
         }
     }
-}
-
-/// 行 → 显示串（CLI/协议层的呈现；NULL 显式写出）。
-fn format_row(r: &Row) -> Vec<String> {
-    r.values.iter().map(format_value).collect()
 }
 
 /// 值 → 显示串。

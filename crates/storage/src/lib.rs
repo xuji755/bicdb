@@ -97,6 +97,7 @@ pub mod cr;
 pub mod datafile;
 pub mod dbwr;
 pub mod fragment;
+pub mod globalctl;
 pub mod heap;
 pub mod itl;
 pub mod key;

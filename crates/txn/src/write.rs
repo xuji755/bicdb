@@ -2551,18 +2551,24 @@ mod tests {
         let src = page_snapshot(&pool, key1);
         let dst = page_snapshot(&pool, key2);
         // 快照 5（迁移之前）：原页 = 原行；新页 = 无此行。
-        let cr_old = bicdb_storage::cr::reconstruct(&src, seq(5), &chain).unwrap();
+        let cr_old =
+            bicdb_storage::cr::reconstruct(&src, bicdb_storage::cr::ReadView::new(seq(5)), &chain)
+                .unwrap();
         assert_eq!(
             heap::row(&cr_old, rid.row_id()),
             Some(&stored_row(&old_row, 0)[..]),
             "旧快照见原行（迁移被撤销；字节 = 落盘形态）"
         );
         assert_eq!(heap::forwarding_target(&cr_old, rid.row_id()), None);
-        let dst_old = bicdb_storage::cr::reconstruct(&dst, seq(5), &chain).unwrap();
+        let dst_old =
+            bicdb_storage::cr::reconstruct(&dst, bicdb_storage::cr::ReadView::new(seq(5)), &chain)
+                .unwrap();
         let target = heap::forwarding_target(&src, rid.row_id()).expect("物理指针");
         assert_eq!(heap::row(&dst_old, target.row_id()), None, "旧快照不见新行");
         // 快照 6（迁移可见）：原页仍是指针。
-        let cr_new = bicdb_storage::cr::reconstruct(&src, seq(6), &chain).unwrap();
+        let cr_new =
+            bicdb_storage::cr::reconstruct(&src, bicdb_storage::cr::ReadView::new(seq(6)), &chain)
+                .unwrap();
         assert_eq!(heap::forwarding_target(&cr_new, rid.row_id()), Some(target));
     }
 
@@ -3033,14 +3039,18 @@ mod tests {
             "删除者必须在本页有活动 ITL 条目"
         );
         // 能看见 T0 插入（seq 1）、看不见 T1 删除的快照：行仍在。
-        let cr = bicdb_storage::cr::reconstruct(&page, seq(1), &chain).unwrap();
+        let cr =
+            bicdb_storage::cr::reconstruct(&page, bicdb_storage::cr::ReadView::new(seq(1)), &chain)
+                .unwrap();
         assert_eq!(
             heap::row(&cr, rid.row_id()),
             Some(&stored_row(&row, 0)[..]),
             "未提交删除：看见插入的旧快照必须仍看到该行"
         );
         // 比 T0 还旧的快照：连插入都不可见——行不存在（两段回溯都生效）。
-        let cr_ancient = bicdb_storage::cr::reconstruct(&page, seq(0), &chain).unwrap();
+        let cr_ancient =
+            bicdb_storage::cr::reconstruct(&page, bicdb_storage::cr::ReadView::new(seq(0)), &chain)
+                .unwrap();
         assert_eq!(
             heap::row(&cr_ancient, rid.row_id()),
             None,
@@ -3049,13 +3059,17 @@ mod tests {
         // 提交后：旧快照（seq 1 < 提交序号）仍可见——删除靠 undo 撤销回去。
         commit(&pool, &mut log, &mut chain, &mut t1, seq(2)).unwrap();
         let page = page_snapshot(&pool, key);
-        let cr_old = bicdb_storage::cr::reconstruct(&page, seq(1), &chain).unwrap();
+        let cr_old =
+            bicdb_storage::cr::reconstruct(&page, bicdb_storage::cr::ReadView::new(seq(1)), &chain)
+                .unwrap();
         assert_eq!(
             heap::row(&cr_old, rid.row_id()),
             Some(&stored_row(&row, 0)[..]),
             "提交后：旧快照（含等号之下）仍看到删除前的行"
         );
-        let cr_new = bicdb_storage::cr::reconstruct(&page, seq(2), &chain).unwrap();
+        let cr_new =
+            bicdb_storage::cr::reconstruct(&page, bicdb_storage::cr::ReadView::new(seq(2)), &chain)
+                .unwrap();
         assert_eq!(heap::row(&cr_new, rid.row_id()), None, "新快照看不到已删行");
     }
 
@@ -3128,13 +3142,17 @@ mod tests {
             "一个事务每块只占一个 ITL 条目"
         );
         // 未提交：CR 把两行都抹掉（不再 TooManyRounds）。
-        let cr = bicdb_storage::cr::reconstruct(&page, seq(0), &chain).unwrap();
+        let cr =
+            bicdb_storage::cr::reconstruct(&page, bicdb_storage::cr::ReadView::new(seq(0)), &chain)
+                .unwrap();
         assert_eq!(heap::row(&cr, r1.row_id()), None);
         assert_eq!(heap::row(&cr, r2.row_id()), None);
         // 提交后可见。
         commit(&pool, &mut log, &mut chain, &mut txn, seq(1)).unwrap();
         let page = page_snapshot(&pool, key);
-        let cr = bicdb_storage::cr::reconstruct(&page, seq(1), &chain).unwrap();
+        let cr =
+            bicdb_storage::cr::reconstruct(&page, bicdb_storage::cr::ReadView::new(seq(1)), &chain)
+                .unwrap();
         assert!(heap::row(&cr, r1.row_id()).is_some());
         assert!(heap::row(&cr, r2.row_id()).is_some());
     }
@@ -3544,14 +3562,24 @@ mod tests {
             let g = pool.pin(key).unwrap();
             bicdb_storage::page::Page::from_bytes(Box::new(*g.as_bytes()))
         };
-        let uncommitted = bicdb_storage::cr::reconstruct(&snapshot_page, seq(0), &chain).unwrap();
+        let uncommitted = bicdb_storage::cr::reconstruct(
+            &snapshot_page,
+            bicdb_storage::cr::ReadView::new(seq(0)),
+            &chain,
+        )
+        .unwrap();
         assert_eq!(
             heap::row(&uncommitted, rid.row_id()),
             None,
             "未提交：CR 抹掉"
         );
         commit(&pool, &mut log, &mut chain, &mut txn, seq(1)).unwrap();
-        let committed = bicdb_storage::cr::reconstruct(&snapshot_page, seq(1), &chain).unwrap();
+        let committed = bicdb_storage::cr::reconstruct(
+            &snapshot_page,
+            bicdb_storage::cr::ReadView::new(seq(1)),
+            &chain,
+        )
+        .unwrap();
         assert_eq!(
             heap::row(&committed, rid.row_id()).map(|b| b.len()),
             Some(row.len()),

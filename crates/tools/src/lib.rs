@@ -19,6 +19,7 @@ pub mod check;
 pub mod dump;
 
 pub use check::{
-    check_heap, check_page, check_page_image, CheckReport, Finding, Severity, Verdict,
+    check_heap, check_page, check_page_image, check_page_image_stream, CheckReport, Finding,
+    Severity, Verdict,
 };
-pub use dump::{page_dump, page_image_dump};
+pub use dump::{page_dump, page_image_dump, page_image_dump_stream};

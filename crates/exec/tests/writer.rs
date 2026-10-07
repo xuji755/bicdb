@@ -135,7 +135,7 @@ fn read_all(
         Ok(Box::new(HeapScanner::new(
             pool,
             &env.chain,
-            snapshot,
+            bicdb_storage::cr::ReadView::new(snapshot),
             DATA_FID,
             blocks.clone(),
         )) as Box<dyn RowCursor>)
@@ -241,8 +241,11 @@ fn update_and_delete_round_trip_on_a_grown_table() {
         );
         w.begin().unwrap();
         let new_row = encode_row(&row(7, "T007"));
-        w.update_row(rid, &new_row).unwrap();
-        w.delete_row(rid2).unwrap();
+        // 旧行 = 插入时的原值（`row(7, "t007")`）——索引维护从它算旧键。
+        let old_row = encode_row(&row(7, "t007"));
+        w.update_row(rid, &old_row, &new_row).unwrap();
+        let old2 = encode_row(&row(8, "t008"));
+        w.delete_row(rid2, &old2).unwrap();
         w.commit().unwrap();
     }
     let snap3 = CommitSeq::from_raw(3).unwrap();
@@ -276,7 +279,13 @@ fn find_rid(
         let hwm = seg.hwm();
         seg.data_blocks(hwm)
     };
-    let mut scanner = HeapScanner::new(pool, &env.chain, snapshot, DATA_FID, blocks);
+    let mut scanner = HeapScanner::new(
+        pool,
+        &env.chain,
+        bicdb_storage::cr::ReadView::new(snapshot),
+        DATA_FID,
+        blocks,
+    );
     while let Some((rid, bytes)) = scanner.next_row().unwrap() {
         let decoded = decode_row(&bytes, &shape()).unwrap();
         if decoded.values[0] == num(&id.to_string()) {
