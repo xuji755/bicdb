@@ -11,7 +11,7 @@ A workspace-isolated memory and asset database for AI agents.
 
 ### What it is
 
-bicdb is a single-machine, workspace-isolated, multi-threaded transactional
+bicdb is a single-machine, workspace-isolated, multi-connection transactional
 database designed for **AI agents** rather than general-purpose RDBMS workloads.
 
 It unifies five kinds of data under one transactional store:
@@ -26,23 +26,28 @@ It unifies five kinds of data under one transactional store:
 
 ### Status
 
-> **Design frozen (2026-10). Phases P1–P4 done; P5 in progress.**
-> Storage, WAL/recovery, transactions, the buffer pool and the B+Tree index are
-> implemented and covered by tests (`cargo test --workspace`). Also landed: the
-> workspace **catalog** (dictionary tables, DDL write side, row cache), the
-> **table access service**, the **SQL front end** (lexer/parser → binder →
-> physical plan → session) with `SELECT` (filters, aggregates, `GROUP BY`/
-> `HAVING`/`DISTINCT`, two-table joins, set operations, `ORDER BY` expressions),
-> `INSERT`/`UPDATE`/`DELETE`, **rule-based index access paths** (equality,
-> `IN`, bounded ranges, index nested-loop joins), the **management plane**
-> (`CREATE FILESYSTEM` / `CREATE WORKSPACE` / `CREATE USER`, password hashing),
-> **local password authentication**, the read-only fixed table `file$`, and a
-> runnable CLI (`bicdb init/sql/shell`) — see [Quick start](#quick-start).
-> Still open: templates (reflink snapshots), routing an authenticated session to
-> the subject's own workspace, the daemon process model, the remote (TCP) protocol
-> and its authentication, plus the documented backlog.
-> The internal design notes, roadmap and evidence packs live in `doc/` and are
-> **not** part of this mirror.
+> **v0.2.0 development line (2026-10).** The on-disk engine, WAL/Undo recovery,
+> transactions, buffer pool, heap tables, B+Tree indexes, catalog and local
+> service protocol are working and covered by the workspace test suite. The SQL
+> layer supports DDL/DML, aggregates, two-table joins, set operations,
+> `INSERT … SELECT`, named parameters and rule-based index access.
+>
+> The management plane now includes filesystems, users, private workspaces,
+> local password authentication, authenticated workspace binding, read-only
+> dictionary views and structure-only workspace templates. A service accepts
+> multiple independent connections; statements are currently serialized by one
+> instance executor.
+>
+> The graph layer is implemented as native transactional storage. It provides a
+> documented Cypher subset, bounded paths and `shortestPath`, scalar/composite/
+> JSON-path property indexes, `PROFILE CYPHER`, SQL `GRAPH_TABLE`, and native
+> BM25 full-text indexes for nodes and relationships. Full-text maintenance can
+> be strict, eventual, manual, batched or timer-driven.
+>
+> This is an active development release, not Neo4j compatibility. Full Cypher
+> 25, APOC/GDS, user-defined procedures, unbounded traversal, graph vector and
+> spatial indexes, parallel statement execution, remote TCP transport and
+> production-scale performance qualification remain open.
 
 ### Documentation
 
@@ -52,7 +57,8 @@ It unifies five kinds of data under one transactional store:
 | [Design](docs/design.md) | Overall architecture: isolation, storage, transactions, retrieval, graph, phases |
 | [Storage design](docs/storage.md) | Storage layer: file layout, page format, ROWID, recovery. **Design frozen (2026-10) — all pending items closed** |
 | [Platform support](docs/platform-support.md) | Supported architectures and compatibility baseline |
-| [Manual](docs/使用手册.md) | **User manual** (Chinese): capability table, install, create database, storage, users & workspaces, connecting, tables, SQL syntax, parameters, commands, operations, drivers |
+| [Manual](docs/使用手册.md) | **User manual** (Chinese): capability table, installation, workspaces, SQL, operations and drivers |
+| [Graph and full-text guide](docs/图数据库与全文检索.md) | Native property graph, Cypher subset, property/full-text indexes, `GRAPH_TABLE`, maintenance and limits |
 | [Changelog](CHANGELOG.md) | Release notes, starting with v0.1.0 |
 
 ### Core constraints
@@ -107,27 +113,17 @@ and is not blocked by them.**
 | `bicdb-client` | Rust driver on top of `bicdb-net` (`Connection`, `ResultSet`, `Row`, `Value`) |
 | `bicdb` (Python, `drivers/python`) | Python driver: DB-API 2.0 subset, stdlib only |
 
-### Development phases
+### Current capability map
 
-| Phase | Goal |
+| Area | Current state |
 | --- | --- |
-| P0 | Freeze contracts and threat boundaries |
-| P1 | Workspace and test foundation |
-| P2 | Scalar types and page storage |
-| P3 | WAL, Undo, and recovery |
-| P4 | Concurrency and B+Tree |
-| P5 | SQL, JSON, and SDK basics |
-| P6 | External assets and memory lifecycle |
-| P7 | Full-text and exact hybrid retrieval |
-| P8 | HNSW |
-| P9 | IVFFlat |
-| P10 | Bounded property graph |
-| P11 | Isolation and full-stack reliability |
-| P12 | Controlled trial release |
-
-Milestones: M1 = recoverable storage (P3); M2 = usable private memory and assets
-(P6); M3 = usable retrieval (P7); M4 = multi-model data (P8–P10); M5 = controlled
-trial (P12).
+| Durable relational core | Implemented: heap, B+Tree, WAL/Undo, recovery, transactions and checkpoints |
+| SQL and clients | Implemented subset: DDL/DML, query operations, CLI, SQL*Plus-style client, Rust and Python drivers |
+| Users and workspaces | Implemented locally: password authentication, private workspace binding, dictionary reads and structure templates |
+| Property graph | Implemented subset: native adjacency, Cypher reads/writes, bounded paths, property indexes and `GRAPH_TABLE` |
+| Graph full text | Implemented: BM25, node/relationship scopes, JSON paths, strict/eventual reads and deferred maintenance |
+| Assets and higher data models | Storage primitives and selected SQL surfaces exist; the public contracts continue to evolve |
+| Later work | TCP, parallel execution, vector/spatial graph indexes, complete Cypher ecosystem and scale qualification |
 
 ### Platform support
 
@@ -220,8 +216,7 @@ bicdb init && bicdb start -p public && bicdb list
 
 Reinstalling never touches `public/`; `scripts/uninstall.sh` keeps data by
 default (`--purge` removes it) and refuses while a workspace is running.
-Design: the layout is documented in the [manual](docs/使用手册.md) §2
-(the internal design note is not part of this mirror).
+The installation layout is documented in the [manual](docs/使用手册.md) §2.
 
 ### Build
 
@@ -254,7 +249,7 @@ graph paths; cross-user authorization (permanently).
 
 ### 这是什么
 
-bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型数据库，
+bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多连接事务型数据库，
 不以通用 RDBMS 负载为目标。
 
 它在同一个事务存储中统一保存五类数据：
@@ -269,18 +264,21 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 
 ### 当前状态
 
-> **设计已冻结（2026-10）；P1–P4 已实现，P5 进行中。**
-> 存储、WAL/恢复、事务、缓冲池与 B+Tree 索引均已实现并有测试覆盖
-> （`cargo test --workspace`）。**已落地**还有：**目录**（字典表、DDL 写侧、行缓存）、
-> **表访问服务**（`bicdb-access`）、**SQL 前端**（词法/语法 → 绑定 → 物理计划 → 会话：
-> `SELECT` 的过滤/聚合/`GROUP BY`·`HAVING`·`DISTINCT`/两表连接/集合运算/`ORDER BY`
-> 表达式，以及 `INSERT`·`UPDATE`·`DELETE`）、**规则式索引访问路径**（等值 / `IN` /
-> 有界范围 / 连接的内表探测）、**管理面**（`CREATE FILESYSTEM`·`CREATE WORKSPACE`·
-> `CREATE USER` 与口令散列）、**本机口令认证**、只读固定表 `file$`，以及
-> **可运行的 CLI**（`bicdb init/sql/shell`，见 [快速上手](#快速上手)）。
-> 仍待做：模板（reflink 快照）、认证后路由到主体自己的工作区、daemon 进程模型、
-> 对外（TCP）协议与其认证，以及已登记的后备清单。内部设计/路线/证据包在 `doc/`，
-> **不随本镜像发布**。
+> **v0.2.0 开发线（2026-10）**。磁盘存储、WAL/Undo 恢复、事务、缓冲池、堆表、
+> B+Tree、目录和本机服务协议已经可运行，并由工作区测试覆盖。SQL 已支持 DDL/DML、
+> 聚合、两表连接、集合运算、`INSERT … SELECT`、具名参数和规则式索引访问。
+>
+> 管理面已经支持文件系统池、用户、私有工作区、本机口令认证、认证后的工作区绑定、
+> 只读字典查询和仅复制结构的工作区模板。同一服务可保持多条独立连接；语句目前仍由
+> 单实例执行器串行调度。
+>
+> 图模块使用原生事务存储，已支持明确边界的 Cypher 子集、有界路径与
+> `shortestPath`、标量/组合/JSON 路径属性索引、`PROFILE CYPHER`、SQL
+> `GRAPH_TABLE`，以及节点和关系上的原生 BM25 全文索引。全文维护支持 strict、
+> eventual、manual、batch 和定时模式。
+>
+> 当前版本仍在开发，不宣称与 Neo4j 完全兼容。完整 Cypher 25、APOC/GDS、用户自定义
+> 过程、无界遍历、图向量/空间索引、语句并行执行、远程 TCP 和生产规模性能验证尚未完成。
 
 ### 文档
 
@@ -290,7 +288,8 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | [总体设计](docs/design.md) | 隔离、存储、事务、检索、图，以及研发阶段 |
 | [存储结构设计](docs/storage.md) | 文件布局、页格式、ROWID、恢复。**设计冻结（2026-10）**——全部待冻结项已关闭 |
 | [平台支持](docs/platform-support.md) | 支持的架构与兼容基线 |
-| [使用手册](docs/使用手册.md) | **使用手册**：能力现状表、安装、建库、存储与登记 FS、用户与工作区、连接、表、SQL 语法参考、参数、命令、运维、驱动 |
+| [使用手册](docs/使用手册.md) | 能力现状、安装、工作区、SQL、运维与驱动 |
+| [图数据库与全文检索](docs/图数据库与全文检索.md) | 原生属性图、Cypher 子集、属性/全文索引、`GRAPH_TABLE`、维护方式和边界 |
 | [更新日志](CHANGELOG.md) | 版本说明，自 v0.1.0 起 |
 
 ### 核心约束
@@ -341,26 +340,17 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多线程事务型
 | `bicdb-client` | Rust 驱动（建在 `bicdb-net` 上：`Connection`/`ResultSet`/`Row`/`Value`） |
 | `bicdb`（Python，`drivers/python`） | Python 驱动：DB-API 2.0 子集，只用标准库 |
 
-### 研发阶段
+### 当前能力图
 
-| 阶段 | 目标 |
+| 领域 | 当前状态 |
 | --- | --- |
-| P0 | 冻结契约与威胁边界 |
-| P1 | 工作区及测试底座 |
-| P2 | 标量类型与页式存储 |
-| P3 | WAL、Undo 及恢复 |
-| P4 | 并发与 B+Tree |
-| P5 | SQL、JSON 与 SDK 基础 |
-| P6 | 外部资产与记忆生命周期 |
-| P7 | 全文与精确混合检索 |
-| P8 | HNSW |
-| P9 | IVFFlat |
-| P10 | 有限属性图 |
-| P11 | 隔离与全栈可靠性 |
-| P12 | 受控试用发布 |
-
-里程碑：M1 = P3 可恢复存储；M2 = P6 可用私有记忆与资产；M3 = P7 可用检索；
-M4 = P8–P10 多模型数据能力；M5 = P12 受控试用。
+| 持久关系内核 | 已实现：堆表、B+Tree、WAL/Undo、恢复、事务和检查点 |
+| SQL 与客户端 | 已实现限定子集：DDL/DML、查询、CLI、SQL*Plus 形态客户端、Rust/Python 驱动 |
+| 用户与工作区 | 已实现本机认证、私有工作区绑定、字典只读查询和结构模板 |
+| 属性图 | 已实现原生邻接、Cypher 读写、有界路径、属性索引和 `GRAPH_TABLE` |
+| 图全文 | 已实现 BM25、节点/关系范围、JSON 路径、strict/eventual 查询和延迟维护 |
+| 资产与上层模型 | 存储原语和部分 SQL 接口已经存在，公开契约仍在演进 |
+| 后续工作 | TCP、并行执行、图向量/空间索引、完整 Cypher 生态与规模化验证 |
 
 ### 平台支持
 
@@ -448,7 +438,7 @@ bicdb init && bicdb start -p public && bicdb list
 ```
 
 重装永不碰 `public/`；卸载默认保数据（`--purge` 才删），有工作区在跑时拒绝卸载。
-设计见[使用手册](docs/使用手册.md) §2（内部设计文档不随本镜像发布）。
+安装布局见[使用手册](docs/使用手册.md) §2。
 
 ### 构建
 

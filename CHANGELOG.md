@@ -6,6 +6,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 
 ## [Unreleased]
 
+### Documentation — 2026-10-10
+
+- Updated the English/Chinese project status to the v0.2.0 development line,
+  including authenticated private workspaces, structure templates, native graph
+  storage, the Cypher subset, property indexes, `GRAPH_TABLE`, graph full-text
+  search and deferred index maintenance.
+- Added a graph and full-text usage guide with runnable SQL examples and explicit
+  limits. The README, manual, documentation index and Wiki now distinguish
+  implemented behavior from later Neo4j/Cypher, TCP, parallel-execution and
+  production-scale qualification work.
+
 **DCL v0.2: dependency order FS → WORKSPACE → USER** — the management-statement
 surface was redesigned (`doc/DCL语句设计_v0.1.md` v0.2) and its **syntax layer (D1)
 landed** in `crates/sql`. Earlier in this cycle: full-repo audit (report
