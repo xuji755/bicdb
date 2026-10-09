@@ -54,6 +54,12 @@ pub fn write_frame(s: &mut UnixStream, head: &str, payload: &str) -> Result<(), 
 
 /// 写一帧（载荷是字节——**结果集里的原始字节不经 UTF-8**）。
 pub fn write_frame_bytes(s: &mut UnixStream, head: &str, payload: &[u8]) -> Result<(), FrameError> {
+    if payload.len() > MAX_FRAME as usize {
+        return Err(FrameError::Bad(format!(
+            "载荷 {} 字节超过上限 {MAX_FRAME}",
+            payload.len()
+        )));
+    }
     let mut out = Vec::with_capacity(payload.len() + head.len() + 16);
     out.extend_from_slice(head.as_bytes());
     out.push(b'\n');
@@ -67,11 +73,54 @@ pub fn write_frame_bytes(s: &mut UnixStream, head: &str, payload: &[u8]) -> Resu
 
 /// 读一帧（字节载荷；调用方按自己的口径解释）。
 pub fn read_frame_bytes(s: &mut UnixStream) -> Result<(String, Vec<u8>), FrameError> {
+    decode_frame(s)
+}
+
+/// Read a frame while invoking `idle` on socket read timeouts.
+/// The caller must configure a finite read timeout. Partial headers and payloads
+/// stay inside the same decoder invocation; a timeout never discards bytes.
+/// EOF, malformed frames and other I/O failures still terminate the read.
+///
+/// # Errors
+/// Returns the same framing and I/O errors as [`read_frame_bytes`].
+pub fn read_frame_bytes_with_idle(
+    s: &mut UnixStream,
+    idle: impl FnMut(),
+) -> Result<(String, Vec<u8>), FrameError> {
+    struct IdleRead<'a, F> {
+        stream: &'a mut UnixStream,
+        idle: F,
+    }
+    impl<F: FnMut()> Read for IdleRead<'_, F> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                match self.stream.read(buf) {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        (self.idle)()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => return result,
+                }
+            }
+        }
+    }
+    decode_frame(&mut IdleRead { stream: s, idle })
+}
+fn decode_frame(s: &mut impl Read) -> Result<(String, Vec<u8>), FrameError> {
     let head = read_line(s)?;
     let len_line = read_line(s)?;
-    let len: u32 = std::str::from_utf8(&len_line)
+    let len_text = std::str::from_utf8(&len_line)
         .map_err(|_| FrameError::Bad("长度行非 UTF-8".to_owned()))?
-        .trim()
+        .trim();
+    if len_text.is_empty() || !len_text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(FrameError::Bad("长度行不是非负十进制整数".to_owned()));
+    }
+    let len: u32 = len_text
         .parse()
         .map_err(|_| FrameError::Bad("长度行不是数".to_owned()))?;
     if len > MAX_FRAME {
@@ -91,7 +140,7 @@ pub fn read_frame(s: &mut UnixStream) -> Result<(String, String), FrameError> {
     Ok((head, String::from_utf8_lossy(&body).into_owned()))
 }
 
-fn read_line(s: &mut UnixStream) -> Result<Vec<u8>, FrameError> {
+fn read_line(s: &mut impl Read) -> Result<Vec<u8>, FrameError> {
     let mut out = Vec::new();
     let mut byte = [0u8; 1];
     loop {

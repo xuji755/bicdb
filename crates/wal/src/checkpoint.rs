@@ -33,8 +33,10 @@
 //!   **按序全部写回**，再发布——低水位一次推到当前日志位置。
 
 use bicdb_common::seq::{CommitSeq, Lsn};
-use bicdb_storage::buffer::BufferPool;
+use bicdb_storage::buffer::{BufferKey, BufferPool};
 use bicdb_storage::controlfile::{CheckpointProgress, ControlFileError};
+use bicdb_storage::rowid::Rdba;
+use bicdb_storage::undo::{repair_committed_slots, UndoChain, UndoChainError, UndoError};
 
 use crate::group::{GroupError, GroupWriter};
 use crate::record::RedoRecord;
@@ -61,6 +63,12 @@ pub enum CheckpointError {
     ControlFile(ControlFileError),
     /// 缓冲池错误（写回失败）。
     Pool(bicdb_storage::buffer::BufferError),
+    /// Undo chain or transaction slot repair.
+    Chain(UndoChainError),
+    /// Transaction slot structure.
+    Undo(UndoError),
+    /// Checkpoint requires the live undo chain bound to this pool.
+    InvalidUndo(&'static str),
     /// **低水位回退**——违反单调性，拒绝发布。
     Regression {
         /// 控制文件里的现值。
@@ -76,6 +84,9 @@ impl std::fmt::Display for CheckpointError {
             CheckpointError::Group(e) => write!(f, "检查点日志：{e}"),
             CheckpointError::ControlFile(e) => write!(f, "检查点控制文件：{e}"),
             CheckpointError::Pool(e) => write!(f, "检查点写回：{e}"),
+            CheckpointError::Chain(e) => write!(f, "检查点 undo 链：{e}"),
+            CheckpointError::Undo(e) => write!(f, "检查点事务表：{e}"),
+            CheckpointError::InvalidUndo(e) => write!(f, "检查点 undo：{e}"),
             CheckpointError::Regression { old, new } => write!(
                 f,
                 "低水位不得回退：现值 {}，请求 {}",
@@ -120,7 +131,7 @@ pub fn low_water(pool: &BufferPool<'_>, workspace: [u8; 8], log_end: Lsn) -> Lsn
 /// 为什么**发布在前**：日志可能正卡在"组满 + 下一组未降级"（`AwaitingCheckpoint`）
 /// ——此时**记录根本写不进去**；而破除阻塞的正是这次发布（降级靠它）。
 /// 检查点记录是诊断 / PITR 的锚，**恢复起点以 CF 为准**，先发布不损正确性：
-/// 之间崩溃 ⇒ 恢复仍从旧（更保守的）起点重放。
+/// 之间崩溃 ⇒ 恢复从已发布的进度开始；该进度之前的页已耐久。
 pub fn publish_checkpoint(
     writer: &mut GroupWriter<'_, '_>,
     progress: CheckpointProgress,
@@ -178,6 +189,62 @@ pub fn full_checkpoint(
     };
     let mut report = publish_checkpoint(writer, progress)?;
     report.pages_written = flushed.pages_written;
+    Ok(report)
+}
+
+/// Full checkpoint at a completed write-operation boundary, including active
+/// transactions. The caller holds the workspace writer and undo-chain locks
+/// and has no outstanding page shadows or guards. Undo and transaction slots
+/// are persisted along with data; recovery finds pre-checkpoint losers by
+/// scanning those slots. Commit marks must be repaired before their WAL is reused.
+pub fn transaction_checkpoint(
+    writer: &mut GroupWriter<'_, '_>,
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+    oldest_snapshot_commit_seq: CommitSeq,
+    timestamp: u64,
+) -> Result<CheckpointReport, CheckpointError> {
+    if chain.bound_pool_addr() != Some(pool as *const _ as usize) {
+        return Err(CheckpointError::InvalidUndo(
+            "chain must be bound to the checkpoint pool",
+        ));
+    }
+    let end = writer.appended_lsn();
+    writer.flush(end)?;
+    let mut header = chain.page(0).map_err(CheckpointError::Chain)?;
+    let before = *header.as_bytes();
+    repair_committed_slots(&mut header, &writer.checkpoint_commits())
+        .map_err(CheckpointError::Undo)?;
+    if *header.as_bytes() != before {
+        let segment = chain.segment();
+        let block = segment
+            .logical_block(0)
+            .ok_or(CheckpointError::InvalidUndo("missing header block"))?;
+        let rdba = Rdba::from_parts(segment.file_id(), block)
+            .ok_or(CheckpointError::InvalidUndo("invalid header address"))?;
+        let mut h = header
+            .header()
+            .ok_or(CheckpointError::InvalidUndo("invalid header page"))?;
+        // end is the NEXT record position; stamping end would skip its redo.
+        let stamp = Lsn::from_raw(end.as_raw().saturating_sub(1)).expect("LSN domain");
+        h.page_lsn = h.page_lsn.max(stamp);
+        header.write_header(&h);
+        header.bump_mod_seq();
+        let mut guard = pool.pin(BufferKey::new(segment.workspace_ref(), rdba))?;
+        guard.as_bytes_mut().copy_from_slice(header.as_bytes());
+        guard.mark_dirty(stamp);
+    }
+    let current = writer.commit_watermark();
+    let report = full_checkpoint(
+        writer,
+        pool,
+        chain.segment().workspace_ref(),
+        current,
+        current,
+        oldest_snapshot_commit_seq,
+        timestamp,
+    )?;
+    writer.clear_checkpoint_commits();
     Ok(report)
 }
 

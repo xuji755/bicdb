@@ -214,6 +214,79 @@ pub struct ObjectVersion {
 }
 
 impl<'io> Catalog<'io> {
+    /// Sanitized dictionary rows for SQL read-only sources. Authentication and
+    /// workspace visibility are enforced by the SQL resolver before this call.
+    pub fn sql_dictionary_rows(
+        &mut self,
+        snapshot: CommitSeq,
+        name: &str,
+    ) -> Result<Vec<Vec<crate::row::DictValue>>, CatalogError> {
+        use crate::row::DictValue;
+        let definition = crate::dict::DICT_TABLES
+            .iter()
+            .find(|table| table.name == name)
+            .ok_or(CatalogError::NotFound)?;
+        self.resolve(snapshot, crate::dict::namespace::TABLE, name)?;
+        let password_owner = if name == "col$" && self.is_public() {
+            Some(
+                self.resolve(snapshot, crate::dict::namespace::TABLE, "user$")?
+                    .obj,
+            )
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        for (_, mut values) in self.scan(name)? {
+            if values.len() != definition.columns.len() {
+                return Err(CatalogError::Row(RowCodecError::ColumnCount {
+                    expected: definition.columns.len(),
+                    got: values.len(),
+                }));
+            }
+            // Hide credential structure as well as credential values.
+            if password_owner.is_some_and(|obj| {
+                values.first() == Some(&DictValue::Num(u64::from(obj)))
+                    && values.get(2) == Some(&DictValue::Text("passwd".to_owned()))
+            }) {
+                continue;
+            }
+            if name == "user$" {
+                values = values
+                    .into_iter()
+                    .zip(definition.columns)
+                    .filter_map(|(value, column)| (column.name != "passwd").then_some(value))
+                    .collect();
+            }
+            rows.push(values);
+        }
+        Ok(rows)
+    }
+
+    /// List actual live table descriptors in this workspace, including dictionary
+    /// tables. This metadata API grants no permission to read dictionary rows.
+    pub fn tables(&mut self) -> Result<Vec<ObjectRef>, CatalogError> {
+        let mut tables = Vec::new();
+        for (_, values) in self.scan("obj$")? {
+            let row = ObjRow::from_values(&values)?;
+            if row.type_code == crate::dict::obj_kind::TABLE && row.status == 1 {
+                tables.push(ObjectRef::of(&row));
+            }
+        }
+        tables.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(tables)
+    }
+    /// List live native graph objects in this workspace only.
+    pub fn graphs(&mut self) -> Result<Vec<ObjectRef>, CatalogError> {
+        let mut graphs = Vec::new();
+        for (_, values) in self.scan("obj$")? {
+            let row = ObjRow::from_values(&values)?;
+            if row.type_code == crate::dict::obj_kind::GRAPH && row.status == 1 {
+                graphs.push(ObjectRef::of(&row));
+            }
+        }
+        graphs.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(graphs)
+    }
     // ───────────────────────── 装载戳 ─────────────────────────
 
     /// **当前的提交序号**（装载戳 = 缓存条目的 `loaded_at`）。

@@ -43,6 +43,10 @@ pub struct SourcePlan {
     pub seg_block: u32,
     /// **固定表名**（`None` = 普通表）：行由引擎即时产生，开扫描走内存游标。
     pub fixed: Option<&'static str>,
+    /// Text literals/parameters for a read-only table-valued function.
+    pub function_args: Option<Vec<crate::bind::statement::TableArgument>>,
+    /// Read-only typed Cypher source.
+    pub graph_table: Option<crate::bind::statement::BoundGraphTable>,
     /// 行形状。
     pub shape: RowShape,
 }
@@ -105,7 +109,10 @@ pub fn plan_statement(
         BoundStatement::SetOp(o) => Ok(Some(plan_setop(o, seg_block_of)?)),
         BoundStatement::Update(u) => Ok(Some(plan_update(u, seg_block_of)?)),
         BoundStatement::Delete(d) => Ok(Some(plan_delete(d, seg_block_of)?)),
-        BoundStatement::Ddl(_) | BoundStatement::Transaction(_) | BoundStatement::Dcl(_) => {
+        BoundStatement::ShowTables
+        | BoundStatement::Ddl(_)
+        | BoundStatement::Transaction(_)
+        | BoundStatement::Dcl(_) => {
             Ok(None) // 不走算子通道
         }
     }
@@ -128,6 +135,8 @@ fn plan_select(
                 None => seg_block_of.segment_block(t.obj.obj)?,
             },
             fixed: t.fixed,
+            function_args: t.function_args.clone(),
+            graph_table: t.graph_table.clone(),
             shape: t.shape.clone(),
         });
     }
@@ -323,6 +332,17 @@ fn plan_insert(
             })?;
             let mut shifted = sub.clone();
             shifted.node = shift_sources(&sub.node, 1);
+            // SELECT 结果按目标列清单映射到整行；未列出的列填 NULL。
+            // 来源列序不能直接当表列序，且来源宽度可以小于表宽度。
+            let mut exprs = vec![PlanExpr::Literal(Value::Null); width];
+            for (source_col, target_col) in i.target_cols.iter().enumerate() {
+                exprs[*target_col] = PlanExpr::Column(source_col);
+            }
+            shifted.node = PlanNode::Project {
+                input: Box::new(shifted.node),
+                exprs,
+            };
+            shifted.output = i.table_shape.clone();
             for s in shifted.sources.iter_mut() {
                 s.id += 1;
             }
@@ -335,6 +355,8 @@ fn plan_insert(
         dataobj: i.table.dataobj,
         seg_block,
         fixed: None, // 写目标恒是普通表（固定表没有写入口）
+        function_args: None,
+        graph_table: None,
         shape: i.table_shape.clone(),
     }];
     if let Some(sub) = &insert_source {
@@ -458,6 +480,8 @@ fn plan_update(
             dataobj: u.table.dataobj,
             seg_block,
             fixed: None, // 写目标恒是普通表（固定表没有写入口）
+            function_args: None,
+            graph_table: None,
             shape: u.table_shape.clone(),
         }],
         kind: PlanKind::Update,
@@ -488,6 +512,8 @@ fn plan_delete(
             dataobj: d.table.dataobj,
             seg_block,
             fixed: None, // 写目标恒是普通表（固定表没有写入口）
+            function_args: None,
+            graph_table: None,
             shape: d.table_shape.clone(),
         }],
         kind: PlanKind::Delete,
@@ -516,7 +542,7 @@ fn plan_setop(
             ..s.clone()
         });
     }
-    let node = match o.kind {
+    let mut node = match o.kind {
         BoundSetKind::Union => {
             let append = PlanNode::Append {
                 inputs: vec![left.node.clone(), right_node],
@@ -545,6 +571,27 @@ fn plan_setop(
             width: o.width,
         },
     };
+    if !o.sort.is_empty() {
+        let keys = o.sort.iter().map(sort_key_output).collect();
+        node = match o.limit {
+            Some(n) => PlanNode::TopN {
+                input: Box::new(node),
+                keys,
+                keep: n.saturating_add(o.offset),
+            },
+            None => PlanNode::Sort {
+                input: Box::new(node),
+                keys,
+            },
+        };
+    }
+    if o.limit.is_some() || o.offset > 0 {
+        node = PlanNode::Limit {
+            input: Box::new(node),
+            limit: o.limit.unwrap_or(u64::MAX),
+            offset: o.offset,
+        };
+    }
     Ok(PhysicalPlan {
         node,
         insert_source: None,
@@ -654,9 +701,9 @@ fn try_index_inner(
             seg_page0,
             key_kind,
             shape: right.shape.clone(),
-            low: Some(PlanExpr::Param(0)),
+            low: Some(PlanExpr::Param(s.params.len())),
             low_exclusive: false,
-            high: Some(PlanExpr::Param(0)),
+            high: Some(PlanExpr::Param(s.params.len())),
             high_exclusive: false,
             points: Vec::new(),
             covered: false,
@@ -1036,6 +1083,7 @@ fn value_kind_of(v: &Value) -> Option<ColKind> {
         Value::Number(_) => Some(ColKind::Number),
         Value::Bool(_) => Some(ColKind::Bool),
         Value::Bytes(_) => Some(ColKind::Bytes),
+        Value::GraphElement(_) => Some(ColKind::GraphElement),
     }
 }
 

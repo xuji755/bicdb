@@ -18,6 +18,70 @@ use bicdb_cli::config::InstanceParams;
 use bicdb_exec::Value;
 use bicdb_sql::session::{QueryResult, Session, SessionError};
 
+#[test]
+fn growing_rows_near_page_capacity_migrate_and_preserve_rollback_and_restart() {
+    let dir = TempDir::new("near-full-growing-rows");
+    let mut inst = create_instance(&params_for(dir.path()), None).expect("建区");
+    ok(
+        &mut inst,
+        "CREATE TABLE growing_rows (id NUMBER NOT NULL, value VARCHAR2(1024))",
+    );
+    ok(
+        &mut inst,
+        "CREATE UNIQUE INDEX growing_rows_pk ON growing_rows(id)",
+    );
+    let original = "a".repeat(200);
+    let values = (0..80)
+        .map(|id| format!("({id},'{original}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    ok(
+        &mut inst,
+        &format!("INSERT INTO growing_rows VALUES {values}"),
+    );
+    let before = rows(&ok(
+        &mut inst,
+        "SELECT id, value FROM growing_rows ORDER BY id",
+    ));
+    let longer = "b".repeat(201);
+    let rolled_back = ok(
+        &mut inst,
+        &format!("BEGIN; UPDATE growing_rows SET value = '{longer}'; ROLLBACK"),
+    );
+    assert_eq!(affected(&rolled_back[1..2]), 80);
+    assert_eq!(
+        rows(&ok(
+            &mut inst,
+            "SELECT id, value FROM growing_rows ORDER BY id"
+        )),
+        before
+    );
+    assert_eq!(
+        affected(&ok(
+            &mut inst,
+            &format!("UPDATE growing_rows SET value = '{longer}'")
+        )),
+        80
+    );
+    let after = rows(&ok(
+        &mut inst,
+        "SELECT id, value FROM growing_rows ORDER BY id",
+    ));
+    assert_eq!(after.len(), 80);
+    assert!(after.iter().all(|row| row[1] == longer));
+    inst.shutdown().expect("关闭");
+    drop(inst);
+    let mut inst = open_instance(&params_for(dir.path())).expect("恢复");
+    assert_eq!(
+        rows(&ok(
+            &mut inst,
+            "SELECT id, value FROM growing_rows ORDER BY id"
+        )),
+        after
+    );
+    inst.shutdown().expect("关闭");
+}
+
 /// 一个测试独占的实例目录（进程号 + 名字；跑完删）。
 struct TempDir(PathBuf);
 
@@ -902,6 +966,222 @@ fn index_equality_lookups_stay_correct_through_stale_entries() {
 /// 数值参数（测试里手搓 `Value`）。
 fn num_val(n: i64) -> Value {
     Value::Number(bicdb_types::Number::parse(&n.to_string()).expect("数值"))
+}
+
+#[test]
+fn audit_parameters_reach_dml_and_insert_select() {
+    let dir = TempDir::new("audit-params");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    ok(&mut inst, "CREATE TABLE t (id NUMBER, v NUMBER)");
+    ok(&mut inst, "INSERT INTO t VALUES (1,10),(2,20)");
+    let seq = inst.seq();
+    let mut s = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    assert_eq!(
+        s.execute_with_params(
+            "UPDATE t SET v = :v WHERE id = :id",
+            &[("v", num_val(99)), ("id", num_val(1))]
+        )
+        .unwrap(),
+        vec![QueryResult::Affected(1)]
+    );
+    assert_eq!(
+        s.execute_with_params("DELETE FROM t WHERE id = :id", &[("id", num_val(2))])
+            .unwrap(),
+        vec![QueryResult::Affected(1)]
+    );
+    assert_eq!(
+        s.execute_with_params(
+            "INSERT INTO t SELECT id + :delta, v FROM t WHERE id = :id",
+            &[("delta", num_val(2)), ("id", num_val(1))]
+        )
+        .unwrap(),
+        vec![QueryResult::Affected(1)]
+    );
+    assert_eq!(
+        rows(&s.execute("SELECT id, v FROM t ORDER BY id").unwrap()),
+        vec![vec!["1", "99"], vec!["3", "99"]]
+    );
+}
+
+#[test]
+fn audit_set_operations_apply_tail_to_the_entire_result() {
+    let dir = TempDir::new("audit-set-tail");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT 9 AS n UNION ALL SELECT 1 ORDER BY n LIMIT 1",
+            vec![vec!["1"]],
+        ),
+        (
+            "SELECT 9 AS n UNION ALL SELECT 1 UNION ALL SELECT 5 ORDER BY n LIMIT 1 OFFSET 1",
+            vec![vec!["5"]],
+        ),
+        ("SELECT 9 AS n UNION ALL SELECT 1 LIMIT 0", vec![]),
+        ("SELECT 9 AS n EXCEPT SELECT 1 LIMIT 0", vec![]),
+    ] {
+        assert_eq!(rows(&ok(&mut inst, sql)), expected, "{sql}");
+    }
+}
+
+#[test]
+fn audit_set_operations_share_a_named_parameter_namespace() {
+    let dir = TempDir::new("audit-set-params");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    assert_eq!(ok_params(&mut inst, "SELECT CAST(:a AS NUMBER) AS n UNION ALL SELECT CAST(:b AS NUMBER) UNION ALL SELECT CAST(:a AS NUMBER) ORDER BY n", &[("a", num_val(9)), ("b", num_val(1))]), vec![vec!["1"], vec!["9"], vec!["9"]]);
+}
+
+#[test]
+fn audit_join_parameters_survive_both_access_paths() {
+    let dir = TempDir::new("audit-join-params");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    ok(
+        &mut inst,
+        "CREATE TABLE a (id NUMBER); CREATE TABLE b (id NUMBER)",
+    );
+    ok(
+        &mut inst,
+        "INSERT INTO a VALUES (1),(2); INSERT INTO b VALUES (1),(2)",
+    );
+    for indexed in [false, true] {
+        if indexed {
+            ok(&mut inst, "CREATE INDEX b_id ON b (id)");
+        }
+        assert_eq!(
+            ok_params(
+                &mut inst,
+                "SELECT a.id + :delta FROM a JOIN b ON a.id = b.id AND b.id = :id WHERE a.id = :id",
+                &[("delta", num_val(10)), ("id", num_val(2))]
+            ),
+            vec![vec!["12"]],
+            "indexed={indexed}"
+        );
+    }
+}
+
+#[test]
+fn audit_unique_precheck_does_not_poison_later_statements() {
+    let dir = TempDir::new("audit-unique-seen");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    ok(
+        &mut inst,
+        "CREATE TABLE t (id NUMBER); CREATE UNIQUE INDEX t_id ON t(id)",
+    );
+    let seq = inst.seq();
+    let mut s = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    s.execute(
+        "BEGIN; INSERT INTO t VALUES (1); DELETE FROM t WHERE id = 1; INSERT INTO t VALUES (1)",
+    )
+    .unwrap();
+    assert!(s.execute("INSERT INTO t VALUES (2),(2)").is_err());
+    s.execute("INSERT INTO t VALUES (2)").unwrap();
+    assert!(s.execute("INSERT INTO t VALUES (1)").is_err());
+    s.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&s.execute("SELECT id FROM t ORDER BY id").unwrap()),
+        vec![vec!["1"], vec!["2"]]
+    );
+}
+
+#[test]
+fn audit_invalid_parameter_names_are_rejected_before_writing() {
+    let dir = TempDir::new("audit-param-validation");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    ok(&mut inst, "CREATE TABLE t (id NUMBER)");
+    let seq = inst.seq();
+    let mut s = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    assert!(s
+        .execute_with_params("INSERT INTO t VALUES (1)", &[("unused", num_val(2))])
+        .is_err());
+    assert!(s
+        .execute_with_params(
+            "INSERT INTO t VALUES (:id)",
+            &[("id", num_val(2)), ("id", num_val(3))]
+        )
+        .is_err());
+    assert!(s
+        .execute_with_params(
+            "BEGIN; INSERT INTO t VALUES (4); COMMIT",
+            &[("unused", num_val(5))]
+        )
+        .is_err());
+    assert!(rows(&s.execute("SELECT id FROM t").unwrap()).is_empty());
+    // 参数名一样的字符串和注释不能被当成参数使用。
+    assert!(s
+        .execute_with_params("SELECT ':unused' /* :unused */", &[("unused", num_val(5))])
+        .is_err());
+}
+
+#[test]
+fn audit_duplicate_insert_target_columns_are_rejected() {
+    let dir = TempDir::new("audit-insert-cols");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    ok(&mut inst, "CREATE TABLE t (id NUMBER, v NUMBER)");
+    assert!(run(&mut inst, "INSERT INTO t (id,id) VALUES (1,2)").is_err());
+    assert!(run(&mut inst, "INSERT INTO t (id,id) SELECT 1,2").is_err());
+    assert!(rows(&ok(&mut inst, "SELECT * FROM t")).is_empty());
+}
+
+#[test]
+fn audit_insert_select_maps_target_columns_and_fills_omissions() {
+    let dir = TempDir::new("audit-insert-select-cols");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    ok(
+        &mut inst,
+        "CREATE TABLE t (id NUMBER, v NUMBER, note VARCHAR2(8))",
+    );
+    ok(
+        &mut inst,
+        "INSERT INTO t (v,id) SELECT 20,1; INSERT INTO t (id) SELECT 2",
+    );
+    assert_eq!(
+        rows(&ok(&mut inst, "SELECT * FROM t ORDER BY id")),
+        vec![vec!["1", "20", "NULL"], vec!["2", "NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn audit_writes_enforce_not_null_and_byte_lengths_atomically() {
+    let dir = TempDir::new("audit-column-constraints");
+    let mut inst = create_instance(&params_for(dir.path()), None).unwrap();
+    ok(
+        &mut inst,
+        "CREATE TABLE t (id NUMBER NOT NULL, v VARCHAR2(3))",
+    );
+    for sql in [
+        "INSERT INTO t VALUES (NULL,'x')",
+        "INSERT INTO t (v) VALUES ('x')",
+        "INSERT INTO t SELECT NULL,'x'",
+        "INSERT INTO t VALUES (1,'abcd')",
+        "INSERT INTO t VALUES (1,'汉字')",
+        "INSERT INTO t VALUES (1,'ok'),(2,'long')",
+    ] {
+        assert!(run(&mut inst, sql).is_err(), "必须拒绝：{sql}");
+    }
+    assert!(rows(&ok(&mut inst, "SELECT * FROM t")).is_empty());
+    ok(&mut inst, "INSERT INTO t VALUES (1,'汉'),(2,'ok')");
+    for sql in [
+        "UPDATE t SET id = NULL",
+        "UPDATE t SET v = 'long'",
+        "UPDATE t SET v = CASE WHEN id = 1 THEN 'new' ELSE 'long' END",
+    ] {
+        assert!(run(&mut inst, sql).is_err(), "必须拒绝：{sql}");
+    }
+    assert_eq!(
+        rows(&ok(&mut inst, "SELECT * FROM t ORDER BY id")),
+        vec![vec!["1", "汉"], vec!["2", "ok"]]
+    );
+    let seq = inst.seq();
+    let mut s = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    s.execute("BEGIN; INSERT INTO t VALUES (3,'ok')").unwrap();
+    assert!(s
+        .execute("UPDATE t SET v = CASE WHEN id = 1 THEN 'new' ELSE 'long' END")
+        .is_err());
+    assert!(s.in_transaction());
+    s.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&s.execute("SELECT * FROM t ORDER BY id").unwrap()),
+        vec![vec!["1", "汉"], vec!["2", "ok"], vec!["3", "ok"]]
+    );
 }
 
 /// 带参数跑一条（返回结果集的行）。

@@ -201,6 +201,10 @@ fn serialize_rows(rows: &[Row]) -> Result<Vec<u8>, ExecError> {
                     out.extend_from_slice(&(b.len() as u32).to_le_bytes());
                     out.extend_from_slice(b);
                 }
+                Value::GraphElement(v) => {
+                    out.push(4);
+                    out.extend_from_slice(&crate::value::encode_graph_element(*v));
+                }
             }
         }
     }
@@ -265,6 +269,14 @@ fn try_parse_one_row(blob: &[u8], at: &mut usize) -> Result<Option<Row>, ExecErr
                 let b = blob[p..p + len].to_vec();
                 p += len;
                 Value::Bytes(b)
+            }
+            4 => {
+                if p + 13 > blob.len() {
+                    return Ok(None);
+                }
+                let value = crate::value::decode_graph_element(&blob[p..p + 13])?;
+                p += 13;
+                Value::GraphElement(value)
             }
             _ => return Err(ExecError::Spill(format!("溢出流未知值 tag {tag}"))),
         };
@@ -482,6 +494,11 @@ mod tests {
                 Value::Bytes(vec![1, 2, 3]),
             ]),
             Row::new(vec![Value::Bytes(b"hello".to_vec())]),
+            Row::new(vec![Value::GraphElement(crate::value::GraphElement {
+                graph: 42,
+                kind: crate::value::GraphElementKind::Node,
+                id: 7,
+            })]),
         ];
         let blob = serialize_rows(&rows).unwrap();
         assert_eq!(deserialize_rows(&blob).unwrap(), rows, "往返无损");

@@ -1725,6 +1725,11 @@ pub fn rollback_record(
 /// 阶段就是普通回滚的重放）：补偿都是"把某处置回旧值"，重复应用不产生
 /// 额外效果——已"确保不存在"的行再删 = 无操作；已原位恢复的行再写 = 无操作。
 pub fn apply_undo_to_page(page: &mut Page, record: &UndoRecord) -> Result<(), RollbackError> {
+    if page.header().map(|header| header.page_type) == Some(crate::page::PageType::Adjacency)
+        && record.op != UndoOp::ItlOverwrite
+    {
+        return crate::adjacency::apply_undo(page, record);
+    }
     let row_no = record.rowid.row_id();
     let index = crate::heap::slot_index(row_no)
         .ok_or(RollbackError::Undo(UndoError::SlotOutOfRange(row_no)))?;

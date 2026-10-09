@@ -188,7 +188,7 @@ impl<'s, S: PageStore> Tree<'s, S> {
         Ok(block)
     }
 
-    /// **右移**到"该键应属"的叶（键 ≥ 高键 ⇒ 沿 `link_next`）。
+    /// 高键仅保存 key，不含 ROWID：先右移，再沿前驱校正重复键的复合下界。
     fn settle_leaf(
         &mut self,
         mut block: u32,
@@ -199,13 +199,41 @@ impl<'s, S: PageStore> Tree<'s, S> {
             let page = self.store.read(block)?;
             let view = IndexPage::new(&page)?;
             if !view.needs_right_move(key, rowid)? {
-                return Ok(block);
+                break;
             }
             let (_, next) = view.links()?;
             if next == no_link() {
-                return Ok(block); // ∞ 高键已由 needs_right_move 排除；防御
+                break; // ∞ 高键已由 needs_right_move 排除；防御
             }
             block = crate::store::block_of(next);
+        }
+        let target = Entry::Leaf {
+            key: key.to_vec(),
+            rowid: rowid.unwrap_or_else(|| RowId::from_bytes(&[0u8; 6])),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut candidate = block;
+        loop {
+            if !seen.insert(block) {
+                return Err(IndexError::Malformed("叶前驱链形成环"));
+            }
+            let page = self.store.read(block)?;
+            let previous = IndexPage::new(&page)?.links()?.0;
+            if previous == no_link() {
+                return Ok(candidate);
+            }
+            let previous_block = crate::store::block_of(previous);
+            let previous_page = self.store.read(previous_block)?;
+            let previous_view = IndexPage::new(&previous_page)?;
+            let count = usize::from(previous_view.entry_count());
+            if count > 1 && cmp_entries(&previous_view.entry(count - 1)?, &target) == Ordering::Less
+            {
+                return Ok(candidate);
+            }
+            if count > 1 {
+                candidate = previous_block;
+            }
+            block = previous_block;
         }
     }
 
@@ -841,10 +869,10 @@ impl<'s, S: PageStore> Tree<'s, S> {
                         return Err(IndexError::Malformed("叶链键序非单调"));
                     }
                 }
-                // 条目 < 高键（∞ 除外）。
+                // 高键不含 ROWID；重复 key 可以跨叶，等于高键合法。
                 if let Some(hk) = &high {
-                    if sk.0.as_slice() >= hk.as_slice() {
-                        return Err(IndexError::Malformed("条目不小于高键"));
+                    if sk.0.as_slice() > hk.as_slice() {
+                        return Err(IndexError::Malformed("条目大于高键"));
                     }
                 }
                 prev_key = Some(sk);

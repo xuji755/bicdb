@@ -175,6 +175,23 @@ pub fn file_extend_blocks() -> u64 {
     FILE_EXTEND_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// Initial DDL allocation and later segment growth use the same bounded policy.
+// Otherwise a file full of existing rows can grow those rows but cannot create
+// the next graph/full-text index, despite autoextend being configured.
+fn plan_extent_growing(
+    file: &mut crate::datafile::DataFile<'_>,
+    current: CurrentPages<'_>,
+) -> Result<crate::datafile::PlannedExtent, SegmentSpaceError> {
+    match file.plan_allocate_extent(current) {
+        Ok(planned) => Ok(planned),
+        Err(crate::datafile::DataFileError::FileFull) => {
+            file.extend(file.blocks() + file_extend_blocks())?;
+            Ok(file.plan_allocate_extent(current)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// 段头（公共部分的值形态；§5.11）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
@@ -662,7 +679,7 @@ pub fn plan_create(
     table_opts: u16,
     current: CurrentPages<'_>,
 ) -> Result<PlannedCreate, SegmentSpaceError> {
-    let planned = file.plan_allocate_extent(current)?;
+    let planned = plan_extent_growing(file, current)?;
     let page0 = file.layout().first_block_of(planned.extent);
     let file_id = file.file_id();
     // 文件级位图页的镜像 → rdba（与 `plan_extend` 同款换算）。
@@ -838,6 +855,18 @@ impl<'io, 'f> Segment<'io, 'f> {
         })
     }
 
+    /// Refresh the cached segment header and extent mapping after physical WAL
+    /// replay. Recovery runs before binding a buffer pool; active pooled writers
+    /// must continue using their planned/current metadata instead of this read.
+    pub fn refresh_after_replay(&mut self) -> Result<(), SegmentSpaceError> {
+        let page = self.file.read_page(self.page0)?;
+        let header = read_header(&page)?;
+        let map = read_extents(&page)?;
+        self.header = header;
+        self.map = map;
+        Ok(())
+    }
+
     /// **打开既有段（池优先的段头读）**——活系统形态。
     ///
     /// **为什么需要它**：段头页是 no-force 的（与撤销页/元数据页同规）——写路径
@@ -990,15 +1019,7 @@ impl<'io, 'f> Segment<'io, 'f> {
         &mut self,
         current: CurrentPages<'_>,
     ) -> Result<crate::datafile::PlannedExtent, SegmentSpaceError> {
-        match self.file.plan_allocate_extent(current) {
-            Ok(p) => Ok(p),
-            Err(crate::datafile::DataFileError::FileFull) => {
-                let want = self.file.blocks() + file_extend_blocks();
-                self.file.extend(want)?;
-                Ok(self.file.plan_allocate_extent(current)?)
-            }
-            Err(e) => Err(e.into()),
-        }
+        plan_extent_growing(self.file, current)
     }
 
     /// **计划扩展**（**不写盘**）：分配新区 + 段头页（区映射/计数）+ 段内
@@ -1709,6 +1730,62 @@ mod space_tests {
         assert_eq!(bitmap::free_level(&bmp, 1).unwrap(), FreeLevel::Full);
         assert_eq!(bitmap::free_level(&bmp, 2).unwrap(), FreeLevel::High);
         assert_eq!(bitmap::free_level(&bmp, 7).unwrap(), FreeLevel::High);
+    }
+
+    #[test]
+    fn planned_creation_autoextends_without_reusing_pending_extents() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(F), 3, 3, WS, 512).unwrap();
+        let blocks = file.blocks();
+        let runs = file.runs().to_vec();
+        let mut pending = std::collections::BTreeMap::<u32, Page>::new();
+        let mut reserved = std::collections::BTreeSet::new();
+        loop {
+            let plan = file.plan_allocate_extent(&mut |block| pending.get(&block).cloned());
+            match plan {
+                Ok(plan) => {
+                    assert!(reserved.insert(file.layout().first_block_of(plan.extent)));
+                    for (index, _, after) in plan.images {
+                        pending.insert(plan.run_start + u32::from(index), after);
+                    }
+                }
+                Err(crate::datafile::DataFileError::FileFull) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        // Disk remains behind these no-force allocations. Ignoring `current`
+        // would reuse the first extent, rather than growing the file.
+        assert_eq!(
+            file.plan_allocate_extent(&mut |_| None).unwrap().extent,
+            crate::bitmap::ExtentNo::from_raw(0).unwrap()
+        );
+        let plan = plan_create(
+            &mut file,
+            SegType::Adjacency,
+            91,
+            91,
+            8,
+            0,
+            0,
+            &mut |block| pending.get(&block).cloned(),
+        )
+        .unwrap();
+        assert!(file.blocks() > blocks);
+        assert_eq!(file.runs(), runs);
+        // A formerly incomplete tail extent can begin before the old EOF;
+        // its full allocation must cross it and require the extension.
+        assert!(u64::from(plan.page0) + u64::from(EXTENT_BLOCKS) > blocks);
+        assert!(!reserved.contains(&plan.page0));
+        assert_eq!(read_header(&plan.fresh[0].1).unwrap().obj, 91);
+        for (address, before, _) in plan.images {
+            if let Some(current) = pending.get(&address.block_id()) {
+                assert_eq!(
+                    before.as_bytes(),
+                    current.as_bytes(),
+                    "allocation uses current bitmap"
+                );
+            }
+        }
     }
 
     #[test]

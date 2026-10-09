@@ -15,16 +15,16 @@
 //! 回滚：沿链从新到旧补偿（每条都经池、带 redo）→ 释放槽
 //! ```
 //!
-//! # 为什么撤销页也走缓冲池（且**立即落盘**）
+//! # 撤销页也走缓冲池（no-force）
 //!
 //! §11.1.2：**undo 自身必须受 redo 保护**。本模块把 [`UndoChain::plan_append`]
 //! 的计划页**经缓冲池**写入：每页（撤销页 / 段头页 / 位图页）都按
 //! "差异 → redo 记录 → page_lsn → 标脏" 走一遍（WAL 规则 2 由池保证）。
 //!
-//! 与数据页不同，撤销页**写后立即 `flush`**（仍是经池的写：redo 先落、
-//! page_lsn 推进、WAL 规则 2 强制）。理由：链的读取是**直读段文件**的
-//! （`UndoChain::read` 供回滚/CR 用），立即落盘让"池里的写"与"文件里的读"
-//! 始终一致；数据页保持 no-force（提交路径上没有数据页 I/O 的纪律不变）。
+//! 数据页与撤销页均先留在缓存，提交不强制写回数据/Undo 文件。活系统的
+//! 撤销链读取必须通过绑定的同一个缓冲池（`UndoChain::with_pool`），以看到
+//! 尚未写回的内容。检查点或缓存空间压力才写回脏页，写回前仍强制满足
+//! WAL 规则 2；redo 提交记录必须先持久化，才可向调用者确认提交。
 //!
 //! # 顺序（不可换）
 //!
@@ -44,13 +44,20 @@ use bicdb_storage::undo::{
 use bicdb_wal::group::{GroupError, GroupWriter};
 use bicdb_wal::record::{page_diff, BlockRef, RedoRecord};
 
+/// Transactional type-5 adjacency-page writes, sharing the ordinary ITL/undo/WAL path.
+pub mod adjacency;
+
 /// 写路径错误。
 #[derive(Debug)]
 pub enum TxnError {
+    /// Adjacency-page format, capacity or relationship identity error.
+    Adjacency(bicdb_storage::adjacency::AdjacencyError),
     /// 缓冲池。
     Pool(BufferError),
     /// 日志写入。
     Log(GroupError),
+    /// Transaction-aware checkpoint.
+    Checkpoint(bicdb_wal::checkpoint::CheckpointError),
     /// undo 链。
     Chain(UndoChainError),
     /// undo 结构（事务表等）。
@@ -116,8 +123,10 @@ pub enum TxnError {
 impl std::fmt::Display for TxnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TxnError::Adjacency(e) => write!(f, "写路径邻接：{e}"),
             TxnError::Pool(e) => write!(f, "写路径缓冲池：{e}"),
             TxnError::Log(e) => write!(f, "写路径日志：{e}"),
+            TxnError::Checkpoint(e) => write!(f, "写路径检查点：{e}"),
             TxnError::Chain(e) => write!(f, "写路径 undo 链：{e}"),
             TxnError::Undo(e) => write!(f, "写路径 undo：{e}"),
             TxnError::Rollback(e) => write!(f, "写路径回滚：{e}"),
@@ -169,14 +178,41 @@ macro_rules! from_impl {
 from_impl!(
     BufferError => Pool,
     GroupError => Log,
+    bicdb_wal::checkpoint::CheckpointError => Checkpoint,
     UndoChainError => Chain,
     UndoError => Undo,
     RollbackError => Rollback,
     HeapError => Heap,
+    bicdb_storage::adjacency::AdjacencyError => Adjacency,
     ItlError => Itl,
     RowIdRangeError => RowId,
     bicdb_storage::segment::SegmentSpaceError => Segment,
 );
+
+/// Reclaim WAL at a completed operation boundary. Callers hold the single
+/// writer locks and have released all page guards and local pending changes.
+pub fn checkpoint_safe_point(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &UndoChain<'_, '_>,
+) -> Result<(), TxnError> {
+    if matches!(
+        log.switch_blocked(),
+        Some(bicdb_wal::group::SwitchBlocked::AwaitingCheckpoint)
+    ) {
+        require_pool_bound(chain, pool)?;
+        // Conservative diagnostic snapshot watermark: this helper cannot see
+        // the Engine registry. No undo is reclaimed by a checkpoint.
+        bicdb_wal::checkpoint::transaction_checkpoint(
+            log,
+            pool,
+            chain,
+            CommitSeq::from_raw(0).expect("zero"),
+            0,
+        )?;
+    }
+    Ok(())
+}
 
 /// 一个进行中的事务（内存态；持久面在事务表槽与 undo 链上）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +250,7 @@ pub fn begin(
     snapshot: CommitSeq,
 ) -> Result<Txn, TxnError> {
     require_pool_bound(chain, pool)?;
+    checkpoint_safe_point(pool, log, chain)?;
     let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     let (slot, txn_slot) = bicdb_storage::undo::allocate_slot(&mut header_after)?;
@@ -252,6 +289,14 @@ pub fn insert_row(
     policy: &InsertPolicy,
 ) -> Result<RowId, TxnError> {
     require_pool_bound(chain, pool)?;
+    // Deleted slots retain their original offset for undo/consistent reads.
+    // Until slot retirement is tracked against the undo reclaim watermark,
+    // transactional insertion must append a slot rather than overwrite it.
+    let safe_policy = InsertPolicy {
+        reuse_free_slots: false,
+        ..*policy
+    };
+    let policy = &safe_policy;
     // 单闩锁纪律：**不在持有卫兵时调用池**——先在快照上改，再分步回写。
     let (data_before, mut local) = {
         let g = pool.pin(block)?;
@@ -389,6 +434,14 @@ pub fn update_row(
     alloc: &mut dyn FnMut(usize) -> Result<BufferKey, TxnError>,
 ) -> Result<UpdateOutcome, TxnError> {
     require_pool_bound(chain, pool)?;
+    // Deleted slots retain their original offset for undo/consistent reads.
+    // Until slot retirement is tracked against the undo reclaim watermark,
+    // transactional insertion must append a slot rather than overwrite it.
+    let safe_policy = InsertPolicy {
+        reuse_free_slots: false,
+        ..*policy
+    };
+    let policy = &safe_policy;
     let (src_before, mut src_local) = {
         let g = pool.pin(block)?;
         (*g.as_bytes(), Page::from_bytes(Box::new(*g.as_bytes())))
@@ -640,8 +693,8 @@ enum ItlAcquire {
 /// `Committed` + 准确序号、锁计数归零——已提交的槽从此**可复用**（这是 ITL
 /// 槽回收的唯一路径；没有它，同一页 32 个写事务后就是死路）。
 ///
-/// 只清 `Some(Committed)` 的事务表槽：查不到（槽已复用）的条目**不猜**——
-/// 宁可让它占着不可复用，也不把可能的活动事务误判成已提交。
+/// 槽已回收的旧事务不再活动（与 CR 的 `lookup=None => Visible` 契约一致）：
+/// 保留未知提交序号，清除锁计数，允许复用，不能一直扩展 ITL 消耗行空间。
 /// 清除字节随后续语句的页差异一并入 redo（比"清除不生成 redo"保守，语义等价）。
 fn cleanout_committed(page: &mut Page, chain: &UndoChain<'_, '_>) -> Result<(), TxnError> {
     let header = chain.page(0)?;
@@ -650,10 +703,18 @@ fn cleanout_committed(page: &mut Page, chain: &UndoChain<'_, '_>) -> Result<(), 
         if e.state != ItlState::Active {
             continue;
         }
-        if let Some(slot) = bicdb_storage::undo::find_slot(&header, e.txn_id)? {
-            if slot.state == TxnState::Committed {
+        match bicdb_storage::undo::find_slot(&header, e.txn_id)? {
+            Some(slot) if slot.state == TxnState::Committed => {
                 itl::cleanout(page, i, slot.commit_seq)?;
             }
+            None => {
+                let mut retired = e;
+                retired.state = ItlState::Committed;
+                retired.commit_seq = None;
+                retired.lock_cnt = 0;
+                itl::write_itl(page, i, &retired)?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -744,6 +805,16 @@ pub enum LockOutcome {
     },
 }
 
+fn data_itl_slot(page: &Page, ordinal: u16) -> Result<u8, TxnError> {
+    if page.header().map(|h| h.page_type) == Some(bicdb_storage::page::PageType::Adjacency) {
+        let bytes = bicdb_storage::adjacency::record(page, ordinal)?;
+        Ok(bicdb_storage::adjacency::decode(bytes)?.itl_slot)
+    } else {
+        let row = heap::row(page, ordinal).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
+        Ok(row[1])
+    }
+}
+
 /// **在一页上判定某行的锁归属**（不做 I/O、不改页——判定与写入分离，
 /// 等待发生在 latch 之外，§5.4.2）。
 ///
@@ -759,8 +830,7 @@ pub fn decide_row_lock(
     block: BufferKey,
     row_no: u16,
 ) -> Result<LockOutcome, TxnError> {
-    let row = heap::row(local, row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
-    let slot_byte = row[1];
+    let slot_byte = data_itl_slot(local, row_no)?;
     if slot_byte == bicdb_storage::row::ITL_SLOT_NONE {
         return Ok(LockOutcome::Acquired { reentrant: false });
     }
@@ -869,8 +939,7 @@ fn lock_and_occupy(
         }),
         LockOutcome::Acquired { reentrant: true } => {
             // 同一行的重入：槽已就位，不重复计 `lock_cnt`。
-            let row = heap::row(local, row_no).ok_or(TxnError::Heap(HeapError::NoSuchRow))?;
-            Ok((u16::from(row[1]), true))
+            Ok((u16::from(data_itl_slot(local, row_no)?), true))
         }
         LockOutcome::Acquired { reentrant: false } => {
             let (slot, fresh) = occupy_itl(pool, log, chain, txn, local, block, itl_max)?;
@@ -900,6 +969,7 @@ pub fn commit(
     commit_seq: CommitSeq,
 ) -> Result<(), TxnError> {
     require_pool_bound(chain, pool)?;
+    checkpoint_safe_point(pool, log, chain)?;
     let lsn = log.append(|l| RedoRecord::commit(l, txn.raw(), commit_seq.as_raw()))?;
     log.flush(lsn)?; // **提交点**：此后事务已提交（不可再回滚）
 
@@ -948,6 +1018,7 @@ pub fn rollback(
     let mut at = read_slot(&header, txn.slot)?.undo_current;
     let mut count = 0u64;
     while let Some(pos) = at {
+        checkpoint_safe_point(pool, log, chain)?;
         let record = chain.read(pos)?;
         at = record.prev;
         let key = BufferKey::new(
@@ -964,6 +1035,7 @@ pub fn rollback(
         count += 1;
     }
     // 释放槽（经池、带 redo）。
+    checkpoint_safe_point(pool, log, chain)?;
     let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     free_slot(&mut header_after, txn.slot)?;
@@ -977,6 +1049,12 @@ pub fn rollback(
         header_after.as_bytes(),
         false,
     )?;
+    // Releasing the slot makes its undo pages eligible for physical reuse.
+    // Make compensation and the release durable before another transaction
+    // can reuse those pages; otherwise crash recovery can see an old loser
+    // whose undo records have already been overwritten by a new page owner.
+    let done = log.append(|lsn| RedoRecord::rollback_done(lsn, txn.raw()))?;
+    log.flush(done)?;
     txn.state = TxnState::Free;
     Ok(count)
 }
@@ -1107,6 +1185,7 @@ pub fn rollback_to_mark(
     };
     let mut count = 0u64;
     while let Some(pos) = at {
+        checkpoint_safe_point(pool, log, chain)?;
         if Some(pos) == mark.at {
             break;
         }
@@ -1126,6 +1205,7 @@ pub fn rollback_to_mark(
         count += 1;
     }
     // 槽头置回回滚点（幂等：没变就不写）。
+    checkpoint_safe_point(pool, log, chain)?;
     let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
     let mut slot = read_slot(&header_after, txn.slot)?;
@@ -1688,6 +1768,46 @@ mod tests {
         assemble_row(0, 1, &[false], &[], &[payload]).unwrap()
     }
 
+    #[test]
+    fn recycled_transaction_owner_is_cleaned_without_growing_itl() {
+        let io = mem();
+        let mut file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let segment = create_undo_segment(&mut file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment);
+        let slot = chain.allocate_slot().unwrap();
+        let mut header = chain.page(0).unwrap();
+        let owner = bicdb_storage::undo::txn_id_of(
+            slot,
+            &bicdb_storage::undo::read_slot(&header, slot).unwrap(),
+        );
+        bicdb_storage::undo::free_slot(&mut header, slot).unwrap();
+        chain.segment_mut().write_page(0, &mut header).unwrap();
+        assert!(chain.lookup(owner).unwrap().is_none());
+        let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+        itl::write_itl(
+            &mut page,
+            0,
+            &ItlEntry {
+                txn_id: owner,
+                undo_ptr: None,
+                commit_seq: None,
+                lock_cnt: 7,
+                state: ItlState::Active,
+            },
+        )
+        .unwrap();
+        cleanout_committed(&mut page, &chain).unwrap();
+        let cleared = itl::read_itl(&page, 0).unwrap();
+        assert_eq!(cleared.state, ItlState::Committed);
+        assert_eq!(
+            cleared.commit_seq, None,
+            "do not invent a retired owner's commit sequence"
+        );
+        assert_eq!(cleared.lock_cnt, 0);
+        assert_eq!(itl::find_reusable(&page).unwrap(), Some(0));
+        assert_eq!(itl::itl_count(&page).unwrap(), 1);
+    }
+
     /// 期望的"落盘行"：行头 `itl_slot` 由写路径回填为**实际占用的 ITL 槽号**
     /// （调用方给的字节会被改写——见 `insert_row`）。
     fn stored_row(row: &[u8], itl_slot: u8) -> Vec<u8> {
@@ -1844,6 +1964,210 @@ mod tests {
         )
         .unwrap();
         (undo_file, data_handle, pool, cf)
+    }
+
+    #[test]
+    fn checkpoint_repairs_durable_commit_and_recovers_precheckpoint_loser() {
+        let io = mem();
+        let (mut undo_file, data_handle, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let seg_page0 = segment.page0_block();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let policy = InsertPolicy::in_place(0);
+        let bytes = row_bytes(b"durable-winner");
+        let mut winner = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let winner_rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut winner,
+            key,
+            &bytes,
+            &policy,
+        )
+        .unwrap();
+        // Failure window: commit durable, transaction slot still Active.
+        let commit_lsn = log
+            .append(|l| RedoRecord::commit(l, winner.raw(), 7))
+            .unwrap();
+        log.flush(commit_lsn).unwrap();
+        assert_eq!(
+            read_slot(&chain.page(0).unwrap(), winner.slot)
+                .unwrap()
+                .state,
+            TxnState::Active
+        );
+        let mut loser = begin(&pool, &mut log, &mut chain, seq(7)).unwrap();
+        let loser_rid = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut loser,
+            key,
+            &row_bytes(b"old-loser"),
+            &policy,
+        )
+        .unwrap();
+        // Interrupt rollback after applying only the newest inverse. The
+        // checkpoint persists this prefix while the full undo chain remains.
+        for byte in *b"LM" {
+            update_row(
+                &pool,
+                &mut log,
+                &mut chain,
+                &mut loser,
+                key,
+                loser_rid.row_id(),
+                &row_bytes(&vec![byte; b"old-loser".len()]),
+                &policy,
+                &mut |_| Err(TxnError::StaleCache),
+            )
+            .unwrap();
+        }
+        let head = read_slot(&chain.page(0).unwrap(), loser.slot)
+            .unwrap()
+            .undo_current
+            .unwrap();
+        let record = chain.read(head).unwrap();
+        let before = *pool.pin(key).unwrap().as_bytes();
+        let mut partial = Page::from_bytes(Box::new(before));
+        apply_undo_to_page(&mut partial, &record).unwrap();
+        write_page_change(
+            &pool,
+            &mut log,
+            loser.raw(),
+            key,
+            &before,
+            partial.as_bytes(),
+            false,
+        )
+        .unwrap();
+        let checkpoint =
+            bicdb_wal::checkpoint::transaction_checkpoint(&mut log, &pool, &chain, seq(0), 0)
+                .unwrap();
+        assert_eq!(checkpoint.progress.current_commit_seq, seq(7));
+        assert_eq!(
+            read_slot(&chain.page(0).unwrap(), winner.slot)
+                .unwrap()
+                .state,
+            TxnState::Committed
+        );
+        drop(chain);
+        drop(pool);
+        let mut reopened = DataFile::open(&io, Path::new(UNDO_F)).unwrap();
+        let undo_handle = reopened.handle();
+        let mut chain = UndoChain::open(
+            bicdb_storage::segment::Segment::open(&mut reopened, seg_page0).unwrap(),
+        );
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let groups = online_groups(&io, &cf_ro, Path::new(WAL), spec()).unwrap();
+        let mut resolve = |r: Rdba| match r.file_id() {
+            1 => Some((undo_handle, r.block_id())),
+            3 => Some((data_handle, r.block_id())),
+            _ => None,
+        };
+        let report = recover(
+            &io,
+            &groups,
+            checkpoint.progress.checkpoint_lsn,
+            &mut chain,
+            &mut log,
+            &mut resolve,
+        )
+        .unwrap();
+        assert!(
+            report.analysis.committed().is_empty(),
+            "winner commit precedes recovery start"
+        );
+        assert_eq!(report.undo.txns_rolled_back, 1);
+        let page = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
+        assert_eq!(
+            heap::row(&page, winner_rid.row_id()),
+            Some(&stored_row(&bytes, 0)[..])
+        );
+        assert!(heap::row(&page, loser_rid.row_id()).is_none());
+    }
+
+    #[test]
+    fn replacing_deleted_rows_preserves_offsets_and_durable_rollback() {
+        let io = mem();
+        let (mut undo_file, _, pool, mut cf) = harness(&io, ArchiveMode::NoArchive);
+        let segment = create_undo_segment(&mut undo_file, 2, 3, 4).unwrap();
+        let mut chain = UndoChain::open(segment).with_pool(&pool);
+        let mut log = GroupWriter::create(&io, &mut cf, Path::new(WAL), spec(), lsn(0)).unwrap();
+        let key = BufferKey::new(WS, rdba(3, 1));
+        let policy = InsertPolicy::in_place(0);
+        let original = row_bytes(&vec![b'A'; 4096]);
+        let mut seed = begin(&pool, &mut log, &mut chain, seq(0)).unwrap();
+        let old = insert_row(
+            &pool, &mut log, &mut chain, &mut seed, key, &original, &policy,
+        )
+        .unwrap();
+        commit(&pool, &mut log, &mut chain, &mut seed, seq(1)).unwrap();
+        let mut rewrite = begin(&pool, &mut log, &mut chain, seq(1)).unwrap();
+        delete_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut rewrite,
+            key,
+            old.row_id(),
+            &policy,
+        )
+        .unwrap();
+        let replacement = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut rewrite,
+            key,
+            &row_bytes(b"digest"),
+            &policy,
+        )
+        .unwrap();
+        let another = insert_row(
+            &pool,
+            &mut log,
+            &mut chain,
+            &mut rewrite,
+            key,
+            &row_bytes(&vec![b'B'; 4096]),
+            &policy,
+        )
+        .unwrap();
+        assert_ne!(
+            old, replacement,
+            "an undo-protected deleted slot must not be reused"
+        );
+        let during = page_snapshot(&pool, key);
+        let snapshot = bicdb_storage::cr::reconstruct(
+            &during,
+            bicdb_storage::cr::ReadView::new(seq(1)),
+            &chain,
+        )
+        .unwrap();
+        assert_eq!(
+            heap::row(&snapshot, old.row_id()),
+            Some(stored_row(&original, 0).as_slice())
+        );
+        rollback(&pool, &mut log, &mut chain, &mut rewrite).unwrap();
+        let restored = page_snapshot(&pool, key);
+        assert_eq!(
+            heap::row(&restored, old.row_id()),
+            Some(stored_row(&original, 0).as_slice())
+        );
+        assert!(heap::row(&restored, replacement.row_id()).is_none());
+        assert!(heap::row(&restored, another.row_id()).is_none());
+        // The terminal record and preceding compensation are flushed on return.
+        let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
+        let groups = online_groups(&io, &cf_ro, Path::new(WAL), spec()).unwrap();
+        let analysis = bicdb_wal::analysis::analyze_from(&io, &groups, lsn(0)).unwrap();
+        assert!(matches!(
+            analysis.txns.get(&rewrite.raw()),
+            Some(bicdb_wal::analysis::TxnOutcome::RolledBack)
+        ));
     }
 
     #[test]
@@ -2111,7 +2435,7 @@ mod tests {
         // 段头与撤销页的修改由重做阶段按 redo 重放重建到文件上。
         let mut undo_file2 =
             bicdb_storage::datafile::DataFile::open(&io, Path::new(UNDO_F)).unwrap();
-        let chain = UndoChain::open(
+        let mut chain = UndoChain::open(
             bicdb_storage::segment::Segment::open(&mut undo_file2, seg_page0).unwrap(),
         );
 
@@ -2123,7 +2447,7 @@ mod tests {
             3 => Some((data_handle, r.block_id())),
             _ => None,
         };
-        let report = recover(&io, &groups, lsn(0), &chain, &mut log, &mut resolve).unwrap();
+        let report = recover(&io, &groups, lsn(0), &mut chain, &mut log, &mut resolve).unwrap();
         assert_eq!(report.undo.txns_rolled_back, 1, "只有一个输家");
 
         let page = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
@@ -2209,7 +2533,7 @@ mod tests {
         // 重做阶段按 redo 重放重建到文件上（`crash_after_dml_*` 同规）。
         let mut undo_file2 =
             bicdb_storage::datafile::DataFile::open(&io, Path::new(UNDO_F)).unwrap();
-        let chain = UndoChain::open(
+        let mut chain = UndoChain::open(
             bicdb_storage::segment::Segment::open(&mut undo_file2, seg_page0).unwrap(),
         );
         let cf_ro = ControlFile::open(&io, Path::new(A), Path::new(B)).unwrap();
@@ -2229,7 +2553,7 @@ mod tests {
             3 => Some((data_handle, rd.block_id())),
             _ => None,
         };
-        let report = recover(&io, &groups, lsn(0), &chain, &mut log, &mut resolve).unwrap();
+        let report = recover(&io, &groups, lsn(0), &mut chain, &mut log, &mut resolve).unwrap();
         assert_eq!(report.undo.txns_rolled_back, 1, "输家被回滚");
 
         // 胜者的行在、输家的行被撤销——且撤销链读的是**本轮**的记录。
@@ -2570,6 +2894,27 @@ mod tests {
             bicdb_storage::cr::reconstruct(&src, bicdb_storage::cr::ReadView::new(seq(6)), &chain)
                 .unwrap();
         assert_eq!(heap::forwarding_target(&cr_new, rid.row_id()), Some(target));
+        // Index lookup must resolve forwarding at the requested snapshot too.
+        // Following the current pointer first loses the original row entirely.
+        let old = bicdb_storage::scan::fetch_rows_resolved(
+            &pool,
+            &chain,
+            bicdb_storage::cr::ReadView::new(seq(5)),
+            &[rid, target, rid],
+        )
+        .unwrap();
+        assert_eq!(old[0], Some((rid, stored_row(&old_row, 0))));
+        assert_eq!(old[1], None);
+        assert_eq!(old[2], old[0], "batch order and duplicate requests survive");
+        let current = bicdb_storage::scan::fetch_rows_resolved(
+            &pool,
+            &chain,
+            bicdb_storage::cr::ReadView::new(seq(6)),
+            &[rid, target],
+        )
+        .unwrap();
+        assert_eq!(current[0], Some((target, stored_row(&big, 0))));
+        assert_eq!(current[1], current[0]);
     }
 
     #[test]
@@ -2657,7 +3002,7 @@ mod tests {
         // 恢复侧**直读链**（无池；P1：撤销页由重做重建到文件上）。
         let mut undo_file2 =
             bicdb_storage::datafile::DataFile::open(&io, Path::new(UNDO_F)).unwrap();
-        let chain = UndoChain::open(
+        let mut chain = UndoChain::open(
             bicdb_storage::segment::Segment::open(&mut undo_file2, seg_page0).unwrap(),
         );
 
@@ -2669,7 +3014,7 @@ mod tests {
             3 => Some((data_handle, rd.block_id())),
             _ => None,
         };
-        let report = recover(&io, &groups, lsn(0), &chain, &mut log, &mut resolve).unwrap();
+        let report = recover(&io, &groups, lsn(0), &mut chain, &mut log, &mut resolve).unwrap();
         assert_eq!(report.undo.txns_rolled_back, 1, "迁移事务是输家");
 
         let src = pagefile::read_page_verified(&io, data_handle, 1).unwrap();

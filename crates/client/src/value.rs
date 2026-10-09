@@ -1,7 +1,7 @@
-//! **驱动的值模型**（协议 §3 的 API 面：四种形态，不认识引擎类型）。
+//! **驱动的值模型**（协议 §3 的 API 面：标量及图元素身份，不认识持久列类型）。
 //!
 //! ```text
-//! Null │ Number(十进制文本) │ Bool │ Bytes(原字节)
+//! Null │ Number(十进制文本) │ Bool │ Bytes(原字节) │ GraphElement
 //! ```
 //!
 //! **为什么数值留文本**：SQL 的 `NUMBER` 任意精度——转 `f64` 会丢精度，
@@ -24,6 +24,15 @@ pub enum Value {
     Bool(bool),
     /// 字节串（原字节；文本列也是这个形态）。
     Bytes(Vec<u8>),
+    /// 图对象中的节点/边身份句柄；`kind` 是 `n`（节点）或 `e`（边）。
+    GraphElement {
+        /// 工作区内图对象号。
+        graph: u32,
+        /// `n`（节点）或 `e`（边）。
+        kind: char,
+        /// 图内局部元素 ID。
+        id: u64,
+    },
 }
 
 impl Value {
@@ -78,6 +87,15 @@ impl Value {
         std::str::from_utf8(self.as_bytes()?).ok()
     }
 
+    /// 取图元素身份 `(graph, kind, id)`。
+    #[must_use]
+    pub fn as_graph_element(&self) -> Option<(u32, char, u64)> {
+        match self {
+            Value::GraphElement { graph, kind, id } => Some((*graph, *kind, *id)),
+            _ => None,
+        }
+    }
+
     /// 形态名（错误信息里用）。
     #[must_use]
     pub fn kind_name(&self) -> &'static str {
@@ -86,6 +104,7 @@ impl Value {
             Value::Number(_) => "数值",
             Value::Bool(_) => "布尔",
             Value::Bytes(_) => "字节串",
+            Value::GraphElement { .. } => "图元素",
         }
     }
 }
@@ -162,6 +181,7 @@ impl std::fmt::Display for Value {
                     Ok(())
                 }
             },
+            Value::GraphElement { graph, kind, id } => write!(f, "{graph}:{kind}:{id}"),
         }
     }
 }

@@ -123,15 +123,6 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         Ok(BufferKey::new(self.ws, rdba))
     }
 
-    /// 一张页的当前镜像（池优先；未命中退化为直读）。
-    fn page_image(&self, file: &DataFile<'_>, block: u32) -> Result<Page, TableAccessError> {
-        match self.pool.pin(self.key_of(file.file_id(), block)?) {
-            Ok(g) => Ok(Page::from_bytes(Box::new(*g.as_bytes()))),
-            Err(BufferError::Unresolved { .. }) => Ok(file.read_page(block)?),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// **插入一行**（选址 → 增长 → 事务引擎行写）。
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
@@ -144,6 +135,12 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         row: &[u8],
         policy: &InsertPolicy,
     ) -> Result<RowId, TableAccessError> {
+        // Keep allocation estimates consistent with transactional slot safety.
+        let safe_policy = InsertPolicy {
+            reuse_free_slots: false,
+            ..*policy
+        };
+        let policy = &safe_policy;
         let block = self.space_for_row(log, txn, file, seg_page0, row.len(), policy)?;
         let rid = write::insert_row(
             self.pool,
@@ -209,11 +206,28 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         row_len: usize,
         policy: &InsertPolicy,
     ) -> Result<bool, TableAccessError> {
-        let page = self.page_image(file, block)?;
-        if page.header().map(|h| h.page_type) != Some(PageType::HeapTable) {
-            return Ok(false);
+        let fits = |page: &Page| {
+            if page.header().map(|h| h.page_type) != Some(PageType::HeapTable) {
+                return false;
+            }
+            // Preserve the extra ITL reservation when selecting an existing page.
+            heap::can_insert(
+                page,
+                row_len.saturating_add(bicdb_storage::page::ITL_ENTRY_LEN),
+                policy,
+            )
+        };
+        // Space checks only inspect the current page. Borrow it under a shared
+        // latch instead of allocating and copying a complete 16 KiB page.
+        let key = self.key_of(file.file_id(), block)?;
+        if let Some(page) = self.pool.pin_shared(key) {
+            return Ok(fits(&page));
         }
-        Ok(heap::can_insert(&page, row_len, policy))
+        match self.pool.pin(key) {
+            Ok(page) => Ok(fits(&page)),
+            Err(BufferError::Unresolved { .. }) => Ok(fits(&file.read_page(block)?)),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// **增长一页**：段追加位 → 格式化 → 先落盘 + fsync → 全页 redo → 池。返回块号。
@@ -284,6 +298,12 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         row: &[u8],
         policy: &InsertPolicy,
     ) -> Result<(), TableAccessError> {
+        // Keep allocation estimates consistent with transactional slot safety.
+        let safe_policy = InsertPolicy {
+            reuse_free_slots: false,
+            ..*policy
+        };
+        let policy = &safe_policy;
         let fid = file.file_id();
         let pool = self.pool;
         let ws = self.ws;

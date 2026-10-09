@@ -59,6 +59,8 @@ pub enum DdlError {
     Index(bicdb_index::IndexError),
     /// 名字非法（保留名：`$` 结尾或预置名）。
     ReservedName(String),
+    /// Internal dictionary tables and indexes are SQL read-only.
+    ReadOnlyDictionary(String),
     /// **唯一键冲突**（DCL 的字典行：`fs$` 名字/路径、`ws$` 名字、`user$` 名字）。
     ///
     /// 单独一支是为了文案：`AlreadyExists` 会套上"对象 `…` 已存在"的外壳，
@@ -87,6 +89,7 @@ impl std::fmt::Display for DdlError {
             DdlError::Row(e) => write!(f, "DDL·行：{e}"),
             DdlError::Index(e) => write!(f, "DDL·索引：{e}"),
             DdlError::ReservedName(n) => write!(f, "名字 `{n}` 是保留名（`$` 结尾或预置名）"),
+            DdlError::ReadOnlyDictionary(n) => write!(f, "字典对象 `{n}` 只读，不能修改或删除"),
             DdlError::AlreadyExists(n) => write!(f, "对象 `{n}` 已存在"),
             DdlError::UniqueViolation(why) => f.write_str(why),
             DdlError::NotFound(n) => write!(f, "对象 `{n}` 不存在"),
@@ -293,6 +296,20 @@ pub(crate) struct DictWriter<'a, 'b, 'io, 'lio, 'lf> {
     changed: Vec<u32>,
 }
 
+impl Catalog<'_> {
+    pub(crate) fn check_ddl_deadline(&self) -> Result<(), DdlError> {
+        if self
+            .ddl_deadline
+            .is_some_and(|end| std::time::Instant::now() >= end)
+        {
+            return Err(DdlError::BadIndexDef(
+                "graph statement time budget exceeded (phase native DDL)".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl<'a, 'b, 'io, 'lio, 'lf> DictWriter<'a, 'b, 'io, 'lio, 'lf> {
     fn ws(&self) -> [u8; 8] {
         self.cat.ws()
@@ -300,6 +317,7 @@ impl<'a, 'b, 'io, 'lio, 'lf> DictWriter<'a, 'b, 'io, 'lio, 'lf> {
 
     /// 表定义（**内核常量**：字典表才有）+ 段头块（**活路径**：obj$ → seg$）。
     fn table(&mut self, name: &str) -> Result<(&'static DictTable, u32), DdlError> {
+        self.cat.check_ddl_deadline()?;
         let def = dict::DICT_TABLES
             .iter()
             .find(|t| t.name == name)
@@ -594,6 +612,7 @@ pub(crate) fn dcl_txn<R>(
     engine: &Engine<'_, '_, '_, '_>,
     body: impl FnOnce(&mut DictWriter<'_, '_, '_, '_, '_>) -> Result<R, DdlError>,
 ) -> Result<(R, u64), DdlError> {
+    cat.check_ddl_deadline()?;
     let mut txn = engine.begin()?;
     let seq = engine.reserve_commit_seq(&mut txn)?;
     let outcome = engine.with_write_context(&mut txn, |pool, log, chain, txn| {
@@ -606,7 +625,10 @@ pub(crate) fn dcl_txn<R>(
             seq,
             changed: Vec::new(),
         };
-        let r = body(&mut w);
+        let r = body(&mut w).and_then(|r| {
+            w.cat.check_ddl_deadline()?;
+            Ok(r)
+        });
         (r, w.changed.clone())
     });
     let (result, changed) = outcome;
@@ -626,6 +648,12 @@ pub(crate) fn dcl_txn<R>(
             // 未清（后续语句会撞上），要一并报出来。
             let rolled = engine.rollback(&mut txn);
             cat.row_cache().bump_and_clear();
+            // A new object-ID batch may have been reserved in this transaction.
+            // Its seq$ high-water mark has rolled back; retaining the in-memory
+            // batch could commit IDs that a later reservation issues again.
+            // Drop cached IDs even when rollback fails; only durable seq$ state
+            // may seed subsequent allocations. Gaps in committed batches are safe.
+            cat.obj_seq.set(None);
             match rolled {
                 Ok(_) => Err(e),
                 Err(rb) => Err(DdlError::BadTableDef(format!(
@@ -733,8 +761,12 @@ fn allocate_obj_number(
         }
     }
     // 取新批：读 seq$ 行（键点查）+ 刷回 next_val = 批上界。
-    let (seq_def, seq_block) = w.table("seq$").map_err(|_| {
-        DdlError::BadTableDef("seq$ 未初始化（先跑 init_dictionary_tables）".to_owned())
+    let (seq_def, seq_block) = w.table("seq$").map_err(|error| match error {
+        DdlError::NotFound(_) => {
+            DdlError::BadTableDef("seq$ 未初始化（先跑 init_dictionary_tables）".to_owned())
+        }
+        // Preserve timeout/I/O errors rather than misreporting a missing sequence.
+        other => other,
     })?;
     let key_val = DictValue::Num(OBJECT_ID_SEQ);
     let col1 = seq_def
@@ -826,40 +858,19 @@ impl<'a, 'b, 'io, 'lio, 'lf> DictWriter<'a, 'b, 'io, 'lio, 'lf> {
         Ok(())
     }
 
-    /// **删除一行**（含其索引项）：先按旧行值删索引项，再删堆行。
+    /// Delete the heap version, retaining redo-only index candidates. Removing
+    /// candidates here would make restored rows unreachable after rollback or
+    /// crash recovery, and prevent CR readers finding a previous dictionary row.
+    /// Lookup/range callers recheck row visibility and keys; GC needs a horizon.
     fn delete_row(
         &mut self,
         table: &str,
-        def: &'static DictTable,
+        _def: &'static DictTable,
         rid: RowId,
     ) -> Result<(), DdlError> {
-        let values = self.cat.fetch(table, rid)?;
-        let ws = self.ws();
-        // 索引项按**稳定 ROWID**（= 索引里存的那个）删；堆行删**落点**。
+        // Preserve the stable index entrance when following a forwarding row.
+        self.cat.fetch(table, rid)?;
         let landed = self.cat.resolve_rid(rid)?;
-        for key_def in def.keys {
-            let comps = key_components(&values, def, key_def)?;
-            let idx_block = live_index_block(self.cat, key_def.name)?;
-            let new_root = acc_index::delete_entry(
-                self.pool,
-                self.log,
-                self.cat.file_mut(),
-                ws,
-                idx_block,
-                self.txn,
-                &comps,
-                rid,
-            )?;
-            acc_index::write_tree_head_redo(
-                self.pool,
-                self.log,
-                self.cat.file_mut(),
-                ws,
-                idx_block,
-                self.txn,
-                new_root,
-            )?;
-        }
         let mut access = TableAccess::new(self.pool, self.ws());
         access.delete(
             self.log,
@@ -965,15 +976,18 @@ impl<'a, 'b, 'io, 'lio, 'lf> DictWriter<'a, 'b, 'io, 'lio, 'lf> {
         bobj: u32,
         unique: bool,
         col_numbers: &[u32],
+        graph_source: Option<(u32, &[u8])>,
     ) -> Result<(), DdlError> {
         let ind = vec![
             DictValue::Num(u64::from(obj)),
             DictValue::Num(u64::from(bobj)),
-            DictValue::Num(u64::from(dict::index_kind::BTREE)),
+            DictValue::Num(u64::from(
+                graph_source.map_or(dict::index_kind::BTREE, |(kind, _)| kind),
+            )),
             DictValue::Num(col_numbers.len() as u64),
             DictValue::Bool(unique),
             DictValue::Num(1), // status = 有效
-            DictValue::Null,   // expr_src（表达式索引随 C4+）
+            graph_source.map_or(DictValue::Null, |(_, v)| DictValue::Bytes(v.to_vec())),
         ];
         self.insert_row("ind$", &ind)?;
         self.cat
@@ -1003,46 +1017,191 @@ pub fn create_table(
     engine: &Engine<'_, '_, '_, '_>,
     spec: &TableSpec,
 ) -> Result<CreateTableOutcome, DdlError> {
+    create_table_kind(cat, engine, spec, dict::obj_kind::TABLE)
+}
+
+/// Create a legacy graph descriptor and transactional record heap atomically.
+/// Kept for legacy layout adapters; SQL uses `create_graph_with_physical_routes`.
+pub fn create_graph(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+) -> Result<CreateTableOutcome, DdlError> {
+    create_table_kind(cat, engine, &graph_table_spec(name), dict::obj_kind::GRAPH)
+}
+
+fn graph_table_spec(name: &str) -> TableSpec {
+    let columns = [
+        ("ordinal", ColTypeCode::Number, 0),
+        ("data", ColTypeCode::Bytes, 4096),
+    ]
+    .into_iter()
+    .map(|(name, type_code, length)| ColumnSpec {
+        name: name.into(),
+        type_code,
+        length,
+        precision: None,
+        scale: None,
+        nullable: false,
+    })
+    .collect();
+    TableSpec {
+        name: name.into(),
+        columns,
+        options: TableOptions::default(),
+    }
+}
+
+/// Create a graph, its record/ordinal trees and all four physical routes in
+/// one DDL transaction. The callback must publish the layout manifest before
+/// returning; any failure rolls back the named graph and every owned object.
+pub fn create_graph_with_physical_routes(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    publish: impl FnOnce(
+        GraphPhysicalRoute,
+        GraphPhysicalRoute,
+        &GraphPhysicalRoutes,
+        &mut Catalog<'_>,
+        &BufferPool<'_>,
+        &mut GroupWriter<'_, '_>,
+        &mut UndoChain<'_, '_>,
+        &mut Txn,
+    ) -> Result<(), DdlError>,
+) -> Result<CreateTableOutcome, DdlError> {
+    let spec = graph_table_spec(name);
+    validate_new_table(cat, &spec)?;
+    let (outcome, seq) = with_ddl_txn(cat, engine, |w| {
+        let (outcome, primary) = create_table_kind_inner(w, &spec, dict::obj_kind::GRAPH)?;
+        let routes = create_graph_physical_routes_inner(w, outcome.obj)?;
+        publish(
+            GraphPhysicalRoute {
+                obj: outcome.obj,
+                block: outcome.seg_block,
+            },
+            primary.expect("graph ordinal tree"),
+            &routes,
+            w.cat,
+            w.pool,
+            w.log,
+            w.chain,
+            w.txn,
+        )?;
+        Ok(outcome)
+    })?;
+    Ok(CreateTableOutcome {
+        commit_seq: seq,
+        ..outcome
+    })
+}
+
+/// Add the graph-owned key tree to an older graph heap. Call only outside a
+/// user transaction, before its first automatic-commit write. Read-only graph
+/// queries never perform this DDL or mutate the old snapshot format.
+pub fn ensure_graph_storage_index(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+) -> Result<(), DdlError> {
+    let (obj, kind) = object_ref(cat, name)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(name.into()));
+    }
+    for index in index_objects_of(cat, obj)? {
+        let (_, unique, columns) = index_definition(cat, index)?;
+        if unique && columns == [1] {
+            return Ok(());
+        }
+    }
+    let spec = IndexSpec {
+        name: format!("i_graph_{obj}$"),
+        table: name.into(),
+        unique: true,
+        columns: vec!["ordinal".into()],
+    };
+    let segment = live_segment_block(cat, obj)?;
+    with_ddl_txn(cat, engine, |writer| {
+        create_index_inner(writer, &spec, obj, &[1], segment)
+    })?;
+    Ok(())
+}
+
+fn create_table_kind(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    spec: &TableSpec,
+    kind: u32,
+) -> Result<CreateTableOutcome, DdlError> {
+    validate_new_table(cat, spec)?;
+    let (outcome, seq) = with_ddl_txn(cat, engine, |w| {
+        create_table_kind_inner(w, spec, kind).map(|(outcome, _)| outcome)
+    })?;
+    Ok(CreateTableOutcome {
+        commit_seq: seq,
+        ..outcome
+    })
+}
+
+fn validate_new_table(cat: &mut Catalog<'_>, spec: &TableSpec) -> Result<(), DdlError> {
     check_user_name(&spec.name)?;
     validate_table_spec(spec)?;
     // 快速失败（真正的闸门是 `i_obj_name` 唯一索引——见模块文档）。
     if object_exists(cat, &spec.name)? {
         return Err(DdlError::AlreadyExists(spec.name.clone()));
     }
-    let (outcome, seq) = with_ddl_txn(cat, engine, |w| {
-        let obj = allocate_obj_number(w, None)?;
-        let dataobj = obj;
-        let seg_block = create_table_segment(
-            w.cat,
-            w.pool,
-            w.log,
-            w.txn,
-            SegType::Heap,
-            obj,
-            dataobj,
-            &spec.options,
-        )?;
-        w.insert_obj(
-            obj,
-            &spec.name,
-            dict::namespace::TABLE,
-            dict::obj_kind::TABLE,
-        )?;
-        w.insert_tab(obj, spec.columns.len() as u32, &spec.options)?;
-        w.insert_cols(obj, &spec.columns)?;
-        w.insert_seg(dataobj, seg_block)?;
-        w.insert_stat(obj, 0)?; // 空表：行数估计 0（后续由统计路径刷新）
-        Ok(CreateTableOutcome {
+    Ok(())
+}
+
+fn create_table_kind_inner(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    spec: &TableSpec,
+    kind: u32,
+) -> Result<(CreateTableOutcome, Option<GraphPhysicalRoute>), DdlError> {
+    let obj = allocate_obj_number(w, None)?;
+    let dataobj = obj;
+    let seg_block = create_table_segment(
+        w.cat,
+        w.pool,
+        w.log,
+        w.txn,
+        SegType::Heap,
+        obj,
+        dataobj,
+        &spec.options,
+    )?;
+    w.insert_obj(obj, &spec.name, dict::namespace::TABLE, kind)?;
+    w.insert_tab(obj, spec.columns.len() as u32, &spec.options)?;
+    w.insert_cols(obj, &spec.columns)?;
+    w.insert_seg(dataobj, seg_block)?;
+    w.insert_stat(obj, 0)?; // 空表：行数估计 0（后续由统计路径刷新）
+    let mut primary = None;
+    if kind == dict::obj_kind::GRAPH {
+        // A reserved, graph-owned unique key tree is created in the same
+        // DDL transaction. Ordinary CREATE/DROP INDEX cannot manage it.
+        let index_obj = allocate_obj_number(w, None)?;
+        let block = create_index_object(w, index_obj, obj, &format!("i_graph_{obj}$"), &[1], true)?;
+        primary = Some(GraphPhysicalRoute {
+            obj: index_obj,
+            block,
+        });
+        for kind in [
+            dict::index_kind::GRAPH_NODES,
+            dict::index_kind::GRAPH_OUT,
+            dict::index_kind::GRAPH_IN,
+        ] {
+            create_graph_access_tree(w, obj, kind, &[])?;
+        }
+    }
+    Ok((
+        CreateTableOutcome {
             obj,
             dataobj,
             seg_block,
             commit_seq: 0, // 提交后填
-        })
-    })?;
-    Ok(CreateTableOutcome {
-        commit_seq: seq,
-        ..outcome
-    })
+        },
+        primary,
+    ))
 }
 
 /// **活对象的段头块**（`obj$` → `dataobj#` → `seg$.block_id`）。
@@ -1287,6 +1446,31 @@ fn create_index_object(
     col_numbers: &[u32],
     unique: bool,
 ) -> Result<u32, DdlError> {
+    create_index_object_with_source(w, obj, base_obj, name, col_numbers, unique, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_index_object_with_source(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    obj: u32,
+    base_obj: u32,
+    name: &str,
+    col_numbers: &[u32],
+    unique: bool,
+    graph_source: Option<(u32, &[u8])>,
+) -> Result<u32, DdlError> {
+    let dataobj = obj;
+    let seg_block = create_empty_index_segment(w, obj)?;
+    w.insert_obj(obj, name, dict::namespace::INDEX, dict::obj_kind::INDEX)?;
+    w.insert_index_rows(obj, base_obj, unique, col_numbers, graph_source)?;
+    w.insert_seg(dataobj, seg_block)?;
+    Ok(seg_block)
+}
+
+fn create_empty_index_segment(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    obj: u32,
+) -> Result<u32, DdlError> {
     let dataobj = obj;
     let seg_block = create_table_segment(
         w.cat,
@@ -1320,10 +1504,1178 @@ fn create_index_object(
             root,
         )?;
     }
-    w.insert_obj(obj, name, dict::namespace::INDEX, dict::obj_kind::INDEX)?;
-    w.insert_index_rows(obj, base_obj, unique, col_numbers)?;
-    w.insert_seg(dataobj, seg_block)?;
     Ok(seg_block)
+}
+
+/// Native graph expression-tree creation/rebuild outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphIndexOutcome {
+    /// Stable index object ID.
+    pub obj: u32,
+    /// Number of current element entries.
+    pub entries: usize,
+    /// DDL commit watermark.
+    pub commit_seq: u64,
+}
+
+fn graph_index_identity(
+    cat: &mut Catalog<'_>,
+    name: &str,
+    graph: &str,
+) -> Result<(u32, u32), DdlError> {
+    let (base, kind) = object_ref(cat, graph)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(graph.into()));
+    }
+    let obj = object_number_ns(cat, name, dict::namespace::INDEX)?;
+    let index = cat
+        .indexes_of(
+            CommitSeq::from_raw(cat.current_seq()).expect("commit sequence"),
+            base,
+        )
+        .map_err(|e| DdlError::BadIndexDef(e.to_string()))?
+        .into_iter()
+        .find(|i| i.obj == obj && i.kind == dict::index_kind::GRAPH_PROPERTY);
+    if index.is_none() {
+        return Err(DdlError::BadIndexDef(
+            "index is not a property index of this graph".into(),
+        ));
+    }
+    Ok((obj, base))
+}
+
+fn build_graph_tree(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    obj: u32,
+    base: u32,
+    name: &str,
+    source: &[u8],
+    unique: bool,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<(), DdlError> {
+    let block = create_index_object_with_source(
+        w,
+        obj,
+        base,
+        name,
+        &[0],
+        unique,
+        Some((dict::index_kind::GRAPH_PROPERTY, source)),
+    )?;
+    fill_graph_tree(w, block, entries)?;
+    w.insert_stat(obj, entries.len() as u64)?;
+    Ok(())
+}
+
+fn fill_graph_tree(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    block: u32,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<(), DdlError> {
+    let ws = w.cat.ws();
+    for (key, id) in entries {
+        w.cat.check_ddl_deadline()?;
+        if *id == 0 || *id >= 1 << 48 || key.len() > bicdb_index::MAX_KEY_LEN {
+            return Err(DdlError::BadIndexDef("invalid graph index entry".into()));
+        }
+        bicdb_txn::write::checkpoint_safe_point(w.pool, w.log, w.chain)?;
+        let bytes = id.to_le_bytes();
+        let payload = RowId::from_bytes(bytes[..6].try_into().expect("element ID"));
+        let root = acc_index::insert_entry(
+            w.pool,
+            w.log,
+            w.cat.file_mut(),
+            ws,
+            block,
+            w.txn,
+            key,
+            payload,
+        )?;
+        acc_index::write_tree_head_redo(w.pool, w.log, w.cat.file_mut(), ws, block, w.txn, root)?;
+    }
+    Ok(())
+}
+
+/// Create a graph-owned property B-tree atomically with its metadata. Source is
+/// a validated graph index descriptor; entries contain typed keys and IDs.
+#[allow(clippy::too_many_arguments)]
+pub fn create_graph_property_index(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    source: &[u8],
+    unique: bool,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<GraphIndexOutcome, DdlError> {
+    check_user_name(name)?;
+    if source.is_empty() || source.len() > 4096 {
+        return Err(DdlError::BadIndexDef("invalid graph index source".into()));
+    }
+    if object_exists_ns(cat, name, dict::namespace::INDEX)? {
+        return Err(DdlError::AlreadyExists(name.into()));
+    }
+    let (base, kind) = object_ref(cat, graph)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(graph.into()));
+    }
+    let (obj, seq) = with_ddl_txn(cat, engine, |w| {
+        let obj = allocate_obj_number(w, None)?;
+        build_graph_tree(w, obj, base, name, source, unique, entries)?;
+        Ok(obj)
+    })?;
+    Ok(GraphIndexOutcome {
+        obj,
+        entries: entries.len(),
+        commit_seq: seq,
+    })
+}
+
+/// Rebuild into a fresh segment in one DDL transaction. Failed builds restore
+/// the old dictionary routing and tree; successful builds remove stale entries.
+pub fn rebuild_graph_property_index(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    source: &[u8],
+    unique: bool,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<GraphIndexOutcome, DdlError> {
+    let (obj, _) = graph_index_identity(cat, name, graph)?;
+    let key = crate::open::comp_num(u64::from(obj));
+    let (_, definition) = cat
+        .lookup("i_ind_pk", &[Some(&key)])?
+        .ok_or_else(|| DdlError::NotFound(name.into()))?;
+    if definition.get(4) != Some(&DictValue::Bool(unique))
+        || definition.get(6) != Some(&DictValue::Bytes(source.to_vec()))
+    {
+        return Err(DdlError::BadIndexDef(
+            "REBUILD cannot change a graph index definition".into(),
+        ));
+    }
+    let (_, seq) = with_ddl_txn(cat, engine, |w| {
+        reset_graph_tree(w, obj, entries)?;
+        Ok(())
+    })?;
+    Ok(GraphIndexOutcome {
+        obj,
+        entries: entries.len(),
+        commit_seq: seq,
+    })
+}
+
+fn reset_graph_tree(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    obj: u32,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<(), DdlError> {
+    // Keep dictionary key rows intact: their B-tree delete has no undo.
+    // Build a fresh segment, then change only undo-protected non-key values.
+    let block = create_empty_index_segment(w, obj)?;
+    fill_graph_tree(w, block, entries)?;
+    set_index_status(w, obj, 1)?;
+    switch_graph_segment(w, obj, block, entries.len())
+}
+
+fn switch_graph_segment(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    obj: u32,
+    block: u32,
+    rows: usize,
+) -> Result<(), DdlError> {
+    let key = crate::open::comp_num(u64::from(obj));
+    let (def, seg_block) = w.table("seg$")?;
+    let (rid, mut values) = w
+        .cat
+        .lookup("i_seg_pk", &[Some(&key)])?
+        .ok_or_else(|| DdlError::NotFound(obj.to_string()))?;
+    values[2] = DictValue::Num(u64::from(block));
+    values[4] = DictValue::Num(w.seq.as_raw());
+    w.update_row_nonkey("seg$", seg_block, def, rid, &values)?;
+    w.write_through_seg(&values)?;
+    let (def, stat_block) = w.table("stat$")?;
+    let (rid, mut values) = w
+        .cat
+        .lookup("i_stat_pk", &[Some(&key)])?
+        .ok_or_else(|| DdlError::NotFound(obj.to_string()))?;
+    values[1] = DictValue::Num(rows as u64);
+    values[4] = DictValue::Num(w.seq.as_raw());
+    w.update_row_nonkey("stat$", stat_block, def, rid, &values)?;
+    set_object_status(w, obj, 1)?;
+    Ok(())
+}
+
+/// Prepared native full-text image; SQL validates the versioned document codec.
+pub struct GraphFulltextBuild<'a> {
+    /// Versioned, validated full-text definition.
+    pub source: &'a [u8],
+    /// Domain/field/channel/term/revision keys with element-ID payloads.
+    pub entries: &'a [(Vec<u8>, u64)],
+    /// Checksummed document records, keyed by native ordinal.
+    pub rows: &'a std::collections::BTreeMap<u64, Vec<u8>>,
+}
+
+/// Protected document heap name derived from its owning stable index ID.
+pub fn graph_fulltext_store_name(index: u32) -> String {
+    format!("gft_{index}$")
+}
+
+/// Protected graph-wide lightweight full-text change journal.
+pub fn graph_fulltext_journal_name(graph: u32) -> String {
+    format!("gftq_{graph}$")
+}
+type NativeRecordRows = std::collections::BTreeMap<u64, Vec<u8>>;
+type JournalBuilder<'a> = dyn FnMut(u32) -> Result<NativeRecordRows, DdlError> + 'a;
+
+fn replace_graph_fulltext_journal(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    graph: u32,
+    rows: &NativeRecordRows,
+) -> Result<(), DdlError> {
+    if rows.is_empty() {
+        return Err(DdlError::BadIndexDef("empty full-text journal".into()));
+    }
+    let name = graph_fulltext_journal_name(graph);
+    if !object_exists_ns(w.cat, &name, dict::namespace::TABLE)? {
+        let data = allocate_obj_number(w, None)?;
+        let options = TableOptions::default();
+        let heap = create_table_segment(
+            w.cat,
+            w.pool,
+            w.log,
+            w.txn,
+            SegType::Heap,
+            data,
+            data,
+            &options,
+        )?;
+        w.insert_obj(
+            data,
+            &name,
+            dict::namespace::TABLE,
+            dict::obj_kind::GRAPH_FULLTEXT_QUEUE,
+        )?;
+        w.insert_tab(data, 2, &options)?;
+        w.insert_cols(data, &fulltext_columns())?;
+        w.insert_seg(data, heap)?;
+        w.insert_stat(data, rows.len() as u64)?;
+        let key = allocate_obj_number(w, None)?;
+        let tree = create_index_object(w, key, data, &format!("i_gftq_{graph}$"), &[1], true)?;
+        w.insert_stat(key, rows.len() as u64)?;
+        fill_fulltext_heap(w, heap, tree, rows)?;
+    } else {
+        let (data, kind) = object_ref(w.cat, &name)?;
+        if kind != dict::obj_kind::GRAPH_FULLTEXT_QUEUE {
+            return Err(DdlError::WrongKind(name));
+        }
+        let keys = w
+            .cat
+            .indexes_of(
+                CommitSeq::from_raw(w.cat.current_seq()).expect("sequence"),
+                data,
+            )
+            .map_err(|e| DdlError::BadIndexDef(e.to_string()))?;
+        if keys.len() != 1
+            || keys[0].kind != dict::index_kind::BTREE
+            || !keys[0].is_unique
+            || keys[0].cols.len() != 1
+            || keys[0].cols[0].col != 1
+        {
+            return Err(DdlError::BadIndexDef(
+                "invalid full-text journal tree".into(),
+            ));
+        }
+        let key = keys[0].obj;
+        let heap = create_table_segment(
+            w.cat,
+            w.pool,
+            w.log,
+            w.txn,
+            SegType::Heap,
+            data,
+            data,
+            &TableOptions::default(),
+        )?;
+        let tree = create_empty_index_segment(w, key)?;
+        fill_fulltext_heap(w, heap, tree, rows)?;
+        switch_graph_segment(w, key, tree, rows.len())?;
+        set_index_status(w, key, 1)?;
+        switch_graph_segment(w, data, heap, rows.len())?;
+    }
+    Ok(())
+}
+fn drop_graph_fulltext_journal(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    graph: u32,
+) -> Result<(), DdlError> {
+    let name = graph_fulltext_journal_name(graph);
+    if !object_exists_ns(w.cat, &name, dict::namespace::TABLE)? {
+        return Ok(());
+    }
+    let (data, kind) = object_ref(w.cat, &name)?;
+    if kind != dict::obj_kind::GRAPH_FULLTEXT_QUEUE {
+        return Err(DdlError::WrongKind(name));
+    }
+    for index in index_objects_of(w.cat, data)? {
+        let index_name = object_name(w.cat, index)?;
+        drop_index_rows(w, index, &index_name)?;
+    }
+    drop_table_rows(w, data, &name)
+}
+
+fn fulltext_identity(cat: &mut Catalog<'_>, name: &str, graph: &str) -> Result<u32, DdlError> {
+    let (base, kind) = object_ref(cat, graph)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(graph.into()));
+    }
+    let obj = object_number_ns(cat, name, dict::namespace::INDEX)?;
+    if !cat
+        .indexes_of(
+            CommitSeq::from_raw(cat.current_seq()).expect("sequence"),
+            base,
+        )
+        .map_err(|e| DdlError::BadIndexDef(e.to_string()))?
+        .iter()
+        .any(|i| i.obj == obj && i.kind == dict::index_kind::GRAPH_FULLTEXT)
+    {
+        return Err(DdlError::BadIndexDef(
+            "not a full-text index of this graph".into(),
+        ));
+    }
+    Ok(obj)
+}
+
+fn fulltext_columns() -> Vec<ColumnSpec> {
+    [
+        ("ordinal", ColTypeCode::Number, 0),
+        ("data", ColTypeCode::Bytes, 4096),
+    ]
+    .into_iter()
+    .map(|(name, type_code, length)| ColumnSpec {
+        name: name.into(),
+        type_code,
+        length,
+        precision: None,
+        scale: None,
+        nullable: false,
+    })
+    .collect()
+}
+
+fn fill_fulltext_heap(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    heap: u32,
+    key_tree: u32,
+    rows: &std::collections::BTreeMap<u64, Vec<u8>>,
+) -> Result<(), DdlError> {
+    let columns = [
+        dict::ColDef {
+            col: 1,
+            name: "ordinal",
+            type_code: ColTypeCode::Number,
+            length: 0,
+            nullable: false,
+        },
+        dict::ColDef {
+            col: 2,
+            name: "data",
+            type_code: ColTypeCode::Bytes,
+            length: 4096,
+            nullable: false,
+        },
+    ];
+    let mut bytes = 0usize;
+    for (ordinal, data) in rows {
+        w.cat.check_ddl_deadline()?;
+        bytes = bytes.saturating_add(data.len());
+        if data.len() > 4096 || bytes > 100 * 1024 * 1024 {
+            return Err(DdlError::BadIndexDef(
+                "full-text record byte budget exceeded".into(),
+            ));
+        }
+        bicdb_txn::write::checkpoint_safe_point(w.pool, w.log, w.chain)?;
+        let encoded = row::encode(
+            &[DictValue::Num(*ordinal), DictValue::Bytes(data.clone())],
+            &columns,
+        )?;
+        let ws = w.ws();
+        let rid = TableAccess::new(w.pool, ws).insert(
+            w.log,
+            w.chain,
+            w.txn,
+            w.cat.file_mut(),
+            heap,
+            &encoded,
+            &InsertPolicy::in_place(0),
+        )?;
+        let key = row::key_from_row(&encoded, &[0])?;
+        let root = acc_index::insert_entry(
+            w.pool,
+            w.log,
+            w.cat.file_mut(),
+            ws,
+            key_tree,
+            w.txn,
+            &key,
+            rid,
+        )?;
+        acc_index::write_tree_head_redo(
+            w.pool,
+            w.log,
+            w.cat.file_mut(),
+            ws,
+            key_tree,
+            w.txn,
+            root,
+        )?;
+    }
+    Ok(())
+}
+
+/// Create postings, protected document heap and ordinal tree in one native DDL transaction.
+pub fn create_graph_fulltext_index(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    build: &GraphFulltextBuild<'_>,
+) -> Result<GraphIndexOutcome, DdlError> {
+    create_graph_fulltext_index_inner(cat, engine, name, graph, build, None)
+}
+
+/// Atomically create a full-text index and register its stable allocated ID in
+/// the graph journal. The callback is a pure prepared-image builder.
+pub fn create_graph_fulltext_index_with_journal(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    build: &GraphFulltextBuild<'_>,
+    mut journal: impl FnMut(u32) -> Result<NativeRecordRows, DdlError>,
+) -> Result<GraphIndexOutcome, DdlError> {
+    create_graph_fulltext_index_inner(cat, engine, name, graph, build, Some(&mut journal))
+}
+
+fn create_graph_fulltext_index_inner(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    build: &GraphFulltextBuild<'_>,
+    mut journal: Option<&mut JournalBuilder<'_>>,
+) -> Result<GraphIndexOutcome, DdlError> {
+    check_user_name(name)?;
+    if build.source.is_empty() || build.source.len() > 4096 || build.rows.is_empty() {
+        return Err(DdlError::BadIndexDef("invalid full-text image".into()));
+    }
+    if object_exists_ns(cat, name, dict::namespace::INDEX)? {
+        return Err(DdlError::AlreadyExists(name.into()));
+    }
+    let (base, kind) = object_ref(cat, graph)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(graph.into()));
+    }
+    let (obj, seq) = with_ddl_txn(cat, engine, |w| {
+        let obj = allocate_obj_number(w, None)?;
+        let block = create_index_object_with_source(
+            w,
+            obj,
+            base,
+            name,
+            &[0],
+            false,
+            Some((dict::index_kind::GRAPH_FULLTEXT, build.source)),
+        )?;
+        fill_graph_tree(w, block, build.entries)?;
+        w.insert_stat(obj, build.entries.len() as u64)?;
+        let data = allocate_obj_number(w, None)?;
+        let data_name = graph_fulltext_store_name(obj);
+        let options = TableOptions::default();
+        let heap = create_table_segment(
+            w.cat,
+            w.pool,
+            w.log,
+            w.txn,
+            SegType::Heap,
+            data,
+            data,
+            &options,
+        )?;
+        w.insert_obj(
+            data,
+            &data_name,
+            dict::namespace::TABLE,
+            dict::obj_kind::GRAPH_FULLTEXT_DATA,
+        )?;
+        w.insert_tab(data, 2, &options)?;
+        w.insert_cols(data, &fulltext_columns())?;
+        w.insert_seg(data, heap)?;
+        w.insert_stat(data, build.rows.len() as u64)?;
+        let key_obj = allocate_obj_number(w, None)?;
+        let key_block =
+            create_index_object(w, key_obj, data, &format!("i_gft_{obj}$"), &[1], true)?;
+        w.insert_stat(key_obj, build.rows.len() as u64)?;
+        fill_fulltext_heap(w, heap, key_block, build.rows)?;
+        if let Some(builder) = journal.as_mut() {
+            let rows = builder(obj)?;
+            replace_graph_fulltext_journal(w, base, &rows)?;
+        }
+
+        Ok(obj)
+    })?;
+    Ok(GraphIndexOutcome {
+        obj,
+        entries: build.entries.len(),
+        commit_seq: seq,
+    })
+}
+
+/// Replace all three physical segments; only commit publishes their stable routes.
+pub fn rebuild_graph_fulltext_index(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    build: &GraphFulltextBuild<'_>,
+) -> Result<GraphIndexOutcome, DdlError> {
+    rebuild_graph_fulltext_index_inner(cat, engine, name, graph, build, None)
+}
+
+/// Publish fresh full-text segments and the rebuilt consumer watermark atomically.
+pub fn rebuild_graph_fulltext_index_with_journal(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    build: &GraphFulltextBuild<'_>,
+    journal: &NativeRecordRows,
+) -> Result<GraphIndexOutcome, DdlError> {
+    rebuild_graph_fulltext_index_inner(cat, engine, name, graph, build, Some(journal))
+}
+
+fn rebuild_graph_fulltext_index_inner(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    build: &GraphFulltextBuild<'_>,
+    journal: Option<&NativeRecordRows>,
+) -> Result<GraphIndexOutcome, DdlError> {
+    let obj = fulltext_identity(cat, name, graph)?;
+    let base = object_number(cat, graph)?;
+    let index = cat
+        .indexes_of(
+            CommitSeq::from_raw(cat.current_seq()).expect("sequence"),
+            base,
+        )
+        .map_err(|e| DdlError::BadIndexDef(e.to_string()))?
+        .into_iter()
+        .find(|i| i.obj == obj)
+        .expect("identity");
+    if index.expr_src.as_deref() != Some(build.source) || build.rows.is_empty() {
+        return Err(DdlError::BadIndexDef(
+            "REBUILD cannot change full-text definition".into(),
+        ));
+    }
+    let (data, kind) = object_ref(cat, &graph_fulltext_store_name(obj))?;
+    if kind != dict::obj_kind::GRAPH_FULLTEXT_DATA {
+        return Err(DdlError::WrongKind(name.into()));
+    }
+    let keys = cat
+        .indexes_of(
+            CommitSeq::from_raw(cat.current_seq()).expect("sequence"),
+            data,
+        )
+        .map_err(|e| DdlError::BadIndexDef(e.to_string()))?;
+    if keys.len() != 1
+        || keys[0].kind != dict::index_kind::BTREE
+        || !keys[0].is_unique
+        || keys[0].cols.len() != 1
+        || keys[0].cols[0].col != 1
+    {
+        return Err(DdlError::BadIndexDef(
+            "invalid full-text record tree".into(),
+        ));
+    }
+    let key_obj = keys[0].obj;
+    let (_, seq) = with_ddl_txn(cat, engine, |w| {
+        let heap = create_table_segment(
+            w.cat,
+            w.pool,
+            w.log,
+            w.txn,
+            SegType::Heap,
+            data,
+            data,
+            &TableOptions::default(),
+        )?;
+        let key_tree = create_empty_index_segment(w, key_obj)?;
+        fill_fulltext_heap(w, heap, key_tree, build.rows)?;
+        reset_graph_tree(w, obj, build.entries)?;
+        switch_graph_segment(w, key_obj, key_tree, build.rows.len())?;
+        set_index_status(w, key_obj, 1)?;
+        switch_graph_segment(w, data, heap, build.rows.len())?;
+        if let Some(rows) = journal {
+            replace_graph_fulltext_journal(w, base, rows)?;
+        }
+
+        Ok(())
+    })?;
+    Ok(GraphIndexOutcome {
+        obj,
+        entries: build.entries.len(),
+        commit_seq: seq,
+    })
+}
+
+fn drop_fulltext_store(w: &mut DictWriter<'_, '_, '_, '_, '_>, index: u32) -> Result<(), DdlError> {
+    let name = graph_fulltext_store_name(index);
+    let (data, kind) = object_ref(w.cat, &name)?;
+    if kind != dict::obj_kind::GRAPH_FULLTEXT_DATA {
+        return Err(DdlError::WrongKind(name));
+    }
+    for key in index_objects_of(w.cat, data)? {
+        let key_name = object_name(w.cat, key)?;
+        drop_index_rows(w, key, &key_name)?;
+    }
+    drop_table_rows(w, data, &name)
+}
+
+/// Replace a validated full-text descriptor using a non-key dictionary update.
+/// The expected descriptor is compared before publication. SQL callers preserve
+/// the text definition and alter only maintenance policy; no tree is rebuilt.
+///
+/// # Errors
+/// Reject wrong ownership, invalid lengths or a descriptor changed by the caller.
+pub fn alter_graph_fulltext_source(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    expected: &[u8],
+    source: &[u8],
+) -> Result<u64, DdlError> {
+    if source.is_empty() || source.len() > 4096 {
+        return Err(DdlError::BadIndexDef(
+            "invalid full-text descriptor size".into(),
+        ));
+    }
+    let obj = fulltext_identity(cat, name, graph)?;
+    let (_, seq) = with_ddl_txn(cat, engine, |w| {
+        let key = crate::open::comp_num(u64::from(obj));
+        let (rid, mut values) = w
+            .cat
+            .lookup("i_ind_pk", &[Some(&key)])?
+            .ok_or_else(|| DdlError::NotFound(name.into()))?;
+        if values[6] != DictValue::Bytes(expected.to_vec()) {
+            return Err(DdlError::BadIndexDef("full-text descriptor changed".into()));
+        }
+        let (def, block) = w.table("ind$")?;
+        values[6] = DictValue::Bytes(source.to_vec());
+        w.update_row_nonkey("ind$", block, def, rid, &values)?;
+        set_object_status(w, obj, 1)?;
+        Ok(())
+    })?;
+    Ok(seq)
+}
+
+/// Drop only a full-text index owned by the stated graph, including its document heap.
+pub fn drop_graph_fulltext_index(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+) -> Result<DropOutcome, DdlError> {
+    drop_graph_fulltext_index_inner(cat, engine, name, graph, None)
+}
+
+/// Remove the index and unregister its graph journal consumer in one DDL transaction.
+pub fn drop_graph_fulltext_index_with_journal(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    journal: &NativeRecordRows,
+) -> Result<DropOutcome, DdlError> {
+    drop_graph_fulltext_index_inner(cat, engine, name, graph, Some(journal))
+}
+
+fn drop_graph_fulltext_index_inner(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+    journal: Option<&NativeRecordRows>,
+) -> Result<DropOutcome, DdlError> {
+    let obj = fulltext_identity(cat, name, graph)?;
+    let (out, _) = with_ddl_txn(cat, engine, |w| {
+        drop_fulltext_store(w, obj)?;
+        drop_index_rows(w, obj, name)?;
+        if let Some(rows) = journal {
+            let base = object_number(w.cat, graph)?;
+            replace_graph_fulltext_journal(w, base, rows)?;
+        }
+
+        Ok(DropOutcome {
+            obj,
+            indexes: vec![],
+        })
+    })?;
+    Ok(out)
+}
+
+/// Descriptor for a protected directory/adjacency tree; not a property expression.
+pub fn graph_access_descriptor(kind: u32) -> Option<&'static [u8]> {
+    match kind {
+        dict::index_kind::GRAPH_NODES => Some(b"bicdb-graph-access-v1:nodes"),
+        dict::index_kind::GRAPH_OUT => Some(b"bicdb-graph-access-v1:out"),
+        dict::index_kind::GRAPH_IN => Some(b"bicdb-graph-access-v1:in"),
+        _ => None,
+    }
+}
+
+/// Descriptor for a v3 physical route. These are graph-owned companions, not
+/// property expressions. Adjacency authority is a segment, never a B-tree.
+pub fn graph_physical_descriptor(kind: u32) -> Option<&'static [u8]> {
+    match kind {
+        dict::index_kind::GRAPH_ADJACENCY => Some(b"bicdb-graph-physical-v3:adjacency"),
+        dict::index_kind::GRAPH_SOURCE_ENTRY => Some(b"bicdb-graph-physical-v3:source"),
+        dict::index_kind::GRAPH_EDGE_LOCATOR => Some(b"bicdb-graph-physical-v3:locator"),
+        dict::index_kind::GRAPH_REVERSE => Some(b"bicdb-graph-physical-v3:reverse"),
+        _ => None,
+    }
+}
+/// One graph-owned physical object and its current native segment header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphPhysicalRoute {
+    /// Dictionary object ID, owned by `GraphPhysicalRoutes::graph`.
+    pub obj: u32,
+    /// Segment-header block in the graph's workspace datafile.
+    pub block: u32,
+}
+/// Complete route set for the v3 SQL adapter. Presence alone does not mean a
+/// v2 graph has migrated: its transactional graph manifest chooses authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphPhysicalRoutes {
+    /// Logical named graph dictionary object ID.
+    pub graph: u32,
+    /// Type-3 authoritative adjacency segment.
+    pub adjacency: GraphPhysicalRoute,
+    /// Physical source -> snapshot metadata row B-tree.
+    pub source: GraphPhysicalRoute,
+    /// Logical edge ID -> stable edge ROWID B-tree.
+    pub locator: GraphPhysicalRoute,
+    /// Physical incoming/type/source/edge candidate B-tree.
+    pub incoming: GraphPhysicalRoute,
+}
+fn physical_route_suffix(kind: u32) -> &'static str {
+    match kind {
+        dict::index_kind::GRAPH_ADJACENCY => "adj",
+        dict::index_kind::GRAPH_SOURCE_ENTRY => "source",
+        dict::index_kind::GRAPH_EDGE_LOCATOR => "locator",
+        _ => "reverse",
+    }
+}
+/// Resolve and validate all four routes without writing. Incomplete, duplicate,
+/// forged-descriptor or wrong-segment sets fail rather than silently rebuilding.
+pub fn graph_physical_routes(
+    cat: &mut Catalog<'_>,
+    graph: &str,
+) -> Result<Option<GraphPhysicalRoutes>, DdlError> {
+    let (base, kind) = object_ref(cat, graph)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(graph.into()));
+    }
+    let indexes = cat
+        .indexes_of(
+            CommitSeq::from_raw(cat.current_seq()).expect("sequence"),
+            base,
+        )
+        .map_err(|e| DdlError::BadIndexDef(e.to_string()))?;
+    let mut routes = std::collections::BTreeMap::new();
+    for index in indexes {
+        let Some(descriptor) = graph_physical_descriptor(index.kind) else {
+            continue;
+        };
+        if index.status != 1
+            || index.is_unique
+            || index.cols.len() != 1
+            || index.cols[0].col != 0
+            || index.cols[0].pos != 1
+            || index.cols[0].is_desc
+            || index.expr_src.as_deref() != Some(descriptor)
+        {
+            return Err(DdlError::BadIndexDef(
+                "invalid graph physical route descriptor".into(),
+            ));
+        }
+        let block = live_segment_block(cat, index.obj)?;
+        let segment = cat.segment_at(block)?;
+        let expected = if index.kind == dict::index_kind::GRAPH_ADJACENCY {
+            SegType::Adjacency
+        } else {
+            SegType::BTree
+        };
+        if segment.header().seg_type != expected
+            || segment.header().obj != index.obj
+            || segment.header().dataobj != index.obj
+        {
+            return Err(DdlError::BadIndexDef(
+                "invalid graph physical segment ownership/type".into(),
+            ));
+        }
+        if routes
+            .insert(
+                index.kind,
+                GraphPhysicalRoute {
+                    obj: index.obj,
+                    block,
+                },
+            )
+            .is_some()
+        {
+            return Err(DdlError::BadIndexDef(
+                "duplicate graph physical route".into(),
+            ));
+        }
+    }
+    if routes.is_empty() {
+        return Ok(None);
+    }
+    if routes.len() != 4 {
+        return Err(DdlError::BadIndexDef(
+            "incomplete graph physical routes".into(),
+        ));
+    }
+    Ok(Some(GraphPhysicalRoutes {
+        graph: base,
+        adjacency: routes[&dict::index_kind::GRAPH_ADJACENCY],
+        source: routes[&dict::index_kind::GRAPH_SOURCE_ENTRY],
+        locator: routes[&dict::index_kind::GRAPH_EDGE_LOCATOR],
+        incoming: routes[&dict::index_kind::GRAPH_REVERSE],
+    }))
+}
+/// Create the complete managed route set and run a migration/fill callback in
+/// the same DDL transaction. The callback must publish authority/manifest and
+/// source rows atomically; callers may also create an empty inactive route set.
+/// Read-only queries never call this API. Rejects any existing physical routes.
+pub fn create_graph_physical_routes(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    graph: &str,
+    populate: impl FnOnce(
+        &GraphPhysicalRoutes,
+        &mut Catalog<'_>,
+        &BufferPool<'_>,
+        &mut GroupWriter<'_, '_>,
+        &mut UndoChain<'_, '_>,
+        &mut Txn,
+    ) -> Result<(), DdlError>,
+) -> Result<GraphPhysicalRoutes, DdlError> {
+    if graph_physical_routes(cat, graph)?.is_some() {
+        return Err(DdlError::BadIndexDef(
+            "graph physical routes already exist".into(),
+        ));
+    }
+    let (base, _) = object_ref(cat, graph)?;
+    let (routes, _) = with_ddl_txn(cat, engine, |w| {
+        let routes = create_graph_physical_routes_inner(w, base)?;
+        populate(&routes, w.cat, w.pool, w.log, w.chain, w.txn)?;
+        Ok(routes)
+    })?;
+    Ok(routes)
+}
+
+/// Prepare authority for an explicitly validated legacy graph migration.
+/// A complete existing inactive set is replaced with fresh routes in the same
+/// transaction as population. This avoids adopting redo-only candidates left
+/// by an aborted migration. Invalid/incomplete/foreign sets fail validation.
+/// The caller must prove that the current manifest still selects legacy data.
+pub fn prepare_graph_migration_routes(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    graph: &str,
+    populate: impl FnOnce(
+        &GraphPhysicalRoutes,
+        &mut Catalog<'_>,
+        &BufferPool<'_>,
+        &mut GroupWriter<'_, '_>,
+        &mut UndoChain<'_, '_>,
+        &mut Txn,
+    ) -> Result<(), DdlError>,
+) -> Result<GraphPhysicalRoutes, DdlError> {
+    match graph_physical_routes(cat, graph)? {
+        None => create_graph_physical_routes(cat, engine, graph, populate),
+        Some(_) => rebuild_graph_physical_routes(cat, engine, graph, populate),
+    }
+}
+
+/// Replace all four physical routes in one transaction. Old dictionary rows
+/// remain reconstructible by CR, and old segments are retained for snapshot
+/// readers. The callback republishes source metadata and manifest atomically.
+pub fn rebuild_graph_physical_routes(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    graph: &str,
+    populate: impl FnOnce(
+        &GraphPhysicalRoutes,
+        &mut Catalog<'_>,
+        &BufferPool<'_>,
+        &mut GroupWriter<'_, '_>,
+        &mut UndoChain<'_, '_>,
+        &mut Txn,
+    ) -> Result<(), DdlError>,
+) -> Result<GraphPhysicalRoutes, DdlError> {
+    let old = graph_physical_routes(cat, graph)?
+        .ok_or_else(|| DdlError::BadIndexDef("graph has no physical routes to rebuild".into()))?;
+    let mut objects = Vec::new();
+    for route in [old.adjacency, old.source, old.locator, old.incoming] {
+        objects.push((route.obj, object_name(cat, route.obj)?));
+    }
+    let (routes, _) = with_ddl_txn(cat, engine, |w| {
+        for (obj, name) in objects {
+            drop_index_rows(w, obj, &name)?;
+            let key = crate::open::comp_num(u64::from(obj));
+            if let Some((rid, _)) = w.cat.lookup("i_stat_pk", &[Some(&key)])? {
+                let def = dict::DICT_TABLES
+                    .iter()
+                    .find(|table| table.name == "stat$")
+                    .expect("stat$ kernel definition");
+                w.delete_row("stat$", def, rid)?;
+            }
+        }
+        let routes = create_graph_physical_routes_inner(w, old.graph)?;
+        populate(&routes, w.cat, w.pool, w.log, w.chain, w.txn)?;
+        w.changed.push(old.graph);
+        Ok(routes)
+    })?;
+    Ok(routes)
+}
+
+fn create_graph_physical_routes_inner(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    base: u32,
+) -> Result<GraphPhysicalRoutes, DdlError> {
+    let mut created = Vec::new();
+    for kind in [
+        dict::index_kind::GRAPH_ADJACENCY,
+        dict::index_kind::GRAPH_SOURCE_ENTRY,
+        dict::index_kind::GRAPH_EDGE_LOCATOR,
+        dict::index_kind::GRAPH_REVERSE,
+    ] {
+        w.cat.check_ddl_deadline()?;
+        let obj = allocate_obj_number(w, None)?;
+        let name = format!("i_graph_{base}_{}$", physical_route_suffix(kind));
+        let descriptor = graph_physical_descriptor(kind).expect("physical kind");
+        let block = if kind == dict::index_kind::GRAPH_ADJACENCY {
+            let block = create_table_segment(
+                w.cat,
+                w.pool,
+                w.log,
+                w.txn,
+                SegType::Adjacency,
+                obj,
+                obj,
+                &TableOptions::default(),
+            )?;
+            w.insert_obj(obj, &name, dict::namespace::INDEX, dict::obj_kind::INDEX)?;
+            w.insert_index_rows(obj, base, false, &[0], Some((kind, descriptor)))?;
+            w.insert_seg(obj, block)?;
+            block
+        } else {
+            create_index_object_with_source(
+                w,
+                obj,
+                base,
+                &name,
+                &[0],
+                false,
+                Some((kind, descriptor)),
+            )?
+        };
+        w.insert_stat(obj, 0)?;
+        created.push(GraphPhysicalRoute { obj, block });
+    }
+    let routes = GraphPhysicalRoutes {
+        graph: base,
+        adjacency: created[0],
+        source: created[1],
+        locator: created[2],
+        incoming: created[3],
+    };
+    Ok(routes)
+}
+
+/// Input for a graph-owned native tree, built from a validated graph image.
+pub struct GraphAccessBuild<'a> {
+    /// GRAPH_NODES, GRAPH_OUT or GRAPH_IN.
+    pub kind: u32,
+    /// Ordered keys and 48-bit element IDs.
+    pub entries: &'a [(Vec<u8>, u64)],
+}
+fn create_graph_access_tree(
+    w: &mut DictWriter<'_, '_, '_, '_, '_>,
+    base: u32,
+    kind: u32,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<u32, DdlError> {
+    let source = graph_access_descriptor(kind)
+        .ok_or_else(|| DdlError::BadIndexDef("invalid graph access kind".into()))?;
+    let suffix = match kind {
+        dict::index_kind::GRAPH_NODES => "nodes",
+        dict::index_kind::GRAPH_OUT => "out",
+        _ => "in",
+    };
+    let obj = allocate_obj_number(w, None)?;
+    let block = create_index_object_with_source(
+        w,
+        obj,
+        base,
+        &format!("i_graph_{base}_{suffix}$"),
+        &[0],
+        false,
+        Some((kind, source)),
+    )?;
+    fill_graph_tree(w, block, entries)?;
+    w.insert_stat(obj, entries.len() as u64)?;
+    Ok(obj)
+}
+
+/// Populate missing protected access trees of an older graph atomically.
+/// Caller must be outside a user transaction; read-only queries never call this.
+pub fn ensure_graph_access_indexes(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    graph: &str,
+    builds: &[GraphAccessBuild<'_>],
+) -> Result<(), DdlError> {
+    let (base, kind) = object_ref(cat, graph)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(graph.into()));
+    }
+    let mut requested = std::collections::BTreeSet::new();
+    for build in builds {
+        if graph_access_descriptor(build.kind).is_none() || !requested.insert(build.kind) {
+            return Err(DdlError::BadIndexDef(
+                "invalid/duplicate access tree build".into(),
+            ));
+        }
+    }
+    if requested.len() != 3 {
+        return Err(DdlError::BadIndexDef(
+            "three access tree builds required".into(),
+        ));
+    }
+    let indexes = cat
+        .indexes_of(
+            CommitSeq::from_raw(cat.current_seq()).expect("sequence"),
+            base,
+        )
+        .map_err(|e| DdlError::BadIndexDef(e.to_string()))?;
+    let mut existing = std::collections::BTreeSet::new();
+    for i in indexes {
+        if let Some(source) = graph_access_descriptor(i.kind) {
+            if i.status != 1
+                || i.is_unique
+                || i.cols.len() != 1
+                || i.cols[0].col != 0
+                || i.expr_src.as_deref() != Some(source)
+                || !existing.insert(i.kind)
+            {
+                return Err(DdlError::BadIndexDef(
+                    "invalid graph access metadata".into(),
+                ));
+            }
+        }
+    }
+    if existing.len() == 3 {
+        return Ok(());
+    }
+    with_ddl_txn(cat, engine, |w| {
+        for build in builds {
+            if !existing.contains(&build.kind) {
+                create_graph_access_tree(w, base, build.kind, build.entries)?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Atomically rebuild all three protected access trees, or create missing old
+/// graph trees. Object identity survives; old routing is undo-protected on error.
+pub fn rebuild_graph_access_indexes(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    graph: &str,
+    builds: &[GraphAccessBuild<'_>],
+) -> Result<(), DdlError> {
+    let (base, kind) = object_ref(cat, graph)?;
+    if kind != dict::obj_kind::GRAPH {
+        return Err(DdlError::WrongKind(graph.into()));
+    }
+    let mut requested = std::collections::BTreeSet::new();
+    for b in builds {
+        if graph_access_descriptor(b.kind).is_none() || !requested.insert(b.kind) {
+            return Err(DdlError::BadIndexDef(
+                "invalid/duplicate access build".into(),
+            ));
+        }
+    }
+    if requested.len() != 3 {
+        return Err(DdlError::BadIndexDef("three access builds required".into()));
+    }
+    let indexes = cat
+        .indexes_of(
+            CommitSeq::from_raw(cat.current_seq()).expect("sequence"),
+            base,
+        )
+        .map_err(|e| DdlError::BadIndexDef(e.to_string()))?;
+    let mut existing = std::collections::BTreeMap::new();
+    for i in indexes {
+        if let Some(source) = graph_access_descriptor(i.kind) {
+            if i.is_unique
+                || i.cols.len() != 1
+                || i.cols[0].col != 0
+                || i.expr_src.as_deref() != Some(source)
+                || existing.insert(i.kind, i.obj).is_some()
+            {
+                return Err(DdlError::BadIndexDef(
+                    "invalid graph access metadata".into(),
+                ));
+            }
+        }
+    }
+    with_ddl_txn(cat, engine, |w| {
+        for b in builds {
+            if let Some(obj) = existing.get(&b.kind) {
+                reset_graph_tree(w, *obj, b.entries)?;
+            } else {
+                create_graph_access_tree(w, base, b.kind, b.entries)?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Explicit graph-index drop; ordinary DROP INDEX cannot bypass ownership.
+pub fn drop_graph_property_index(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    graph: &str,
+) -> Result<DropOutcome, DdlError> {
+    let (obj, _) = graph_index_identity(cat, name, graph)?;
+    let (out, _) = with_ddl_txn(cat, engine, |w| {
+        drop_index_rows(w, obj, name)?;
+        Ok(DropOutcome {
+            obj,
+            indexes: vec![],
+        })
+    })?;
+    Ok(out)
 }
 
 // ───────────────────────────── 建索引 ─────────────────────────────
@@ -1476,9 +2828,30 @@ pub fn drop_table(
     engine: &Engine<'_, '_, '_, '_>,
     name: &str,
 ) -> Result<DropOutcome, DdlError> {
+    drop_heap_kind(cat, engine, name, dict::obj_kind::TABLE)
+}
+
+/// Drop a named graph without permitting DROP TABLE to bypass its type.
+pub fn drop_graph(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+) -> Result<DropOutcome, DdlError> {
+    drop_heap_kind(cat, engine, name, dict::obj_kind::GRAPH)
+}
+
+fn drop_heap_kind(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    name: &str,
+    expected: u32,
+) -> Result<DropOutcome, DdlError> {
     let obj = object_number(cat, name)?;
+    if obj < dict::obj_kind::USER_FIRST {
+        return Err(DdlError::ReadOnlyDictionary(name.to_owned()));
+    }
     let kind = object_kind(cat, name)?;
-    if kind != dict::obj_kind::TABLE {
+    if kind != expected {
         return Err(DdlError::WrongKind(name.to_owned()));
     }
     let index_objs = index_objects_of(cat, obj)?;
@@ -1488,8 +2861,21 @@ pub fn drop_table(
     }
     let (outcome, _seq) = with_ddl_txn(cat, engine, |w| {
         for &i in &index_objs {
+            let key = crate::open::comp_num(u64::from(i));
+            let (_, definition) = w
+                .cat
+                .lookup("i_ind_pk", &[Some(&key)])?
+                .ok_or_else(|| DdlError::NotFound(i.to_string()))?;
+            if definition.get(2)
+                == Some(&DictValue::Num(u64::from(dict::index_kind::GRAPH_FULLTEXT)))
+            {
+                drop_fulltext_store(w, i)?;
+            }
             let iname = object_name(w.cat, i)?;
             drop_index_rows(w, i, &iname)?;
+        }
+        if expected == dict::obj_kind::GRAPH {
+            drop_graph_fulltext_journal(w, obj)?;
         }
         drop_table_rows(w, obj, name)?;
         Ok(DropOutcome {
@@ -1507,9 +2893,24 @@ pub fn drop_index(
     name: &str,
 ) -> Result<DropOutcome, DdlError> {
     let obj = object_number_ns(cat, name, dict::namespace::INDEX)?;
+    if obj < dict::obj_kind::USER_FIRST {
+        return Err(DdlError::ReadOnlyDictionary(name.to_owned()));
+    }
     let kind = object_kind_ns(cat, name, dict::namespace::INDEX)?;
     if kind != dict::obj_kind::INDEX {
         return Err(DdlError::WrongKind(name.to_owned()));
+    }
+    let (base, _, _) = index_definition(cat, obj)?;
+    let base_name = object_name(cat, base)?;
+    if matches!(
+        object_ref(cat, &base_name)?.1,
+        dict::obj_kind::GRAPH
+            | dict::obj_kind::GRAPH_FULLTEXT_DATA
+            | dict::obj_kind::GRAPH_FULLTEXT_QUEUE
+    ) {
+        return Err(DdlError::BadIndexDef(
+            "graph storage index is managed by its graph".into(),
+        ));
     }
     let (outcome, _seq) = with_ddl_txn(cat, engine, |w| {
         drop_index_rows(w, obj, name)?;
@@ -1604,12 +3005,10 @@ fn check_kind_or(cat: &mut Catalog<'_>, name: &str, kind: u32) -> Result<(), Ddl
     Ok(())
 }
 
-/// 某表的全部索引对象号（`ind$` 的 `bobj#` 过滤；表小 ⇒ 全扫 `i_ind_pk`）。
+/// Enumerate visible dictionary rows; raw tree entries can outlive rolled-back DDL.
 fn index_objects_of(cat: &mut Catalog<'_>, table_obj: u32) -> Result<Vec<u32>, DdlError> {
-    let inds = cat.scan_index("i_ind_pk")?;
     let mut out = Vec::new();
-    for (_k, rid) in inds {
-        let values = cat.fetch("ind$", rid)?;
+    for (_, values) in cat.scan("ind$")? {
         let (obj, bobj) = match (values.first(), values.get(1)) {
             (Some(DictValue::Num(o)), Some(DictValue::Num(b))) => (*o as u32, *b as u32),
             _ => continue,
@@ -1663,7 +3062,7 @@ fn drop_index_rows(
     w.changed.push(obj);
     w.cat
         .row_cache()
-        .note_change_name(dict::namespace::TABLE, name);
+        .note_change_name(dict::namespace::INDEX, name);
     Ok(())
 }
 
@@ -1723,6 +3122,730 @@ pub(crate) mod tests {
     const WS: [u8; 8] = [13u8; 8];
     const UNDO_F: &str = "/mem/ddl_undo.dat";
     const DATA_F: &str = "/mem/ddl_file0.dat";
+
+    #[test]
+    fn graph_key_tree_is_owned_protected_idempotent_and_dropped_with_graph() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "graph_tree");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        let created = create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        let indexes = cat.indexes_of(seq(cat.current_seq()), created.obj).unwrap();
+        assert_eq!(indexes.len(), 4);
+        assert!(indexes[0].is_unique);
+        assert_eq!(indexes[0].cols.len(), 1);
+        assert_eq!(indexes[0].cols[0].col, 1);
+        let index_name = format!("i_graph_{}$", created.obj);
+        assert!(matches!(
+            drop_index(&mut cat, rig.engine, &index_name),
+            Err(DdlError::BadIndexDef(_))
+        ));
+        assert!(matches!(
+            rebuild_index(&mut cat, rig.engine, &index_name),
+            Err(DdlError::BadIndexDef(_))
+        ));
+        let previous = cat.current_seq();
+        ensure_graph_storage_index(&mut cat, rig.engine, "knowledge").unwrap();
+        assert_eq!(cat.current_seq(), previous);
+        let dropped = drop_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        assert_eq!(
+            dropped.indexes,
+            indexes.iter().map(|i| i.obj).collect::<Vec<_>>()
+        );
+        assert!(cat
+            .resolve(seq(cat.current_seq()), dict::namespace::INDEX, &index_name)
+            .is_err());
+    }
+
+    #[test]
+    fn graph_physical_routes_are_typed_snapshot_routed_protected_and_reopenable() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "graph_physical_routes");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        let graph = create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        assert_eq!(graph_physical_routes(&mut cat, "knowledge").unwrap(), None);
+        let cols = [
+            dict::ColDef {
+                col: 1,
+                name: "ordinal",
+                type_code: ColTypeCode::Number,
+                length: 0,
+                nullable: false,
+            },
+            dict::ColDef {
+                col: 2,
+                name: "data",
+                type_code: ColTypeCode::Bytes,
+                length: 4096,
+                nullable: false,
+            },
+        ];
+        let mut metadata = None;
+        let routes = create_graph_physical_routes(
+            &mut cat,
+            rig.engine,
+            "knowledge",
+            |routes, cat, pool, log, chain, txn| {
+                let ws = cat.ws();
+                let bytes = row::encode(
+                    &[DictValue::Num(4u64 << 60), DictValue::Bytes(vec![7; 32])],
+                    &cols,
+                )?;
+                let rid = TableAccess::new(pool, ws).insert(
+                    log,
+                    chain,
+                    txn,
+                    cat.file_mut(),
+                    graph.seg_block,
+                    &bytes,
+                    &InsertPolicy::in_place(0),
+                )?;
+                let root = acc_index::insert_entry(
+                    pool,
+                    log,
+                    cat.file_mut(),
+                    ws,
+                    routes.source.block,
+                    txn,
+                    b"owner",
+                    rid,
+                )?;
+                acc_index::write_tree_head_redo(
+                    pool,
+                    log,
+                    cat.file_mut(),
+                    ws,
+                    routes.source.block,
+                    txn,
+                    root,
+                )?;
+                metadata = Some(rid);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            graph_physical_routes(&mut cat, "knowledge").unwrap(),
+            Some(routes)
+        );
+        assert_eq!(
+            cat.segment_at(routes.adjacency.block)
+                .unwrap()
+                .header()
+                .seg_type,
+            SegType::Adjacency
+        );
+        assert!(cat
+            .graph_index_range(routes.adjacency.obj, None, None, 10)
+            .is_err());
+        assert_eq!(
+            cat.graph_index_range(routes.source.obj, None, None, 10)
+                .unwrap(),
+            vec![(b"owner".to_vec(), metadata.unwrap())]
+        );
+        for route in [
+            routes.adjacency,
+            routes.source,
+            routes.locator,
+            routes.incoming,
+        ] {
+            let name = object_name(&mut cat, route.obj).unwrap();
+            assert!(drop_index(&mut cat, rig.engine, &name).is_err());
+        }
+        assert!(create_graph_physical_routes(
+            &mut cat,
+            rig.engine,
+            "knowledge",
+            |_, _, _, _, _, _| Ok(())
+        )
+        .is_err());
+        rig.pool.flush_workspace(WS).unwrap();
+        drop(cat);
+        let mut reopened = open_catalog(io, &rig);
+        assert_eq!(
+            graph_physical_routes(&mut reopened, "knowledge").unwrap(),
+            Some(routes)
+        );
+        // The raw test Catalog::open does not run instance startup recovery or
+        // adopt the Engine watermark; the surviving engine is authoritative.
+        let view = bicdb_storage::cr::ReadView::new(seq(rig.engine.current_seq()));
+        let rows = rig
+            .engine
+            .with_read_context(|pool, chain| {
+                bicdb_storage::scan::fetch_rows_resolved(pool, chain, view, &[metadata.unwrap()])
+            })
+            .unwrap();
+        let decoded = row::decode(&rows[0].as_ref().unwrap().1, &cols).unwrap();
+        assert_eq!(
+            decoded,
+            vec![DictValue::Num(4u64 << 60), DictValue::Bytes(vec![7; 32])]
+        );
+        let mut updating = rig.engine.begin().unwrap();
+        rig.engine
+            .with_write_context(&mut updating, |pool, log, chain, txn| {
+                let ws = reopened.ws();
+                let bytes = row::encode(
+                    &[DictValue::Num(4u64 << 60), DictValue::Bytes(vec![8; 32])],
+                    &cols,
+                )
+                .unwrap();
+                TableAccess::new(pool, ws)
+                    .update(
+                        log,
+                        chain,
+                        txn,
+                        reopened.file_mut(),
+                        graph.seg_block,
+                        metadata.unwrap(),
+                        &bytes,
+                        &InsertPolicy::in_place(0),
+                    )
+                    .unwrap();
+            });
+        for (read_view, expected_byte) in [(view, 7), (view.with_own(Some(updating.id())), 8)] {
+            let rows = rig
+                .engine
+                .with_read_context(|pool, chain| {
+                    bicdb_storage::scan::fetch_rows_resolved(
+                        pool,
+                        chain,
+                        read_view,
+                        &[metadata.unwrap()],
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                row::decode(&rows[0].as_ref().unwrap().1, &cols).unwrap()[1],
+                DictValue::Bytes(vec![expected_byte; 32])
+            );
+        }
+        rig.engine.rollback(&mut updating).unwrap();
+        let rows = rig
+            .engine
+            .with_read_context(|pool, chain| {
+                bicdb_storage::scan::fetch_rows_resolved(pool, chain, view, &[metadata.unwrap()])
+            })
+            .unwrap();
+        assert_eq!(
+            row::decode(&rows[0].as_ref().unwrap().1, &cols).unwrap()[1],
+            DictValue::Bytes(vec![7; 32])
+        );
+        let dropped = drop_graph(&mut reopened, rig.engine, "knowledge").unwrap();
+        for route in [
+            routes.adjacency,
+            routes.source,
+            routes.locator,
+            routes.incoming,
+        ] {
+            assert!(dropped.indexes.contains(&route.obj));
+        }
+        assert!(graph_physical_routes(&mut reopened, "knowledge").is_err());
+    }
+
+    #[test]
+    fn graph_physical_route_callback_failure_rolls_back_all_objects_and_heap_data() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "graph_physical_failure");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        let graph = create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        let previous = cat
+            .indexes_of(seq(cat.current_seq()), graph.obj)
+            .unwrap()
+            .iter()
+            .map(|i| i.obj)
+            .collect::<Vec<_>>();
+        let mut written = None;
+        let failure = create_graph_physical_routes(
+            &mut cat,
+            rig.engine,
+            "knowledge",
+            |routes, cat, pool, log, chain, txn| {
+                let ws = cat.ws();
+                let bytes = bicdb_storage::row::assemble_row(
+                    0,
+                    0xFF,
+                    &[false],
+                    &[],
+                    &[b"uncommitted source metadata".as_slice()],
+                )
+                .unwrap();
+                let rid = TableAccess::new(pool, ws).insert(
+                    log,
+                    chain,
+                    txn,
+                    cat.file_mut(),
+                    graph.seg_block,
+                    &bytes,
+                    &InsertPolicy::in_place(0),
+                )?;
+                written = Some(rid);
+                let root = acc_index::insert_entry(
+                    pool,
+                    log,
+                    cat.file_mut(),
+                    ws,
+                    routes.locator.block,
+                    txn,
+                    b"edge",
+                    rid,
+                )?;
+                acc_index::write_tree_head_redo(
+                    pool,
+                    log,
+                    cat.file_mut(),
+                    ws,
+                    routes.locator.block,
+                    txn,
+                    root,
+                )?;
+                Err(DdlError::BadIndexDef(
+                    "injected after physical route fill".into(),
+                ))
+            },
+        );
+        assert!(failure.is_err());
+        assert_eq!(graph_physical_routes(&mut cat, "knowledge").unwrap(), None);
+        assert_eq!(
+            cat.indexes_of(seq(cat.current_seq()), graph.obj)
+                .unwrap()
+                .iter()
+                .map(|i| i.obj)
+                .collect::<Vec<_>>(),
+            previous
+        );
+        let view = bicdb_storage::cr::ReadView::new(seq(cat.current_seq()));
+        let rows = rig
+            .engine
+            .with_read_context(|pool, chain| {
+                bicdb_storage::scan::fetch_rows_resolved(pool, chain, view, &[written.unwrap()])
+            })
+            .unwrap();
+        assert!(rows[0].is_none());
+        let routes =
+            create_graph_physical_routes(&mut cat, rig.engine, "knowledge", |_, _, _, _, _, _| {
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            graph_physical_routes(&mut cat, "knowledge").unwrap(),
+            Some(routes)
+        );
+    }
+
+    #[test]
+    fn graph_physical_partial_routes_are_rejected_without_silent_creation() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "graph_physical_partial");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        let graph = create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        with_ddl_txn(&mut cat, rig.engine, |w| {
+            let obj = allocate_obj_number(w, None)?;
+            create_index_object_with_source(
+                w,
+                obj,
+                graph.obj,
+                "partial$",
+                &[0],
+                false,
+                Some((
+                    dict::index_kind::GRAPH_SOURCE_ENTRY,
+                    graph_physical_descriptor(dict::index_kind::GRAPH_SOURCE_ENTRY).unwrap(),
+                )),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let previous = cat.current_seq();
+        assert!(graph_physical_routes(&mut cat, "knowledge").is_err());
+        assert!(create_graph_physical_routes(
+            &mut cat,
+            rig.engine,
+            "knowledge",
+            |_, _, _, _, _, _| Ok(())
+        )
+        .is_err());
+        assert_eq!(cat.current_seq(), previous);
+    }
+
+    #[test]
+    fn graph_access_rebuild_is_atomic_across_three_tree_routes() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "graph_access_rebuild");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        let graph = create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        let original = vec![(b"original".to_vec(), 17)];
+        let builds = [
+            GraphAccessBuild {
+                kind: dict::index_kind::GRAPH_NODES,
+                entries: &original,
+            },
+            GraphAccessBuild {
+                kind: dict::index_kind::GRAPH_OUT,
+                entries: &original,
+            },
+            GraphAccessBuild {
+                kind: dict::index_kind::GRAPH_IN,
+                entries: &original,
+            },
+        ];
+        rebuild_graph_access_indexes(&mut cat, rig.engine, "knowledge", &builds).unwrap();
+        let indexes = cat.indexes_of(seq(cat.current_seq()), graph.obj).unwrap();
+        let routes: Vec<_> = indexes
+            .iter()
+            .filter(|i| graph_access_descriptor(i.kind).is_some())
+            .map(|i| (i.obj, live_segment_block(&mut cat, i.obj).unwrap()))
+            .collect();
+        assert_eq!(routes.len(), 3);
+        let good = vec![(b"changed".to_vec(), 39)];
+        let bad = vec![(b"changed".to_vec(), 0)];
+        let failed = [
+            GraphAccessBuild {
+                kind: dict::index_kind::GRAPH_NODES,
+                entries: &good,
+            },
+            GraphAccessBuild {
+                kind: dict::index_kind::GRAPH_OUT,
+                entries: &good,
+            },
+            GraphAccessBuild {
+                kind: dict::index_kind::GRAPH_IN,
+                entries: &bad,
+            },
+        ];
+        assert!(rebuild_graph_access_indexes(&mut cat, rig.engine, "knowledge", &failed).is_err());
+        for (obj, block) in routes {
+            assert_eq!(live_segment_block(&mut cat, obj).unwrap(), block);
+            let rows = cat.graph_index_range(obj, None, None, 10).unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|(key, id)| (key.clone(), id.as_raw()))
+                    .collect::<Vec<_>>(),
+                original
+            );
+        }
+        let previous = cat.current_seq();
+        ensure_graph_access_indexes(&mut cat, rig.engine, "knowledge", &builds).unwrap();
+        assert_eq!(cat.current_seq(), previous);
+        assert!(
+            rebuild_graph_access_indexes(&mut cat, rig.engine, "knowledge", &builds[..2]).is_err()
+        );
+    }
+
+    #[test]
+    fn fulltext_native_routes_are_stable_atomic_protected_and_graph_owned() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "fulltext_native_routes");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        let rows =
+            std::collections::BTreeMap::from([(0, vec![0; 32]), (1, b"old-document".to_vec())]);
+        let entries = vec![(b"old-term".to_vec(), 17)];
+        let source = b"validated-fulltext-definition";
+        let build = GraphFulltextBuild {
+            source,
+            entries: &entries,
+            rows: &rows,
+        };
+        let invalid = vec![(b"bad".to_vec(), 0)];
+        assert!(create_graph_fulltext_index(
+            &mut cat,
+            rig.engine,
+            "bad",
+            "knowledge",
+            &GraphFulltextBuild {
+                entries: &invalid,
+                ..build
+            }
+        )
+        .is_err());
+        assert!(!object_exists_ns(&mut cat, "bad", dict::namespace::INDEX).unwrap());
+        let index = create_graph_fulltext_index(&mut cat, rig.engine, "words", "knowledge", &build)
+            .unwrap();
+        let data_name = graph_fulltext_store_name(index.obj);
+        let (data, kind) = object_ref(&mut cat, &data_name).unwrap();
+        assert_eq!(kind, dict::obj_kind::GRAPH_FULLTEXT_DATA);
+        let key = index_objects_of(&mut cat, data).unwrap()[0];
+        let routes = [index.obj, data, key].map(|obj| live_segment_block(&mut cat, obj).unwrap());
+        assert!(drop_table(&mut cat, rig.engine, &data_name).is_err());
+        let key_name = object_name(&mut cat, key).unwrap();
+        assert!(drop_index(&mut cat, rig.engine, &key_name).is_err());
+        assert!(rebuild_index(&mut cat, rig.engine, &key_name).is_err());
+        assert!(rebuild_graph_fulltext_index(
+            &mut cat,
+            rig.engine,
+            "words",
+            "knowledge",
+            &GraphFulltextBuild {
+                entries: &invalid,
+                ..build
+            }
+        )
+        .is_err());
+        for (obj, expected) in [index.obj, data, key].into_iter().zip(routes) {
+            assert_eq!(live_segment_block(&mut cat, obj).unwrap(), expected);
+        }
+        assert_eq!(
+            cat.graph_index_range(index.obj, None, None, 10).unwrap()[0].0,
+            b"old-term"
+        );
+        let new_rows =
+            std::collections::BTreeMap::from([(0, vec![1; 32]), (1, b"new-document".to_vec())]);
+        let new_entries = vec![(b"new-term".to_vec(), 29)];
+        // Inject a missing final metadata row: rebuilding switches the posting
+        // and ordinal routes before the document route's statistics fail.
+        // Native undo must restore all three routes, including the one whose
+        // seg$ update already happened before the failure was detected.
+        with_ddl_txn(&mut cat, rig.engine, |w| {
+            let key = crate::open::comp_num(u64::from(data));
+            let (rid, _) = w
+                .cat
+                .lookup("i_stat_pk", &[Some(&key)])?
+                .expect("statistics");
+            let (def, _) = w.table("stat$")?;
+            w.delete_row("stat$", def, rid)
+        })
+        .unwrap();
+        assert!(rebuild_graph_fulltext_index(
+            &mut cat,
+            rig.engine,
+            "words",
+            "knowledge",
+            &GraphFulltextBuild {
+                source,
+                entries: &new_entries,
+                rows: &new_rows
+            }
+        )
+        .is_err());
+        for (obj, previous) in [index.obj, data, key].into_iter().zip(routes) {
+            assert_eq!(live_segment_block(&mut cat, obj).unwrap(), previous);
+        }
+        assert_eq!(
+            cat.graph_index_range(index.obj, None, None, 10).unwrap()[0].0,
+            b"old-term"
+        );
+        with_ddl_txn(&mut cat, rig.engine, |w| {
+            w.insert_stat(data, rows.len() as u64)
+        })
+        .unwrap();
+        let rebuilt = rebuild_graph_fulltext_index(
+            &mut cat,
+            rig.engine,
+            "words",
+            "knowledge",
+            &GraphFulltextBuild {
+                source,
+                entries: &new_entries,
+                rows: &new_rows,
+            },
+        )
+        .unwrap();
+        assert_eq!(rebuilt.obj, index.obj);
+        for (obj, previous) in [index.obj, data, key].into_iter().zip(routes) {
+            assert_ne!(live_segment_block(&mut cat, obj).unwrap(), previous);
+        }
+        create_graph(&mut cat, rig.engine, "other").unwrap();
+        assert!(drop_graph_fulltext_index(&mut cat, rig.engine, "words", "other").is_err());
+        drop_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        assert!(!object_exists(&mut cat, &data_name).unwrap());
+        assert!(!object_exists_ns(&mut cat, "words", dict::namespace::INDEX).unwrap());
+        assert!(!object_exists_ns(&mut cat, &key_name, dict::namespace::INDEX).unwrap());
+    }
+
+    #[test]
+    fn fulltext_journal_registration_and_rebuild_failures_restore_all_routes() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "fulltext_journal_atomic");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        let graph = create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        let rows = NativeRecordRows::from([(0, vec![0; 32]), (1, b"documents".to_vec())]);
+        let entries = vec![(b"term".to_vec(), 17)];
+        let build = GraphFulltextBuild {
+            source: b"validated-descriptor",
+            rows: &rows,
+            entries: &entries,
+        };
+        assert!(create_graph_fulltext_index_with_journal(
+            &mut cat,
+            rig.engine,
+            "failed",
+            "knowledge",
+            &build,
+            |_| Err(DdlError::BadIndexDef(
+                "injected registration failure".into()
+            ))
+        )
+        .is_err());
+        assert!(!object_exists_ns(&mut cat, "failed", dict::namespace::INDEX).unwrap());
+        let queue_name = graph_fulltext_journal_name(graph.obj);
+        assert!(!object_exists(&mut cat, &queue_name).unwrap());
+        let queue_rows = NativeRecordRows::from([(0, vec![0; 32]), (1, b"journal".to_vec())]);
+        let index = create_graph_fulltext_index_with_journal(
+            &mut cat,
+            rig.engine,
+            "words",
+            "knowledge",
+            &build,
+            |_| Ok(queue_rows.clone()),
+        )
+        .unwrap();
+        let (data, _) = object_ref(&mut cat, &graph_fulltext_store_name(index.obj)).unwrap();
+        let key = index_objects_of(&mut cat, data).unwrap()[0];
+        let (queue, kind) = object_ref(&mut cat, &queue_name).unwrap();
+        assert_eq!(kind, dict::obj_kind::GRAPH_FULLTEXT_QUEUE);
+        let queue_key = index_objects_of(&mut cat, queue).unwrap()[0];
+        let ids = [index.obj, data, key, queue, queue_key];
+        let routes: Vec<_> = ids
+            .iter()
+            .map(|id| live_segment_block(&mut cat, *id).unwrap())
+            .collect();
+        let invalid = NativeRecordRows::from([
+            (0, vec![0; 32]),
+            (1, b"journal".to_vec()),
+            (2, vec![0; 4097]),
+        ]);
+        assert!(rebuild_graph_fulltext_index_with_journal(
+            &mut cat,
+            rig.engine,
+            "words",
+            "knowledge",
+            &build,
+            &invalid
+        )
+        .is_err());
+        assert_eq!(
+            ids.iter()
+                .map(|id| live_segment_block(&mut cat, *id).unwrap())
+                .collect::<Vec<_>>(),
+            routes,
+            "journal failure after full-text route switches must roll everything back"
+        );
+        assert!(drop_index(&mut cat, rig.engine, &format!("i_gftq_{}$", graph.obj)).is_err());
+        assert!(drop_table(&mut cat, rig.engine, &queue_name).is_err());
+        rebuild_graph_fulltext_index_with_journal(
+            &mut cat,
+            rig.engine,
+            "words",
+            "knowledge",
+            &build,
+            &queue_rows,
+        )
+        .unwrap();
+        for (id, old) in ids.iter().zip(routes) {
+            assert_ne!(live_segment_block(&mut cat, *id).unwrap(), old);
+        }
+        drop_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        assert!(!object_exists(&mut cat, &queue_name).unwrap());
+        assert!(!object_exists_ns(
+            &mut cat,
+            &format!("i_gftq_{}$", graph.obj),
+            dict::namespace::INDEX
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn graph_property_rebuild_failure_restores_old_routing_and_entries() {
+        let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+        io.add_dir("/mem");
+        let rig = rig(io, "graph_property_rebuild");
+        let mut cat = open_catalog(io, &rig);
+        init_dictionary_tables(&mut cat, rig.engine).unwrap();
+        let graph = create_graph(&mut cat, rig.engine, "knowledge").unwrap();
+        let source = b"validated-descriptor";
+        let entries = vec![(b"alpha".to_vec(), 17), (b"beta".to_vec(), 29)];
+        let created = create_graph_property_index(
+            &mut cat,
+            rig.engine,
+            "names",
+            "knowledge",
+            source,
+            false,
+            &entries,
+        )
+        .unwrap();
+        let old_block = live_segment_block(&mut cat, created.obj).unwrap();
+        let rows = cat.graph_index_range(created.obj, None, None, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(key, id)| (key.clone(), id.as_raw()))
+                .collect::<Vec<_>>(),
+            entries
+        );
+        // Fail after replacing metadata and inserting an entry in the new tree.
+        let invalid = vec![(b"new".to_vec(), 31), (b"invalid".to_vec(), 1 << 48)];
+        assert!(rebuild_graph_property_index(
+            &mut cat,
+            rig.engine,
+            "names",
+            "knowledge",
+            source,
+            false,
+            &invalid
+        )
+        .is_err());
+        assert_eq!(
+            live_segment_block(&mut cat, created.obj).unwrap(),
+            old_block
+        );
+        let rows = cat.graph_index_range(created.obj, None, None, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(key, id)| (key.clone(), id.as_raw()))
+                .collect::<Vec<_>>(),
+            entries
+        );
+        assert!(create_graph_property_index(
+            &mut cat,
+            rig.engine,
+            "failed",
+            "knowledge",
+            source,
+            false,
+            &invalid
+        )
+        .is_err());
+        assert!(cat
+            .resolve(seq(cat.current_seq()), dict::namespace::INDEX, "failed")
+            .is_err());
+        assert_eq!(
+            cat.indexes_of(seq(cat.current_seq()), graph.obj)
+                .unwrap()
+                .len(),
+            5
+        );
+        let rebuilt = rebuild_graph_property_index(
+            &mut cat,
+            rig.engine,
+            "names",
+            "knowledge",
+            source,
+            false,
+            &[(b"replacement".to_vec(), 39)],
+        )
+        .unwrap();
+        assert_eq!(rebuilt.obj, created.obj);
+        assert_ne!(
+            live_segment_block(&mut cat, created.obj).unwrap(),
+            old_block
+        );
+        let rows = cat.graph_index_range(created.obj, None, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.as_raw(), 39);
+    }
 
     fn seq(v: u64) -> CommitSeq {
         CommitSeq::from_raw(v).unwrap()
@@ -2163,10 +4286,24 @@ pub fn rebuild_index(
 ) -> Result<CreateIndexOutcome, DdlError> {
     // 先读旧定义（键列名 + 唯一标志 + 基表名）。
     let (obj, kind) = object_ref_ns(cat, name, dict::namespace::INDEX)?;
+    if obj < dict::obj_kind::USER_FIRST {
+        return Err(DdlError::ReadOnlyDictionary(name.to_owned()));
+    }
     if kind != dict::obj_kind::INDEX {
         return Err(DdlError::WrongKind(name.to_owned()));
     }
     let (bobj, unique, col_numbers) = index_definition(cat, obj)?;
+    let base_name = object_name(cat, bobj)?;
+    if matches!(
+        object_ref(cat, &base_name)?.1,
+        dict::obj_kind::GRAPH
+            | dict::obj_kind::GRAPH_FULLTEXT_DATA
+            | dict::obj_kind::GRAPH_FULLTEXT_QUEUE
+    ) {
+        return Err(DdlError::BadIndexDef(
+            "graph storage index is managed by its graph".into(),
+        ));
+    }
     let table_name = object_name(cat, bobj)?;
     let mut columns = Vec::with_capacity(col_numbers.len());
     for cn in &col_numbers {
@@ -2476,4 +4613,98 @@ mod c5_tests {
         assert_eq!(usable[0].obj, rebuilt.obj);
         assert_eq!(usable[0].status, 1);
     }
+}
+
+/// Reserve durable graph element IDs independently of user transaction rollback.
+/// Unused IDs may be skipped; deleted and rolled-back IDs are never reused.
+pub fn reserve_graph_ids(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    obj: u32,
+    count: u64,
+) -> Result<(u64, u64), DdlError> {
+    reserve_graph_ids_from(cat, engine, obj, count, None)
+}
+
+/// Inspect whether the native sequence has never reserved graph element IDs.
+/// Provisioning holds the single-writer instance lock; nonempty range imports
+/// also recheck freshness inside their reservation transaction.
+pub fn graph_ids_are_fresh(cat: &mut Catalog<'_>, obj: u32) -> Result<bool, DdlError> {
+    Ok(graph_allocator_next(cat, obj)?.map_or(true, |next| next == 1))
+}
+
+/// Read the durable next-unused ID, including unspent and failed-query ranges.
+pub fn graph_allocator_next(cat: &mut Catalog<'_>, obj: u32) -> Result<Option<u64>, DdlError> {
+    let comp = crate::open::comp_num((1u64 << 32) + u64::from(obj));
+    match cat.lookup("i_seq_pk", &[Some(&comp)])? {
+        None => Ok(None),
+        Some((_, values)) => match values.get(2) {
+            Some(DictValue::Num(next)) if *next > 0 && *next < 1 << 48 => Ok(Some(*next)),
+            _ => Err(DdlError::BadTableDef("invalid graph sequence".into())),
+        },
+    }
+}
+
+/// Initialize a nonempty snapshot ID range in a fresh native sequence.
+/// The freshness guard and update share one native DDL transaction.
+pub fn reserve_initial_graph_ids(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    obj: u32,
+    count: u64,
+) -> Result<(u64, u64), DdlError> {
+    reserve_graph_ids_from(cat, engine, obj, count, Some(1))
+}
+fn reserve_graph_ids_from(
+    cat: &mut Catalog<'_>,
+    engine: &Engine<'_, '_, '_, '_>,
+    obj: u32,
+    count: u64,
+    expected: Option<u64>,
+) -> Result<(u64, u64), DdlError> {
+    if count == 0 {
+        return Err(DdlError::BadTableDef("empty graph ID reservation".into()));
+    }
+    let (range, _) = with_ddl_txn(cat, engine, |w| {
+        let (def, block) = w.table("seq$")?;
+        let seq_id = (1u64 << 32) + u64::from(obj);
+        let comp = crate::open::comp_num(seq_id);
+        let hit = w.cat.lookup("i_seq_pk", &[Some(&comp)])?;
+        let next = match &hit {
+            Some((_, v)) => match v.get(2) {
+                Some(DictValue::Num(n)) => *n,
+                _ => return Err(DdlError::BadTableDef("invalid graph sequence".into())),
+            },
+            None => 1,
+        };
+        if next == 0 || next >= 1 << 48 {
+            return Err(DdlError::BadTableDef("invalid graph sequence".into()));
+        }
+        if expected.is_some_and(|value| value != next) {
+            return Err(DdlError::BadTableDef(
+                "graph snapshot allocator is not fresh".into(),
+            ));
+        }
+        let high = next
+            .checked_add(count)
+            .filter(|n| *n < 1 << 48)
+            .ok_or_else(|| DdlError::BadTableDef("graph ID space exhausted".into()))?;
+        if let Some((rid, mut values)) = hit {
+            values[2] = DictValue::Num(high);
+            w.update_row_nonkey("seq$", block, def, rid, &values)?;
+        } else {
+            w.insert_row(
+                "seq$",
+                &[
+                    DictValue::Num(seq_id),
+                    DictValue::Text(format!("graph_{obj}")),
+                    DictValue::Num(high),
+                    DictValue::Num(count),
+                    DictValue::Num(0),
+                ],
+            )?;
+        }
+        Ok((next, high - 1))
+    })?;
+    Ok(range)
 }

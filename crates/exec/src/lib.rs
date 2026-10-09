@@ -63,7 +63,8 @@ pub use setops::{all_columns_keys, Append, SetOp, SetOpKind, Unique};
 pub use sort::{Sort, SortKey, TopN};
 pub use spill::SpillSpace;
 pub use value::{
-    cast_value, decode_row, encode_row, kind_name, row_bytes, ColKind, Row, RowShape, Value,
+    cast_value, decode_graph_element, decode_row, encode_graph_element, encode_row, kind_name,
+    row_bytes, ColKind, GraphElement, GraphElementKind, Row, RowShape, Value,
 };
 pub use wmm::{AreaClaim, PoolStats, WorkArea, WorkMemoryPool};
 pub use writer::TableAccessWriter;

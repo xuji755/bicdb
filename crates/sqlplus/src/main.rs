@@ -1,7 +1,7 @@
 //! **bicdbcli** —— bicdb 的 SQL\*Plus 形态客户端（独立命令行工具）。
 //!
 //! ```text
-//! bicdbcli [选项] <实例目录> [@脚本]
+//! bicdbcli [选项] -p <参数文件或实例目录> [@脚本]
 //!   -S              静默（不出横幅）
 //!   -s <套接字>     指定控制套接字（默认 <实例目录>/bicdb.sock）
 //!   -U <主体>       以某个主体认证（口令取 `$BICDB_PASSWORD` 或终端提示；
@@ -31,11 +31,12 @@ const USAGE: &str = "\
 bicdbcli —— bicdb 的 SQL*Plus 形态客户端
 
 用法：
-  bicdbcli [选项] <实例目录> [@脚本]
+  bicdbcli [选项] -p <参数文件或实例目录> [@脚本]
 
 选项：
   -S              静默（不出横幅与提示符由 SET SQLPROMPT 控制）
   -s <套接字>      控制套接字（默认 <实例目录>/bicdb.sock）
+  -p <参数文件或实例目录>  数据库连接目标
   -U <主体>       以某个主体认证（口令取 $BICDB_PASSWORD 或终端提示；只对经服务有效）
   --direct        强制直连（服务在跑时会被实例锁挡住）
   -? -h --help    本帮助
@@ -45,6 +46,7 @@ bicdbcli —— bicdb 的 SQL*Plus 形态客户端
   /               重跑当前缓冲区
   LIST / RUN / DEL / APPEND / CHANGE / CLEAR BUFFER   缓冲编辑
   SET / SHOW      会话参数（ECHO/FEEDBACK/TIMING/PAGESIZE/LINESIZE/NULL/…）
+  SHOW TABLES     当前工作区的表（含字典表和固定表），带类型和对象号
   SPOOL <文件|OFF> 把输出同时写进文件
   @<文件>         跑脚本；DESCRIBE <对象>；HOST !<命令>；EXIT
   HELP            全部命令
@@ -90,8 +92,6 @@ fn run(args: &[String]) -> Result<i32, String> {
     let mut silent = false;
     let mut direct = false;
     let mut socket: Option<PathBuf> = None;
-    // **认证凭据**（`-U <主体>` + 口令；`bicdb sql` 与这里共用一份取法）。
-    let creds = bicdb_cli::clientauth::from_args(args)?;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -103,6 +103,10 @@ fn run(args: &[String]) -> Result<i32, String> {
             "-p" | "--ini" | "--params-file" => {
                 ini = Some(PathBuf::from(it.next().ok_or("-p 缺参数文件路径")?));
             }
+            "-U" | "--user" => {
+                it.next().ok_or("-U/--user 缺主体名")?;
+            }
+            other if other.starts_with("-U=") || other.starts_with("--user=") => {}
             other if other.starts_with('@') => script = Some(PathBuf::from(&other[1..])),
             other if other.starts_with('-') => {
                 return Err(format!("不认识的选项 `{other}`（`--help` 看用法）"));
@@ -110,6 +114,8 @@ fn run(args: &[String]) -> Result<i32, String> {
             other => return Err(format!("不认识的参数 `{other}`（`--help` 看用法）")),
         }
     }
+    // Validate flags before prompting for credentials; both clients share this path.
+    let creds = bicdb_cli::clientauth::from_args(args)?;
     // **实例寻址**：`-p` > `$BICDB_INI` > `./bicdb.ini`（照 Oracle 的口径，
     // 不指向目录——根区目录注册在参数文件里）。
     // **`-s <套接字>` 明确指定了连接目标**：参数文件找不到也不挡路——它这时

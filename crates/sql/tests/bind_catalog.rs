@@ -222,9 +222,13 @@ fn binder_resolves_against_the_real_catalog() {
         );
         let mut view = CatalogViewImpl::new(&mut cat_a, snap);
         let mut r = NameResolver::new(&mut view);
+        assert_eq!(
+            r.resolve_table("obj$").unwrap(),
+            ResolvedName::FixedTable("obj$")
+        );
         assert!(matches!(
-            r.resolve_table("obj$").unwrap_err(),
-            BindError::NotFound { .. }
+            r.resolve_write_target("obj$").unwrap_err(),
+            BindError::NotWritable(_)
         ));
         assert!(matches!(
             r.resolve_index("i_obj_pk").unwrap_err(),

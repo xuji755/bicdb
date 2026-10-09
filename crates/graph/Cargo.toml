@@ -8,3 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bicdb-common = { path = "../common" }
+bicdb-types = { path = "../types" }
+bicdb-storage = { path = "../storage" }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+
+[dev-dependencies]
+bicdb-index = { path = "../index" }

@@ -2,7 +2,7 @@
 用它跑一遍 DB-API 面。
 
 钉的是"驱动**真能**说话"：建表/写入/查询/参数/事务/`describe`/错误类型/
-非 UTF-8 字节串无损/读己所写/实例忙。**不用 mock**——协议错了就得在这儿现形。
+非 UTF-8 字节串无损/读己所写/多会话隔离。**不用 mock**——协议错了就得在这儿现形。
 
 跑法（仓库根）：``python3 -m unittest discover -s drivers/python/tests``
 （``BICDB_BIN`` 可指定 bicdb 可执行文件；默认取 ``target/debug/bicdb``）。
@@ -126,6 +126,18 @@ class LiveDriver(unittest.TestCase):
         self.conn.commit()
         self.assertEqual(cur.execute("SELECT s FROM w").fetchall(), [("汉字",)])
 
+    def test_graph_table_returns_typed_element_handles(self):
+        cur = self.conn.cursor()
+        cur.execute("CREATE GRAPH py_element")
+        cur.execute("CYPHER py_element 'CREATE (:N {name:\"python\"})'")
+        row = cur.execute(
+            "SELECT entity,name FROM GRAPH_TABLE(py_element,"
+            "'MATCH (n) RETURN n,n.name' "
+            "COLUMNS(entity GRAPH_ELEMENT,name VARCHAR2(32)))"
+        ).fetchone()
+        self.assertIsInstance(row[0], bicdb.GraphElement)
+        self.assertEqual((row[0].kind, row[0].id, row[1]), ("n", 1, "python"))
+
     def test_explicit_sql_transactions_via_cursor(self):
         cur = self.conn.cursor()
         cur.execute("CREATE TABLE x (id NUMBER NOT NULL)")
@@ -202,8 +214,27 @@ class LiveDriver(unittest.TestCase):
         self.assertEqual(cols[1].type_name, "VARCHAR2(32)")
         self.assertTrue(cols[1].nullable)
 
+    def test_column_constraints_and_parameterized_dml(self):
+        cur = self.conn.cursor()
+        cur.execute("CREATE TABLE constraints_t (id NUMBER NOT NULL, v VARCHAR2(3))")
+        with self.assertRaises(bicdb.IntegrityError):
+            cur.execute("INSERT INTO constraints_t VALUES (:id, :v)", {"id": None, "v": "ok"})
+        self.conn.rollback()
+        with self.assertRaises(bicdb.DataError):
+            cur.execute("INSERT INTO constraints_t VALUES (1, :v)", {"v": "汉字"})
+        self.conn.rollback()
+        cur.execute("INSERT INTO constraints_t VALUES (1, 'old')")
+        self.conn.commit()
+        cur.execute("UPDATE constraints_t SET v = :v WHERE id = :id", {"v": "new", "id": 1})
+        self.assertEqual(cur.rowcount, 1)
+        self.conn.commit()
+        cur.execute("SELECT v FROM constraints_t WHERE id = 1")
+        self.assertEqual(cur.fetchone(), ("new",))
+        cur.execute("DELETE FROM constraints_t WHERE id = :id", {"id": 1})
+        self.assertEqual(cur.rowcount, 1)
+        self.conn.commit()
+
     def test_autocommit_mode(self):
-        self.conn.close()  # 服务一次只服务一条连接：先让开
         conn = bicdb.connect(str(self.root), autocommit=True)
         cur = conn.cursor()
         cur.execute("CREATE TABLE a (id NUMBER NOT NULL)")
@@ -219,10 +250,19 @@ class LiveDriver(unittest.TestCase):
             [(decimal.Decimal(1),)],
         )
 
-    def test_second_connection_reports_busy(self):
-        with self.assertRaises(bicdb.OperationalError) as ctx:
-            bicdb.connect(str(self.root), handshake_timeout=0.3)
-        self.assertIn("忙", str(ctx.exception))
+    def test_two_connections_isolate_and_refresh_transactions(self):
+        cur = self.conn.cursor()
+        cur.execute("CREATE TABLE multi_t (id NUMBER NOT NULL)")
+        self.conn.commit()
+        other = bicdb.connect(str(self.root))
+        self.addCleanup(other.close)
+        cur.execute("INSERT INTO multi_t VALUES (1)")
+        other_cur = other.cursor()
+        other_cur.execute("SELECT count(*) FROM multi_t")
+        self.assertEqual(other_cur.fetchone(), (decimal.Decimal(0),))
+        self.conn.commit()
+        other_cur.execute("SELECT count(*) FROM multi_t")
+        self.assertEqual(other_cur.fetchone(), (decimal.Decimal(1),))
 
     def test_connect_without_a_running_instance_is_a_named_error(self):
         empty = Path(tempfile.mkdtemp(prefix="bicdb-py-empty-"))

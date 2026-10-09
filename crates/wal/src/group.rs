@@ -41,6 +41,7 @@
 //! 走 [`WalShared`]）——位先记在共享态并置 `stale_dirty`，由**下一次前台
 //! 发布**（`flush` / `publish_checkpoint`）取走并落控制文件（`take_stale_dirty`）。
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -494,6 +495,11 @@ pub struct GroupWriter<'io, 'cf> {
     /// 写线程看不到事务层，但它写过的提交记录自带序号，无需外部喂；
     /// §11.10、待讨论清单第 35 条）。
     last_commit_seq: Option<CommitSeq>,
+    /// Committed watermark, independent from whether a new commit was sampled.
+    commit_watermark: CommitSeq,
+    /// Commit outcomes since the last transaction-aware checkpoint. One entry
+    /// per physical undo slot; wrap checks prevent repairing a reused slot.
+    checkpoint_commits: BTreeMap<u16, (u64, CommitSeq)>,
     /// 切换点采样的墙钟源（毫秒；默认系统时钟，测试可换固定函数。
     /// 返回 0 表示"无时间语义"——该次不采样，与检查点路径的约定一致）。
     clock_ms: fn() -> u64,
@@ -571,6 +577,7 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             current_start: AtomicU64::new(start_lsn.as_raw()),
             stale_dirty: AtomicBool::new(false),
         });
+        let initial_seq = cf.checkpoint_progress()?.current_commit_seq;
         let mut writer = Self {
             cf,
             dir: dir.to_path_buf(),
@@ -579,6 +586,8 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             wal,
             records_in_group: 0,
             last_commit_seq: None,
+            commit_watermark: initial_seq,
+            checkpoint_commits: BTreeMap::new(),
             clock_ms: system_clock_ms,
         };
         writer.activate(0)?; // 首组：序列号 = 1
@@ -672,6 +681,7 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             current_start: AtomicU64::new(current_start.as_raw()),
             stale_dirty: AtomicBool::new(false),
         });
+        let initial_seq = cf.checkpoint_progress()?.current_commit_seq;
         Ok(Self {
             cf,
             dir: dir.to_path_buf(),
@@ -680,8 +690,40 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
             wal,
             records_in_group: 0,
             last_commit_seq: None,
+            commit_watermark: initial_seq,
+            checkpoint_commits: BTreeMap::new(),
             clock_ms: system_clock_ms,
         })
+    }
+
+    /// Seed the committed watermark after startup recovery (monotonic).
+    pub fn seed_commit_seq(&mut self, seq: CommitSeq) {
+        self.commit_watermark = self.commit_watermark.max(seq);
+    }
+
+    /// Highest commit sequence seen by this writer or restored at startup.
+    pub fn commit_watermark(&self) -> CommitSeq {
+        self.commit_watermark
+    }
+
+    /// Commit records whose slot marks must be durable before reclaiming WAL.
+    pub(crate) fn checkpoint_commits(&self) -> Vec<(bicdb_storage::undo::TxnId, CommitSeq)> {
+        self.checkpoint_commits
+            .values()
+            .map(|(raw, seq)| {
+                let bytes = raw.to_le_bytes();
+                (
+                    bicdb_storage::undo::TxnId::from_bytes(
+                        bytes[..6].try_into().expect("six bytes"),
+                    ),
+                    *seq,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn clear_checkpoint_commits(&mut self) {
+        self.checkpoint_commits.clear();
     }
 
     // -- 追加与刷盘 ----------------------------------------------------------
@@ -734,6 +776,8 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         // 预检的 probe 可能与之不同）——仅在不一致时重建。
         // 提交记录的序号顺手记下（**落盘成功才生效**）——切换点采样用它。
         let commit_seq = record.commit_seq();
+        let txn_raw = record.txn_id;
+        let rollback_done = record.op == crate::record::RecordOp::RollbackDone as u8;
         let mut reuse = Some(record);
         let lsn = self.wal.buffer.append(|lsn| match reuse.take() {
             Some(r) if r.lsn == lsn => r,
@@ -741,8 +785,19 @@ impl<'io, 'cf> GroupWriter<'io, 'cf> {
         })?;
         if let Some(raw) = commit_seq {
             if let Some(seq) = CommitSeq::from_raw(raw) {
-                self.last_commit_seq = Some(seq);
+                self.seed_commit_seq(seq);
+                self.last_commit_seq = Some(self.commit_watermark);
+                self.checkpoint_commits
+                    .insert(txn_raw as u16, (txn_raw, seq));
             }
+        }
+        if rollback_done
+            && self
+                .checkpoint_commits
+                .get(&(txn_raw as u16))
+                .is_some_and(|(raw, _)| *raw == txn_raw)
+        {
+            self.checkpoint_commits.remove(&(txn_raw as u16));
         }
         self.records_in_group += 1;
         Ok(lsn)

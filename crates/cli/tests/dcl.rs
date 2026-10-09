@@ -61,6 +61,128 @@ fn run(inst: &mut bicdb_cli::boot::Instance, home: &Home, sql: &str) -> Result<S
 }
 
 #[test]
+fn schema_templates_copy_empty_structure_and_refuse_data_or_owned_sources() {
+    let holder = TempDir::new("schema-template");
+    let home = home_of(holder.path());
+    let params = InstanceParams::for_init(&home.public_dir(), None, &[]).unwrap();
+    let mut public = create_instance(&params, Some(&home)).unwrap();
+    let disk = home.root.join("disk");
+    std::fs::create_dir(&disk).unwrap();
+    run(
+        &mut public,
+        &home,
+        &format!("CREATE FILESYSTEM disk USING '{}'", disk.display()),
+    )
+    .unwrap();
+    run(&mut public, &home, "CREATE WORKSPACE seed").unwrap();
+    let (params, _) =
+        bicdb_cli::boot::instance_params(Some(&home.root.join("seed/bicdb.ini")), &[]).unwrap();
+    {
+        let mut seed = bicdb_cli::boot::open_instance(&params).unwrap();
+        let seq = seed.seq();
+        let mut session = Session::new(seed.pool, seed.engine, &mut seed.catalog, seq);
+        session.execute("CREATE TABLE empty_init (id NUMBER NOT NULL, name VARCHAR2(32), data BYTES(256)); CREATE UNIQUE INDEX empty_id ON empty_init(id); CREATE INDEX empty_name ON empty_init(name)").unwrap();
+        drop(session);
+        seed.shutdown().unwrap();
+    }
+    run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'empty_template' FROM seed",
+    )
+    .unwrap();
+    assert!(run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'empty_template' FROM seed"
+    )
+    .is_err());
+    assert!(run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE '../escape' FROM seed"
+    )
+    .is_err());
+    assert!(run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'public_copy' FROM public"
+    )
+    .is_err());
+    run(
+        &mut public,
+        &home,
+        "CREATE WORKSPACE cloned FROM TEMPLATE 'empty_template'",
+    )
+    .unwrap();
+    assert!(home.root.join("cloned/workspace-template.info").is_file());
+    {
+        let (params, _) =
+            bicdb_cli::boot::instance_params(Some(&home.root.join("cloned/bicdb.ini")), &[])
+                .unwrap();
+        let mut cloned = bicdb_cli::boot::open_instance(&params).unwrap();
+        let seq = cloned.seq();
+        let mut session = Session::new(cloned.pool, cloned.engine, &mut cloned.catalog, seq);
+        assert!(session.execute("SELECT * FROM empty_init").is_ok());
+        session
+            .execute("INSERT INTO empty_init VALUES (1, 'private-clone', NULL)")
+            .unwrap();
+        assert!(session
+            .execute("INSERT INTO empty_init VALUES (1, 'duplicate', NULL)")
+            .is_err());
+        drop(session);
+        cloned.shutdown().unwrap();
+    }
+    // A populated source must never be accepted as an initialization template.
+    assert!(run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'bad_data' FROM cloned"
+    )
+    .unwrap_err()
+    .contains("非空"));
+    run(
+        &mut public,
+        &home,
+        "CREATE USER owner IDENTIFIED BY 'test-only-password' USING WORKSPACE cloned",
+    )
+    .unwrap();
+    assert!(run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'bad_owner' FROM cloned"
+    )
+    .unwrap_err()
+    .contains("无主"));
+    run(
+        &mut public,
+        &home,
+        "CREATE WORKSPACE clone_two FROM TEMPLATE 'empty_template'",
+    )
+    .unwrap();
+    let script = home.root.join("templates/empty_template/schema.sql");
+    let original = std::fs::read(&script).unwrap();
+    std::fs::write(&script, b"CREATE TABLE corrupted (id NUMBER);").unwrap();
+    assert!(run(
+        &mut public,
+        &home,
+        "CREATE WORKSPACE broken FROM TEMPLATE 'empty_template'"
+    )
+    .is_err());
+    assert!(!home.root.join("broken").exists());
+    std::fs::write(&script, original).unwrap();
+    run(
+        &mut public,
+        &home,
+        "ALTER DATABASE DROP TEMPLATE 'empty_template'",
+    )
+    .unwrap();
+    assert!(!home.root.join("templates/empty_template").exists());
+    assert!(home.root.join("clone_two/bicdb.ini").exists());
+    public.shutdown().unwrap();
+}
+
+#[test]
 fn filesystem_pool_round_trip() {
     let holder = TempDir::new("home_root");
     let home = home_of(holder.path());
@@ -545,4 +667,257 @@ fn user_lifecycle_round_trip() {
     }
 
     inst.shutdown().expect("关");
+}
+
+/// Graph initialization copies definitions and policy; graph/index identities,
+/// stale postings, source counters and source event data must be fresh.
+#[test]
+fn graph_schema_templates_clone_index_policy_and_empty_state_without_source_data() {
+    use bicdb_exec::Value;
+    fn query(inst: &mut bicdb_cli::boot::Instance, sql: &str) -> Vec<Vec<Value>> {
+        let seq = inst.seq();
+        let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+        let result = session
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let Some(QueryResult::Rows { rows, .. }) = result.last() else {
+            panic!("{sql}: rows required")
+        };
+        rows.clone()
+    }
+    fn without_identity(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+        let mut rows: Vec<Vec<Value>> = rows
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| (i != 1).then_some(v))
+                    .collect()
+            })
+            .collect();
+        rows.sort_by(|a, b| match (&a[0], &b[0]) {
+            (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+            _ => panic!("index names must be strings"),
+        });
+        rows
+    }
+    let holder = TempDir::new("graph-schema-template");
+    let home = home_of(holder.path());
+    let params = InstanceParams::for_init(&home.public_dir(), None, &[]).unwrap();
+    let mut public = create_instance(&params, Some(&home)).unwrap();
+    let disk = home.root.join("disk");
+    std::fs::create_dir(&disk).unwrap();
+    run(
+        &mut public,
+        &home,
+        &format!("CREATE FILESYSTEM disk USING '{}'", disk.display()),
+    )
+    .unwrap();
+    run(&mut public, &home, "CREATE WORKSPACE graph_seed").unwrap();
+    let seed_ini = home.root.join("graph_seed/bicdb.ini");
+    let (params, _) = bicdb_cli::boot::instance_params(Some(&seed_ini), &[]).unwrap();
+    let mut seed = bicdb_cli::boot::open_instance(&params).unwrap();
+    run(&mut seed,&home,r#"CREATE TABLE memo (id NUMBER); CREATE UNIQUE INDEX memo_id ON memo(id);
+      CREATE GRAPH "MixedGraph"; CREATE GRAPH g2;
+      CREATE UNIQUE GRAPH INDEX node_key ON "MixedGraph" NODES LABEL "Entity" (config."Tenant",name);
+      CREATE GRAPH INDEX label_tree ON "MixedGraph" NODES LABEL "Entity" ();
+      CREATE GRAPH INDEX link_weight ON "MixedGraph" RELATIONSHIPS TYPE "LINK" (weight);
+      CYPHER "MixedGraph" 'CREATE (:Entity {db_type:"d1",name:"DO_NOT_COPY",config:{Tenant:"d1"}})';
+      CREATE FULLTEXT GRAPH INDEX node_words ON "MixedGraph" NODES LABEL ("Entity","Fault") (name,config."Alias"[0]."Question","literal.dot") OPTIONS '{"update":"batch","interval_ms":1000,"batch_rows":7}';
+      ALTER FULLTEXT GRAPH INDEX node_words ON "MixedGraph" PAUSE;
+      CREATE FULLTEXT GRAPH INDEX edge_words ON "MixedGraph" RELATIONSHIPS TYPE ("LINK","Depends") (config."Question"[1],"Purpose") OPTIONS '{"update":"manual","batch_rows":3}';
+      CREATE FULLTEXT GRAPH INDEX inherited_words ON g2 NODES (name) OPTIONS '{"update":"batch"}';
+      CYPHER "MixedGraph" 'MATCH (n) DELETE n';"#).unwrap();
+    let property = without_identity(query(&mut seed, r#"SHOW GRAPH INDEXES ON "MixedGraph""#));
+    let source = query(&mut seed, r#"SHOW FULLTEXT GRAPH INDEXES ON "MixedGraph""#);
+    assert!(
+        source
+            .iter()
+            .any(|r| r[8] == Value::Number(bicdb_types::Number::parse("1").unwrap())),
+        "source contains stale derived document, not live graph data"
+    );
+    assert!(run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'busy_graph' FROM graph_seed"
+    )
+    .is_err());
+    assert!(!home.root.join("templates/busy_graph").exists());
+    seed.shutdown().unwrap();
+    drop(seed);
+    run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'graph_init' FROM graph_seed",
+    )
+    .unwrap();
+    let script =
+        std::fs::read_to_string(home.root.join("templates/graph_init/schema.sql")).unwrap();
+    assert!(script.contains("CREATE GRAPH \"MixedGraph\""));
+    assert!(script.contains("CREATE FULLTEXT GRAPH INDEX"));
+    assert!(script.contains("PAUSE"));
+    assert!(!script.contains("DO_NOT_COPY"));
+    assert!(!script.contains("i_graph_"));
+    // A correct checksum does not authorize executable data or foreign targets.
+    let manifest_path = home.root.join("templates/graph_init/manifest");
+    let original_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let script_path = home.root.join("templates/graph_init/schema.sql");
+    for (i, forged) in [
+        "CREATE GRAPH kg; CYPHER kg 'CREATE (:Stolen)';",
+        "CREATE GRAPH kg; CREATE GRAPH INDEX ix ON foreign_graph NODES (name);",
+        "CREATE GRAPH kg; ALTER FULLTEXT GRAPH INDEX foreign_index ON kg PAUSE;",
+        "CREATE GRAPH kg; DROP GRAPH kg;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let digest = bicdb_common::sha256::digest(forged.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        std::fs::write(&script_path, forged).unwrap();
+        std::fs::write(
+            &manifest_path,
+            format!("BICDB_SCHEMA_TEMPLATE_V1\ngraph_init\n{digest}\n"),
+        )
+        .unwrap();
+        let name = format!("forged_copy_{i}");
+        assert!(run(
+            &mut public,
+            &home,
+            &format!("CREATE WORKSPACE {name} FROM TEMPLATE 'graph_init'")
+        )
+        .is_err());
+        assert!(
+            !home.root.join(&name).exists(),
+            "validation precedes target file creation"
+        );
+        assert!(query(
+            &mut public,
+            &format!("SELECT name FROM ws$ WHERE name='{name}'")
+        )
+        .is_empty());
+    }
+    std::fs::write(&script_path, &script).unwrap();
+    std::fs::write(&manifest_path, original_manifest).unwrap();
+    for name in ["copy_a", "copy_b"] {
+        run(
+            &mut public,
+            &home,
+            &format!("CREATE WORKSPACE {name} FROM TEMPLATE 'graph_init'"),
+        )
+        .unwrap();
+        let (params, _) =
+            bicdb_cli::boot::instance_params(Some(&home.root.join(name).join("bicdb.ini")), &[])
+                .unwrap();
+        let mut cloned = bicdb_cli::boot::open_instance(&params).unwrap();
+        assert_eq!(
+            without_identity(query(&mut cloned, r#"SHOW GRAPH INDEXES ON "MixedGraph""#)),
+            property
+        );
+        let ft = query(
+            &mut cloned,
+            r#"SHOW FULLTEXT GRAPH INDEXES ON "MixedGraph""#,
+        );
+        assert_eq!(ft.len(), source.len());
+        for row in &ft {
+            let original = source.iter().find(|r| r[0] == row[0]).unwrap();
+            for i in [2, 3, 4, 5, 14, 15, 16, 17] {
+                assert_eq!(
+                    row[i], original[i],
+                    "preserve definition and policy at column {i}"
+                );
+            }
+            for i in [8, 10, 11, 12, 13] {
+                assert_eq!(
+                    row[i],
+                    Value::Number(bicdb_types::Number::parse("0").unwrap()),
+                    "fresh graph/index state"
+                );
+            }
+            assert_eq!(row[18], Value::Bytes(b"v4".to_vec()));
+            if row[0] == Value::Bytes(b"node_words".to_vec()) {
+                assert_eq!(row[9], Value::Bytes(b"PAUSED".to_vec()));
+            }
+        }
+        assert_eq!(query(&mut cloned, "SHOW GRAPHS").len(), 2);
+        assert_eq!(
+            query(
+                &mut cloned,
+                r#"CYPHER "MixedGraph" 'MATCH (n) RETURN count(*) AS n'"#
+            )[0][0],
+            Value::Number(bicdb_types::Number::parse("0").unwrap())
+        );
+        assert!(query(&mut cloned, "SELECT * FROM memo").is_empty());
+        if name == "copy_a" {
+            run(&mut cloned,&home,r#"CYPHER "MixedGraph" 'CREATE (:Entity {db_type:"d1",name:"clone_word",config:{Tenant:"d1"}})'; INSERT INTO memo VALUES (1); ALTER FULLTEXT GRAPH INDEX node_words ON "MixedGraph" RESUME; ALTER FULLTEXT GRAPH INDEX node_words ON "MixedGraph" WAIT;"#).unwrap();
+            assert_eq!(query(&mut cloned,r#"SEARCH FULLTEXT GRAPH INDEX node_words ON "MixedGraph" FOR 'clone_word' OPTIONS '{"db_type":"d1","consistency":"eventual"}'"#).len(),1);
+            assert!(run(&mut cloned,&home,r#"CYPHER "MixedGraph" 'CREATE (:Entity {name:"clone_word",config:{Tenant:"d1"}})'"#).is_err(),"unique property tree remains functional");
+        }
+        cloned.shutdown().unwrap();
+        drop(cloned);
+    }
+    let mut seed = bicdb_cli::boot::open_instance(&params).unwrap();
+    run(
+        &mut seed,
+        &home,
+        r#"CYPHER "MixedGraph" 'CREATE (:Entity {name:"live_source"})'"#,
+    )
+    .unwrap();
+    seed.shutdown().unwrap();
+    drop(seed);
+    assert!(run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'nonempty_graph' FROM graph_seed"
+    )
+    .unwrap_err()
+    .contains("非空"));
+    assert!(!home.root.join("templates/nonempty_graph").exists());
+    run(
+        &mut public,
+        &home,
+        "ALTER DATABASE DROP TEMPLATE 'graph_init'",
+    )
+    .unwrap();
+    assert!(home.root.join("copy_a/bicdb.ini").exists());
+    assert!(home.root.join("copy_b/bicdb.ini").exists());
+    // A graph-only schema is a valid initialization template.
+    run(&mut public, &home, "CREATE WORKSPACE graph_only").unwrap();
+    let (graph_params, _) =
+        bicdb_cli::boot::instance_params(Some(&home.root.join("graph_only/bicdb.ini")), &[])
+            .unwrap();
+    {
+        let mut graph_only = bicdb_cli::boot::open_instance(&graph_params).unwrap();
+        run(&mut graph_only, &home, "CREATE GRAPH empty_graph").unwrap();
+        graph_only.shutdown().unwrap();
+    }
+    run(
+        &mut public,
+        &home,
+        "ALTER DATABASE ADD TEMPLATE 'graph_only' FROM graph_only",
+    )
+    .unwrap();
+    run(
+        &mut public,
+        &home,
+        "CREATE WORKSPACE graph_only_copy FROM TEMPLATE 'graph_only'",
+    )
+    .unwrap();
+    let (graph_params, _) =
+        bicdb_cli::boot::instance_params(Some(&home.root.join("graph_only_copy/bicdb.ini")), &[])
+            .unwrap();
+    {
+        let mut graph_only = bicdb_cli::boot::open_instance(&graph_params).unwrap();
+        assert_eq!(query(&mut graph_only, "SHOW GRAPHS").len(), 1);
+        assert_eq!(
+            query(
+                &mut graph_only,
+                "CYPHER empty_graph 'MATCH (n) RETURN count(*)'"
+            )[0][0],
+            Value::Number(bicdb_types::Number::parse("0").unwrap())
+        );
+        graph_only.shutdown().unwrap();
+    }
+    public.shutdown().unwrap();
 }

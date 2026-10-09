@@ -229,23 +229,22 @@ pub fn grow(page: &mut Page, itl_max: u16) -> Result<u16, ItlError> {
     // 新固定头末尾 = 68 + (count+1−1)×24；其后还有槽位目录 2B×slot_count。
     let old_fixed_end = crate::page::FIXED_HEADER_LEN + (usize::from(count) - 1) * ITL_ENTRY_LEN;
     let new_fixed_end = crate::page::FIXED_HEADER_LEN + usize::from(count) * ITL_ENTRY_LEN;
-    let need = new_fixed_end + usize::from(header.slot_count) * SLOT_ENTRY_LEN;
+    let prefix = if header.page_type == crate::page::PageType::Adjacency {
+        crate::page::ADJACENCY_BODY_HEADER_LEN
+    } else {
+        0
+    };
+    let need = new_fixed_end + prefix + usize::from(header.slot_count) * SLOT_ENTRY_LEN;
     if need > usize::from(header.free_end) {
         return Err(ItlError::NotEnoughSpace);
     }
     // **槽位目录随固定头后移**（§5.4.1 第 2 条"页头向后推移"的完整含义）：
     // 目录紧跟在固定头之后，不搬它，读者就会把行区字节当槽位读——行看起来
     // "消失"。从后往前搬（向上地址复制，须防自覆盖）。
-    let slots = usize::from(header.slot_count);
+    let moved = prefix + usize::from(header.slot_count) * SLOT_ENTRY_LEN;
     {
         let bytes = page.as_bytes_mut();
-        for i in (0..slots).rev() {
-            let src = old_fixed_end + i * SLOT_ENTRY_LEN;
-            let dst = new_fixed_end + i * SLOT_ENTRY_LEN;
-            let (lo, hi) = (bytes[src], bytes[src + 1]);
-            bytes[dst] = lo;
-            bytes[dst + 1] = hi;
-        }
+        bytes.copy_within(old_fixed_end..old_fixed_end + moved, new_fixed_end);
     }
     header.itl_count = count + 1;
     page.write_header(&header);

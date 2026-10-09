@@ -1,12 +1,11 @@
 //! **Rust 驱动的实机验收**：起一个真服务（`bicdb start`），用它跑一遍驱动面。
 //!
 //! 钉的是"驱动**真能**说话"：建表/写入/查询/参数/事务/`describe`/错误原文/
-//! 非 UTF-8 字节串无损/版本核对/读己所写/实例忙。**不用 mock**——协议错了
+//! 非 UTF-8 字节串无损/版本核对/读己所写/多会话隔离。**不用 mock**——协议错了
 //! 就得在这儿现形。
 //!
-//! **测试形态**：服务一次只服务一条连接（V1.0 单写者），所以用例里是
-//! "一条连接做完事，断开，再连"——不是并发两条（那会拿到"实例正忙"，
-//! 见 `a_second_connection_reports_busy_not_a_hang`）。
+//! 每条连接保有独立身份、快照和显式事务；服务在一个实例执行器上公平调度
+//! 请求，连接之间不能共享未提交数据或用旧图快照覆盖新提交。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -159,13 +158,11 @@ fn driver_talks_to_a_real_service() {
     let rs = conn.query("SELECT id FROM t ORDER BY id", &[]).expect("查");
     assert_eq!(rs.len(), 3, "回滚后应回到 3 行");
 
-    // 提交之后，**换一条连接**（新的会话/新快照）也看得见这行。
-    // 注：服务一次只服务一条连接，所以是"先断开再连"，不是并发两条。
+    // 提交之后，同时在线的另一会话在下一条语句刷新到最新提交。
     conn.execute("BEGIN", &[]).expect("begin");
     conn.execute("INSERT INTO t VALUES (5, 'eps')", &[])
         .expect("插入");
     conn.commit().expect("提交");
-    conn.close();
     let mut other = Connection::connect(dir.path()).expect("第二条连接");
     let rs = other
         .query("SELECT id FROM t ORDER BY id", &[])
@@ -182,6 +179,8 @@ fn driver_talks_to_a_real_service() {
     };
     assert_eq!(get("mode").as_deref(), Some("service"));
     assert_eq!(get("wire").as_deref(), Some("1"));
+    assert_eq!(get("connections").as_deref(), Some("2"));
+    assert_eq!(get("workspace_kind").as_deref(), Some("private"));
     assert!(get("pid").is_some());
 }
 
@@ -235,19 +234,110 @@ fn connecting_where_nothing_runs_is_a_named_error() {
     assert!(matches!(err, Error::Discover { .. }), "{err}");
 }
 
-/// **实例正忙**：服务一次只服务一条连接（V1.0 单写者）——第二条连接要拿到
-/// **具名错误**（可重试），不是无声挂住。
 #[test]
-fn a_second_connection_reports_busy_not_a_hang() {
-    let dir = serving("busy");
-    let _first = Connection::connect(dir.path()).expect("第一条连接");
-    let t0 = std::time::Instant::now();
-    let err = Connection::connect_with_timeout(dir.path(), std::time::Duration::from_millis(300))
-        .expect_err("第二条应被挡回");
-    assert!(err.is_busy(), "应是「忙」：{err}");
+fn two_live_connections_isolate_transactions_and_fence_stale_graph_writes() {
+    let dir = serving("multi-session");
+    let mut first = Connection::connect(dir.path()).expect("第一条连接");
+    let mut second = Connection::connect(dir.path()).expect("第二条连接");
+    first
+        .execute(
+            "CREATE TABLE t (id NUMBER NOT NULL); CREATE UNIQUE INDEX t_pk ON t (id)",
+            &[],
+        )
+        .unwrap();
+    first.begin().unwrap();
+    first.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    assert_eq!(
+        second
+            .query("SELECT count(*) FROM t", &[])
+            .unwrap()
+            .row(0)
+            .unwrap()
+            .i64(0)
+            .unwrap(),
+        0,
+        "另一连接不能看到未提交行"
+    );
+    first.commit().unwrap();
+    assert_eq!(
+        second
+            .query("SELECT count(*) FROM t", &[])
+            .unwrap()
+            .row(0)
+            .unwrap()
+            .i64(0)
+            .unwrap(),
+        1,
+        "空闲连接的下一条语句应刷新到最新提交"
+    );
+
+    // 断开连接必须由服务端回滚悬挂事务，不能留下锁或幽灵提交。
+    let mut abandoned = Connection::connect(dir.path()).expect("第三条连接");
+    abandoned.begin().unwrap();
+    abandoned.execute("INSERT INTO t VALUES (9)", &[]).unwrap();
+    abandoned.close();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    second.execute("INSERT INTO t VALUES (9)", &[]).unwrap();
+    assert_eq!(
+        second
+            .query("SELECT count(*) FROM t", &[])
+            .unwrap()
+            .row(0)
+            .unwrap()
+            .i64(0)
+            .unwrap(),
+        2,
+        "断线事务必须回滚并释放唯一键写入"
+    );
+
+    first.execute("CREATE GRAPH kg", &[]).unwrap();
+    first
+        .execute(
+            "CREATE UNIQUE GRAPH INDEX graph_keys ON kg NODES LABEL \"N\" (key)",
+            &[],
+        )
+        .unwrap();
+    first
+        .execute("CYPHER kg 'CREATE (:N {key:1})'", &[])
+        .unwrap();
+    first.begin().unwrap();
+    assert_eq!(
+        first
+            .query("CYPHER kg 'MATCH (n:N) RETURN count(n)'", &[])
+            .unwrap()
+            .row(0)
+            .unwrap()
+            .i64(0)
+            .unwrap(),
+        1
+    );
+    second
+        .execute("CYPHER kg 'CREATE (:N {key:2})'", &[])
+        .unwrap();
+    let error = first
+        .execute("CYPHER kg 'CREATE (:N {key:3})'", &[])
+        .unwrap_err()
+        .to_string();
     assert!(
-        t0.elapsed() < std::time::Duration::from_secs(5),
-        "不该等到默认握手超时：{:?}",
-        t0.elapsed()
+        error.contains("changed") || error.contains("proof root"),
+        "{error}"
+    );
+    first.rollback().unwrap();
+    second
+        .execute("CYPHER kg 'MERGE (:N {key:4})'", &[])
+        .unwrap();
+    first
+        .execute("CYPHER kg 'MERGE (:N {key:4})'", &[])
+        .unwrap();
+    assert_eq!(
+        second
+            .query("CYPHER kg 'MATCH (n:N) RETURN count(n)'", &[])
+            .unwrap()
+            .row(0)
+            .unwrap()
+            .i64(0)
+            .unwrap(),
+        3,
+        "跨连接 MERGE 不得重复创建唯一节点"
     );
 }

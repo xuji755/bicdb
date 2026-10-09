@@ -22,13 +22,23 @@ use super::{BindError, CatalogColumn, CatalogIndex, CatalogObject, CatalogView, 
 pub struct CatalogViewImpl<'c, 'io> {
     catalog: &'c mut Catalog<'io>,
     snapshot: CommitSeq,
+    graph_access: bool,
 }
 
 impl<'c, 'io> CatalogViewImpl<'c, 'io> {
     /// 建视图（`snapshot` = 语句快照）。
     #[must_use]
     pub fn new(catalog: &'c mut Catalog<'io>, snapshot: CommitSeq) -> Self {
-        Self { catalog, snapshot }
+        Self {
+            catalog,
+            snapshot,
+            graph_access: false,
+        }
+    }
+
+    pub(crate) fn with_graph_access(mut self, enabled: bool) -> Self {
+        self.graph_access = enabled;
+        self
     }
 
     fn ns_of(code: u32) -> NameSpace {
@@ -60,7 +70,17 @@ impl CatalogView for CatalogViewImpl<'_, '_> {
             obj: r.obj,
             name: r.name,
             namespace: Self::ns_of(r.namespace),
-            type_code: r.type_code,
+            type_code: if self.graph_access
+                && matches!(
+                    r.type_code,
+                    bicdb_catalog::dict::obj_kind::GRAPH
+                        | bicdb_catalog::dict::obj_kind::GRAPH_FULLTEXT_DATA
+                        | bicdb_catalog::dict::obj_kind::GRAPH_FULLTEXT_QUEUE
+                ) {
+                bicdb_catalog::dict::obj_kind::TABLE
+            } else {
+                r.type_code
+            },
             dataobj: r.dataobj,
             status: r.status,
             mtime: r.mtime,
@@ -91,6 +111,7 @@ impl CatalogView for CatalogViewImpl<'_, '_> {
             .map_err(|e| Self::map_err("<索引枚举>", NameSpace::Table, e))?;
         Ok(idx
             .into_iter()
+            .filter(|i| !bicdb_catalog::dict::index_kind::is_graph_auxiliary(i.kind))
             .map(|i| CatalogIndex {
                 obj: i.obj,
                 bobj: i.bobj,
@@ -111,6 +132,31 @@ impl CatalogView for CatalogViewImpl<'_, '_> {
     }
 
     fn fixed_columns(&mut self, name: &str) -> Result<Option<Vec<CatalogColumn>>, BindError> {
+        if let Some(columns) = crate::attachment_sql::columns(name) {
+            if self.catalog.is_public() {
+                return Ok(None);
+            }
+            for table in [
+                "ag_schema_version",
+                "ag_attachment_schema",
+                "ag_attachment",
+                "ag_attachment_chunk",
+                "ag_session",
+            ] {
+                match self
+                    .catalog
+                    .resolve(self.snapshot, NameSpace::Table.code(), table)
+                {
+                    Ok(_) => {}
+                    Err(CatalogError::NotFound) => return Ok(None),
+                    Err(error) => return Err(BindError::Catalog(error.to_string())),
+                }
+            }
+            return Ok(Some(columns));
+        }
+        if let Some(columns) = super::dictionary_columns(name) {
+            return Ok(Some(columns));
+        }
         // **不查字典**（`arch/03` §3.1.4）：固定表的存在性由清单本身回答；
         // 行的产生在查询期（`file$` 的内容 = 控制文件内存映像）。
         if !super::FIXED_TABLES.contains(&name) {

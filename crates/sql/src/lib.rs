@@ -48,10 +48,16 @@
 #![deny(missing_docs)]
 
 pub mod ast;
+pub(crate) mod attachment_sql;
 pub mod auth;
 pub mod bind;
 pub mod dcl_exec;
 pub mod dml_index;
+/// Native graph-owned adjacency transaction port; SQL version selection remains
+/// in the graph executor rather than being implied by empty route existence.
+pub mod graph_adjacency;
+mod graph_manifest;
+pub(crate) mod graph_sql;
 pub mod lexer;
 pub mod parser;
 pub mod plan;
@@ -65,9 +71,9 @@ pub use ast::{
     CreateWorkspaceStmt, DefElem, DefElemArg, DeleteStmt, DropFilesystemStmt, DropStmt,
     DropUserStmt, Expr, FromItem, FsQuota, FsRef, FuncCall, IndexElem, IndexStmt, IndexTargetKind,
     InsertStmt, JoinExpr, JoinType, Location, NullTest, NullTestType, ObjectType, ParamRef,
-    QuotaAmount, RangeVar, ResTarget, SelectStmt, SetOperation, SortBy, SortByDir, SortByNulls,
-    Stmt, TransactionStmt, TransactionStmtKind, TypeCast, TypeName, UpdateStmt, VariableSetKind,
-    VariableSetStmt, WorkRef,
+    QuotaAmount, RangeFunction, RangeVar, ResTarget, SelectStmt, SetOperation, SortBy, SortByDir,
+    SortByNulls, Stmt, TransactionStmt, TransactionStmtKind, TypeCast, TypeName, UpdateStmt,
+    VariableSetKind, VariableSetStmt, WorkRef,
 };
 pub use auth::{authenticate, AuthError, Identity};
 pub use bind::{

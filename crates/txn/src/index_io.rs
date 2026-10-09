@@ -403,13 +403,23 @@ mod tests {
                 tree.root()
             };
             root_out = root;
-            // 树头随索引段（段头扩展区）——生产路径由调用方在事务内写（C4 的
-            // 建索引路径）；这里写盘供恢复后开树（该 6B 不被页差异覆盖）。
+            // Use the same pooled/WAL path as production. Direct file writes
+            // behind a dirty cached header would be overwritten by checkpoint.
             {
-                let mut header = idx_seg.read_page(0).unwrap();
+                let key = BufferKey::new(WS, rdba_of(DATA_FID, seg_page0).unwrap());
+                let before = *pool.pin(key).unwrap().as_bytes();
+                let mut header = Page::from_bytes(Box::new(before));
                 bicdb_storage::segment::write_tree_head(&mut header, root).unwrap();
-                idx_seg.write_page(0, &mut header).unwrap();
-                idx_seg.sync().unwrap();
+                write::write_page_change(
+                    &pool,
+                    &mut log,
+                    txn.raw(),
+                    key,
+                    &before,
+                    header.as_bytes(),
+                    false,
+                )
+                .unwrap();
             }
             commit(&pool, &mut log, &mut chain, &mut txn, seq(1)).unwrap();
 

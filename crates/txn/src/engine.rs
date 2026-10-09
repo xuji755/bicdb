@@ -70,6 +70,14 @@ pub struct LockStatus {
     pub reentrant: bool,
 }
 
+struct GraphAuthorityReceipt {
+    ws: [u8; 8],
+    graph: u32,
+    owner: Option<TxnId>,
+    epoch: u64,
+    header: Vec<u8>,
+}
+
 /// **事务引擎**（一个工作区一个实例；共享资源在内部串行化）。
 pub struct Engine<'a, 'b, 'io, 'f> {
     pool: &'a BufferPool<'b>,
@@ -83,6 +91,10 @@ pub struct Engine<'a, 'b, 'io, 'f> {
     gate: WaitGate,
     /// 当前提交序号（**已发布**的最大值；`begin` 的语句快照取它）。
     current_seq: Mutex<CommitSeq>,
+    /// At most 128 complete graph validation receipts for this process/epoch.
+    /// Any commit invalidates receipts from older epochs; owner scopes isolate
+    /// uncommitted overlays. Cold/restarted processes always validate fully.
+    graph_authorities: Mutex<Vec<GraphAuthorityReceipt>>,
     /// **下一个可用提交序号**（预约与提交共用这一个号源——
     /// 预约取走的号，提交时不再另取）。
     next_seq: Mutex<CommitSeq>,
@@ -113,10 +125,11 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
     /// 建引擎：`initial_seq` = 启动时的提交序号水位（来自控制文件 / 恢复）。
     pub fn new(
         pool: &'a BufferPool<'b>,
-        wal: GroupWriter<'io, 'f>,
+        mut wal: GroupWriter<'io, 'f>,
         chain: UndoChain<'io, 'f>,
         initial_seq: CommitSeq,
     ) -> Self {
+        wal.seed_commit_seq(initial_seq);
         Self {
             pool,
             wal: Mutex::new(wal),
@@ -124,6 +137,7 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
             snapshots: Mutex::new(SnapshotRegistry::new()),
             gate: WaitGate::new(),
             current_seq: Mutex::new(initial_seq),
+            graph_authorities: Mutex::new(Vec::new()),
             next_seq: Mutex::new(initial_seq),
             policy: WaitPolicy::default(),
         }
@@ -194,6 +208,58 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
             .as_raw()
     }
 
+    /// Kernel-only receipt of a completely validated snapshot or an atomic
+    /// publication derived from one. This is not an externally supplied flag.
+    pub fn remember_graph_authority(
+        &self,
+        ws: [u8; 8],
+        graph: u32,
+        owner: Option<TxnId>,
+        epoch: u64,
+        header: &[u8],
+    ) {
+        if epoch != self.current_seq() || header.len() > 4096 {
+            return;
+        }
+        let mut receipts = self
+            .graph_authorities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        receipts.retain(|r| !(r.ws == ws && r.graph == graph && r.owner == owner));
+        if receipts.len() == 128 {
+            receipts.remove(0);
+        }
+        receipts.push(GraphAuthorityReceipt {
+            ws,
+            graph,
+            owner,
+            epoch,
+            header: header.to_vec(),
+        });
+    }
+    /// Match a validated source only in this exact committed epoch and owner.
+    pub fn graph_authority_validated(
+        &self,
+        ws: [u8; 8],
+        graph: u32,
+        owner: Option<TxnId>,
+        epoch: u64,
+        header: &[u8],
+    ) -> bool {
+        epoch == self.current_seq()
+            && self
+                .graph_authorities
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|r| {
+                    r.ws == ws
+                        && r.graph == graph
+                        && r.owner == owner
+                        && r.epoch == epoch
+                        && r.header == header
+                })
+    }
     /// **完全检查点**（§11.7 的"关闭工作区前"形态）：脏页按序全部写回 →
     /// 低水位一次推到当前日志位置 → 发布（控制文件 + 检查点记录）。
     ///
@@ -204,15 +270,25 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         workspace: [u8; 8],
     ) -> Result<bicdb_wal::checkpoint::CheckpointReport, bicdb_wal::checkpoint::CheckpointError>
     {
-        let current = *self.current_seq.lock().unwrap_or_else(|e| e.into_inner());
-        let oldest = self.oldest_snapshot().unwrap_or(current);
+        let oldest = self.oldest_snapshot();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
-        bicdb_wal::checkpoint::full_checkpoint(
-            &mut wal, self.pool, workspace, current, current, oldest, timestamp,
+        let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if workspace != chain.segment().workspace_ref() {
+            return Err(bicdb_wal::checkpoint::CheckpointError::InvalidUndo(
+                "workspace mismatch",
+            ));
+        }
+        let current = wal.commit_watermark();
+        bicdb_wal::checkpoint::transaction_checkpoint(
+            &mut wal,
+            self.pool,
+            &chain,
+            oldest.unwrap_or(current),
+            timestamp,
         )
     }
 
@@ -339,13 +415,11 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
             let mut wal = self.wal.lock().unwrap_or_else(|e| e.into_inner());
             let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             write::commit(self.pool, &mut wal, &mut chain, &mut txn.txn, seq)?;
+            // Publish while holding the writer lock: a checkpoint must not
+            // discard a durable commit with a stale published watermark.
+            let mut cur = self.current_seq.lock().unwrap_or_else(|e| e.into_inner());
+            *cur = (*cur).max(seq);
         }
-        // **发布取 max**：倒序提交不让水位回退（使用约束见 `reserve_commit_seq`）。
-        let mut cur = self.current_seq.lock().unwrap_or_else(|e| e.into_inner());
-        if seq > *cur {
-            *cur = seq;
-        }
-        drop(cur);
         self.gate.wake(txn.txn.txn_id);
         Ok(seq)
     }

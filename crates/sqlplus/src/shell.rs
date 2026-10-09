@@ -285,6 +285,39 @@ impl Shell {
                 Ok(Some(Flow::Continue))
             }
             "SHOW" => {
+                let sql_arg = arg.trim().trim_end_matches(';').trim();
+                let mut words = sql_arg.split_whitespace();
+                let graph_indexes = words
+                    .next()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("GRAPH"))
+                    && words
+                        .next()
+                        .is_some_and(|v| v.eq_ignore_ascii_case("INDEXES"));
+                let mut words = sql_arg.split_whitespace();
+                let fulltext_indexes = words
+                    .next()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("FULLTEXT"))
+                    && words
+                        .next()
+                        .is_some_and(|v| v.eq_ignore_ascii_case("GRAPH"))
+                    && words
+                        .next()
+                        .is_some_and(|v| v.eq_ignore_ascii_case("INDEXES"));
+                if sql_arg.eq_ignore_ascii_case("TABLES")
+                    || sql_arg.eq_ignore_ascii_case("GRAPHS")
+                    || graph_indexes
+                    || fulltext_indexes
+                {
+                    let results = self.conn.execute(&format!("SHOW {sql_arg}"))?;
+                    for result in &results {
+                        self.out.result(
+                            &self.settings,
+                            result,
+                            self.settings.termout || self.interactive,
+                        );
+                    }
+                    return Ok(Some(Flow::Continue));
+                }
                 let which = (!arg.trim().is_empty()).then(|| arg.trim());
                 if arg.trim().eq_ignore_ascii_case("SPOOL") {
                     if self.out.spooling() {
@@ -355,7 +388,8 @@ impl Shell {
                 self.execute_buffer()?;
                 Ok(Some(Flow::Continue))
             }
-            "DEL" | "DELETE" => {
+            // DELETE is SQL; only DEL edits the input buffer.
+            "DEL" => {
                 let Some((from, to)) = parse_range(arg, self.buf.len()) else {
                     self.out.line(true, "!  DEL 的范围不认识");
                     return Ok(Some(Flow::Continue));

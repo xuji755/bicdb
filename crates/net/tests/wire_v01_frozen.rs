@@ -107,6 +107,42 @@ fn a_half_frame_is_an_error() {
     assert!(format!("{err}").contains("连接"), "{err}");
 }
 
+#[test]
+fn malformed_frame_lengths_are_rejected_by_both_drivers() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    for length in ["", "-1", "-0", "+1", "1_0", "67108865"] {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        a.write_all(format!("OK\n{length}\n").as_bytes()).unwrap();
+        drop(a);
+        assert!(
+            matches!(
+                bicdb_net::frame::read_frame_bytes(&mut b),
+                Err(bicdb_net::frame::FrameError::Bad(_))
+            ),
+            "{length:?}"
+        );
+    }
+}
+
+#[test]
+fn oversized_writes_do_not_send_a_partial_frame() {
+    use std::os::unix::net::UnixStream;
+    let (mut a, mut b) = UnixStream::pair().unwrap();
+    a.set_write_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    let payload = vec![0; bicdb_net::frame::MAX_FRAME as usize + 1];
+    assert!(matches!(
+        bicdb_net::frame::write_frame_bytes(&mut a, "SQL", &payload),
+        Err(bicdb_net::frame::FrameError::Bad(_))
+    ));
+    bicdb_net::frame::write_frame_bytes(&mut a, "SQL", b"ok").unwrap();
+    assert_eq!(
+        bicdb_net::frame::read_frame_bytes(&mut b).unwrap(),
+        ("SQL".to_owned(), b"ok".to_vec())
+    );
+}
+
 // ───────────────────── 协议 §7.3/§7.4：认证（D6） ─────────────────────
 
 /// 认证请求示例（协议 §7.3）：主体 `alice`、口令 `s3cr3t`。

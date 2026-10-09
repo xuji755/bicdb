@@ -4,7 +4,7 @@
 //! 会话解析一个名字，按固定顺序查三处（REQ-SQL-003 第一步；spec/SQL §0.4）：
 //!   ① 对象命名空间（obj$，namespace 1=表 / 2=索引）——用户对象 + 预置对象
 //!   ② 固定表命名空间（保留名清单，**不在 obj$**）：file$ / session$ / lock$
-//!   ③ 自举对象（obj# ≤ 99）——**不在会话解析范围内**（引擎内部用）✗
+//!   ③ 字典对象——经清单转为只读行源；管理清单仅本机管理身份可读。
 //! ```
 //!
 //! **三条规则从这里直接得到**：
@@ -23,8 +23,8 @@
 //! **已落地**：类型推导（动作 3）、参数定型（动作 4）——见 `bind::expr`；
 //! **登记点（动作 6）** 的"计划缓存键"部分只保证**可观测**（`BoundRefs` 带
 //! `(obj#, mtime)`），缓存本体随 S6。`public` 工作区的**管理元数据过滤**已由
-//! "自举对象出局"覆盖
-//! （`user$`/`ws$`/`fs$` 都是自举对象），`file$` 的 admin 例外见 [`ResolvePolicy`]。
+//! 解析策略覆盖：PUBLIC 的 user$/ws$/fs$/wq$ 仅 admin；字典行源不含口令列。
+//! `file$` 的 admin 例外见 [`ResolvePolicy`]。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,7 +63,29 @@ impl NameSpace {
 ///
 /// `session$`/`lock$` 随会话层落地（`API` REQ-API-018）；名字现在就占用，
 /// 免得将来再撞名。
-pub const FIXED_TABLES: &[&str] = &["file$", "session$", "lock$"];
+pub const FIXED_TABLES: &[&str] = &["file$", "session$", "lock$", "attachment$"];
+
+/// SQL-visible dictionary definitions. Physical credential columns are excluded.
+pub fn dictionary_columns(name: &str) -> Option<Vec<CatalogColumn>> {
+    let table = bicdb_catalog::dict::DICT_TABLES
+        .iter()
+        .find(|table| table.name == name)?;
+    Some(
+        table
+            .columns
+            .iter()
+            .filter(|column| !(name == "user$" && column.name == "passwd"))
+            .enumerate()
+            .map(|(index, column)| CatalogColumn {
+                col: index as u32 + 1,
+                name: column.name.to_owned(),
+                type_code: column.type_code as u32,
+                length: column.length,
+                nullable: column.nullable,
+            })
+            .collect(),
+    )
+}
 
 /// **预置对象名**（工作区创建时建立；属主可读写、**不可删**、**名字保留**）。
 pub const PRESET_OBJECTS: &[&str] = &[
@@ -311,9 +333,9 @@ impl BoundRefs {
 /// 三格解析的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedName {
-    /// 第 ① 格：对象命名空间里的对象（`obj# ≥ 100`；自举对象出局）。
+    /// 第 ① 格：对象命名空间里的普通对象（`obj# ≥ 100`）。
     Object(CatalogObject),
-    /// 第 ② 格：固定表（只读；**没有写入口**）。
+    /// 只读行源：固定表或经过投影的字典表（没有写入口）。
     FixedTable(&'static str),
 }
 
@@ -365,8 +387,27 @@ impl<'v, V: CatalogView> NameResolver<'v, V> {
 
     /// **`SELECT` 表源**：三格顺序查（① 对象 → ② 固定表 → ③ 出局）。
     pub fn resolve_table(&mut self, name: &str) -> Result<ResolvedName, BindError> {
-        // ① 对象命名空间。自举对象（obj# ≤ 99）**在解析范围内出局**。
+        // Dictionary sources are resolved before ordinary objects, including
+        // stat$/seq$ which are not bootstrap tables.
         match self.view.resolve(NameSpace::Table, name) {
+            Ok(obj)
+                if bicdb_catalog::dict::DICT_TABLES
+                    .iter()
+                    .any(|table| table.name == name) =>
+            {
+                if bicdb_catalog::dict::is_public_only(name) && !self.policy.is_admin {
+                    return Err(BindError::NotFound {
+                        name: name.to_owned(),
+                        ns: NameSpace::Table,
+                    });
+                }
+                let table = bicdb_catalog::dict::DICT_TABLES
+                    .iter()
+                    .find(|table| table.name == name)
+                    .expect("matched dictionary");
+                self.refs.note_object(obj.obj, obj.mtime);
+                return Ok(ResolvedName::FixedTable(table.name));
+            }
             Ok(obj) if obj.obj > BOOTSTRAP_MAX => {
                 self.refs.note_object(obj.obj, obj.mtime);
                 return Ok(ResolvedName::Object(obj));
@@ -377,6 +418,12 @@ impl<'v, V: CatalogView> NameResolver<'v, V> {
         }
         // ② 固定表命名空间。
         if let Some(fixed) = FIXED_TABLES.iter().find(|t| **t == name) {
+            if *fixed == "attachment$" && (self.view.is_public() || self.policy.is_admin) {
+                return Err(BindError::NotFound {
+                    name: name.to_owned(),
+                    ns: NameSpace::Table,
+                });
+            }
             // `public` 的管理元数据 `file$`：只有 admin 可见（`public` 的
             // `file$` 对普通用户不可见，本工作区的 `file$` 对其属主可见）。
             if *fixed == "file$" && self.view.is_public() && !self.policy.is_admin {
@@ -414,11 +461,20 @@ impl<'v, V: CatalogView> NameResolver<'v, V> {
     /// 固定表不在这一格 ⇒ "只读 = 没有入口"（写 `file$` 的表现是"不存在"）。
     pub fn resolve_write_target(&mut self, name: &str) -> Result<CatalogObject, BindError> {
         let obj = self.view.resolve(NameSpace::Table, name)?;
+        if bicdb_catalog::dict::DICT_TABLES
+            .iter()
+            .any(|table| table.name == name)
+        {
+            return Err(BindError::NotWritable(name.to_owned()));
+        }
         if obj.obj <= BOOTSTRAP_MAX {
             return Err(BindError::NotFound {
                 name: name.to_owned(),
                 ns: NameSpace::Table,
             });
+        }
+        if obj.type_code != bicdb_catalog::dict::obj_kind::TABLE {
+            return Err(BindError::NotWritable(name.to_owned()));
         }
         self.refs.note_object(obj.obj, obj.mtime);
         Ok(obj)
@@ -447,7 +503,7 @@ impl<'v, V: CatalogView> NameResolver<'v, V> {
     }
 }
 
-/// 自举对象号上界（`obj# ≤ 99` 不在会话解析范围内；与 `bicdb-catalog` 同源）。
+/// 自举对象号上界（内部对象只经专用只读行源查询；与 catalog 同源）。
 pub const BOOTSTRAP_MAX: u32 = bicdb_catalog::obj_kind::BOOTSTRAP_MAX;
 
 #[cfg(test)]

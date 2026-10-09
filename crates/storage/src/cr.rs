@@ -201,7 +201,10 @@ pub fn reconstruct(
 ) -> Result<Page, CrError> {
     let ReadView { snapshot, own } = view;
     let header = page.header().ok_or(CrError::NotDataPage)?;
-    if !matches!(header.page_type, PageType::HeapTable | PageType::Temporary) {
+    if !matches!(
+        header.page_type,
+        PageType::HeapTable | PageType::Temporary | PageType::Adjacency
+    ) {
         // **撤销页不参与 CR**：它的 ITL[0] 是"页归属"（由 `plan_append`
         // 直接写入、链上没有对应的 `ITL 覆盖` 终止符）——走 CR 必被
         // 判成数据不一致。撤销页的内容**直读**（`UndoChain::read`）。

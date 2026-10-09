@@ -34,6 +34,10 @@ pub fn hash_key(seed: u64, values: &[Value]) -> u64 {
                 mix(&mut h, &(b.len() as u64).to_le_bytes(), PRIME);
                 mix(&mut h, b, PRIME);
             }
+            Value::GraphElement(v) => {
+                mix(&mut h, &[4], PRIME);
+                mix(&mut h, &crate::value::encode_graph_element(*v), PRIME);
+            }
         }
     }
     h

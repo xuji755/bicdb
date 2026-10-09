@@ -32,6 +32,43 @@ fn store(capacity: u32) -> MemStore {
 }
 
 #[test]
+fn duplicate_keys_across_leaf_splits_are_all_readable_and_deletable() {
+    let mut s = store(2048);
+    let mut tree = Tree::create(&mut s, FILE_ID, WS).unwrap();
+    let duplicate = big_key(5, 600);
+    // Deliberately insert ROWIDs in descending order across many leaf splits.
+    for i in (1..=160).rev() {
+        tree.insert(&duplicate, rid(1, i)).unwrap();
+    }
+    let expected = (1..=160)
+        .map(|i| (duplicate.clone(), rid(1, i)))
+        .collect::<Vec<_>>();
+    let scanned = tree
+        .range(Some(&duplicate), Some(&duplicate), 1000)
+        .unwrap();
+    assert_eq!(
+        scanned.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+        expected.iter().map(|(_, r)| *r).collect::<Vec<_>>()
+    );
+    assert_eq!(tree.lookup(&duplicate).unwrap(), Some(rid(1, 1)));
+    tree.validate().unwrap();
+    for i in [1, 60, 160] {
+        assert!(tree.delete(&duplicate, rid(1, i)).unwrap());
+    }
+    let expected = expected
+        .into_iter()
+        .filter(|(_, r)| ![rid(1, 1), rid(1, 60), rid(1, 160)].contains(r))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tree.range(Some(&duplicate), Some(&duplicate), 1000)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(tree.lookup(&duplicate).unwrap(), Some(rid(1, 2)));
+    tree.validate().unwrap();
+}
+
+#[test]
 fn single_page_insert_lookup_scan_delete() {
     let mut s = store(64);
     let mut tree = Tree::create(&mut s, FILE_ID, WS).unwrap();

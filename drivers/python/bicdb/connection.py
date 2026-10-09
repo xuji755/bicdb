@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import decimal
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -28,6 +29,15 @@ _WRITE_KEYWORDS = frozenset({"insert", "update", "delete", "merge", "replace"})
 
 #: DDL 首关键字（先提交再执行）。
 _DDL_KEYWORDS = frozenset({"create", "drop", "alter", "truncate", "grant", "revoke"})
+
+
+@dataclass(frozen=True)
+class GraphElement:
+    """GRAPH_TABLE 返回的图元素身份，不包含属性快照。"""
+
+    graph: int
+    kind: str
+    id: int
 
 
 def _first_keyword(sql: str) -> str:
@@ -62,6 +72,7 @@ def python_value(v: wire.Value, kind: str, text_as_str: bool = True) -> object:
     | ``n`` | ``decimal.Decimal``（**精确**——引擎的 NUMBER 任意精度） |
     | ``o`` | ``bool`` |
     | ``b`` | UTF-8 能解出 ⇒ ``str``；否则 **``bytes``**（不替换成 ``�``） |
+    | ``g`` | :class:`GraphElement` |
     """
     if v.is_null():
         return None
@@ -72,6 +83,11 @@ def python_value(v: wire.Value, kind: str, text_as_str: bool = True) -> object:
         return decimal.Decimal(text)
     if kind == "o":
         return bool(v.as_bool())
+    if kind == "g":
+        element = v.as_graph_element()
+        if element is None:
+            raise exceptions.InterfaceError(f"列形态是图元素，载荷却是 {v.tag!r}:{v.text!r}")
+        return GraphElement(*element)
     raw = v.as_bytes()
     if text_as_str:
         try:
@@ -277,6 +293,16 @@ class Connection:
             return self._link.describe(name)
         except wire.ServerError as e:
             raise exceptions.from_server(str(e)) from None
+
+    def route_owned(self, selection: Optional[str] = None) -> dict:
+        """Resolve the authenticated user's workspace through PUBLIC."""
+        self._check_open()
+        try:
+            return self._link.route_owned(selection)
+        except wire.ServerError as error:
+            raise exceptions.from_server(str(error)) from None
+        except (wire.ProtocolError, OSError) as error:
+            raise exceptions.OperationalError(str(error)) from None
 
     def status(self) -> dict:
         """服务自述（``key=value``）。"""

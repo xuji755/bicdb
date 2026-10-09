@@ -169,6 +169,8 @@ pub struct Catalog<'io> {
     pool: Option<&'io BufferPool<'io>>,
     /// **当前的提交序号**（装载戳；打开时 = 恢复后的最新已提交序号）。
     pub(crate) current_seq: u64,
+    /// Trusted, statement-scoped cancellation point for native DDL publication.
+    pub(crate) ddl_deadline: Option<std::time::Instant>,
     /// **`object_id` 序列的内存批**（`[下一个待发, 已持久化的上界)`；
     /// `None` = 尚未取批）。C5：序列分配 = 内存取号 + 成批刷入
     /// （**跳号无害**——崩溃丢掉未发的批，号只前进不重复）。
@@ -255,8 +257,18 @@ impl<'io> Catalog<'io> {
             cache: crate::cache::RowCache::with_caps(0, crate::cache::cache_caps()),
             pool: None,
             current_seq: 0,
+            ddl_deadline: None,
             obj_seq: std::cell::Cell::new(None),
         })
+    }
+
+    /// Replace an optional trusted DDL deadline; callers restore the returned
+    /// value on all exits. None preserves the ordinary non-graph DDL behavior.
+    pub fn replace_ddl_deadline(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<std::time::Instant> {
+        std::mem::replace(&mut self.ddl_deadline, deadline)
     }
 
     /// 工作区标识。
@@ -393,6 +405,11 @@ impl<'io> Catalog<'io> {
             .usable_indexes_of(snapshot, table_obj)
             .map_err(|e| mismatch(e.to_string()))?
         {
+            // Graph expression trees contain element IDs and are maintained by
+            // the graph executor. They must never enter ordinary heap DML.
+            if dict::index_kind::is_graph_auxiliary(idx.kind) {
+                continue;
+            }
             let mut ordinals = Vec::with_capacity(idx.cols.len());
             for ic in &idx.cols {
                 let at = cols
@@ -561,7 +578,7 @@ impl<'io> Catalog<'io> {
     /// **取一行（容忍死索引项）**：回滚留下的孤儿条目（`arch/09` §9.1.2：
     /// 索引项**不做独立撤销**）回表会取不到行——那不是错误，是"该项已死"。
     ///
-    /// 唯一索引至多一条活条目 ⇒ 读到死条目即视同"不存在"，无须续查。
+    /// 唯一索引仍可包含多个回滚遗留项；调用方必须续查并复核行键。
     pub fn fetch_opt(
         &mut self,
         table: &str,
@@ -632,25 +649,92 @@ impl<'io> Catalog<'io> {
         let block = self.index_block_of(index)?;
         let fid = self.file.file_id();
         let ws = self.ws;
-        let root = segment::read_tree_head(&self.page_pooled(block)?)?;
+        let header = self.page_pooled(block)?;
+        if segment::read_header(&header)?.seg_type != segment::SegType::BTree {
+            return Err(mismatch("index range requires a B-tree segment"));
+        }
+        let root = segment::read_tree_head(&header)?;
         let found = match self.pool {
             // 活系统形态：树读**经池**（索引页 no-force；直读会拿到旧像）。
             Some(pool) => {
                 let mut store = bicdb_index::ReadOnlyStore::new(pool, fid, ws);
                 let mut tree = Tree::open(&mut store, fid, root)?;
-                tree.lookup(&encoded)?
+                tree.range(Some(&encoded), Some(&encoded), usize::MAX)?
             }
             None => {
                 let mut seg = self.open_segment(block)?;
                 let mut store = SegmentStore::new(&mut seg, ws);
                 let mut tree = Tree::open(&mut store, fid, root)?;
-                tree.lookup(&encoded)?
+                tree.range(Some(&encoded), Some(&encoded), usize::MAX)?
             }
         };
-        match found {
-            None => Ok(None),
-            Some(rid) => Ok(self.fetch_opt(table, rid)?.map(|row| (rid, row))),
+        for (_, rid) in found {
+            let Some(values) = self.fetch_opt(table, rid)? else {
+                continue;
+            };
+            // Index entries survive rollback and heap slots can be reused.
+            // A live row at the old ROWID may therefore belong to another key.
+            if dictionary_row_key(table, &key_def, &values)? == encoded {
+                return Ok(Some((rid, values)));
+            }
         }
+        Ok(None)
+    }
+
+    /// Snapshot point lookup for bootstrap dictionary keys. Unlike the legacy
+    /// current-state catalog API, this follows CR and verifies the visible row
+    /// key. Redo-only candidates are retained through dictionary deletion.
+    /// This does not populate the current-state row cache with a historical row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lookup_snapshot(
+        &mut self,
+        index: &str,
+        components: &[Option<&[u8]>],
+        pool: &BufferPool<'_>,
+        chain: &bicdb_storage::undo::UndoChain<'_, '_>,
+        view: bicdb_storage::cr::ReadView,
+        remaining: &mut usize,
+    ) -> Result<Option<(RowId, Vec<DictValue>)>, OpenError> {
+        let (table, definition) = self.key_def(index)?;
+        let def = self.table_def(table)?;
+        if components.len() != definition.cols.len() {
+            return Err(mismatch("dictionary snapshot key shape mismatch"));
+        }
+        if *remaining == 0 {
+            return Err(mismatch("graph catalog snapshot work budget exceeded"));
+        }
+        *remaining -= 1;
+        let encoded = key::encode(components);
+        let block = self.index_block_of(index)?;
+        let fid = self.file.file_id();
+        let root = segment::read_tree_head(&self.page_pooled(block)?)?;
+        let mut store = bicdb_index::ReadOnlyStore::new(pool, fid, self.ws);
+        let mut tree = Tree::open(&mut store, fid, root)?;
+        let candidates = tree.range(Some(&encoded), Some(&encoded), remaining.saturating_add(1))?;
+        if candidates.len() > *remaining {
+            return Err(mismatch("graph catalog snapshot candidate budget exceeded"));
+        }
+        *remaining -= candidates.len();
+        let types: Vec<_> = def.columns.iter().map(|col| col.type_code).collect();
+        let heap = Segment::open_pooled(pool, &mut self.file, self.tables[table].0, self.ws)?;
+        for (_, rid) in candidates {
+            if rid.file_id() != fid || heap.logical_of_block(rid.block_id()).is_none() {
+                return Err(mismatch("dictionary snapshot candidate outside its heap"));
+            }
+            let visible = bicdb_storage::scan::fetch_rows_resolved(pool, chain, view, &[rid])
+                .map_err(|error| mismatch(error.to_string()))?;
+            let Some((landed, bytes)) = visible.into_iter().next().flatten() else {
+                continue;
+            };
+            if landed.file_id() != fid || heap.logical_of_block(landed.block_id()).is_none() {
+                return Err(mismatch("dictionary snapshot row outside its heap"));
+            }
+            let values = row::decode_typed(&bytes, &types)?;
+            if dictionary_row_key(table, &definition, &values)? == encoded {
+                return Ok(Some((rid, values)));
+            }
+        }
+        Ok(None)
     }
 
     /// **一个索引的条目**（`(键分量, ROWID)`，键序；`lo`/`hi` 为闭区间，
@@ -680,11 +764,57 @@ impl<'io> Catalog<'io> {
             }
         };
         let mut result = Vec::with_capacity(entries.len());
+        // User-table index callers already perform their own row validation.
+        // Dictionary scans must do the same here before grouping columns or
+        // resolving objects, including stale entries whose slot was reused.
+        let dictionary_key = self.key_def(index).ok();
         for (k, rid) in entries {
+            if let Some((table, definition)) = dictionary_key {
+                let Some(values) = self.fetch_opt(table, rid)? else {
+                    continue;
+                };
+                if dictionary_row_key(table, &definition, &values)? != k {
+                    continue;
+                }
+            }
             let comps = key::decode(&k).map_err(|e| mismatch(e.to_string()))?;
             result.push((comps, rid));
         }
         Ok(result)
+    }
+
+    /// Bounded raw-key access for graph-owned expression trees. Ordinary
+    /// `range_index` remains a decoded SQL-key API. Graph leaves carry element
+    /// IDs and are never interpreted as heap row addresses.
+    pub fn graph_index_range(
+        &mut self,
+        obj: u32,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, RowId)>, OpenError> {
+        let block =
+            crate::ddl::live_segment_block(self, obj).map_err(|e| mismatch(e.to_string()))?;
+        let header = self.page_pooled(block)?;
+        if segment::read_header(&header)?.seg_type != segment::SegType::BTree {
+            return Err(mismatch("graph range requires a B-tree segment"));
+        }
+        let root = segment::read_tree_head(&header)?;
+        let fid = self.file.file_id();
+        let ws = self.ws;
+        match self.pool {
+            Some(pool) => {
+                let mut store = bicdb_index::ReadOnlyStore::new(pool, fid, ws);
+                let mut tree = Tree::open(&mut store, fid, root)?;
+                Ok(tree.range(lo, hi, limit)?)
+            }
+            None => {
+                let mut seg = self.open_segment(block)?;
+                let mut store = SegmentStore::new(&mut seg, ws);
+                let mut tree = Tree::open(&mut store, fid, root)?;
+                Ok(tree.range(lo, hi, limit)?)
+            }
+        }
     }
 
     /// **索引全扫**（键序）。
@@ -694,6 +824,32 @@ impl<'io> Catalog<'io> {
 }
 
 // ─────────────── 键分量的字节形态（与行内字节同源）───────────────
+
+fn dictionary_row_key(
+    table: &str,
+    definition: &KeyDef,
+    values: &[DictValue],
+) -> Result<Vec<u8>, OpenError> {
+    let columns = dict::DICT_TABLES
+        .iter()
+        .find(|entry| entry.name == table)
+        .ok_or_else(|| mismatch(format!("missing dictionary definition for {table}")))?
+        .columns;
+    let mut components = Vec::with_capacity(definition.cols.len());
+    for col in definition.cols {
+        let at = usize::from(*col) - 1;
+        let value = values
+            .get(at)
+            .ok_or_else(|| mismatch("dictionary key column exceeds row"))?;
+        let column = columns
+            .iter()
+            .find(|entry| entry.col == *col)
+            .ok_or_else(|| mismatch("dictionary key column not in definition"))?;
+        components.push(row::component_bytes(value, column)?);
+    }
+    let refs = components.iter().map(|c| c.as_deref()).collect::<Vec<_>>();
+    Ok(key::encode(&refs))
+}
 
 /// 数值分量的字节（字典表的数值列一律 `INTEGER` = `NUMBER(38,0)` 的保序编码）。
 #[must_use]

@@ -383,6 +383,7 @@ fn bound_key(v: &Value) -> Result<Vec<u8>, ExecError> {
         Value::Number(n) => n.encode(),
         Value::Bool(b) => bicdb_types::encode_boolean(*b).to_vec(),
         Value::Bytes(b) => b.clone(),
+        Value::GraphElement(v) => crate::value::encode_graph_element(*v).to_vec(),
     };
     Ok(bicdb_storage::key::encode(&[Some(&payload)]))
 }
@@ -406,5 +407,6 @@ fn decode_key(key: &[u8], kind: ColKind) -> Result<Value, ExecError> {
                 .map_err(|e| ExecError::BadStoredRow(e.to_string()))?,
         ),
         ColKind::Bytes => Value::Bytes(payload.clone()),
+        ColKind::GraphElement => Value::GraphElement(crate::value::decode_graph_element(payload)?),
     })
 }

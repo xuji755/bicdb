@@ -36,7 +36,7 @@ conn.close()
 from __future__ import annotations
 
 from . import exceptions, wire
-from .connection import Connection
+from .connection import Connection, GraphElement
 from .cursor import Cursor
 from .exceptions import (  # noqa: F401 - 供 `except bicdb.X` 用
     DataError,
@@ -56,6 +56,7 @@ __all__ = [
     "connect",
     "Connection",
     "Cursor",
+    "GraphElement",
     "Warning",
     "Error",
     "InterfaceError",

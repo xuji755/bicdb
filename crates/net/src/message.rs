@@ -158,6 +158,58 @@ impl AuthOk {
     }
 }
 
+/// Additive ROUTE response. Strings are hex UTF-8 to preserve embedded newlines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedWorkspace {
+    /// Authenticated principal, never supplied by the request.
+    pub user_id: u64,
+    /// Owned workspace ID.
+    pub workspace_id: u64,
+    /// Workspace label.
+    pub name: String,
+    /// Registered absolute directory.
+    pub root: String,
+}
+impl OwnedWorkspace {
+    /// Encode server response.
+    pub fn encode(&self) -> String {
+        format!(
+            "user_id={}\nworkspace_id={}\nname_hex={}\nroot_hex={}\n",
+            self.user_id,
+            self.workspace_id,
+            crate::value::hex_encode(self.name.as_bytes()),
+            crate::value::hex_encode(self.root.as_bytes())
+        )
+    }
+    /// Strictly decode identity and path; never guess an incomplete route.
+    pub fn decode(text: &str) -> Result<Self, String> {
+        let get = |key: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .ok_or_else(|| "ROUTE 应答缺字段".to_owned())
+        };
+        let decode = |key: &str| -> Result<String, String> {
+            let s = get(key)?;
+            if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("ROUTE 非法编码".into());
+            }
+            String::from_utf8(crate::value::hex_decode(s)).map_err(|_| "ROUTE 非 UTF-8".into())
+        };
+        let result = Self {
+            user_id: get("user_id=")?.parse().map_err(|_| "ROUTE 非法主体号")?,
+            workspace_id: get("workspace_id=")?
+                .parse()
+                .map_err(|_| "ROUTE 非法工作区号")?,
+            name: decode("name_hex=")?,
+            root: decode("root_hex=")?,
+        };
+        if result.user_id == 0 || result.workspace_id == 0 || result.root.is_empty() {
+            return Err("ROUTE 非法绑定".into());
+        }
+        Ok(result)
+    }
+}
+
 /// 结果集的一列（名 + 形态 + 类型信息）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
@@ -579,6 +631,33 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_route_roundtrip_and_invalid_fields() {
+        let route = super::OwnedWorkspace {
+            user_id: 2,
+            workspace_id: 3,
+            name: "私有区\n=test".into(),
+            root: "/tmp/私有\n=root".into(),
+        };
+        let decoded = super::OwnedWorkspace::decode(&route.encode()).unwrap();
+        assert_eq!(decoded.user_id, route.user_id);
+        assert_eq!(decoded.workspace_id, route.workspace_id);
+        assert_eq!(decoded.name, route.name);
+        assert_eq!(decoded.root, route.root);
+        assert!(super::OwnedWorkspace::decode(
+            "user_id=0\nworkspace_id=1\nname_hex=61\nroot_hex=2f61\n"
+        )
+        .is_err());
+        assert!(super::OwnedWorkspace::decode(
+            "user_id=1\nworkspace_id=2\nname_hex=zz\nroot_hex=2f61\n"
+        )
+        .is_err());
+        assert!(super::OwnedWorkspace::decode(
+            "user_id=1\nworkspace_id=2\nname_hex=61\nroot_hex=ff\n"
+        )
+        .is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -8,10 +8,9 @@
 //!
 //! # 两条纪律
 //!
-//! 1. **先排序再批量**：`fetch_rows` 不做排序（它按请求顺序回填结果，分组按
-//!    首次出现序）——**排序是调用方的责任**（`sort_rowids` 提供），排过序的
-//!    请求才让同块多行相邻、让 CR 只做一次/块；未排序时最坏退化为"每行一次
-//!    重建"（仍然正确，只是慢）。
+//! 1. **先分组再批量**：`fetch_rows` 在每一轮转发中按块地址分组，
+//!    同块共享一次 CR，输出仍按原请求顺序回填。`sort_rowids` 保留给上游
+//!    合并/物化使用；输入是否排序不影响一致性。
 //! 2. **批量不改变语义**：CR 快照在整个扫描期固定（§12.1）；批内批间一致。
 //!    返回 `None` 表示"该行在快照下不存在"（已删/未提交/槽复用）——与
 //!    点查的语义完全相同。
@@ -22,6 +21,7 @@ use crate::heap;
 use crate::page::Page;
 use crate::rowid::{Rdba, RowId};
 use crate::undo::UndoChain;
+use std::collections::BTreeMap;
 
 /// 顺序扫描的**区读上限**（§5.12：一次 `pread` ≤ 8 页 = 128 KiB）——默认值。
 ///
@@ -84,6 +84,13 @@ pub enum ScanError {
         /// 块号。
         block: u32,
     },
+    /// 转发指针损坏或链超过上限；不能被解释成“行已删除”。
+    BadForwarding {
+        /// 入口 ROWID。
+        rowid: RowId,
+        /// 原因。
+        why: &'static str,
+    },
 }
 
 impl std::fmt::Display for ScanError {
@@ -102,6 +109,9 @@ impl std::fmt::Display for ScanError {
                 write!(f, "扫描：区读请求 {expected} 页、只拿到 {got} 页")
             }
             ScanError::BadBlock { block } => write!(f, "扫描：块号 {block} 编不出 ROWID"),
+            ScanError::BadForwarding { rowid, why } => {
+                write!(f, "扫描：ROWID {rowid} 转发链损坏：{why}")
+            }
         }
     }
 }
@@ -126,38 +136,6 @@ pub fn sort_rowids(ids: &mut [RowId]) {
     ids.sort_unstable_by_key(|r| (r.file_id(), r.block_id(), r.row_id()));
 }
 
-/// **把一个 ROWID 解析到当前落点**（沿行迁移的转发链；只读、有限跳）。
-///
-/// 读不到页/槽不是 Normal ⇒ 原样返回（由调用方的 `None`/判活逻辑说话——
-/// 这里**不制造错误**：解析失败与"行不在"对回表是同一种结果）。
-fn resolve_forwarding(
-    pool: &BufferPool<'_>,
-    workspace: [u8; 8],
-    rid: RowId,
-) -> Result<RowId, ScanError> {
-    let mut cur = rid;
-    for _ in 0..crate::scan::FORWARD_MAX_HOPS {
-        let rdba = match Rdba::from_parts(cur.file_id(), cur.block_id()) {
-            Some(r) => r,
-            None => return Ok(cur),
-        };
-        let mut pages = pool.read_run(workspace, rdba, 1)?;
-        let Some(page) = pages.pop() else {
-            return Ok(cur);
-        };
-        match heap::slot_status(&page, cur.row_id()) {
-            Some(crate::page::SlotStatus::Forwarding) => {
-                match heap::forwarding_target(&page, cur.row_id()) {
-                    Some(next) => cur = next,
-                    None => return Ok(cur),
-                }
-            }
-            _ => return Ok(cur),
-        }
-    }
-    Ok(cur)
-}
-
 /// 转发链跳数上限（与 `catalog` 的 `forward_max_hops` 同源口径）。
 pub const FORWARD_MAX_HOPS: usize = 16;
 
@@ -165,13 +143,13 @@ pub const FORWARD_MAX_HOPS: usize = 16;
 ///
 /// - 返回与请求**同序**的 `Vec<Option<Vec<u8>>>`；`None` = 该行在视角下不
 ///   存在（已删/未提交/槽已复用）——与点查语义一致；
-/// - 同块的多行共享**一次区读（`count = 1`）**与**一次 CR 块重建**——
-///   未按块排序时结果仍正确，但每块的重建次数会退化（见模块文档）。
+/// - 每轮转发中，同块的多行共享**一次区读**与**一次 CR 块重建**，
+///   输入顺序不影响结果；后续转发可能再次访问同一块。
 ///
 /// **批量回表**（索引回表的主路径；`rows` = 索引项里记的 ROWID）。
 ///
-/// **跟随转发指针**（见 [`resolve_forwarding`]）——索引项存的是稳定入口，
-/// 行迁移后要靠它落到当前页；不解析的话迁移过的行会回表落空。
+/// **在 CR 快照页上跟随转发指针**——索引项存的是稳定入口。
+/// 先还原页、再判断转发：迁移前的旧视图必须返回入口处的原行。
 ///
 /// # Errors
 /// 页读失败（I/O）、ROWID 形态非法。
@@ -190,7 +168,7 @@ pub fn fetch_rows(
 /// 一行 + 它**解析转发之后**的物理位置（[`fetch_rows_resolved`] 的返回元素）。
 pub type ResolvedRow = Option<(RowId, Vec<u8>)>;
 
-/// 与 [`fetch_rows`] 同一条路，额外返回每行**解析转发之后**的物理 `ROWID`。
+/// 与 [`fetch_rows`] 同一条路，额外返回每行**在快照中解析转发之后**的物理 `ROWID`。
 ///
 /// 为什么需要它：**同一条活行可能有多条索引项**——改键列只追加新项、不移动
 /// 旧项（索引写没有 undo，见 `arch/09` §9.1.2 的取舍）。于是范围覆盖新旧两个键
@@ -208,35 +186,47 @@ pub fn fetch_rows_resolved(
 ) -> Result<Vec<ResolvedRow>, ScanError> {
     let workspace = chain.segment().workspace_ref();
     let mut out: Vec<ResolvedRow> = vec![None; rows.len()];
-
-    // **先把 ROWID 解析到当前落点**（行迁移的转发链）：索引项里存的是**稳定入口**
-    // （写入时的位置），迁移后原槽位只剩 6B 转发指针——不回解析的话，回表会拿到
-    // `None`（转发槽不是行），于是"这一行明明在、唯一性却漏判"。
-    // 实测抓到的正是这条：改长更新（迁移）之后，同键重复插入被放行。
-    let resolved: Vec<RowId> = rows
-        .iter()
-        .map(|r| resolve_forwarding(pool, workspace, *r).unwrap_or(*r))
-        .collect();
-
-    // 按块分组（保序：处理顺序 = 首次出现的块序；输出按原下标回填）。
-    let mut groups: Vec<(Rdba, Vec<(usize, u16)>)> = Vec::new();
-    for (i, r) in resolved.iter().enumerate() {
-        let rdba =
-            Rdba::from_parts(r.file_id(), r.block_id()).ok_or(ScanError::BadRowId { rowid: *r })?;
-        match groups.iter_mut().find(|(k, _)| *k == rdba) {
-            Some((_, items)) => items.push((i, r.row_id())),
-            None => groups.push((rdba, vec![(i, r.row_id())])),
+    let mut pending: Vec<_> = rows.iter().copied().enumerate().collect();
+    // Each forwarding frontier groups requests by block. Reconstruct at the
+    // caller's fixed view BEFORE following a pointer: a newer migration target
+    // need not exist at an old snapshot, while its original row still does.
+    // Keep only one reconstructed block in memory at a time.
+    for hops in 0..=FORWARD_MAX_HOPS {
+        let mut groups: BTreeMap<Rdba, Vec<(usize, RowId)>> = BTreeMap::new();
+        for (idx, current) in pending.drain(..) {
+            let rdba = Rdba::from_parts(current.file_id(), current.block_id())
+                .ok_or(ScanError::BadRowId { rowid: current })?;
+            groups.entry(rdba).or_default().push((idx, current));
         }
-    }
-
-    for (rdba, items) in groups {
-        let mut pages = pool.read_run(workspace, rdba, 1)?;
-        let page = pages.pop().ok_or(ScanError::EmptyRun { rdba })?;
-        // **一次 CR 块重建**服务本块全部请求行。
-        let cr_page = cr::reconstruct(&page, view, chain)?;
-        for (idx, row_no) in items {
-            let phys = resolved[idx];
-            out[idx] = heap::row(&cr_page, row_no).map(|b| (phys, b.to_vec()));
+        for (rdba, items) in groups {
+            let mut pages = pool.read_run(workspace, rdba, 1)?;
+            let page = pages.pop().ok_or(ScanError::EmptyRun { rdba })?;
+            let snapshot = cr::reconstruct(&page, view, chain)?;
+            for (idx, current) in items {
+                if heap::slot_status(&snapshot, current.row_id())
+                    == Some(crate::page::SlotStatus::Forwarding)
+                {
+                    if hops == FORWARD_MAX_HOPS {
+                        return Err(ScanError::BadForwarding {
+                            rowid: rows[idx],
+                            why: "转发链成环或超过跳数上限",
+                        });
+                    }
+                    let next = heap::forwarding_target(&snapshot, current.row_id()).ok_or(
+                        ScanError::BadForwarding {
+                            rowid: current,
+                            why: "转发目标不可读",
+                        },
+                    )?;
+                    pending.push((idx, next));
+                } else {
+                    out[idx] = heap::row(&snapshot, current.row_id())
+                        .map(|bytes| (current, bytes.to_vec()));
+                }
+            }
+        }
+        if pending.is_empty() {
+            break;
         }
     }
     Ok(out)
@@ -449,6 +439,54 @@ mod tests {
 
     fn rid(block: u32, slot: u16) -> RowId {
         RowId::from_parts(3, block, slot).unwrap()
+    }
+
+    #[test]
+    fn audit_fetch_propagates_a_transient_forwarding_read_failure() {
+        use bicdb_workspace::io::{FaultInjecting, FaultOp, FaultRule};
+        let io = FaultInjecting::new(MemFileIo::new());
+        io.inner().add_dir("/mem");
+        let data = pagefile::create(&io, Path::new(DATA_F), 16).unwrap();
+        let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+        heap::insert_row(&mut page, &row(b"live"), &InsertPolicy::in_place(0)).unwrap();
+        pagefile::write_page(&io, data, 1, &mut page).unwrap();
+        let pool = BufferPool::new(
+            &io,
+            8,
+            move |ws, r| (*ws == WS && r.file_id() == 3).then_some((data, r.block_id())),
+            NoWal,
+        )
+        .unwrap();
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        io.reset_counters();
+        io.add_rule(FaultRule::once(FaultOp::Read, 1, std::io::ErrorKind::Other));
+        assert!(
+            fetch_rows(&pool, &chain, ReadView::new(seq(0)), &[rid(1, 1)]).is_err(),
+            "首次 I/O 失败不得被第二次成功读取掩盖"
+        );
+        assert_eq!(
+            fetch_rows(&pool, &chain, ReadView::new(seq(0)), &[rid(1, 1)]).unwrap()[0],
+            Some(row(b"live"))
+        );
+    }
+
+    #[test]
+    fn audit_forwarding_cycles_are_errors_instead_of_missing_rows() {
+        let io = CountingIo::new();
+        io.inner.add_dir("/mem");
+        let data = pagefile::create(&io, Path::new(DATA_F), 16).unwrap();
+        let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+        heap::insert_row(&mut page, &row(b"live"), &InsertPolicy::in_place(0)).unwrap();
+        heap::migrate_row(&mut page, 1, rid(1, 1)).unwrap();
+        pagefile::write_page(&io, data, 1, &mut page).unwrap();
+        let pool = pool_over(&io, data, 8);
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+        assert!(
+            fetch_rows(&pool, &chain, ReadView::new(seq(0)), &[rid(1, 1)]).is_err(),
+            "转发环属于损坏，不能返回空行"
+        );
     }
 
     /// 假 WAL：水位视为已全落盘（扫描路径不触发 WAL）。

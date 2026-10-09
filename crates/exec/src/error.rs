@@ -25,6 +25,8 @@ pub enum ExecError {
     },
     /// 存储行字节不合规范（解码严格失败）。
     BadStoredRow(String),
+    /// 写入违反目录声明的非空或长度约束。
+    ConstraintViolation(String),
     /// 参数下标越界。
     ParamOutOfRange {
         /// 请求的参数下标。
@@ -86,6 +88,7 @@ impl std::fmt::Display for ExecError {
             }
             ExecError::RowShapeMismatch { col } => write!(f, "行形状不含第 {col} 列"),
             ExecError::BadStoredRow(why) => write!(f, "存储行解码失败：{why}"),
+            ExecError::ConstraintViolation(why) => f.write_str(why),
             ExecError::ParamOutOfRange { index, count } => {
                 write!(f, "参数下标 {index} 越界（共 {count} 个参数）")
             }

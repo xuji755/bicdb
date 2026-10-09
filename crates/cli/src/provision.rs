@@ -53,6 +53,11 @@ impl CliProvisioner {
 
 impl WorkspaceProvisioner for CliProvisioner {
     fn provision(&self, req: &ProvisionRequest) -> Result<(), String> {
+        let template = req
+            .from_template
+            .as_ref()
+            .map(|name| crate::templates::load(req.root.parent().ok_or("工作区没有实例根")?, name))
+            .transpose()?;
         let ws_id = WorkspaceId::from_raw(req.workspace_id)
             .ok_or_else(|| format!("工作区号 {} 越界（48 位、0 保留）", req.workspace_id))?;
         // 参数：**以实例的参数文件为种子**（同实例同口径），日志统一落 `<home>/log/`。
@@ -71,7 +76,32 @@ impl WorkspaceProvisioner for CliProvisioner {
             },
         )
         .map_err(|e| e.to_string())?;
-        inst.shutdown().map_err(|e| e.to_string())?;
+        let applied = (|| -> Result<(), String> {
+            if let Some(template) = template {
+                let seq = inst.seq();
+                {
+                    let mut session = bicdb_sql::session::Session::new(
+                        inst.pool,
+                        inst.engine,
+                        &mut inst.catalog,
+                        seq,
+                    );
+                    template
+                        .apply(&mut session)
+                        .map_err(|error| format!("初始化模板应用失败：{error}"))?;
+                }
+                crate::templates::write_stamp(
+                    &req.root,
+                    template.format,
+                    &template.name,
+                    &template.digest,
+                )?;
+            }
+            Ok(())
+        })();
+        let closed = inst.shutdown().map_err(|e| e.to_string());
+        applied?;
+        closed?;
         Ok(())
     }
 
@@ -100,5 +130,16 @@ impl WorkspaceProvisioner for CliProvisioner {
             return Ok(()); // 幂等：已经不在了
         }
         std::fs::remove_dir_all(root).map_err(|e| format!("删 {} 失败：{e}", root.display()))
+    }
+
+    fn add_schema_template(&self, home: &Path, source: &Path, name: &str) -> Result<(), String> {
+        crate::templates::publish(home, source, name)
+    }
+    fn add_graph_template(&self, home: &Path, source: &Path, name: &str) -> Result<(), String> {
+        crate::templates::publish_graph_data(home, source, name)
+    }
+
+    fn drop_schema_template(&self, home: &Path, name: &str) -> Result<(), String> {
+        crate::templates::remove(home, name)
     }
 }

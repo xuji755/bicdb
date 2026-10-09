@@ -4,7 +4,32 @@
 //!
 //! - 设计依据：§13 有限属性图与AGE参考边界
 //! - 对应阶段：P10
-//! - 当前状态：**未实现**（骨架占位，无可调用 API）
 //!
-//! 本 crate 在对应阶段启动前不提供任何实现。请勿在此添加推测性
-//! 接口——接口须先经 P0 冻结并完成设计评审（见设计文档）。
+//! A bounded property-graph query core. Native SQL owns persistence, identity and
+//! transactions; this crate never opens a remote Neo4j connection.
+
+#![forbid(unsafe_code)]
+
+pub mod access;
+pub mod adjacency_record;
+pub mod corpus_proof;
+mod deadline;
+pub mod fulltext;
+pub mod fulltext_journal;
+mod model;
+mod parser;
+pub mod property_index;
+mod query;
+mod retrieval;
+pub mod storage;
+
+pub use deadline::Deadline;
+pub use model::{
+    Direction, Edge, Error, Graph, GraphChanges, GraphCorpus, Limits, Node, Path, Properties,
+    Value, DEFAULT_DETACH_EDGE_LIMIT, MAX_DETACH_EDGE_LIMIT,
+};
+pub use parser::{parse, Query};
+pub use query::{
+    execute, execute_with_indexes, execute_with_indexes_deadline, execute_with_storage,
+    execute_with_storage_deadline, execute_with_storage_write_deadline, QueryResult,
+};

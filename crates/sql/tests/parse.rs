@@ -12,6 +12,125 @@ use bicdb_sql::ast::{
 };
 use bicdb_sql::parser::{parse, parse_many};
 
+#[test]
+fn graph_storage_rebuild_requires_complete_distinct_clause() {
+    let Stmt::GraphIndex(stmt) = parse("ALTER GRAPH \"KG;知识\" REBUILD STORAGE").unwrap() else {
+        panic!("graph storage rebuild")
+    };
+    assert_eq!(stmt.graph, "KG;知识");
+    assert!(stmt.name.is_none());
+    assert!(matches!(
+        stmt.action,
+        bicdb_sql::ast::GraphIndexAction::RebuildStorage
+    ));
+    for text in [
+        "ALTER GRAPH kg REBUILD",
+        "ALTER GRAPH kg REBUILD RECORDS",
+        "ALTER GRAPH kg REBUILD STORAGE EXTRA",
+        "ALTER GRAPH INDEX ix ON kg REBUILD STORAGE",
+    ] {
+        assert!(parse(text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn graph_storage_upgrade_requires_complete_explicit_clause() {
+    let Stmt::GraphIndex(stmt) = parse("ALTER GRAPH \"KG;知识\" UPGRADE STORAGE").unwrap() else {
+        panic!("graph upgrade")
+    };
+    assert_eq!(stmt.graph, "KG;知识");
+    assert!(stmt.name.is_none());
+    assert!(matches!(
+        stmt.action,
+        bicdb_sql::ast::GraphIndexAction::UpgradeStorage
+    ));
+    for text in [
+        "ALTER GRAPH kg UPGRADE",
+        "ALTER GRAPH kg UPGRADE RECORDS",
+        "ALTER GRAPH INDEX ix ON kg UPGRADE STORAGE",
+    ] {
+        assert!(parse(text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn graph_data_template_requires_explicit_complete_clause() {
+    for (text, data) in [
+        ("ALTER DATABASE ADD TEMPLATE 't' FROM 7", false),
+        (
+            "ALTER DATABASE ADD TEMPLATE 't' FROM seed WITH GRAPH DATA",
+            true,
+        ),
+    ] {
+        let Stmt::AlterDatabase(stmt) = parse(text).unwrap() else {
+            panic!("template")
+        };
+        assert!(
+            matches!(stmt.action,AlterDatabaseAction::AddTemplate { graph_data,.. } if graph_data==data)
+        );
+    }
+    for text in [
+        "ALTER DATABASE ADD TEMPLATE 't' FROM seed WITH DATA",
+        "ALTER DATABASE ADD TEMPLATE 't' FROM seed WITH GRAPH",
+        "ALTER DATABASE ADD TEMPLATE 't' FROM seed WITH GRAPH ROWS",
+        "ALTER DATABASE DROP TEMPLATE 't' WITH GRAPH DATA",
+    ] {
+        assert!(parse(text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn native_graph_index_grammar_preserves_case_and_rejects_ambiguous_targets() {
+    use bicdb_sql::ast::GraphIndexAction;
+    let Stmt::GraphIndex(index) = parse(
+        "CREATE UNIQUE GRAPH INDEX ix ON kg NODES LABEL \"Entity\" (db_type, config.\"Port\")",
+    )
+    .unwrap() else {
+        panic!("graph index");
+    };
+    assert_eq!(index.graph, "kg");
+    assert_eq!(index.name.as_deref(), Some("ix"));
+    assert_eq!(
+        index.action,
+        GraphIndexAction::Create {
+            entity: "nodes".into(),
+            label: Some("Entity".into()),
+            fields: vec![vec!["db_type".into()], vec!["config".into(), "Port".into()]],
+            unique: true
+        }
+    );
+    for text in [
+        "CREATE GRAPH INDEX ix ON kg RELATIONSHIPS TYPE \"LINK\" (weight)",
+        "CREATE GRAPH INDEX ix ON kg NODES LABEL \"Entity\" ()",
+        "SHOW GRAPH INDEXES ON kg",
+        "DROP GRAPH INDEX ix ON kg",
+        "ALTER GRAPH INDEX ix ON kg REBUILD",
+    ] {
+        assert!(
+            matches!(parse(text).unwrap(), Stmt::GraphIndex(_)),
+            "{text}"
+        );
+    }
+    let Stmt::Cypher(query) =
+        parse("PROFILE CYPHER kg 'RETURN $value AS v' PARAMETERS '{\"value\":1}'").unwrap()
+    else {
+        panic!("profile");
+    };
+    assert!(query.profile);
+    for text in [
+        "CREATE GRAPH INDEX ix ON kg NODES TYPE \"Entity\" (name)",
+        "CREATE GRAPH INDEX ix ON kg RELATIONSHIPS LABEL \"LINK\" (weight)",
+        "CREATE GRAPH INDEX ix ON kg (name)",
+        "CREATE GRAPH INDEX ix ON kg NODES (name,)",
+        "DROP GRAPH INDEX ix",
+        "SHOW GRAPH INDEXES",
+        "ALTER GRAPH INDEX ix ON kg",
+        "PROFILE PROFILE CYPHER kg 'RETURN 1'",
+    ] {
+        assert!(parse(text).is_err(), "{text}");
+    }
+}
+
 /// 语句闭集语料（正面清单逐类各若干）。
 const CORPUS: &[&str] = &[
     // ── DDL ──
@@ -529,9 +648,63 @@ fn errors_carry_byte_spans() {
 }
 
 #[test]
-fn graph_table_is_loudly_deferred() {
-    let e = parse("SELECT * FROM GRAPH_TABLE (g)").unwrap_err();
-    assert!(e.message.contains("GRAPH_TABLE"), "{e}");
+fn graph_table_has_explicit_scalar_schema_and_non_lateral_arguments() {
+    let Stmt::Select(s) = parse("SELECT g.code FROM GRAPH_TABLE(kg, :query PARAMETERS :opts COLUMNS (code NUMBER, title VARCHAR2(128), ok BOOLEAN)) AS g").unwrap() else { panic!("select") };
+    let FromItem::GraphTable(g) = &s.from_clause[0] else {
+        panic!("graph table")
+    };
+    assert_eq!(g.graph, "kg");
+    assert_eq!(g.alias.as_ref().unwrap().aliasname, "g");
+    assert_eq!(g.columns.len(), 3);
+    assert_eq!(g.columns[1].type_name.typmods, vec!["128"]);
+    assert!(matches!(g.query, Expr::ParamRef(_)));
+    for sql in [
+        "SELECT * FROM GRAPH_TABLE(kg)",
+        "SELECT * FROM GRAPH_TABLE(kg, 'RETURN 1')",
+        "SELECT * FROM GRAPH_TABLE(public.kg, 'RETURN 1' COLUMNS (v NUMBER))",
+        "SELECT * FROM GRAPH_TABLE(kg, t.query COLUMNS (v NUMBER))",
+        "SELECT * FROM GRAPH_TABLE(kg, 'RETURN 1' PARAMETERS NULL COLUMNS (v NUMBER))",
+        "SELECT * FROM GRAPH_TABLE(kg, 'RETURN 1' COLUMNS ())",
+        "SELECT * FROM GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v NUMBER,))",
+        "SELECT * FROM GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v NUMBER NOT NULL))",
+    ] {
+        assert!(parse(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn cypher_and_graph_table_accept_separate_request_budgets() {
+    let Stmt::Cypher(c) =
+        parse("PROFILE CYPHER kg 'RETURN $v' PARAMETERS '{\"v\":1}' BUDGETS '{\"max_rows\":1}'")
+            .unwrap()
+    else {
+        panic!("cypher")
+    };
+    assert_eq!(c.budgets, "{\"max_rows\":1}");
+    assert!(c.profile);
+    let Stmt::Cypher(c) = parse("CYPHER kg 'RETURN 1' BUDGETS '{}'").unwrap() else {
+        panic!("cypher")
+    };
+    assert_eq!(c.parameters, "{}");
+    let Stmt::Select(s) =
+        parse("SELECT * FROM GRAPH_TABLE(kg,:q PARAMETERS :p BUDGETS :b COLUMNS (v NUMBER))")
+            .unwrap()
+    else {
+        panic!("select")
+    };
+    let FromItem::GraphTable(g) = &s.from_clause[0] else {
+        panic!("graph table")
+    };
+    assert!(matches!(g.budgets, Some(Expr::ParamRef(_))));
+    for sql in [
+        "CYPHER kg 'RETURN 1' BUDGETS 1",
+        "CYPHER kg 'RETURN 1' BUDGETS '{}' BUDGETS '{}'",
+        "CYPHER kg 'RETURN 1' BUDGETS '{}' PARAMETERS '{}'",
+        "SELECT * FROM GRAPH_TABLE(kg,'RETURN 1' BUDGETS t.value COLUMNS (v NUMBER))",
+        "SELECT * FROM GRAPH_TABLE(kg,'RETURN 1' BUDGETS NULL COLUMNS (v NUMBER))",
+    ] {
+        assert!(parse(sql).is_err(), "{sql}");
+    }
 }
 
 /// **依赖检查**（REQ-SQL-002 的验收原文）：AST 模块不 import 任何目录接口。
@@ -740,7 +913,7 @@ fn dcl_shapes_follow_the_frozen_design() {
     };
     assert!(matches!(
         &t1.action,
-        AlterDatabaseAction::AddTemplate { name, from }
+        AlterDatabaseAction::AddTemplate { name, from, graph_data: false }
             if name.as_slice() == b"b" && from.id == Some(7)
     ));
     let Stmt::AlterDatabase(t2) = parse("ALTER DATABASE DROP TEMPLATE 'b'").unwrap() else {
@@ -817,4 +990,104 @@ fn removed_forms_are_rejected_with_pointed_messages() {
     // 配额只能是整数或 `UNLIMITED`。
     let e6 = parse("CREATE WORKSPACE p QUOTA '10G' ON FILESYSTEM 3").unwrap_err();
     assert!(e6.message.contains("UNLIMITED"), "{e6}");
+}
+
+#[test]
+fn graph_access_rebuild_has_distinct_syntax_and_rejects_unknown_maintenance() {
+    let statements = parse_many("ALTER GRAPH kbg REBUILD ACCESS;").unwrap();
+    assert!(
+        matches!(&statements[0],bicdb_sql::ast::Stmt::GraphIndex(s) if s.name.is_none() && matches!(s.action,bicdb_sql::ast::GraphIndexAction::RebuildAccess))
+    );
+    for sql in [
+        "ALTER GRAPH kbg REBUILD",
+        "ALTER GRAPH kbg REBUILD UNKNOWN",
+        "ALTER GRAPH INDEX ix ON kbg REBUILD ACCESS",
+    ] {
+        assert!(parse_many(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn fulltext_graph_sql_has_separate_targets_fixed_json_paths_and_closed_maintenance() {
+    use bicdb_sql::ast::{GraphIndexAction, GraphTextPathPart};
+    let Stmt::GraphIndex(index)=parse("CREATE FULLTEXT GRAPH INDEX ix ON kg NODES LABEL (\"Entity\",\"Fault\") (name,config.answers[0].\"Title\") OPTIONS '{\"update\":\"manual\"}'").unwrap() else {panic!("fulltext")};
+    let GraphIndexAction::FulltextCreate {
+        labels,
+        fields,
+        options,
+        ..
+    } = index.action
+    else {
+        panic!("create")
+    };
+    assert_eq!(labels, ["Entity", "Fault"]);
+    assert_eq!(
+        fields[1],
+        vec![
+            GraphTextPathPart::Key("config".into()),
+            GraphTextPathPart::Key("answers".into()),
+            GraphTextPathPart::Index(0),
+            GraphTextPathPart::Key("Title".into())
+        ]
+    );
+    assert_eq!(options, "{\"update\":\"manual\"}");
+    let Stmt::GraphIndex(sync) = parse("ALTER FULLTEXT GRAPH INDEX ix ON kg SYNC").unwrap() else {
+        panic!("sync");
+    };
+    let Stmt::GraphIndex(rebuild) = parse("ALTER FULLTEXT GRAPH INDEX ix ON kg REBUILD").unwrap()
+    else {
+        panic!("rebuild");
+    };
+    assert!(matches!(sync.action, GraphIndexAction::FulltextSync));
+    assert!(matches!(rebuild.action, GraphIndexAction::FulltextRebuild));
+    for sql in [
+        "CREATE FULLTEXT GRAPH INDEX ix ON kg RELATIONSHIPS TYPE \"CAUSE\" (config.answer)",
+        "SEARCH FULLTEXT GRAPH INDEX ix ON kg FOR 'buffer pool' OPTIONS '{\"db_type\":\"d1\"}'",
+        "SHOW FULLTEXT GRAPH INDEXES ON kg",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg SYNC",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg WAIT",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg WAIT OPTIONS '{\"timeout_ms\":0,\"target_source_seq\":3}'",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg REBUILD",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg PAUSE",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg RESUME",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg OPTIONS '{\"update\":\"batch\",\"interval_ms\":5000}'",
+        "DROP FULLTEXT GRAPH INDEX ix ON kg",
+    ] {
+        assert!(matches!(parse(sql).unwrap(), Stmt::GraphIndex(_)), "{sql}");
+    }
+    for sql in [
+        "CREATE FULLTEXT INDEX ix ON kg (name)",
+        "CREATE FULLTEXT GRAPH INDEX ix ON kg NODES ()",
+        "CREATE FULLTEXT GRAPH INDEX ix ON kg NODES (config[1.5])",
+        "CREATE FULLTEXT GRAPH INDEX ix ON kg NODES (config[-1])",
+        "CREATE FULLTEXT GRAPH INDEX ix ON kg RELATIONSHIPS LABEL x (name)",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg UNKNOWN",
+        "SEARCH FULLTEXT GRAPH INDEX ix ON kg 'buffer'",
+        "SHOW FULLTEXT GRAPH INDEXES",
+        "SELECT config[0] FROM t",
+    ] {
+        assert!(parse(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn graph_fulltext_wait_options_are_optional_and_closed() {
+    use bicdb_sql::ast::{GraphIndexAction, Stmt};
+    let Stmt::GraphIndex(wait) = parse("ALTER FULLTEXT GRAPH INDEX ix ON kg WAIT").unwrap() else {
+        panic!("wait")
+    };
+    assert_eq!(
+        wait.action,
+        GraphIndexAction::FulltextWait {
+            options: "{}".into()
+        }
+    );
+    for sql in [
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg WAIT 10",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg WAIT OPTIONS",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg WAIT OPTIONS 10",
+        "ALTER FULLTEXT GRAPH INDEX ix ON kg WAIT OPTIONS '{}' SYNC",
+    ] {
+        assert!(parse(sql).is_err(), "{sql}");
+    }
 }

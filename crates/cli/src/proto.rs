@@ -25,6 +25,7 @@ pub fn kind_char(kind: ColKind) -> char {
         ColKind::Number => 'n',
         ColKind::Bool => 'o',
         ColKind::Bytes => 'b',
+        ColKind::GraphElement => 'g',
     }
 }
 
@@ -34,6 +35,7 @@ pub fn kind_of(tag: char) -> ColKind {
     match tag {
         'n' => ColKind::Number,
         'o' => ColKind::Bool,
+        'g' => ColKind::GraphElement,
         _ => ColKind::Bytes,
     }
 }
@@ -46,6 +48,14 @@ pub fn wire_value(v: &Value) -> bicdb_net::Value {
         Value::Bool(b) => bicdb_net::Value::Bool(*b),
         Value::Number(n) => bicdb_net::Value::Number(n.to_string()),
         Value::Bytes(b) => bicdb_net::Value::Bytes(b.clone()),
+        Value::GraphElement(element) => bicdb_net::Value::GraphElement {
+            graph: element.graph,
+            kind: match element.kind {
+                bicdb_exec::GraphElementKind::Node => 'n',
+                bicdb_exec::GraphElementKind::Edge => 'e',
+            },
+            id: element.id,
+        },
     }
 }
 
@@ -60,6 +70,18 @@ pub fn engine_value(v: &bicdb_net::Value) -> Value {
             Err(_) => Value::Bytes(t.as_bytes().to_vec()),
         },
         bicdb_net::Value::Bytes(b) => Value::Bytes(b.clone()),
+        bicdb_net::Value::GraphElement { graph, kind, id } => {
+            let kind = match kind {
+                'n' => bicdb_exec::GraphElementKind::Node,
+                'e' => bicdb_exec::GraphElementKind::Edge,
+                _ => return Value::Bytes(format!("{graph}:{kind}:{id}").into_bytes()),
+            };
+            Value::GraphElement(bicdb_exec::GraphElement {
+                graph: *graph,
+                kind,
+                id: *id,
+            })
+        }
     }
 }
 
@@ -158,6 +180,11 @@ mod tests {
         round_trip(Value::Number(Number::parse("-0.001").expect("数")));
         round_trip(Value::Bytes(b"raw\x00\xff".to_vec()));
         round_trip(Value::Bytes(Vec::new()));
+        round_trip(Value::GraphElement(bicdb_exec::GraphElement {
+            graph: 42,
+            kind: bicdb_exec::GraphElementKind::Edge,
+            id: 9,
+        }));
     }
 
     #[test]

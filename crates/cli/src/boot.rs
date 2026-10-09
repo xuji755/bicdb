@@ -851,7 +851,7 @@ pub fn open_unlocked_with(
     let mut writer = GroupWriter::open(io_dyn, cf, &wal_path, spec)?;
 
     // **恢复**（顺序不可换：分析 → 重做 → 输家回滚；见 `wal::recovery`）。
-    let chain = UndoChain::open(undo_seg);
+    let mut chain = UndoChain::open(undo_seg);
     let summary = {
         let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
         let groups = online_groups(io_dyn, &cf_ro, &wal_path, spec)?;
@@ -889,7 +889,7 @@ pub fn open_unlocked_with(
             io_dyn,
             &groups,
             progress.checkpoint_lsn,
-            &chain,
+            &mut chain,
             &mut writer,
             &mut resolve,
         )?;

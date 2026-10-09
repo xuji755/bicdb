@@ -66,6 +66,8 @@ pub enum UndoPhaseError {
     Io(io::Error),
     /// 日志写入/刷盘错误。
     Group(GroupError),
+    /// Recovery checkpoint could not durably save compensation.
+    Checkpoint(crate::checkpoint::CheckpointError),
     /// 页文件错误（损坏按损坏处理）。
     Page(PageFileError),
     /// 事务表访问错误。
@@ -87,6 +89,7 @@ impl std::fmt::Display for UndoPhaseError {
         match self {
             UndoPhaseError::Io(e) => write!(f, "撤销阶段 I/O：{e}"),
             UndoPhaseError::Group(e) => write!(f, "撤销阶段日志：{e}"),
+            UndoPhaseError::Checkpoint(e) => write!(f, "撤销阶段检查点：{e}"),
             UndoPhaseError::Page(e) => write!(f, "撤销阶段页文件：{e}"),
             UndoPhaseError::Undo(e) => write!(f, "撤销阶段事务表：{e}"),
             UndoPhaseError::Chain(e) => write!(f, "撤销阶段链读取：{e}"),
@@ -153,8 +156,22 @@ pub fn rollback_losers(
     slots: &[u16],
     resolve: &mut BlockResolver<'_>,
 ) -> Result<UndoReport, UndoPhaseError> {
+    rollback_losers_with_checkpoints(io, writer, chain, slots, resolve, &mut |_| Ok(()))
+}
+
+// Regular instance recovery supplies a durable checkpoint callback. PITR keeps
+// its separate replay policy through the public, non-checkpointing entry point.
+pub(crate) fn rollback_losers_with_checkpoints(
+    io: &dyn FileIo,
+    writer: &mut GroupWriter<'_, '_>,
+    chain: &UndoChain<'_, '_>,
+    slots: &[u16],
+    resolve: &mut BlockResolver<'_>,
+    safe_point: &mut impl FnMut(&mut GroupWriter<'_, '_>) -> Result<(), UndoPhaseError>,
+) -> Result<UndoReport, UndoPhaseError> {
     let mut report = UndoReport::default();
     for &slot in slots {
+        safe_point(writer)?;
         let head_page = chain.segment().read_page(0)?;
         let txn_slot = read_slot(&head_page, slot)?;
         if txn_slot.state == TxnState::Free {
@@ -188,6 +205,7 @@ pub fn rollback_losers(
         // ② 整链从新到旧应用逆操作。
         let mut at = txn_slot.undo_current;
         while let Some(pos) = at {
+            safe_point(writer)?;
             let record = chain.read(pos)?;
             at = record.prev;
             let rdba = Rdba::from_parts(record.rowid.file_id(), record.rowid.block_id())
@@ -209,6 +227,7 @@ pub fn rollback_losers(
         }
 
         // ③ "回滚完成"标记（此后分析一眼判出；不是正确性前提——补偿幂等）。
+        safe_point(writer)?;
         let lsn = writer.append(|l| RedoRecord::rollback_done(l, txn_raw))?;
         writer.flush(lsn)?;
         report.redo_records += 1;

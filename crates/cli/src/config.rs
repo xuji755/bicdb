@@ -201,6 +201,8 @@ pub struct RunParams {
     pub socket: String,
     /// 服务日志（相对根区目录；也接受绝对路径）。
     pub log: String,
+    /// 同时保持的客户端连接上限。
+    pub max_connections: usize,
     /// 等锁单次挂起时长（毫秒）。
     pub park_ms: u64,
     /// 死锁检测阈值（毫秒）。
@@ -253,6 +255,29 @@ pub struct RunParams {
     pub stop_wait_s: u64,
     /// 等就绪的轮询间隔（毫秒）。
     pub ready_poll_ms: u64,
+    /// Default interval for batch full-text indexes without an index override.
+    pub fulltext_interval_ms: u64,
+    /// Default rows per maintenance transaction, overridden by index OPTIONS.
+    pub fulltext_batch_rows: usize,
+    /// Distinct incident relationships allowed per Cypher DETACH statement.
+    pub graph_detach_edge_limit: usize,
+    /// Workspace graph max_nodes ceiling.
+    pub graph_max_nodes: usize,
+    /// Workspace graph max_edges ceiling.
+    pub graph_max_edges: usize,
+    /// Workspace graph max_rows ceiling.
+    pub graph_max_rows: usize,
+    /// Workspace graph max_expansions ceiling.
+    pub graph_max_expansions: usize,
+    /// Workspace adjacency candidate ceiling, independent of expression work.
+    pub graph_max_edge_expansions: usize,
+    /// Cooperative graph statement duration in milliseconds.
+    pub graph_max_elapsed_ms: usize,
+    /// Workspace graph max_depth ceiling.
+    pub graph_max_depth: usize,
+    /// Workspace graph max_text_bytes ceiling.
+    pub graph_max_text_bytes: usize,
+
     // ── auth（认证与口令） ──
     /// **口令散列（PBKDF2-HMAC-SHA512）的迭代数**。
     ///
@@ -274,6 +299,23 @@ pub struct RunParams {
     pub request_timeout_ms: u64,
 }
 
+impl RunParams {
+    /// Effective graph policy passed to every SQL/service session.
+    pub fn graph_limits(&self) -> bicdb_sql::session::GraphLimits {
+        bicdb_sql::session::GraphLimits {
+            max_nodes: self.graph_max_nodes,
+            max_edges: self.graph_max_edges,
+            max_rows: self.graph_max_rows,
+            max_expansions: self.graph_max_expansions,
+            max_edge_expansions: self.graph_max_edge_expansions,
+            max_elapsed_ms: self.graph_max_elapsed_ms,
+            max_depth: self.graph_max_depth,
+            max_text_bytes: self.graph_max_text_bytes,
+            max_detach_edges: self.graph_detach_edge_limit,
+        }
+    }
+}
+
 impl Default for RunParams {
     fn default() -> Self {
         // 全部取自 [`SPECS`] 的声明（**默认值只有一个来源**：改声明即改默认）。
@@ -283,6 +325,7 @@ impl Default for RunParams {
             file_extend_blocks: bicdb_storage::segment::DEFAULT_FILE_EXTEND_BLOCKS,
             socket: crate::lock::SOCKET_FILE.to_owned(),
             log: "bicdb.log".to_owned(),
+            max_connections: json_u64(d("max_connections")) as usize,
             park_ms: bicdb_txn::write::WaitPolicy::default()
                 .park_timeout
                 .as_millis() as u64,
@@ -307,6 +350,18 @@ impl Default for RunParams {
             row_cache_bytes: json_u64(d("row_cache_bytes")),
             rid_forward_max_hops: json_u64(d("rid_forward_max_hops")) as usize,
             bulk_fill_percent: json_u64(d("bulk_fill_percent")) as u8,
+            fulltext_interval_ms: json_u64(d("fulltext_interval_ms")),
+            fulltext_batch_rows: json_u64(d("fulltext_batch_rows")) as usize,
+            graph_detach_edge_limit: json_u64(d("detach_edge_limit")) as usize,
+            graph_max_nodes: json_u64(d("max_nodes")) as usize,
+            graph_max_edges: json_u64(d("max_edges")) as usize,
+            graph_max_rows: json_u64(d("max_rows")) as usize,
+            graph_max_expansions: json_u64(d("max_expansions")) as usize,
+            graph_max_edge_expansions: json_u64(d("max_edge_expansions")) as usize,
+            graph_max_elapsed_ms: json_u64(d("max_elapsed_ms")) as usize,
+            graph_max_depth: json_u64(d("max_depth")) as usize,
+            graph_max_text_bytes: json_u64(d("max_text_bytes")) as usize,
+
             start_wait_s: json_u64(d("start_wait_s")),
             stop_wait_s: json_u64(d("stop_wait_s")),
             ready_poll_ms: json_u64(d("ready_poll_ms")),
@@ -448,11 +503,88 @@ pub const SPECS: &[Spec] = &[
         doc: "每组成员页数（512 B/页）",
     },
     Spec {
+        section: "graph",
+        key: "max_nodes",
+        effect: Effect::Restart,
+        default: "100000",
+        doc: "工作区图 max_nodes 上限（0–100000；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "max_edges",
+        effect: Effect::Restart,
+        default: "500000",
+        doc: "工作区图 max_edges 上限（0–500000；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "max_rows",
+        effect: Effect::Restart,
+        default: "10000",
+        doc: "工作区图 max_rows 上限（1–10000；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "max_expansions",
+        effect: Effect::Restart,
+        default: "100000",
+        doc: "工作区图 max_expansions 上限（1–100000；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "max_edge_expansions",
+        effect: Effect::Restart,
+        default: "100000",
+        doc: "每条语句的邻接候选边上限（0–100000；重复访问计入；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "max_elapsed_ms",
+        effect: Effect::Restart,
+        default: "60000",
+        doc: "图语句协作式时限毫秒（1–60000；同一语句共享计时；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "max_depth",
+        effect: Effect::Restart,
+        default: "16",
+        doc: "工作区图 max_depth 上限（1–16；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "max_text_bytes",
+        effect: Effect::Restart,
+        default: "104857600",
+        doc: "工作区图 max_text_bytes 上限（1024–104857600；请求只能降低）",
+    },
+    Spec {
+        section: "graph",
+        key: "detach_edge_limit",
+        effect: Effect::Restart,
+        default: "10000",
+        doc: "每条 Cypher 的 DETACH 关联边上限（0–500000；0 只允许孤立节点；CALL/UNION 共享）",
+    },
+    Spec {
+        section: "fulltext",
+        key: "fulltext_interval_ms",
+        effect: Effect::Restart,
+        default: "5000",
+        doc: "批量全文索引维护间隔（毫秒；100–86400000；索引 OPTIONS 优先）",
+    },
+    Spec {
+        section: "fulltext",
+        key: "fulltext_batch_rows",
+        effect: Effect::Restart,
+        default: "256",
+        doc: "每次全文维护事务的事件条数（1–4096；索引 OPTIONS 优先）",
+    },
+    Spec {
         section: "buffer",
         key: "pool_frames",
         effect: Effect::Restart,
-        default: "256",
-        doc: "缓冲池帧数（16 KiB/帧）",
+        default: "8192",
+        doc: "缓冲池帧数（16 KiB/帧；默认 128 MiB）",
     },
     Spec {
         section: "buffer",
@@ -593,6 +725,13 @@ pub const SPECS: &[Spec] = &[
         effect: Effect::Restart,
         default: "bicdb.log",
         doc: "服务日志（同上）",
+    },
+    Spec {
+        section: "service",
+        key: "max_connections",
+        effect: Effect::Restart,
+        default: "64",
+        doc: "同时保持的客户端连接上限（2–1024；语句由实例执行器串行调度）",
     },
     Spec {
         section: "service",
@@ -797,12 +936,41 @@ impl InstanceParams {
             ("init", "wal_group_pages") => {
                 self.init.wal_group_pages = num(value, 34, 1_048_576)? as u32
             }
+            ("graph", "max_nodes") => self.run.graph_max_nodes = num(value, 0, 100000)? as usize,
+            ("graph", "max_edges") => self.run.graph_max_edges = num(value, 0, 500000)? as usize,
+            ("graph", "max_rows") => self.run.graph_max_rows = num(value, 1, 10000)? as usize,
+            ("graph", "max_expansions") => {
+                self.run.graph_max_expansions = num(value, 1, 100000)? as usize
+            }
+            ("graph", "max_edge_expansions") => {
+                self.run.graph_max_edge_expansions = num(value, 0, 100000)? as usize
+            }
+            ("graph", "max_elapsed_ms") => {
+                self.run.graph_max_elapsed_ms = num(value, 1, 60000)? as usize
+            }
+            ("graph", "max_depth") => self.run.graph_max_depth = num(value, 1, 16)? as usize,
+            ("graph", "max_text_bytes") => {
+                self.run.graph_max_text_bytes = num(value, 1024, 104857600)? as usize
+            }
+            ("graph", "detach_edge_limit") => {
+                self.run.graph_detach_edge_limit =
+                    num(value, 0, bicdb_sql::session::MAX_DETACH_EDGE_LIMIT as u64)? as usize
+            }
+            ("fulltext", "fulltext_interval_ms") => {
+                self.run.fulltext_interval_ms = num(value, 100, 86_400_000)?
+            }
+            ("fulltext", "fulltext_batch_rows") => {
+                self.run.fulltext_batch_rows = num(value, 1, 4096)? as usize
+            }
             ("buffer", "pool_frames") => self.run.pool_frames = num(value, 16, 1_000_000)? as usize,
             ("storage", "file_extend_blocks") => {
                 self.run.file_extend_blocks = num(value, 8, 1_048_576)?
             }
             ("service", "socket") => self.run.socket = text(value)?,
             ("service", "log") => self.run.log = text(value)?,
+            ("service", "max_connections") => {
+                self.run.max_connections = num(value, 2, 1024)? as usize
+            }
             ("service", "start_wait_s") => self.run.start_wait_s = num(value, 1, 86_400)?,
             ("service", "stop_wait_s") => self.run.stop_wait_s = num(value, 1, 86_400)?,
             ("service", "ready_poll_ms") => self.run.ready_poll_ms = num(value, 1, 60_000)?,
@@ -1083,6 +1251,17 @@ impl InstanceParams {
             ("init", "wal_groups") => self.init.wal_groups.to_string(),
             ("init", "wal_members") => self.init.wal_members.to_string(),
             ("init", "wal_group_pages") => self.init.wal_group_pages.to_string(),
+            ("graph", "max_nodes") => self.run.graph_max_nodes.to_string(),
+            ("graph", "max_edges") => self.run.graph_max_edges.to_string(),
+            ("graph", "max_rows") => self.run.graph_max_rows.to_string(),
+            ("graph", "max_expansions") => self.run.graph_max_expansions.to_string(),
+            ("graph", "max_edge_expansions") => self.run.graph_max_edge_expansions.to_string(),
+            ("graph", "max_elapsed_ms") => self.run.graph_max_elapsed_ms.to_string(),
+            ("graph", "max_depth") => self.run.graph_max_depth.to_string(),
+            ("graph", "max_text_bytes") => self.run.graph_max_text_bytes.to_string(),
+            ("graph", "detach_edge_limit") => self.run.graph_detach_edge_limit.to_string(),
+            ("fulltext", "fulltext_interval_ms") => self.run.fulltext_interval_ms.to_string(),
+            ("fulltext", "fulltext_batch_rows") => self.run.fulltext_batch_rows.to_string(),
             ("buffer", "pool_frames") => self.run.pool_frames.to_string(),
             ("buffer", "hash_buckets") => self.run.hash_buckets.to_string(),
             ("buffer", "bucket_latches") => self.run.bucket_latches.to_string(),
@@ -1104,6 +1283,7 @@ impl InstanceParams {
             ("index", "bulk_fill_percent") => self.run.bulk_fill_percent.to_string(),
             ("service", "socket") => self.run.socket.clone(),
             ("service", "log") => self.run.log.clone(),
+            ("service", "max_connections") => self.run.max_connections.to_string(),
             ("service", "start_wait_s") => self.run.start_wait_s.to_string(),
             ("service", "stop_wait_s") => self.run.stop_wait_s.to_string(),
             ("service", "ready_poll_ms") => self.run.ready_poll_ms.to_string(),
@@ -1265,6 +1445,88 @@ mod tests {
     const MIN: &str = "[instance]\ndb_root = /tmp/x\n";
 
     #[test]
+    fn graph_workspace_budgets_have_bounds_rendering_and_cli_precedence() {
+        assert_eq!(
+            RunParams::default().graph_limits(),
+            bicdb_sql::session::GraphLimits::default()
+        );
+        for (name, minimum, maximum, default) in [
+            ("max_nodes", 0, 100000, 100000),
+            ("max_edges", 0, 500000, 500000),
+            ("max_rows", 1, 10000, 10000),
+            ("max_expansions", 1, 100000, 100000),
+            ("max_edge_expansions", 0, 100000, 100000),
+            ("max_elapsed_ms", 1, 60000, 60000),
+            ("max_depth", 1, 16, 16),
+            ("max_text_bytes", 1024, 104857600, 104857600),
+        ] {
+            for value in [minimum, maximum, default] {
+                let (p, table) =
+                    InstanceParams::from_text(&format!("{MIN}[graph]\n{name}={value}\n"), None)
+                        .unwrap();
+                p.run.graph_limits().validate_workspace().unwrap();
+                let key = format!("graph.{name}");
+                assert!(table
+                    .iter()
+                    .any(|(k, v, s)| k == &key && v == &value.to_string() && *s == Source::File));
+                let (again, _) = InstanceParams::from_text(&p.render(), None).unwrap();
+                assert_eq!(again.run.graph_limits(), p.run.graph_limits());
+            }
+            for bad in [
+                "-1".to_owned(),
+                "true".into(),
+                "1.5".into(),
+                (maximum + 1).to_string(),
+            ] {
+                assert!(
+                    InstanceParams::from_text(&format!("{MIN}[graph]\n{name}={bad}\n"), None)
+                        .is_err(),
+                    "{name}={bad}"
+                );
+            }
+            if minimum > 0 {
+                assert!(InstanceParams::from_text(
+                    &format!("{MIN}[graph]\n{name}={}\n", minimum - 1),
+                    None
+                )
+                .is_err());
+            }
+        }
+        let directory = dir("graph-budgets");
+        let ini = directory.join("bicdb.ini");
+        std::fs::write(
+            &ini,
+            format!(
+                "{MIN}[graph]\nmax_rows=8\nmax_depth=3\nmax_edge_expansions=8\nmax_elapsed_ms=8\n"
+            ),
+        )
+        .unwrap();
+        let (p, table) = InstanceParams::load_with_overrides(
+            Some(&ini),
+            &[
+                ("graph.max_rows".into(), "2".into()),
+                ("graph.max_edge_expansions".into(), "0".into()),
+                ("graph.max_elapsed_ms".into(), "7".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(p.run.graph_max_rows, 2);
+        assert_eq!(p.run.graph_max_edge_expansions, 0);
+        assert_eq!(p.run.graph_max_elapsed_ms, 7);
+        assert!(table
+            .iter()
+            .any(|(k, v, s)| k == "graph.max_elapsed_ms" && v == "7" && *s == Source::Cli));
+        assert!(table
+            .iter()
+            .any(|(k, v, s)| k == "graph.max_edge_expansions" && v == "0" && *s == Source::Cli));
+        assert_eq!(p.run.graph_max_depth, 3);
+        assert!(table
+            .iter()
+            .any(|(k, v, s)| k == "graph.max_rows" && v == "2" && *s == Source::Cli));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn parse_handles_sections_comments_and_lines() {
         let text =
             "# 注释\n[instance]\ndb_root = /data  # 行尾注释\n\n[buffer]\npool_frames = 64\n";
@@ -1294,6 +1556,27 @@ mod tests {
             InstanceParams::parse("[instance]\ndb_root /x\n"),
             Err(ConfigError::Malformed { line: 2, .. })
         ));
+    }
+
+    #[test]
+    fn service_connection_limit_is_bounded_and_round_trips() {
+        for value in [2, 64, 1024] {
+            let (params, _) = InstanceParams::from_text(
+                &format!("{MIN}[service]\nmax_connections={value}\n"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(params.run.max_connections, value);
+            let (again, _) = InstanceParams::from_text(&params.render(), None).unwrap();
+            assert_eq!(again.run.max_connections, value);
+        }
+        for value in ["0", "1", "1025", "many"] {
+            assert!(InstanceParams::from_text(
+                &format!("{MIN}[service]\nmax_connections={value}\n"),
+                None,
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1357,6 +1640,55 @@ mod tests {
                 .expect_err("应拒绝");
         assert!(matches!(e, ConfigError::UnknownKey { .. }), "{e}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn graph_detach_limit_defaults_bounds_render_and_cli_precedence() {
+        assert_eq!(
+            RunParams::default().graph_detach_edge_limit,
+            bicdb_sql::session::DEFAULT_DETACH_EDGE_LIMIT
+        );
+        for limit in [0, 7, bicdb_sql::session::MAX_DETACH_EDGE_LIMIT] {
+            let (p, table) = InstanceParams::from_text(
+                &format!("{MIN}[graph]\ndetach_edge_limit={limit}\n"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(p.run.graph_detach_edge_limit, limit);
+            assert!(table.iter().any(|(k, v, s)| k == "graph.detach_edge_limit"
+                && v == &limit.to_string()
+                && *s == Source::File));
+            let (rendered, _) = InstanceParams::from_text(&p.render(), None).unwrap();
+            assert_eq!(rendered.run.graph_detach_edge_limit, limit);
+        }
+        for bad in ["-1", "500001", "1.5", "invalid", "18446744073709551616"] {
+            assert!(
+                matches!(
+                    InstanceParams::from_text(
+                        &format!("{MIN}[graph]\ndetach_edge_limit={bad}\n"),
+                        None
+                    ),
+                    Err(ConfigError::BadValue { .. })
+                ),
+                "{bad}"
+            );
+        }
+        let d = dir("graph-detach-budget");
+        std::fs::write(
+            d.join(FILE_NAME),
+            format!("{MIN}[graph]\ndetach_edge_limit=7\n"),
+        )
+        .unwrap();
+        let (p, table) = InstanceParams::load_with_overrides(
+            Some(&d),
+            &[("graph.detach_edge_limit".to_owned(), "3".to_owned())],
+        )
+        .unwrap();
+        assert_eq!(p.run.graph_detach_edge_limit, 3);
+        assert!(table
+            .iter()
+            .any(|(k, v, s)| k == "graph.detach_edge_limit" && v == "3" && *s == Source::Cli));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

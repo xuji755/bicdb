@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! 一个单元： <标记> <载荷字节数> \n <载荷>
-//!   标记： - NULL │ n 数值（文本，十进制） │ o 布尔（"0"/"1"） │ b 字节串（**十六进制**）
+//!   标记： - NULL │ n 数值（文本，十进制） │ o 布尔（"0"/"1"） │ b 字节串（**十六进制**）│ g 图元素
 //! ```
 //!
 //! **为什么这样定**：
@@ -24,6 +24,15 @@ pub enum Value {
     Bool(bool),
     /// 字节串（原字节）。
     Bytes(Vec<u8>),
+    /// 命名图中的节点/边身份；`kind` 为 `n`（节点）或 `e`（边）。
+    GraphElement {
+        /// 工作区内图对象号。
+        graph: u32,
+        /// `n`（节点）或 `e`（边）。
+        kind: char,
+        /// 图内局部元素 ID。
+        id: u64,
+    },
 }
 
 impl Value {
@@ -97,6 +106,11 @@ impl Value {
                 out.extend_from_slice(format!("b{}\n", hex.len()).as_bytes());
                 out.extend_from_slice(hex.as_bytes());
             }
+            Value::GraphElement { graph, kind, id } => {
+                let body = format!("{graph}:{kind}:{id}");
+                out.extend_from_slice(format!("g{}\n", body.len()).as_bytes());
+                out.extend_from_slice(body.as_bytes());
+            }
         }
     }
 
@@ -108,9 +122,28 @@ impl Value {
             b'n' => Value::Number(text.to_owned()),
             b'o' => Value::Bool(text == "1"),
             b'b' => Value::Bytes(hex_decode(text)),
+            b'g' => {
+                decode_graph_element(text).unwrap_or_else(|| Value::Bytes(text.as_bytes().to_vec()))
+            }
             _ => Value::Bytes(text.as_bytes().to_vec()),
         }
     }
+}
+
+fn decode_graph_element(text: &str) -> Option<Value> {
+    let mut fields = text.split(':');
+    let graph = fields.next()?.parse().ok()?;
+    let kind_text = fields.next()?;
+    let kind = match kind_text {
+        "n" => 'n',
+        "e" => 'e',
+        _ => return None,
+    };
+    let id = fields.next()?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(Value::GraphElement { graph, kind, id })
 }
 
 impl From<&str> for Value {
@@ -184,4 +217,26 @@ pub fn hex_decode(s: &str) -> Vec<u8> {
         i += 2;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Value;
+
+    #[test]
+    fn graph_element_round_trips_and_rejects_bad_payloads() {
+        let value = Value::GraphElement {
+            graph: 42,
+            kind: 'n',
+            id: 7,
+        };
+        let mut encoded = Vec::new();
+        value.encode(&mut encoded);
+        assert_eq!(encoded, b"g6\n42:n:7");
+        assert_eq!(Value::decode(b'g', "42:n:7"), value);
+        assert_eq!(
+            Value::decode(b'g', "42:x:7"),
+            Value::Bytes(b"42:x:7".to_vec())
+        );
+    }
 }

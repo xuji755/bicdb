@@ -29,6 +29,8 @@ use crate::ast::{
 /// 一条绑定后的语句。
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundStatement {
+    /// Read-only table names, dispatched by the session metadata path.
+    ShowTables,
     /// `SELECT`（单表；投影 + 过滤 + 排序 + 限行）。
     Select(BoundSelect),
     /// `INSERT … VALUES`。
@@ -111,6 +113,12 @@ pub struct BoundSetOp {
     pub right: Box<BoundStatement>,
     /// 输出列数（两侧必须一致）。
     pub width: usize,
+    /// 合并结果的排序键（只引用输出列）。
+    pub sort: Vec<BoundSortKey>,
+    /// 合并结果的限行。
+    pub limit: Option<u64>,
+    /// 合并结果的偏移。
+    pub offset: u64,
 }
 
 /// 绑定后的 `INSERT`。
@@ -145,10 +153,49 @@ pub struct BoundTable {
     pub obj: CatalogObject,
     /// **固定表名**（`None` = 普通表）：行在查询期由引擎即时产生，**没有段**。
     pub fixed: Option<&'static str>,
+    /// Arguments for a non-lateral attachment table-valued source.
+    pub function_args: Option<Vec<TableArgument>>,
+    /// Typed graph query source; absent for ordinary/fixed tables.
+    pub graph_table: Option<BoundGraphTable>,
     /// 列（`source` = 别名或表名）。
     pub columns: Vec<BoundColumn>,
     /// 行形状。
     pub shape: RowShape,
+}
+
+/// Graph source with bound text arguments and a stable positional schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundGraphTable {
+    /// Workspace-local graph name.
+    pub graph: String,
+    /// Cypher query.
+    pub query: TableArgument,
+    /// JSON object parameters.
+    pub parameters: TableArgument,
+    /// JSON request budget object.
+    pub budgets: TableArgument,
+    /// Declared columns.
+    pub columns: Vec<GraphTableColumn>,
+}
+
+/// One typed GRAPH_TABLE output column (NULL always allowed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphTableColumn {
+    /// SQL alias, independent of the Cypher RETURN alias.
+    pub name: String,
+    /// Exact SQL kind, including transient graph element handles.
+    pub kind: ColKind,
+    /// Maximum UTF-8 byte length for text; zero for numbers/booleans.
+    pub length: usize,
+}
+
+/// A bound table-function argument. Only text literals and text parameters apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableArgument {
+    /// UTF-8 text bytes.
+    Literal(Vec<u8>),
+    /// Index into the statement parameter vector.
+    Parameter(usize),
 }
 
 /// 连接（**本版两表**：`INNER`/`LEFT`；逗号连接 = 无 `ON` 的内连接）。
@@ -180,7 +227,7 @@ fn bind_range_var<V: CatalogView>(
     let mut fixed: Option<&'static str> = None;
     let table = match resolver.resolve_table(&table_name)? {
         ResolvedName::Object(o) => o,
-        // **固定表**（第 ② 格）：只读、无段、无版本——列从清单取。
+        // Read-only source: fixed table or sanitized dictionary projection.
         ResolvedName::FixedTable(n) => {
             fixed = Some(n);
             CatalogObject {
@@ -204,7 +251,7 @@ fn bind_range_var<V: CatalogView>(
         .alias
         .as_ref()
         .map_or_else(|| table_name.clone(), |a| a.aliasname.clone());
-    // 固定表的列从**清单**取（不查字典——它压根不在字典里）。
+    // Read-only source columns come from the SQL-visible definition.
     let cols = match fixed {
         Some(n) => resolver
             .view()
@@ -231,6 +278,244 @@ fn bind_range_var<V: CatalogView>(
         alias: rv.alias.as_ref().map(|a| a.aliasname.clone()),
         obj: table,
         fixed,
+        function_args: None,
+        graph_table: None,
+        columns,
+        shape,
+    })
+}
+
+fn bind_from_item<V: CatalogView>(
+    resolver: &mut NameResolver<'_, V>,
+    item: &FromItem,
+    params: &mut BoundParams,
+) -> Result<BoundTable, BindError> {
+    match item {
+        FromItem::RangeVar(rv) => bind_range_var(resolver, rv),
+        FromItem::GraphTable(graph) => bind_graph_table(resolver, graph, params),
+        FromItem::RangeFunction(function) => {
+            if function.name != "attachment_grep" || !(1..=3).contains(&function.args.len()) {
+                return Err(BindError::Unsupported("attachment_grep(pattern [, session_id [, attachment_id]]) requires 1..3 text arguments".into()));
+            }
+            // Resolve the authenticated-only directory as well as all physical
+            // sources, so normal object visibility and version tracking apply.
+            resolver.resolve_table("attachment$")?;
+            for name in [
+                "ag_schema_version",
+                "ag_attachment_schema",
+                "ag_attachment",
+                "ag_attachment_chunk",
+                "ag_session",
+            ] {
+                resolver.resolve_table(name)?;
+            }
+            let mut table = bind_range_var(
+                resolver,
+                &ast::RangeVar {
+                    relname: "attachment$".into(),
+                    alias: function.alias.clone(),
+                    location: function.location,
+                },
+            )?;
+            table.name = function.name.clone();
+            table.fixed = Some("attachment_grep");
+            let source = function
+                .alias
+                .as_ref()
+                .map_or(function.name.as_str(), |alias| alias.aliasname.as_str());
+            let columns =
+                crate::attachment_sql::columns("attachment_grep").expect("known function");
+            table.columns = columns
+                .iter()
+                .map(|c| BoundColumn {
+                    name: c.name.clone(),
+                    kind: col_kind(c.type_code).expect("known type"),
+                    nullable: c.nullable,
+                    table_col: Some(c.col),
+                    source: Some(source.into()),
+                })
+                .collect();
+            table.shape = RowShape::new(table.columns.iter().map(|c| c.kind).collect());
+            let mut arguments = Vec::new();
+            for argument in &function.args {
+                if !matches!(argument, Expr::AConst(_) | Expr::ParamRef(_)) {
+                    return Err(BindError::Unsupported("attachment_grep arguments must be text literals or named parameters; LATERAL expressions are not supported".into()));
+                }
+                let scope = BindScope {
+                    table_columns: &[],
+                    output_names: &Default::default(),
+                };
+                let (argument, _) = bind_expr(argument, &scope, params, Some(ColKind::Bytes))?;
+                arguments.push(match argument {
+                    PlanExpr::Literal(bicdb_exec::Value::Bytes(bytes)) => {
+                        TableArgument::Literal(bytes)
+                    }
+                    PlanExpr::Param(index) => TableArgument::Parameter(index),
+                    _ => {
+                        return Err(BindError::Unsupported(
+                            "attachment_grep arguments must be non-null text".into(),
+                        ))
+                    }
+                });
+            }
+            table.function_args = Some(arguments);
+            Ok(table)
+        }
+        FromItem::Join(_) => Err(BindError::Unsupported(
+            "nested joins: only two sources are supported".into(),
+        )),
+    }
+}
+
+fn graph_table_argument(
+    argument: &Expr,
+    params: &mut BoundParams,
+) -> Result<TableArgument, BindError> {
+    let scope = BindScope {
+        table_columns: &[],
+        output_names: &Default::default(),
+    };
+    let (argument, _) = bind_expr(argument, &scope, params, Some(ColKind::Bytes))?;
+    match argument {
+        PlanExpr::Literal(bicdb_exec::Value::Bytes(bytes)) => Ok(TableArgument::Literal(bytes)),
+        PlanExpr::Param(index) => Ok(TableArgument::Parameter(index)),
+        _ => Err(BindError::Unsupported(
+            "GRAPH_TABLE arguments must be non-null text literals or named parameters".into(),
+        )),
+    }
+}
+
+fn bind_graph_table<V: CatalogView>(
+    resolver: &mut NameResolver<'_, V>,
+    graph: &ast::GraphTable,
+    params: &mut BoundParams,
+) -> Result<BoundTable, BindError> {
+    // Resolve the actual graph for visibility and object version tracking.
+    let obj = match resolver.resolve_table(&graph.graph)? {
+        ResolvedName::Object(obj)
+            if obj.type_code == bicdb_catalog::obj_kind::GRAPH && obj.status == 1 =>
+        {
+            obj
+        }
+        _ => {
+            return Err(BindError::Unsupported(
+                "GRAPH_TABLE requires a named graph in the current workspace".into(),
+            ))
+        }
+    };
+    if graph.columns.is_empty() || graph.columns.len() > 256 {
+        return Err(BindError::Unsupported(
+            "GRAPH_TABLE requires 1..256 scalar columns".into(),
+        ));
+    }
+    let query = graph_table_argument(&graph.query, params)?;
+    if let TableArgument::Literal(bytes) = &query {
+        if bytes.len() > 1024 * 1024 {
+            return Err(BindError::Unsupported(
+                "GRAPH_TABLE query exceeds 1 MiB".into(),
+            ));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| BindError::Unsupported("GRAPH_TABLE query must be UTF-8".into()))?;
+        let parsed = bicdb_graph::parse(text)
+            .map_err(|error| BindError::Unsupported(format!("GRAPH_TABLE: {error}")))?;
+        if !parsed.is_read_only() {
+            return Err(BindError::Unsupported(
+                "GRAPH_TABLE only accepts read-only Cypher queries".into(),
+            ));
+        }
+    }
+    let parameters = match &graph.parameters {
+        Some(argument) => graph_table_argument(argument, params)?,
+        None => TableArgument::Literal(b"{}".to_vec()),
+    };
+    let budgets = match &graph.budgets {
+        Some(argument) => graph_table_argument(argument, params)?,
+        None => TableArgument::Literal(b"{}".to_vec()),
+    };
+    if let TableArgument::Literal(bytes) = &budgets {
+        if bytes.len() > 4096 {
+            return Err(BindError::Unsupported(
+                "GRAPH_TABLE BUDGETS exceeds 4096 bytes".into(),
+            ));
+        }
+        let json = serde_json::from_slice(bytes)
+            .map_err(|_| BindError::Unsupported("BUDGETS must be valid JSON".into()))?;
+        bicdb_graph::Limits::default()
+            .with_request_budgets(&json)
+            .map_err(|e| BindError::Unsupported(e.to_string()))?;
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut declared = Vec::new();
+    for column in &graph.columns {
+        if !names.insert(column.colname.clone()) {
+            return Err(BindError::Unsupported(format!(
+                "duplicate GRAPH_TABLE column `{}`",
+                column.colname
+            )));
+        }
+        let t = &column.type_name;
+        let (kind, length) = match t.name.as_str() {
+            "number" | "int" | "integer" if t.typmods.is_empty() => (ColKind::Number, 0),
+            "boolean" | "bool" if t.typmods.is_empty() => (ColKind::Bool, 0),
+            "graph_element" | "element" if t.typmods.is_empty() => (ColKind::GraphElement, 0),
+            "varchar" | "varchar2" | "text" | "char" | "bytes" if t.typmods.len() <= 1 => {
+                let default = if t.name == "char" { 1 } else { 255 };
+                let length = match t.typmods.first() {
+                    Some(s) => s
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=65535).contains(n))
+                        .ok_or_else(|| {
+                            BindError::Unsupported(
+                                "GRAPH_TABLE text length must be 1..65535 bytes".into(),
+                            )
+                        })?,
+                    None => default,
+                };
+                (ColKind::Bytes, length)
+            }
+            _ => {
+                return Err(BindError::Unsupported(format!(
+                    "unsupported GRAPH_TABLE type `{}` or type modifiers",
+                    t.name
+                )))
+            }
+        };
+        declared.push(GraphTableColumn {
+            name: column.colname.clone(),
+            kind,
+            length,
+        });
+    }
+    let name = "graph_table".to_owned();
+    let alias = graph.alias.as_ref().map(|a| a.aliasname.clone());
+    let source = alias.clone().unwrap_or_else(|| name.clone());
+    let columns: Vec<_> = declared
+        .iter()
+        .enumerate()
+        .map(|(i, column)| BoundColumn {
+            name: column.name.clone(),
+            kind: column.kind,
+            nullable: true,
+            table_col: Some(i as u32 + 1),
+            source: Some(source.clone()),
+        })
+        .collect();
+    let shape = RowShape::new(columns.iter().map(|c| c.kind).collect());
+    Ok(BoundTable {
+        name,
+        alias,
+        obj,
+        fixed: Some("graph_table"),
+        function_args: None,
+        graph_table: Some(BoundGraphTable {
+            graph: graph.graph.clone(),
+            query,
+            parameters,
+            budgets,
+            columns: declared,
+        }),
         columns,
         shape,
     })
@@ -242,17 +527,23 @@ fn bind_range_var<V: CatalogView>(
 fn resolve_from<V: CatalogView>(
     resolver: &mut NameResolver<'_, V>,
     from: &[FromItem],
+    params: &mut BoundParams,
 ) -> Result<BoundFrom, BindError> {
     match from {
-        [FromItem::RangeVar(rv)] => Ok(BoundFrom {
-            tables: vec![bind_range_var(resolver, rv)?],
-            join: None,
-            on_clause: None,
-        }),
+        [item @ (FromItem::RangeVar(_) | FromItem::RangeFunction(_) | FromItem::GraphTable(_))] => {
+            Ok(BoundFrom {
+                tables: vec![bind_from_item(resolver, item, params)?],
+                join: None,
+                on_clause: None,
+            })
+        }
         [FromItem::Join(je)] => match (&je.larg, &je.rarg) {
-            (FromItem::RangeVar(l), FromItem::RangeVar(r)) => {
-                let lt = bind_range_var(resolver, l)?;
-                let rt = bind_range_var(resolver, r)?;
+            (
+                l @ (FromItem::RangeVar(_) | FromItem::RangeFunction(_) | FromItem::GraphTable(_)),
+                r @ (FromItem::RangeVar(_) | FromItem::RangeFunction(_) | FromItem::GraphTable(_)),
+            ) => {
+                let lt = bind_from_item(resolver, l, params)?;
+                let rt = bind_from_item(resolver, r, params)?;
                 // **限定名不许重**（两表同名/别名相撞 ⇒ 引用无从消歧）。
                 let lq = lt.alias.clone().unwrap_or_else(|| lt.name.clone());
                 let rq = rt.alias.clone().unwrap_or_else(|| rt.name.clone());
@@ -282,9 +573,10 @@ fn resolve_from<V: CatalogView>(
             join: None,
             on_clause: None,
         }),
-        [FromItem::RangeVar(a), FromItem::RangeVar(b)] => {
-            let lt = bind_range_var(resolver, a)?;
-            let rt = bind_range_var(resolver, b)?;
+        [a @ (FromItem::RangeVar(_) | FromItem::RangeFunction(_) | FromItem::GraphTable(_)), b @ (FromItem::RangeVar(_) | FromItem::RangeFunction(_) | FromItem::GraphTable(_))] =>
+        {
+            let lt = bind_from_item(resolver, a, params)?;
+            let rt = bind_from_item(resolver, b, params)?;
             Ok(BoundFrom {
                 tables: vec![lt, rt],
                 join: Some(BoundJoin {
@@ -904,9 +1196,9 @@ fn bind_where<V: CatalogView>(
 fn bind_update<V: CatalogView>(
     resolver: &mut NameResolver<'_, V>,
     u: &ast::UpdateStmt,
+    params: &mut BoundParams,
 ) -> Result<BoundUpdate, BindError> {
     let (table, table_columns, table_shape) = single_table(resolver, &u.relation, "UPDATE")?;
-    let mut params = BoundParams::default();
     let mut sets: Vec<(usize, PlanExpr)> = Vec::with_capacity(u.target_list.len());
     if u.target_list.is_empty() {
         return Err(BindError::Unsupported("UPDATE 缺 SET".to_owned()));
@@ -930,16 +1222,16 @@ fn bind_update<V: CatalogView>(
             table_columns: &table_columns,
             output_names: &Default::default(),
         };
-        let (plan, _k) = bind_expr(&item.val, &scope, &mut params, Some(want))?;
+        let (plan, _k) = bind_expr(&item.val, &scope, params, Some(want))?;
         sets.push((idx, plan));
     }
-    let filter = bind_where(resolver, &u.where_clause, &table_columns, &mut params)?;
+    let filter = bind_where(resolver, &u.where_clause, &table_columns, params)?;
     Ok(BoundUpdate {
         table,
         table_shape,
         sets,
         filter,
-        params,
+        params: params.clone(),
     })
 }
 
@@ -947,15 +1239,15 @@ fn bind_update<V: CatalogView>(
 fn bind_delete<V: CatalogView>(
     resolver: &mut NameResolver<'_, V>,
     d: &ast::DeleteStmt,
+    params: &mut BoundParams,
 ) -> Result<BoundDelete, BindError> {
     let (table, table_columns, table_shape) = single_table(resolver, &d.relation, "DELETE")?;
-    let mut params = BoundParams::default();
-    let filter = bind_where(resolver, &d.where_clause, &table_columns, &mut params)?;
+    let filter = bind_where(resolver, &d.where_clause, &table_columns, params)?;
     Ok(BoundDelete {
         table,
         table_shape,
         filter,
-        params,
+        params: params.clone(),
     })
 }
 
@@ -963,6 +1255,7 @@ fn bind_delete<V: CatalogView>(
 fn bind_setop<V: CatalogView>(
     resolver: &mut NameResolver<'_, V>,
     s: &SelectStmt,
+    params: &mut BoundParams,
 ) -> Result<BoundStatement, BindError> {
     let (op, larg, rarg) = match (s.op, &s.larg, &s.rarg) {
         (Some(op), Some(l), Some(r)) => (op, l, r),
@@ -980,8 +1273,8 @@ fn bind_setop<V: CatalogView>(
                     .to_owned(),
             ));
         }
-        let left = bind_statement(resolver, &Stmt::Select((**larg).clone()))?;
-        let right = bind_statement(resolver, &Stmt::Select((**rarg).clone()))?;
+        let left = bind_statement_shared(resolver, &Stmt::Select((**larg).clone()), params)?;
+        let right = bind_statement_shared(resolver, &Stmt::Select((**rarg).clone()), params)?;
         let (lw, rw) = (select_width(&left)?, select_width(&right)?);
         if lw != rw {
             return Err(BindError::Unsupported(format!(
@@ -991,31 +1284,24 @@ fn bind_setop<V: CatalogView>(
         // **外层只能有 `ORDER BY`/`LIMIT`**（PG 口径：`ORDER BY` 对合并结果排序）。
         // 本版：外层 `ORDER BY` 按**输出列名/序号**对合并后的行排序——投影直接用
         // 左侧的输出（`Append` 之后列序即左侧列序）。
-        let mut merged = left.clone();
-        if let BoundStatement::Select(ls) = &left {
-            let mut out = ls.clone();
-            // 外层 `ORDER BY`/`LIMIT` 按**合并结果的输出列**绑（列序 = 左侧列序）；
-            // 两侧各自的尾子句在集合运算里无意义（标准也不允许），直接取外层。
-            let mut output_names = std::collections::BTreeMap::new();
-            for (i, c) in ls.columns.iter().enumerate() {
-                output_names.entry(c.name.clone()).or_insert(i);
-            }
-            let (sort, limit, offset) = bind_tail(
-                &s.sort_clause,
-                &s.limit_count,
-                &s.limit_offset,
-                &ls.columns,
-                &output_names,
-                // 集合运算外层：**没有"输入行"** ⇒ 只能按输出列名/序号排。
-                // （它也没有参数可绑——表达式那一支在这种形态下直接拒绝。）
-                None,
-                &mut Default::default(),
-            )?;
-            out.sort = sort;
-            out.limit = limit;
-            out.offset = offset;
-            merged = BoundStatement::Select(out);
+        let ls = select_output(&left)?;
+        // 外层 `ORDER BY`/`LIMIT` 按**合并结果的输出列**绑（列序 = 左侧列序）；
+        // 两侧各自的尾子句在集合运算里无意义（标准也不允许），直接取外层。
+        let mut output_names = std::collections::BTreeMap::new();
+        for (i, c) in ls.columns.iter().enumerate() {
+            output_names.entry(c.name.clone()).or_insert(i);
         }
+        let (sort, limit, offset) = bind_tail(
+            &s.sort_clause,
+            &s.limit_count,
+            &s.limit_offset,
+            &ls.columns,
+            &output_names,
+            // 集合运算外层：**没有"输入行"** ⇒ 只能按输出列名/序号排。
+            // （它也没有参数可绑——表达式那一支在这种形态下直接拒绝。）
+            None,
+            &mut Default::default(),
+        )?;
         let kind = match op {
             crate::ast::SetOperation::Union => BoundSetKind::Union,
             crate::ast::SetOperation::Intersect => BoundSetKind::Intersect,
@@ -1024,10 +1310,21 @@ fn bind_setop<V: CatalogView>(
         Ok(BoundStatement::SetOp(BoundSetOp {
             kind,
             all: s.all,
-            left: Box::new(merged),
+            left: Box::new(left),
             right: Box::new(right),
             width: lw,
+            sort,
+            limit,
+            offset,
         }))
+    }
+}
+
+fn select_output(bound: &BoundStatement) -> Result<&BoundSelect, BindError> {
+    match bound {
+        BoundStatement::Select(s) => Ok(s),
+        BoundStatement::SetOp(o) => select_output(&o.left),
+        _ => Err(BindError::Unsupported("集合运算来源不是 SELECT".to_owned())),
     }
 }
 
@@ -1036,10 +1333,23 @@ pub fn bind_statement<V: CatalogView>(
     resolver: &mut NameResolver<'_, V>,
     stmt: &Stmt,
 ) -> Result<BoundStatement, BindError> {
+    let mut params = BoundParams::default();
+    let mut bound = bind_statement_shared(resolver, stmt, &mut params)?;
+    publish_params(&mut bound, &params);
+    Ok(bound)
+}
+
+// All expression parameter indexes refer to this statement-wide registry.
+fn bind_statement_shared<V: CatalogView>(
+    resolver: &mut NameResolver<'_, V>,
+    stmt: &Stmt,
+    params: &mut BoundParams,
+) -> Result<BoundStatement, BindError> {
     match stmt {
-        Stmt::Select(s) if s.op.is_some() => bind_setop(resolver, s),
-        Stmt::Select(s) => Ok(BoundStatement::Select(bind_select(resolver, s)?)),
-        Stmt::Insert(i) => Ok(BoundStatement::Insert(bind_insert(resolver, i)?)),
+        Stmt::ShowTables(_) => Ok(BoundStatement::ShowTables),
+        Stmt::Select(s) if s.op.is_some() => bind_setop(resolver, s, params),
+        Stmt::Select(s) => Ok(BoundStatement::Select(bind_select(resolver, s, params)?)),
+        Stmt::Insert(i) => Ok(BoundStatement::Insert(bind_insert(resolver, i, params)?)),
         Stmt::CreateTable(c) => Ok(BoundStatement::Ddl(BoundDdl::CreateTable(
             bind_create_table(c)?,
         ))),
@@ -1051,8 +1361,8 @@ pub fn bind_statement<V: CatalogView>(
         }
         Stmt::Drop(d) => bind_drop(d),
         Stmt::Transaction(t) => Ok(BoundStatement::Transaction(t.kind)),
-        Stmt::Update(u) => Ok(BoundStatement::Update(bind_update(resolver, u)?)),
-        Stmt::Delete(d) => Ok(BoundStatement::Delete(bind_delete(resolver, d)?)),
+        Stmt::Update(u) => Ok(BoundStatement::Update(bind_update(resolver, u, params)?)),
+        Stmt::Delete(d) => Ok(BoundStatement::Delete(bind_delete(resolver, d, params)?)),
         // ── **DCL 族**（`doc/DCL语句设计_v0.1.md` v0.2）──────────────────────
         // **绑定只搬运**：语义在执行层（`crate::dcl_exec`）——那里有目录写侧、
         // 实例注册表与文件系统；这里碰不到，也不该碰（REQ-SQL-002：解析期不 import 目录）。
@@ -1065,10 +1375,38 @@ pub fn bind_statement<V: CatalogView>(
         | Stmt::AlterUser(_)
         | Stmt::DropUser(_)
         | Stmt::AlterDatabase(_) => Ok(BoundStatement::Dcl(Box::new(stmt.clone()))),
-        Stmt::CreateGraph(_) | Stmt::VariableSet(_) => Err(BindError::Unsupported(
+        Stmt::CreateGraph(_)
+        | Stmt::Cypher(_)
+        | Stmt::GraphIndex(_)
+        | Stmt::ShowGraphs(_)
+        | Stmt::VariableSet(_) => Err(BindError::Unsupported(
             "S3 首版的语句面：SELECT / INSERT / CREATE TABLE / CREATE INDEX / DROP / 事务控制"
                 .to_owned(),
         )),
+    }
+}
+
+// Finalize every leaf after all branches have been bound, so planners and
+// executors see the same parameter count and inferred types.
+fn publish_params(bound: &mut BoundStatement, params: &BoundParams) {
+    match bound {
+        BoundStatement::Select(s) => s.params = params.clone(),
+        BoundStatement::Insert(i) => {
+            i.params = params.clone();
+            if let Some(source) = &mut i.source_select {
+                publish_params(source, params);
+            }
+        }
+        BoundStatement::Update(u) => u.params = params.clone(),
+        BoundStatement::Delete(d) => d.params = params.clone(),
+        BoundStatement::SetOp(o) => {
+            publish_params(&mut o.left, params);
+            publish_params(&mut o.right, params);
+        }
+        BoundStatement::ShowTables
+        | BoundStatement::Ddl(_)
+        | BoundStatement::Transaction(_)
+        | BoundStatement::Dcl(_) => {}
     }
 }
 
@@ -1077,6 +1415,7 @@ pub fn bind_statement<V: CatalogView>(
 fn bind_select<V: CatalogView>(
     resolver: &mut NameResolver<'_, V>,
     s: &SelectStmt,
+    params: &mut BoundParams,
 ) -> Result<BoundSelect, BindError> {
     let distinct = s.distinct;
     if s.values_lists.is_some() {
@@ -1085,8 +1424,7 @@ fn bind_select<V: CatalogView>(
         ));
     }
     // **FROM 解析**：单表 / 两表连接（`JOIN … ON`）/ 逗号连接（笛卡尔，条件进 WHERE）。
-    let mut params = BoundParams::default();
-    let from = resolve_from(resolver, &s.from_clause)?;
+    let from = resolve_from(resolver, &s.from_clause, params)?;
     let table_columns: Vec<BoundColumn> =
         from.tables.iter().flat_map(|t| t.columns.clone()).collect();
     // 连接条件（`ON`）：对**合并行**求值，必须是 BOOLEAN。
@@ -1100,7 +1438,7 @@ fn bind_select<V: CatalogView>(
                         table_columns: &table_columns,
                         output_names: &Default::default(),
                     };
-                    let (e, k) = bind_expr(on, &scope, &mut params, Some(ColKind::Bool))?;
+                    let (e, k) = bind_expr(on, &scope, params, Some(ColKind::Bool))?;
                     if k != ColKind::Bool {
                         return Err(BindError::TypeMismatch {
                             what: "ON".to_owned(),
@@ -1125,7 +1463,7 @@ fn bind_select<V: CatalogView>(
             table_columns: &table_columns,
             output_names: &Default::default(),
         };
-        let (e, _k) = bind_expr(g, &scope, &mut params, None)?;
+        let (e, _k) = bind_expr(g, &scope, params, None)?;
         groups.push(e);
     }
     let mut aggs: Vec<bicdb_exec::AggSpec> = Vec::new();
@@ -1142,13 +1480,8 @@ fn bind_select<V: CatalogView>(
             }
             continue;
         }
-        let (e, kind) = bind_expr_agg(
-            &t.val,
-            &table_columns,
-            &mut params,
-            &mut aggs,
-            &mut placeholders,
-        )?;
+        let (e, kind) =
+            bind_expr_agg(&t.val, &table_columns, params, &mut aggs, &mut placeholders)?;
         let name = t.name.clone().unwrap_or_else(|| output_name(&t.val));
         out_columns.push(BoundColumn {
             name,
@@ -1194,7 +1527,7 @@ fn bind_select<V: CatalogView>(
                 table_columns: &table_columns,
                 output_names: &output_names,
             };
-            let (e, k) = bind_expr(w, &scope, &mut params, Some(ColKind::Bool))?;
+            let (e, k) = bind_expr(w, &scope, params, Some(ColKind::Bool))?;
             if k != ColKind::Bool {
                 return Err(BindError::TypeMismatch {
                     what: "WHERE".to_owned(),
@@ -1214,7 +1547,7 @@ fn bind_select<V: CatalogView>(
             let (e, k) = bind_expr_agg(
                 h,
                 &table_columns,
-                &mut params,
+                params,
                 &mut aggs,
                 &mut having_placeholders,
             )?;
@@ -1254,7 +1587,7 @@ fn bind_select<V: CatalogView>(
         &out_columns,
         &output_names,
         Some(&sort_scope),
-        &mut params,
+        params,
     )?;
     if has_agg {
         for k in &mut sort {
@@ -1295,7 +1628,7 @@ fn bind_select<V: CatalogView>(
         groups,
         aggs,
         having,
-        params,
+        params: params.clone(),
     })
 }
 
@@ -1340,6 +1673,7 @@ fn int_literal(e: &Expr, what: &str) -> Result<u64, BindError> {
 fn bind_insert<V: CatalogView>(
     resolver: &mut NameResolver<'_, V>,
     ins: &InsertStmt,
+    params: &mut BoundParams,
 ) -> Result<BoundInsert, BindError> {
     let table_name = ins.relation.relname.clone();
     let table = check_writable(resolver, &table_name)?;
@@ -1370,6 +1704,11 @@ fn bind_insert<V: CatalogView>(
                 .iter()
                 .position(|tc| tc.name == name)
                 .ok_or_else(|| BindError::UnknownColumn(name.clone()))?;
+            if v.contains(&idx) {
+                return Err(BindError::Unsupported(format!(
+                    "INSERT 列清单里的 `{name}` 写了两次"
+                )));
+            }
             v.push(idx);
         }
         v
@@ -1383,7 +1722,7 @@ fn bind_insert<V: CatalogView>(
     if src.values_lists.is_none() {
         // **`INSERT … SELECT`**：来源是另一个 `SELECT`（含集合运算）——
         // 判据是"没有 `VALUES` 列表"（普通 SELECT 与集合运算都走这里）。
-        let source = bind_statement(resolver, &Stmt::Select(src.clone()))?;
+        let source = bind_statement_shared(resolver, &Stmt::Select(src.clone()), params)?;
         let width = select_width(&source)?;
         if width != target_cols.len() {
             return Err(BindError::Unsupported(format!(
@@ -1406,7 +1745,6 @@ fn bind_insert<V: CatalogView>(
         .values_lists
         .as_ref()
         .ok_or_else(|| BindError::Unsupported("INSERT 的来源不是 VALUES".to_owned()))?;
-    let mut params = BoundParams::default();
     let mut rows = Vec::with_capacity(lists.len());
     for list in lists {
         if list.len() != target_cols.len() {
@@ -1423,7 +1761,7 @@ fn bind_insert<V: CatalogView>(
                 table_columns: &[],
                 output_names: &Default::default(),
             };
-            let (plan, _k) = bind_expr(e, &scope, &mut params, Some(want))?;
+            let (plan, _k) = bind_expr(e, &scope, params, Some(want))?;
             row.push(plan);
         }
         rows.push(row);
@@ -1434,7 +1772,7 @@ fn bind_insert<V: CatalogView>(
         target_cols,
         rows,
         source_select: None,
-        params,
+        params: params.clone(),
     })
 }
 
@@ -1656,6 +1994,13 @@ fn bind_drop(d: &ast::DropStmt) -> Result<BoundStatement, BindError> {
         return Err(BindError::Unsupported("一次 DROP 多个对象".to_owned()));
     }
     let name = d.objects[0].relname.clone();
+    if super::FIXED_TABLES.contains(&name.as_str())
+        || bicdb_catalog::dict::DICT_TABLES
+            .iter()
+            .any(|table| table.name == name)
+    {
+        return Err(BindError::NotWritable(name));
+    }
     match d.remove_type {
         ObjectType::Table => Ok(BoundStatement::Ddl(BoundDdl::DropTable(name))),
         ObjectType::Index => Ok(BoundStatement::Ddl(BoundDdl::DropIndex(name))),

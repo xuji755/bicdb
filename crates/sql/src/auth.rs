@@ -29,6 +29,44 @@ use bicdb_catalog::dcl::{self as catdcl, user_status};
 use bicdb_catalog::Catalog;
 use bicdb_common::pbkdf2;
 
+/// Trusted service-side authenticator; supplied by the native service, never by SQL.
+pub trait PrivateAuthProvider {
+    /// Authenticate against PUBLIC and verify this exact workspace's ownership.
+    fn authenticate_private(
+        &self,
+        name: &str,
+        password: &str,
+        workspace: [u8; 8],
+    ) -> Result<PrivateLogin, String>;
+}
+
+/// Verified PUBLIC result returned by the trusted authenticator.
+pub struct PrivateLogin {
+    /// Authoritative principal ID.
+    pub user_id: u64,
+    /// Authoritative principal spelling.
+    pub name: String,
+    /// Exact workspace verified in PUBLIC.
+    pub workspace: [u8; 8],
+}
+
+pub(crate) fn authenticate_private(
+    provider: &dyn PrivateAuthProvider,
+    name: &str,
+    password: &str,
+    workspace: [u8; 8],
+) -> Result<Identity, String> {
+    let login = provider.authenticate_private(name, password, workspace)?;
+    if login.workspace != workspace || login.user_id == 0 || login.name.is_empty() {
+        return Err("认证失败：工作区属主与已认证主体不匹配".into());
+    }
+    Ok(Identity {
+        user_id: login.user_id,
+        name: login.name,
+        expired: false,
+    })
+}
+
 /// 主体不存在时拿来跑"同代价 KDF"的固定盐（**结果丢弃**，不是谁的散列）。
 const MOCK_SALT: &[u8; 16] = b"bicdb-mock-auth!";
 

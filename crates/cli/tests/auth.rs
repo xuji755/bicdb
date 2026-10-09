@@ -180,6 +180,14 @@ fn a_named_subject_is_read_only_and_may_only_change_its_own_password() {
 
     // ① 读：随便。
     assert!(s.execute("SELECT 1").is_ok());
+    let tables = s
+        .execute("SHOW TABLES")
+        .expect("named user may enumerate current PUBLIC table names");
+    let listing = format!("{tables:?}");
+    // Metadata does not grant access to dictionary contents or another workspace.
+    assert!(matches!(tables.last(), Some(QueryResult::Rows { .. })));
+    assert!(listing.contains("table_kind"));
+    assert!(s.execute("SELECT * FROM user$").is_err());
     // ② 写：`public` 对主体**只读**（DML 与 DDL 各钉一条）。
     let e = s
         .execute("CREATE TABLE t (id NUMBER)")
@@ -236,6 +244,11 @@ fn an_expired_session_is_restricted_to_its_own_password_change() {
     // ① 受限：连 `SELECT` 都不放行（MySQL 的受限会话："改密前不能执行普通业务 SQL"）。
     let e = s.execute("SELECT 1").unwrap_err().to_string();
     assert!(e.contains("受限会话"), "{e}");
+    assert!(s
+        .execute("SHOW TABLES")
+        .unwrap_err()
+        .to_string()
+        .contains("受限会话"));
     // ② 改别人的口令：更不行。
     let e = s
         .execute("ALTER USER bob IDENTIFIED BY 'x' REPLACE 'pw-bob'")
@@ -273,4 +286,200 @@ fn authentication_only_exists_on_public() {
     let e = s.authenticate("alice", "pw-one").unwrap_err().to_string();
     assert!(e.contains("不做口令认证"), "{e}");
     assert!(s.is_management_identity(), "没认证 ⇒ 仍是管理面身份");
+}
+
+#[test]
+fn audit_describe_obeys_visibility_and_expired_identity() {
+    let (_h, home, mut inst) = setup("audit-describe");
+    run(&mut inst, &home, "CREATE TABLE visible (id NUMBER)").unwrap();
+    let mut s = session(&mut inst, &home);
+    for name in ["user$", "ws$", "obj$"] {
+        assert!(
+            !s.describe_columns(name).unwrap().is_empty(),
+            "只读字典：{name}"
+        );
+    }
+    assert!(!s
+        .describe_columns("user$")
+        .unwrap()
+        .iter()
+        .any(|column| column.0 == "passwd"));
+    assert!(!s.describe_columns("file$").unwrap().is_empty());
+    s.authenticate("alice", "pw-one").unwrap();
+    assert!(s.describe_columns("file$").is_err());
+    for name in ["user$", "ws$", "fs$", "wq$"] {
+        assert!(s.describe_columns(name).is_err(), "管理清单：{name}");
+    }
+    assert!(!s.describe_columns("obj$").unwrap().is_empty());
+    assert!(!s.describe_columns("visible").unwrap().is_empty());
+    drop(s);
+    run(
+        &mut inst,
+        &home,
+        "ALTER USER alice IDENTIFIED BY 'pw-e' EXPIRE",
+    )
+    .unwrap();
+    let mut s = session(&mut inst, &home);
+    s.authenticate("alice", "pw-e").unwrap();
+    let e = s.describe_columns("visible").unwrap_err().to_string();
+    assert!(e.contains("受限会话"), "{e}");
+}
+
+#[test]
+fn owned_route_requires_auth_and_rejects_foreign_and_expired_workspaces() {
+    let (_holder, home, mut inst) = setup("owned-route");
+    {
+        let mut s = session(&mut inst, &home);
+        assert!(s
+            .route_owned_workspace(None)
+            .unwrap_err()
+            .to_string()
+            .contains("必须先认证"));
+        s.authenticate("alice", "pw-one").unwrap();
+        let (uid, wid, name, root) = s.route_owned_workspace(None).unwrap();
+        assert_eq!(uid, 1);
+        assert_eq!(wid, 2);
+        assert_eq!(name, "w1");
+        assert!(Path::new(&root).is_dir());
+        assert!(s.route_owned_workspace(Some("w2")).is_err());
+        assert!(s.route_owned_workspace(Some("3")).is_err());
+    }
+    run(&mut inst, &home, "CREATE WORKSPACE w3").unwrap();
+    run(&mut inst, &home, "ALTER USER alice USING WORKSPACE w3").unwrap();
+    {
+        let mut s = session(&mut inst, &home);
+        s.authenticate("alice", "pw-one").unwrap();
+        assert!(
+            s.route_owned_workspace(None).is_err(),
+            "multiple workspaces require selection"
+        );
+        assert_eq!(s.route_owned_workspace(Some("w1")).unwrap().2, "w1");
+        assert_eq!(s.route_owned_workspace(Some("4")).unwrap().2, "w3");
+    }
+    run(
+        &mut inst,
+        &home,
+        "ALTER USER alice IDENTIFIED BY 'pw-one' EXPIRE",
+    )
+    .unwrap();
+    let mut s = session(&mut inst, &home);
+    s.authenticate("alice", "pw-one").unwrap();
+    assert!(s
+        .route_owned_workspace(None)
+        .unwrap_err()
+        .to_string()
+        .contains("过期"));
+}
+
+#[test]
+fn dictionary_queries_are_readonly_and_credentials_never_enter_sql() {
+    use bicdb_exec::Value;
+    let (_holder, home, mut inst) = setup("dictionary-readonly");
+    let mut s = session(&mut inst, &home);
+    for table in bicdb_catalog::dict::DICT_TABLES {
+        let results = s
+            .execute(&format!("SELECT * FROM \"{}\"", table.name))
+            .unwrap();
+        let Some(QueryResult::Rows { columns, rows }) = results.last() else {
+            panic!("rows expected");
+        };
+        assert!(
+            rows.iter().all(|row| row.len() == columns.len()),
+            "{}",
+            table.name
+        );
+        for value in rows.iter().flatten() {
+            if let Value::Bytes(bytes) = value {
+                let text = String::from_utf8_lossy(bytes);
+                assert!(!text.contains("pbkdf2-sha512$"));
+                assert!(!text.contains("pw-one") && !text.contains("pw-bob"));
+            }
+        }
+        let rendered = format!("{results:?}");
+        assert!(
+            !rendered.contains("pbkdf2-sha512$"),
+            "{} leaks credentials",
+            table.name
+        );
+        assert!(!rendered.contains("pw-one"));
+        assert!(!rendered.contains("pw-bob"));
+        for sql in [
+            format!(
+                "INSERT INTO \"{}\" SELECT * FROM \"{}\"",
+                table.name, table.name
+            ),
+            format!("DELETE FROM \"{}\" WHERE 1 = 0", table.name),
+            format!(
+                "UPDATE \"{}\" SET \"{}\" = 0 WHERE 1 = 0",
+                table.name, table.columns[0].name
+            ),
+            format!("DROP TABLE \"{}\"", table.name),
+            format!(
+                "CREATE INDEX dictionary_bad_index ON \"{}\" (\"{}\")",
+                table.name, table.columns[0].name
+            ),
+        ] {
+            assert!(s.execute(&sql).is_err(), "must reject {sql}");
+        }
+        assert!(s
+            .execute(&format!("SELECT COUNT(*) FROM \"{}\"", table.name))
+            .is_ok());
+    }
+    let user = s.execute("SELECT * FROM user$ ORDER BY name").unwrap();
+    let Some(QueryResult::Rows { columns, rows }) = user.last() else {
+        panic!("rows expected");
+    };
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["user_id", "name", "status", "ctime"]
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], Value::Bytes(b"alice".to_vec()));
+    assert_eq!(rows[1][1], Value::Bytes(b"bob".to_vec()));
+    for sql in [
+        "SELECT passwd FROM user$",
+        "SELECT u.passwd FROM user$ u",
+        "SELECT name FROM user$ WHERE passwd = 'x'",
+        "SELECT name FROM user$ ORDER BY passwd",
+        "SELECT passwd FROM user$ UNION SELECT passwd FROM user$",
+    ] {
+        let error = s.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("passwd"), "{sql}: {error}");
+    }
+    let metadata = s
+        .execute("SELECT name FROM col$ WHERE name = 'passwd'")
+        .unwrap();
+    assert!(matches!(metadata.last(), Some(QueryResult::Rows { rows, .. }) if rows.is_empty()));
+    let join = s.execute("SELECT o.name, t.cols FROM obj$ o JOIN tab$ t ON o.\"obj#\" = t.\"obj#\" WHERE o.name = 'user$'").unwrap();
+    assert!(matches!(join.last(), Some(QueryResult::Rows { rows, .. }) if rows.len() == 1));
+    for table in bicdb_catalog::dict::DICT_TABLES {
+        for index in table.keys {
+            assert!(s.execute(&format!("DROP INDEX {}", index.name)).is_err());
+        }
+    }
+    // INSERT SELECT uses the same sanitized source, and metadata reads leave
+    // explicit transactions and rollback behavior intact.
+    s.execute("CREATE TABLE user_inventory (name VARCHAR2(128), status NUMBER)")
+        .unwrap();
+    s.execute("BEGIN").unwrap();
+    s.execute("INSERT INTO user_inventory SELECT name, status FROM user$")
+        .unwrap();
+    s.execute("SELECT * FROM tab$").unwrap();
+    assert!(s.in_transaction());
+    s.execute("ROLLBACK").unwrap();
+    assert!(
+        matches!(s.execute("SELECT * FROM user_inventory").unwrap().last(), Some(QueryResult::Rows { rows, .. }) if rows.is_empty())
+    );
+    s.authenticate("alice", "pw-one").unwrap();
+    for table in ["user$", "ws$", "fs$", "wq$"] {
+        assert!(s.execute(&format!("SELECT * FROM {table}")).is_err());
+    }
+    for table in [
+        "obj$", "tab$", "col$", "ind$", "icol$", "seg$", "undo$", "stat$", "seq$",
+    ] {
+        assert!(s.execute(&format!("SELECT * FROM {table}")).is_ok());
+    }
 }

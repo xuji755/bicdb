@@ -97,6 +97,12 @@ pub mod obj_kind {
     pub const INDEX: u32 = 1;
     /// 表。
     pub const TABLE: u32 = 2;
+    /// bicdb 原生命名图（不占用 Oracle 预留类型码）。
+    pub const GRAPH: u32 = 256;
+    /// Protected native full-text document heap, owned by a graph index.
+    pub const GRAPH_FULLTEXT_DATA: u32 = 257;
+    /// Protected graph-wide full-text change journal heap.
+    pub const GRAPH_FULLTEXT_QUEUE: u32 = 258;
     /// 簇（留位）。
     pub const CLUSTER: u32 = 3;
     /// 视图（留位）。
@@ -141,6 +147,39 @@ pub mod index_kind {
     pub const ANN: u32 = 1;
     /// 邻接（图的边）。
     pub const ADJACENCY: u32 = 2;
+    /// Graph property B-tree; leaf payload is a 48-bit element ID, not a heap ROWID.
+    pub const GRAPH_PROPERTY: u32 = 256;
+    /// Graph node directory (global and per-label); leaf payload is an element ID.
+    pub const GRAPH_NODES: u32 = 257;
+    /// Graph outgoing adjacency; key is endpoint and relationship type.
+    pub const GRAPH_OUT: u32 = 258;
+    /// Graph incoming adjacency; key is endpoint and relationship type.
+    pub const GRAPH_IN: u32 = 259;
+    /// Native full-text postings; payload is an element ID, not a heap ROWID.
+    pub const GRAPH_FULLTEXT: u32 = 260;
+    /// Graph-owned type-3 authority segment (not a B-tree).
+    pub const GRAPH_ADJACENCY: u32 = 261;
+    /// Physical source ROWID -> snapshot-bearing source metadata heap ROWID.
+    pub const GRAPH_SOURCE_ENTRY: u32 = 262;
+    /// Edge ID -> stable type-5 directory ROWID.
+    pub const GRAPH_EDGE_LOCATOR: u32 = 263;
+    /// Physical destination/type/source/edge reverse candidates.
+    pub const GRAPH_REVERSE: u32 = 264;
+    /// These trees are maintained by graph execution, never by ordinary heap DML.
+    pub const fn is_graph_auxiliary(kind: u32) -> bool {
+        matches!(
+            kind,
+            GRAPH_PROPERTY
+                | GRAPH_NODES
+                | GRAPH_OUT
+                | GRAPH_IN
+                | GRAPH_FULLTEXT
+                | GRAPH_ADJACENCY
+                | GRAPH_SOURCE_ENTRY
+                | GRAPH_EDGE_LOCATOR
+                | GRAPH_REVERSE
+        )
+    }
 }
 
 /// **命名空间**（`obj$.namespace`）——表与索引各自独立（可同名）。

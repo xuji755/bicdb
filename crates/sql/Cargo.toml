@@ -19,3 +19,5 @@ bicdb-types = { path = "../types" }
 bicdb-wal = { path = "../wal" }
 bicdb-workspace = { path = "../workspace" }
 
+bicdb-graph = { path = "../graph" }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }

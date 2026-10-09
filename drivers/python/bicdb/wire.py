@@ -7,7 +7,7 @@
 ```text
 帧      <首行> \\n <载荷字节数> \\n <载荷字节…>
 值单元  <标记><载荷字节数> \\n <载荷字节…> \\n
-        - NULL │ n 十进制数值文本 │ o 布尔(0/1) │ b 十六进制字节串
+        - NULL │ n 十进制数值文本 │ o 布尔(0/1) │ b 十六进制字节串 │ g 图元素
 ```
 
 **解析纪律（照 MySQL 包序号错乱的教训）**：每个变长字段自带字节数，
@@ -48,9 +48,9 @@ class ServerError(Exception):
 
 @dataclass(frozen=True)
 class Value:
-    """线上的一个值（四种形态）。
+    """线上的一个值。
 
-    - ``tag``：``-`` / ``n`` / ``o`` / ``b``；
+    - ``tag``：``-`` / ``n`` / ``o`` / ``b`` / ``g``；
     - ``text``：``n``/``o`` 的文本（十进制/``0``|``1``）；``b`` 是十六进制；``-`` 为空。
     """
 
@@ -86,6 +86,18 @@ class Value:
 
     def as_float(self) -> Optional[float]:
         if self.tag != "n":
+            return None
+
+    def as_graph_element(self) -> Optional[tuple[int, str, int]]:
+        """图元素载荷 ``graph:n|e:id``，非法载荷返回 ``None``。"""
+        if self.tag != "g":
+            return None
+        fields = self.text.split(":")
+        if len(fields) != 3 or fields[1] not in ("n", "e"):
+            return None
+        try:
+            return int(fields[0]), fields[1], int(fields[2])
+        except ValueError:
             return None
         try:
             return float(self.text)
@@ -414,8 +426,11 @@ def _read_line(sock: socket.socket) -> bytes:
 def read_frame(sock: socket.socket) -> tuple[str, bytes]:
     """读一帧（**读满**声明的字节数；半帧即错）。"""
     head = _read_line(sock).decode("ascii", "replace").strip()
+    length = _read_line(sock).strip()
+    if not length or not all(48 <= b <= 57 for b in length):
+        raise ProtocolError("长度行不是非负十进制整数")
     try:
-        n = int(_read_line(sock).strip() or b"0")
+        n = int(length)
     except ValueError as e:
         raise ProtocolError("长度行不是数") from e
     if n > MAX_FRAME:
@@ -466,6 +481,11 @@ class Link:
             raise TimeoutError(
                 "实例正忙：服务一次只服务一条连接（V1.0 单写者）——稍后重试"
             ) from e
+        except ServerError as error:
+            sock.close()
+            if "正忙" in str(error) or "BUSY" in str(error).upper():
+                raise TimeoutError("实例正忙：服务一次只服务一条连接——稍后重试") from error
+            raise ProtocolError(f"HELLO 失败：{error}") from error
         except ProtocolError:
             sock.close()
             raise
@@ -517,6 +537,18 @@ class Link:
     def sql(self, sql: str, params: Iterable[tuple[str, Value]] = ()) -> list[object]:
         return decode_statements(self.call("SQL", encode_sql(sql, params)))
 
+    def route_owned(self, selection: Optional[str] = None) -> dict:
+        payload = self.call("ROUTE", (selection or "").encode("utf-8"))
+        try:
+            fields = dict(line.split("=", 1) for line in payload.decode("utf-8").splitlines())
+            route = {"user_id": int(fields["user_id"]), "workspace_id": int(fields["workspace_id"]),
+                     "name": bytes.fromhex(fields["name_hex"]).decode("utf-8"), "root": bytes.fromhex(fields["root_hex"]).decode("utf-8")}
+            if route["user_id"] <= 0 or route["workspace_id"] <= 0 or not route["root"]:
+                raise ValueError("invalid route")
+            return route
+        except (KeyError, ValueError) as error:
+            raise ProtocolError("ROUTE 应答无效") from error
+
     def describe(self, name: str) -> list[Column]:
         return decode_columns(self.call("DESCRIBE", name.encode("utf-8")))
 
@@ -537,5 +569,3 @@ class Link:
         except OSError:
             pass
         self.sock.close()
-
-

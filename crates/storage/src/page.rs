@@ -90,6 +90,9 @@ pub const FIXED_HEADER_LEN: usize = 68;
 /// 槽位目录条目长度。
 pub const SLOT_ENTRY_LEN: usize = 2;
 
+/// Adjacency page body prefix: source ROWID, live count, flags, next page, reserved.
+pub const ADJACENCY_BODY_HEADER_LEN: usize = 16;
+
 /// 槽位上限（D-06：槽位从 1 起、0 保留为"无" ⇒ 行号 1..=1023）。
 ///
 /// **与 ROWID 的 `row_id` 10 位域耦合，两者须同时修改**（§5.7）。
@@ -211,7 +214,7 @@ impl PageType {
     pub const fn uses_slot_directory(self) -> bool {
         matches!(
             self,
-            PageType::HeapTable | PageType::Temporary | PageType::Undo
+            PageType::HeapTable | PageType::Temporary | PageType::Undo | PageType::Adjacency
         )
     }
 }
@@ -502,13 +505,25 @@ impl Page {
     /// ITL 条目数的**格式上限**（页头固定区能容纳的条数）。
     pub const MAX_ITL_ENTRIES: usize = 1 + (PAGE_SIZE - FIXED_HEADER_LEN) / ITL_ENTRY_LEN;
 
-    /// `free_start`（**可推导、不存**）：固定头末尾 + 槽位目录长度。
+    /// `free_start`（**可推导、不存**）：固定头末尾 + 类型专用前缀 + 槽位目录长度。
     /// 越出页尾的损坏值夹取到页尾（`free_space` 随之为 0）。
     #[must_use]
     pub fn free_start(&self) -> usize {
-        self.fixed_header_end()
+        self.slot_directory_start()
             .saturating_add(self.slot_count() as usize * SLOT_ENTRY_LEN)
             .min(PAGE_SIZE)
+    }
+
+    /// Slot-directory offset, including the type-specific adjacency prefix.
+    #[must_use]
+    pub fn slot_directory_start(&self) -> usize {
+        self.fixed_header_end().saturating_add(
+            if self.bytes[PAGE_TYPE_OFFSET] == PageType::Adjacency.as_u8() {
+                ADJACENCY_BODY_HEADER_LEN
+            } else {
+                0
+            },
+        )
     }
 
     /// `slot_count`。
@@ -572,7 +587,7 @@ impl Page {
         if index >= self.slot_count() as usize {
             return None;
         }
-        let at = self.fixed_header_end() + index * SLOT_ENTRY_LEN;
+        let at = self.slot_directory_start() + index * SLOT_ENTRY_LEN;
         if at + SLOT_ENTRY_LEN > PAGE_SIZE {
             return None; // 损坏页：目录越出页尾
         }
@@ -589,7 +604,7 @@ impl Page {
         if index >= self.slot_count() as usize {
             return false;
         }
-        let at = self.fixed_header_end() + index * SLOT_ENTRY_LEN;
+        let at = self.slot_directory_start() + index * SLOT_ENTRY_LEN;
         // 与 [`Page::slot`] 同一道防线：`slot_count` 从**损坏页**读出来可能是
         // 65535，只按它判界会让这里的切片越出页尾 panic。
         if at + SLOT_ENTRY_LEN > PAGE_SIZE {

@@ -501,6 +501,11 @@ fn with_session<R>(
 ) -> Result<R, Exit> {
     let seq = inst.seq();
     let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    session.set_fulltext_defaults(
+        inst.params.run.fulltext_interval_ms,
+        inst.params.run.fulltext_batch_rows,
+    )?;
+    session.set_graph_limits(inst.params.run.graph_limits())?;
     attach_dcl(inst.io, inst.params.run.pbkdf2_iterations, &mut session);
     session.set_fixed_table_source(Some(bicdb_cli::fixed::CliFixedTables::new_static(
         &inst.dir, inst.io,
@@ -864,6 +869,11 @@ fn repl(inst: &mut boot::Instance) -> Result<(), Exit> {
     // 会话常驻整场（`Session` 借住实例；收尾在 `Drop` —— 未提交的显式事务回滚）。
     let seq = inst.seq();
     let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+    session.set_fulltext_defaults(
+        inst.params.run.fulltext_interval_ms,
+        inst.params.run.fulltext_batch_rows,
+    )?;
+    session.set_graph_limits(inst.params.run.graph_limits())?;
     attach_dcl(inst.io, inst.params.run.pbkdf2_iterations, &mut session);
     session.set_fixed_table_source(Some(bicdb_cli::fixed::CliFixedTables::new_static(
         &inst.dir, inst.io,

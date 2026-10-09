@@ -48,6 +48,20 @@ pub trait WorkspaceProvisioner {
     /// 日志组齐备，`stat$`/`seq$` 已建）。
     fn provision(&self, req: &ProvisionRequest) -> Result<(), String>;
 
+    /// Publish an immutable empty-schema template from an idle workspace.
+    fn add_schema_template(&self, _home: &Path, _source: &Path, _name: &str) -> Result<(), String> {
+        Err("初始化模板供给方未实现".to_owned())
+    }
+    /// Publish an explicit graph-data snapshot from an idle unowned workspace.
+    fn add_graph_template(&self, _home: &Path, _source: &Path, _name: &str) -> Result<(), String> {
+        Err("带数据图模板供给方未实现".to_owned())
+    }
+
+    /// Remove a template; existing copies have no dependency on it.
+    fn drop_schema_template(&self, _home: &Path, _name: &str) -> Result<(), String> {
+        Err("初始化模板供给方未实现".to_owned())
+    }
+
     /// **删之前的预检**（能不能删）。
     ///
     /// **要在动可见性之前调**：可预见的失败（比如目录被活实例占着）不该把
@@ -74,6 +88,8 @@ pub struct ProvisionRequest {
     pub seed_ini: PathBuf,
     /// 日志落点（`<home>/log/<name>.log`——运维只记一个地方）。
     pub log_path: PathBuf,
+    /// Schema or explicit graph-data template, applied before workspace registration.
+    pub from_template: Option<String>,
 }
 
 /// **管理面的实例侧上下文**：`BICDB_HOME` + 一条 I/O + 工作区供给方。
@@ -271,9 +287,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             Stmt::CreateUser(s) => self.dcl_create_user(s),
             Stmt::AlterUser(s) => self.dcl_alter_user(s),
             Stmt::DropUser(s) => self.dcl_drop_user(s),
-            Stmt::AlterDatabase(_) => Err(self.dcl_err(DclExecError::Pending(
-                "模板（T 组）尚未落地：随 D5（reflink 快照）切片".to_owned(),
-            ))),
+            Stmt::AlterDatabase(s) => self.dcl_schema_template(s),
             other => Err(self.dcl_err(DclExecError::Pending(format!(
                 "`{}` 不是管理面语句",
                 stmt_label(other)
@@ -342,6 +356,12 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     .to_owned(),
             ))
         })?;
+        let from_template = s
+            .from_template
+            .as_ref()
+            .map(|name| String::from_utf8(name.clone()))
+            .transpose()
+            .map_err(|_| self.dcl_err(DclExecError::Path("模板名必须是 UTF-8".into())))?;
         let mut gcf = self.dcl_open_registry(&ctx)?;
 
         // **资格检查先于对象查找**：池非空（依赖顺序 FS → WORKSPACE）。
@@ -390,10 +410,13 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             name: s.name.clone(),
             seed_ini: ctx.home_root.join("public").join("bicdb.ini"),
             log_path: ctx.home_root.join("log").join(format!("{}.log", s.name)),
+            from_template,
         };
-        provisioner
-            .provision(&req)
-            .map_err(|e| self.dcl_err(DclExecError::Path(format!("建工作区文件面失败：{e}"))))?;
+        if let Err(error) = provisioner.provision(&req) {
+            gcf.close()
+                .map_err(|error| self.dcl_err(DclExecError::Registry(error.to_string())))?;
+            return Err(self.dcl_err(DclExecError::Path(format!("建工作区文件面失败：{error}"))));
+        }
 
         // ② 属性：盘级配额（`wq$`）+ `ws$` 一行（**无主容器**）。
         for q in &s.quotas {
@@ -629,6 +652,83 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
     }
 
     // ───────────────────────── U 组：用户生命周期 ─────────────────────────
+
+    fn dcl_schema_template(
+        &mut self,
+        stmt: &crate::ast::AlterDatabaseStmt,
+    ) -> Result<QueryResult, SessionError> {
+        let ctx = self.dcl_ctx()?;
+        let provider = ctx
+            .provisioner
+            .ok_or_else(|| self.dcl_err(DclExecError::Pending("本会话没有模板供给方".into())))?;
+        let decode = |name: &[u8]| {
+            String::from_utf8(name.to_vec())
+                .map_err(|_| SessionError::Dcl("模板名必须是 UTF-8".into()))
+        };
+        match &stmt.action {
+            crate::ast::AlterDatabaseAction::AddTemplate {
+                name,
+                from,
+                graph_data,
+            } => {
+                let name = decode(name)?;
+                let mut registry = self.dcl_open_registry(&ctx)?;
+                let root = (|| {
+                    let (id, _) = resolve_workspace(self.catalog_mut(), &mut registry, from)
+                        .map_err(|error| self.dcl_err(error))?;
+                    let entry = catdcl::ws_by_id(self.catalog_mut(), id)
+                        .map_err(|error| self.dcl_err(DclExecError::Catalog(error)))?
+                        .ok_or_else(|| SessionError::Dcl("源工作区不存在".into()))?;
+                    if entry.user_id.is_some()
+                        || entry.status != ws_status::ACTIVE
+                        || entry.name == "public"
+                    {
+                        return Err(SessionError::Dcl(
+                        "初始化模板要求无主、ACTIVE、非 PUBLIC 的源工作区；不能复制用户所属工作区"
+                            .into(),
+                    ));
+                    }
+                    let root = registry
+                        .workspaces()
+                        .map_err(|error| SessionError::Dcl(error.to_string()))?
+                        .into_iter()
+                        .find(|workspace| workspace.workspace_id.as_raw() == id)
+                        .ok_or_else(|| SessionError::Dcl("源工作区注册根不存在".into()))?
+                        .root;
+                    Ok(root)
+                })();
+                registry
+                    .close()
+                    .map_err(|error| SessionError::Dcl(error.to_string()))?;
+                let root = root?;
+                let root = std::str::from_utf8(&root)
+                    .map_err(|_| SessionError::Dcl("源根目录不是 UTF-8".into()))?;
+                if *graph_data {
+                    provider.add_graph_template(&ctx.home_root, Path::new(root), &name)
+                } else {
+                    provider.add_schema_template(&ctx.home_root, Path::new(root), &name)
+                }
+                .map_err(SessionError::Dcl)?;
+                Ok(QueryResult::Ddl(format!(
+                    "ADD TEMPLATE `{name}`：{}",
+                    if *graph_data {
+                        "带图数据初始化模板（业务表零行）"
+                    } else {
+                        "空白初始化结构模板（不含业务行）"
+                    }
+                )))
+            }
+            crate::ast::AlterDatabaseAction::DropTemplate { name } => {
+                let name = decode(name)?;
+                provider
+                    .drop_schema_template(&ctx.home_root, &name)
+                    .map_err(SessionError::Dcl)?;
+                Ok(QueryResult::Ddl(format!(
+                    "DROP TEMPLATE `{name}`：已删除；既有工作区不受影响"
+                )))
+            }
+        }
+    }
 
     /// `CREATE USER <主体> IDENTIFIED BY '<口令>' USING WORKSPACE <引用>`（U1）。
     ///
@@ -1175,6 +1275,8 @@ fn stmt_label(s: &Stmt) -> &'static str {
         Stmt::Drop(_) => "DROP",
         Stmt::Transaction(_) => "事务控制",
         Stmt::CreateGraph(_) => "CREATE GRAPH",
+        Stmt::Cypher(_) => "CYPHER",
+        Stmt::ShowGraphs(_) => "SHOW GRAPHS",
         Stmt::VariableSet(_) => "ALTER SESSION",
         _ => "DCL",
     }

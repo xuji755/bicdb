@@ -485,6 +485,14 @@ impl Connection {
         self.identity.as_ref().map(|i| i.user_id)
     }
 
+    /// Authoritative workspace route returned by PUBLIC after authentication.
+    pub fn route_owned(
+        &mut self,
+        selection: Option<&str>,
+    ) -> Result<bicdb_net::message::OwnedWorkspace, Error> {
+        self.client.route_owned(selection).map_err(map_err)
+    }
+
     /// 口令是否已过期（受限会话）；`None` = 没认证。
     #[must_use]
     pub fn password_expired(&self) -> Option<bool> {
@@ -629,6 +637,11 @@ fn to_wire(v: &Value) -> bicdb_net::Value {
         Value::Number(t) => bicdb_net::Value::Number(t.clone()),
         Value::Bool(b) => bicdb_net::Value::Bool(*b),
         Value::Bytes(b) => bicdb_net::Value::Bytes(b.clone()),
+        Value::GraphElement { graph, kind, id } => bicdb_net::Value::GraphElement {
+            graph: *graph,
+            kind: *kind,
+            id: *id,
+        },
     }
 }
 
@@ -638,6 +651,11 @@ fn from_wire(v: &bicdb_net::Value) -> Value {
         bicdb_net::Value::Number(t) => Value::Number(t.clone()),
         bicdb_net::Value::Bool(b) => Value::Bool(*b),
         bicdb_net::Value::Bytes(b) => Value::Bytes(b.clone()),
+        bicdb_net::Value::GraphElement { graph, kind, id } => Value::GraphElement {
+            graph: *graph,
+            kind: *kind,
+            id: *id,
+        },
     }
 }
 

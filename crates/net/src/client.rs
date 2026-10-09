@@ -125,6 +125,9 @@ impl Client {
             {
                 ClientError::Busy
             }
+            ClientError::Server(message) if message.starts_with("实例正忙：") => {
+                ClientError::Busy
+            }
             other => other,
         })?;
         // 握手之后不再限时（长查询是正常的；要限时用 `set_timeout`）。
@@ -180,6 +183,15 @@ impl Client {
         };
         let text = self.call_bytes("AUTH", &req.encode())?;
         Ok(AuthOk::decode(&String::from_utf8_lossy(&text)))
+    }
+
+    /// Resolve the authenticated principal's workspace, not an OS/default identity.
+    pub fn route_owned(
+        &mut self,
+        selection: Option<&str>,
+    ) -> Result<crate::message::OwnedWorkspace, ClientError> {
+        let text = self.call("ROUTE", selection.unwrap_or(""))?;
+        crate::message::OwnedWorkspace::decode(&text).map_err(ClientError::Codec)
     }
 
     /// **执行 SQL**（参数随请求：直连与服务两条路径行为一致）。

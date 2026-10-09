@@ -73,6 +73,8 @@ _RULES: tuple[tuple[str, type[DatabaseError]], ...] = (
     ("唯一约束冲突", IntegrityError),
     ("唯一", IntegrityError),
     ("重复键", IntegrityError),
+    ("非空约束", IntegrityError),
+    ("列长度约束", DataError),
     ("绑定期不支持", NotSupportedError),
     ("不支持", NotSupportedError),
     ("不存在", ProgrammingError),

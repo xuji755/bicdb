@@ -91,18 +91,16 @@ fn tier_one_resolves_user_objects_and_captures_version() {
 }
 
 #[test]
-fn tier_three_bootstrap_objects_are_out_of_scope() {
+fn dictionary_objects_resolve_as_readonly_sources() {
     let mut view = FakeView::default().with_bootstrap("obj$", 1);
     let mut r = NameResolver::new(&mut view);
-    // 自举对象在目录里**能**解析到，但会话解析范围**不含**它 ⇒ 一视同仁地"不存在"。
-    let err = r.resolve_table("obj$").unwrap_err();
-    assert!(
-        matches!(err, BindError::NotFound { ref name, .. } if name == "obj$"),
-        "{err}"
+    assert_eq!(
+        r.resolve_table("obj$").unwrap(),
+        ResolvedName::FixedTable("obj$")
     );
-    // 写目标同样出局。
+    assert_eq!(r.refs.objects().get(&1), Some(&7));
     let err2 = r.resolve_write_target("obj$").unwrap_err();
-    assert!(matches!(err2, BindError::NotFound { .. }), "{err2}");
+    assert!(matches!(err2, BindError::NotWritable(_)), "{err2}");
 }
 
 #[test]
@@ -230,4 +228,56 @@ fn index_resolution_records_its_own_version() {
         r2.resolve_index("i_obj_pk").unwrap_err(),
         BindError::NotFound { .. }
     ));
+}
+
+#[test]
+fn graph_table_binds_declared_types_parameters_and_real_graph_version() {
+    use crate::ast::Stmt;
+    let mut view = FakeView::default()
+        .with_table("kg", 100)
+        .with_table("ordinary", 101);
+    view.tables.get_mut("kg").unwrap().type_code = bicdb_catalog::obj_kind::GRAPH;
+    let sql = "SELECT g.id, g.text, g.ok, g.entity FROM GRAPH_TABLE(kg, :q PARAMETERS :p COLUMNS (id NUMBER, text VARCHAR2(128), ok BOOLEAN, entity GRAPH_ELEMENT)) g";
+    let Stmt::Select(_) = crate::parser::parse(sql).unwrap() else {
+        panic!()
+    };
+    let mut resolver = NameResolver::new(&mut view);
+    let bound = bind_statement(&mut resolver, &crate::parser::parse(sql).unwrap()).unwrap();
+    let BoundStatement::Select(bound) = bound else {
+        panic!()
+    };
+    assert_eq!(bound.tables[0].fixed, Some("graph_table"));
+    assert_eq!(
+        bound.tables[0]
+            .columns
+            .iter()
+            .map(|c| c.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            bicdb_exec::ColKind::Number,
+            bicdb_exec::ColKind::Bytes,
+            bicdb_exec::ColKind::Bool,
+            bicdb_exec::ColKind::GraphElement
+        ]
+    );
+    assert_eq!(
+        bound.tables[0].graph_table.as_ref().unwrap().columns[1].length,
+        128
+    );
+    assert_eq!(resolver.into_refs().objects().get(&100), Some(&7));
+    for source in [
+        "GRAPH_TABLE(ordinary, 'RETURN 1' COLUMNS (v NUMBER))",
+        "GRAPH_TABLE(kg, 'CREATE (n) RETURN 1' COLUMNS (v NUMBER))",
+        "GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v NUMBER(2)))",
+        "GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v BOOLEAN(1)))",
+        "GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v VARCHAR2(0)))",
+        "GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v VARCHAR2(65536)))",
+        "GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v VARCHAR2(10,2)))",
+        "GRAPH_TABLE(kg, 'RETURN 1' COLUMNS (v JSON))",
+        "GRAPH_TABLE(kg, 'RETURN 1,2' COLUMNS (v NUMBER,v NUMBER))",
+    ] {
+        let ast = crate::parser::parse(&format!("SELECT * FROM {source}")).unwrap();
+        let mut resolver = NameResolver::new(&mut view);
+        assert!(bind_statement(&mut resolver, &ast).is_err(), "{source}");
+    }
 }

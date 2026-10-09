@@ -17,9 +17,9 @@
 //! - **写前**：预检与写在同一语句内**串行**（单写者），不必在写路径里回查字典
 //!   （写路径持着数据文件，回查会与之别名）。
 //!
-//! **语句内/事务内的重复**由会话侧的**已见键集合**兜住（CR 看不见本事务未提交的
-//! 行——`cr::reconstruct` 只认"已提交且 ≤ 快照"）：同一键在一条语句里出现两次、
-//! 或一个显式事务里跨语句出现两次，都靠它判。
+//! **语句内的重复**由本次预检的**已见键集合**兜住。跨语句重复由带 own 的
+//! CR 回表判定：本事务未提交的插入可见、已删除行不可见。不能跨语句保留
+//! 已见键，否则删除后重插以及失败预检后的重试会被误报为冲突。
 
 use std::collections::HashSet;
 
@@ -168,7 +168,7 @@ impl IndexMaintenance for TableIndexes {
 ///
 /// 跳数上限用 `catalog` 的 `rid_forward_max_hops` 同源常量（本模块没有目录借用，
 /// 故取进程级值；超上限 ⇒ 具名错误，不静默当作"没有迁移"）。
-fn resolve_physical_rid(
+pub(crate) fn resolve_physical_rid(
     pool: &BufferPool<'_>,
     file: &mut DataFile<'_>,
     ws: [u8; 8],
@@ -200,12 +200,12 @@ fn resolve_physical_rid(
 /// ——有测试钉住两者一致）。
 pub const MAX_FORWARD_HOPS: usize = 8;
 
-/// **已见键集合**（语句内/事务内的重复检测）——键 = `(索引对象号, 键字节)`。
+/// **已见键集合**（语句内的重复检测）——键 = `(索引对象号, 键字节)`。
 pub type SeenKeys = HashSet<(u32, Vec<u8>)>;
 
 /// **唯一性预检**（写前）：待写的行里，凡唯一索引的键与**活行**相撞 ⇒ 冲突。
 ///
-/// `[`SeenKeys`]` 里已有的键 ⇒ 语句内/事务内重复（CR 看不见本事务未提交的行）。
+/// `[`SeenKeys`]` 里已有的键 ⇒ 本次语句内重复（事务内已写行由 CR 读己所写判断）。
 #[allow(clippy::too_many_arguments)]
 pub fn check_unique(
     cat: &mut Catalog<'_>,
@@ -269,4 +269,57 @@ pub fn table_indexes(
         .dml_indexes(snapshot, table_obj)
         .map_err(|e| ExecError::BadStoredRow(format!("索引清单：{e}")))?;
     Ok(TableIndexes::new(indexes))
+}
+
+/// Native graph chunk writes use an exact ordinal IN-list. Probe their managed
+/// key tree before materializing DML rather than rescanning every graph row.
+/// This is deliberately limited to that internal shape; ordinary SQL DML keeps
+/// its existing access path. Every returned row is still rechecked by WHERE.
+pub(crate) fn graph_storage_candidates(
+    cat: &mut Catalog<'_>,
+    indexes: &TableIndexes,
+    predicate: Option<&bicdb_exec::Expr>,
+    params: &[bicdb_exec::Value],
+) -> Result<Option<Vec<RowId>>, ExecError> {
+    use bicdb_exec::{Expr, Value};
+    let Some(Expr::InList { expr, list }) = predicate else {
+        return Ok(None);
+    };
+    if **expr != Expr::Column(0) {
+        return Ok(None);
+    }
+    let Some(index) = indexes
+        .indexes
+        .iter()
+        .find(|idx| idx.unique && idx.cols == [0])
+    else {
+        return Ok(None);
+    };
+    if list
+        .iter()
+        .any(|item| !matches!(item, Expr::Param(_) | Expr::Literal(Value::Number(_))))
+    {
+        return Ok(None);
+    }
+    let shape = bicdb_exec::RowShape::new(vec![bicdb_exec::ColKind::Number]);
+    let mut rids = Vec::new();
+    let mut seen = HashSet::new();
+    for item in list {
+        let value = bicdb_exec::expr::eval(item, &bicdb_exec::Row::new(vec![]), params)?;
+        if !matches!(value, Value::Number(_)) {
+            return Ok(None);
+        }
+        let bytes = bicdb_exec::encode_row(&bicdb_exec::Row::new(vec![value]), &shape)?;
+        let key =
+            row::key_from_row(&bytes, &[0]).map_err(|e| ExecError::BadStoredRow(e.to_string()))?;
+        for (_, rid) in cat
+            .range_index(&index.name, Some(&key), Some(&key))
+            .map_err(|e| ExecError::BadStoredRow(format!("graph key index: {e}")))?
+        {
+            if seen.insert(rid) {
+                rids.push(rid);
+            }
+        }
+    }
+    Ok(Some(rids))
 }

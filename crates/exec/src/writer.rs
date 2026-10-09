@@ -35,6 +35,17 @@ use bicdb_wal::group::GroupWriter;
 use crate::dml::{IndexMaintenance, TableWriter};
 use crate::error::ExecError;
 
+/// 目录声明的列约束（SQL 装配层注入；与页布局无关）。
+#[derive(Debug, Clone)]
+pub struct ColumnConstraint {
+    /// 列名（错误定位）。
+    pub name: String,
+    /// 是否允许 NULL。
+    pub nullable: bool,
+    /// 字节串列的最大字节数；其他形态无长度约束。
+    pub max_bytes: Option<usize>,
+}
+
 /// **真件表访问写口**（一个语句一个实例）。
 pub struct TableAccessWriter<'a, 'b, 'io, 'f> {
     pool: &'a BufferPool<'b>,
@@ -55,6 +66,7 @@ pub struct TableAccessWriter<'a, 'b, 'io, 'f> {
     indexes: Option<&'a mut dyn IndexMaintenance>,
     table: TableAccess<'a, 'b>,
     policy: InsertPolicy,
+    constraints: Vec<ColumnConstraint>,
 }
 
 impl<'a, 'b, 'io, 'f> TableAccessWriter<'a, 'b, 'io, 'f> {
@@ -82,6 +94,7 @@ impl<'a, 'b, 'io, 'f> TableAccessWriter<'a, 'b, 'io, 'f> {
             indexes: None,
             table: TableAccess::new(pool, ws),
             policy: InsertPolicy::in_place(0),
+            constraints: Vec::new(),
         }
     }
 
@@ -109,12 +122,48 @@ impl<'a, 'b, 'io, 'f> TableAccessWriter<'a, 'b, 'io, 'f> {
             indexes: None,
             table: TableAccess::new(pool, ws),
             policy: InsertPolicy::in_place(0),
+            constraints: Vec::new(),
         }
     }
 
     /// 装上**索引维护口**（表上有可用索引时由会话层给）。
     pub fn set_indexes(&mut self, indexes: &'a mut dyn IndexMaintenance) {
         self.indexes = Some(indexes);
+    }
+
+    /// SQL 写侧必须在开始写入前注入目标表的列约束。
+    pub fn set_column_constraints(&mut self, constraints: Vec<ColumnConstraint>) {
+        self.constraints = constraints;
+    }
+
+    fn validate_row(&self, row: &[u8]) -> Result<(), ExecError> {
+        if self.constraints.is_empty() {
+            return Ok(());
+        }
+        let view = bicdb_storage::row::RowView::new(row)
+            .map_err(|e| ExecError::BadStoredRow(e.to_string()))?;
+        for (i, c) in self.constraints.iter().enumerate() {
+            if view.is_null(i as u16) {
+                if !c.nullable {
+                    return Err(ExecError::ConstraintViolation(format!(
+                        "列 `{}` 违反非空约束（NOT NULL）",
+                        c.name
+                    )));
+                }
+            } else if let Some(max) = c.max_bytes {
+                let bytes = view
+                    .var_column(i, 0)
+                    .ok_or(ExecError::RowShapeMismatch { col: i })?;
+                if bytes.len() > max {
+                    return Err(ExecError::ConstraintViolation(format!(
+                        "列 `{}` 违反列长度约束：{} 字节超过声明上限 {max}",
+                        c.name,
+                        bytes.len()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// **表选项落到写侧策略**：`pctfree`（页内预留）+ `itl_max`（ITL 上限）。
@@ -230,6 +279,9 @@ impl TableWriter for TableAccessWriter<'_, '_, '_, '_> {
     }
 
     fn insert_row(&mut self, row: &[u8]) -> Result<RowId, ExecError> {
+        self.validate_row(row)?;
+        write::checkpoint_safe_point(self.pool, self.log, self.chain)
+            .map_err(|e| ExecError::TableAccess(e.into()))?;
         let policy = self.policy;
         let heap_seg = self.heap_seg;
         let rid = self.use_txn(|s, txn| {
@@ -243,6 +295,9 @@ impl TableWriter for TableAccessWriter<'_, '_, '_, '_> {
     }
 
     fn update_row(&mut self, rid: RowId, old: &[u8], new: &[u8]) -> Result<(), ExecError> {
+        self.validate_row(new)?;
+        write::checkpoint_safe_point(self.pool, self.log, self.chain)
+            .map_err(|e| ExecError::TableAccess(e.into()))?;
         let policy = self.policy;
         let heap_seg = self.heap_seg;
         // **先堆后索引**（与插入同序）：堆写真成功过才动索引。
@@ -255,6 +310,8 @@ impl TableWriter for TableAccessWriter<'_, '_, '_, '_> {
     }
 
     fn delete_row(&mut self, rid: RowId, old: &[u8]) -> Result<(), ExecError> {
+        write::checkpoint_safe_point(self.pool, self.log, self.chain)
+            .map_err(|e| ExecError::TableAccess(e.into()))?;
         // 删行按 ROWID 定位（不经段头）——段头由 `TableAccessWriter::with_txn` 持有。
         let policy = self.policy;
         self.use_txn(|s, txn| {

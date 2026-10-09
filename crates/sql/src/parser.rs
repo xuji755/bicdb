@@ -293,6 +293,72 @@ impl Parser<'_> {
     fn statement(&mut self) -> Result<Stmt, ParseError> {
         let t = self.peek().clone();
         match t.kind {
+            TokenKind::Keyword(Keyword::Show) => {
+                let start = self.advance().span;
+                let table = self.advance();
+                match &table.kind {
+                    TokenKind::Ident(name) if name == "tables" => {
+                        Ok(Stmt::ShowTables(start.merge(table.span)))
+                    }
+                    TokenKind::Ident(name) if name == "graphs" => {
+                        Ok(Stmt::ShowGraphs(start.merge(table.span)))
+                    }
+                    TokenKind::Ident(name) if name == "fulltext" => {
+                        self.expect_kw(Keyword::Graph)?;
+                        self.expect_graph_word("indexes")?;
+                        self.expect_kw(Keyword::On)?;
+                        let graph = self.col_id()?.0;
+                        Ok(Stmt::GraphIndex(GraphIndexStmt {
+                            graph,
+                            name: None,
+                            action: GraphIndexAction::FulltextShow,
+                            location: start,
+                        }))
+                    }
+                    TokenKind::Keyword(Keyword::Graph) => {
+                        self.expect_graph_word("indexes")?;
+                        self.expect_kw(Keyword::On)?;
+                        let graph = self.col_id()?.0;
+                        Ok(Stmt::GraphIndex(GraphIndexStmt {
+                            graph,
+                            name: None,
+                            action: GraphIndexAction::Show,
+                            location: start,
+                        }))
+                    }
+                    _ => Err(ParseError {
+                        message: "SHOW 支持 TABLES、GRAPHS 或 GRAPH INDEXES ON graph".into(),
+                        span: table.span,
+                    }),
+                }
+            }
+            TokenKind::Ident(ref name) if name == "cypher" => {
+                let location = self.advance().span;
+                self.cypher_stmt(location, false)
+            }
+            TokenKind::Ident(ref name) if name == "profile" => {
+                let location = self.advance().span;
+                self.expect_graph_word("cypher")?;
+                self.cypher_stmt(location, true)
+            }
+            TokenKind::Ident(ref name) if name == "search" => {
+                let location = self.advance().span;
+                self.expect_graph_word("fulltext")?;
+                self.expect_kw(Keyword::Graph)?;
+                self.expect_kw(Keyword::Index)?;
+                let name = self.col_id()?.0;
+                self.expect_kw(Keyword::On)?;
+                let graph = self.col_id()?.0;
+                self.expect_kw(Keyword::For)?;
+                let query = self.utf8_string()?;
+                let options = self.fulltext_options()?;
+                Ok(Stmt::GraphIndex(GraphIndexStmt {
+                    graph,
+                    name: Some(name),
+                    action: GraphIndexAction::FulltextSearch { query, options },
+                    location,
+                }))
+            }
             TokenKind::Keyword(Keyword::Select) | TokenKind::Keyword(Keyword::Values) => {
                 Ok(Stmt::Select(self.select_no_parens()?))
             }
@@ -342,8 +408,174 @@ impl Parser<'_> {
         }
     }
 
+    fn expect_graph_word(&mut self, word: &str) -> Result<(), ParseError> {
+        let token = self.advance();
+        match token.kind {
+            TokenKind::Ident(value) if value == word => Ok(()),
+            _ => Err(ParseError {
+                message: format!("expected {word}"),
+                span: token.span,
+            }),
+        }
+    }
+    fn cypher_stmt(&mut self, location: Span, profile: bool) -> Result<Stmt, ParseError> {
+        let graph = self.col_id()?.0;
+        let query = self.expect_string()?.0;
+        let parameters = if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="parameters") {
+            self.advance();
+            self.expect_string()?.0
+        } else {
+            b"{}".to_vec()
+        };
+        let budgets = if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="budgets") {
+            self.advance();
+            self.expect_string()?.0
+        } else {
+            b"{}".to_vec()
+        };
+        Ok(Stmt::Cypher(CypherStmt {
+            graph,
+            profile,
+            query: String::from_utf8(query).map_err(|_| self.err_here("Cypher must be UTF-8"))?,
+            parameters: String::from_utf8(parameters)
+                .map_err(|_| self.err_here("parameters must be UTF-8"))?,
+            budgets: String::from_utf8(budgets)
+                .map_err(|_| self.err_here("budgets must be UTF-8"))?,
+            location,
+        }))
+    }
+    fn create_graph_index(&mut self, location: Span, unique: bool) -> Result<Stmt, ParseError> {
+        let name = self.col_id()?.0;
+        self.expect_kw(Keyword::On)?;
+        let graph = self.col_id()?.0;
+        let entity = self.col_id()?.0;
+        if entity != "nodes" && entity != "relationships" {
+            return Err(self.err_here("graph index needs NODES or RELATIONSHIPS"));
+        }
+        let label = if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="label" || n=="type") {
+            let marker = self.col_id()?.0;
+            if (entity == "nodes" && marker != "label")
+                || (entity == "relationships" && marker != "type")
+            {
+                return Err(self.err_here("NODES uses LABEL; RELATIONSHIPS uses TYPE"));
+            }
+            Some(self.col_id()?.0)
+        } else {
+            None
+        };
+        self.expect_punct(Punct::LParen)?;
+        let mut fields = vec![];
+        if !self.eat_punct(Punct::RParen) {
+            loop {
+                let mut path = vec![self.col_id()?.0];
+                while self.eat_punct(Punct::Dot) {
+                    path.push(self.col_id()?.0);
+                }
+                fields.push(path);
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::RParen)?;
+        }
+        Ok(Stmt::GraphIndex(GraphIndexStmt {
+            graph,
+            name: Some(name),
+            action: GraphIndexAction::Create {
+                entity,
+                label,
+                fields,
+                unique,
+            },
+            location,
+        }))
+    }
+
+    fn utf8_string(&mut self) -> Result<String, ParseError> {
+        String::from_utf8(self.expect_string()?.0)
+            .map_err(|_| self.err_here("full-text string must be UTF-8"))
+    }
+    fn fulltext_options(&mut self) -> Result<String, ParseError> {
+        if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="options") {
+            self.advance();
+            self.utf8_string()
+        } else {
+            Ok("{}".into())
+        }
+    }
+    fn create_fulltext_graph_index(&mut self, location: Span) -> Result<Stmt, ParseError> {
+        self.expect_kw(Keyword::Graph)?;
+        self.expect_kw(Keyword::Index)?;
+        let name = self.col_id()?.0;
+        self.expect_kw(Keyword::On)?;
+        let graph = self.col_id()?.0;
+        let entity = self.col_id()?.0;
+        if entity != "nodes" && entity != "relationships" {
+            return Err(self.err_here("full-text needs NODES or RELATIONSHIPS"));
+        }
+        let mut labels = vec![];
+        if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="label" || n=="type") {
+            let marker = self.col_id()?.0;
+            if (entity == "nodes" && marker != "label")
+                || (entity == "relationships" && marker != "type")
+            {
+                return Err(self.err_here("NODES uses LABEL; RELATIONSHIPS uses TYPE"));
+            }
+            if self.eat_punct(Punct::LParen) {
+                loop {
+                    labels.push(self.col_id()?.0);
+                    if !self.eat_punct(Punct::Comma) {
+                        break;
+                    }
+                }
+                self.expect_punct(Punct::RParen)?;
+            } else {
+                labels.push(self.col_id()?.0);
+            }
+        }
+        self.expect_punct(Punct::LParen)?;
+        let mut fields = vec![];
+        loop {
+            let mut path = vec![GraphTextPathPart::Key(self.col_id()?.0)];
+            loop {
+                if self.eat_punct(Punct::Dot) {
+                    path.push(GraphTextPathPart::Key(self.col_id()?.0));
+                } else if self.eat_punct(Punct::LBracket) {
+                    let value = self.expect_number_text()?.0.parse().map_err(|_| {
+                        self.err_here("JSON array position must be an unsigned integer")
+                    })?;
+                    path.push(GraphTextPathPart::Index(value));
+                    self.expect_punct(Punct::RBracket)?;
+                } else {
+                    break;
+                }
+            }
+            fields.push(path);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RParen)?;
+        let options = self.fulltext_options()?;
+        Ok(Stmt::GraphIndex(GraphIndexStmt {
+            graph,
+            name: Some(name),
+            action: GraphIndexAction::FulltextCreate {
+                entity,
+                labels,
+                fields,
+                options,
+            },
+            location,
+        }))
+    }
+
     fn create_stmt(&mut self) -> Result<Stmt, ParseError> {
         let location = self.expect_kw(Keyword::Create)?.span;
+        if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="fulltext") {
+            self.advance();
+            return self.create_fulltext_graph_index(location);
+        }
         if self.eat_kw(Keyword::Table) {
             return Ok(Stmt::CreateTable(self.create_table(location)?));
         }
@@ -351,10 +583,13 @@ impl Parser<'_> {
         if self.eat_kw(Keyword::Index) {
             return Ok(Stmt::Index(self.index_stmt(location, unique)?));
         }
-        if unique {
-            return Err(self.err_here("`UNIQUE` 只能用于 `CREATE INDEX`"));
-        }
         if self.eat_kw(Keyword::Graph) {
+            if self.eat_kw(Keyword::Index) {
+                return self.create_graph_index(location, unique);
+            }
+            if unique {
+                return Err(self.err_here("UNIQUE requires GRAPH INDEX"));
+            }
             let (relname, iloc) = self.col_id()?;
             return Ok(Stmt::CreateGraph(CreateGraphStmt {
                 graph: RangeVar {
@@ -364,6 +599,9 @@ impl Parser<'_> {
                 },
                 location,
             }));
+        }
+        if unique {
+            return Err(self.err_here("UNIQUE requires INDEX or GRAPH INDEX"));
         }
         if self.eat_kw(Keyword::Workspace) {
             return Ok(Stmt::CreateWorkspace(self.create_workspace(location)?));
@@ -388,6 +626,38 @@ impl Parser<'_> {
 
     fn drop_stmt(&mut self) -> Result<Stmt, ParseError> {
         let location = self.expect_kw(Keyword::Drop)?.span;
+        if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="fulltext") {
+            self.advance();
+            self.expect_kw(Keyword::Graph)?;
+            self.expect_kw(Keyword::Index)?;
+            let name = self.col_id()?.0;
+            self.expect_kw(Keyword::On)?;
+            let graph = self.col_id()?.0;
+            return Ok(Stmt::GraphIndex(GraphIndexStmt {
+                graph,
+                name: Some(name),
+                action: GraphIndexAction::FulltextDrop,
+                location,
+            }));
+        }
+        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Graph))
+            && matches!(
+                self.tokens.get(self.at + 1).map(|t| &t.kind),
+                Some(TokenKind::Keyword(Keyword::Index))
+            )
+        {
+            self.advance();
+            self.advance();
+            let name = self.col_id()?.0;
+            self.expect_kw(Keyword::On)?;
+            let graph = self.col_id()?.0;
+            return Ok(Stmt::GraphIndex(GraphIndexStmt {
+                graph,
+                name: Some(name),
+                action: GraphIndexAction::Drop,
+                location,
+            }));
+        }
         if self.eat_kw(Keyword::User) {
             let (name, _) = self.name_text("主体名")?;
             let cascade = self.eat_kw(Keyword::Cascade);
@@ -445,6 +715,85 @@ impl Parser<'_> {
 
     fn alter_stmt(&mut self) -> Result<Stmt, ParseError> {
         let location = self.expect_kw(Keyword::Alter)?.span;
+        if matches!(&self.peek().kind,TokenKind::Ident(n) if n=="fulltext") {
+            self.advance();
+            self.expect_kw(Keyword::Graph)?;
+            self.expect_kw(Keyword::Index)?;
+            let name = self.col_id()?.0;
+            self.expect_kw(Keyword::On)?;
+            let graph = self.col_id()?.0;
+            let action = self.col_id()?.0;
+            if !["sync", "wait", "rebuild", "pause", "resume", "options"].contains(&action.as_str())
+            {
+                return Err(self.err_here(
+                    "full-text maintenance needs SYNC, WAIT, REBUILD, PAUSE, RESUME or OPTIONS",
+                ));
+            }
+            return Ok(Stmt::GraphIndex(GraphIndexStmt {
+                graph,
+                name: Some(name),
+                action: match action.as_str() {
+                    "sync" => GraphIndexAction::FulltextSync,
+                    "wait" => GraphIndexAction::FulltextWait {
+                        options: if matches!(&self.peek().kind, TokenKind::Ident(word) if word == "options")
+                        {
+                            self.advance();
+                            self.utf8_string()?
+                        } else {
+                            "{}".into()
+                        },
+                    },
+                    "rebuild" => GraphIndexAction::FulltextRebuild,
+                    "pause" => GraphIndexAction::FulltextPause,
+                    "resume" => GraphIndexAction::FulltextResume,
+                    "options" => GraphIndexAction::FulltextConfigure {
+                        options: self.utf8_string()?,
+                    },
+                    _ => unreachable!("validated action"),
+                },
+                location,
+            }));
+        }
+        if self.eat_kw(Keyword::Graph) {
+            if !self.eat_kw(Keyword::Index) {
+                let graph = self.col_id()?.0;
+                if matches!(&self.peek().kind, TokenKind::Ident(word) if word == "upgrade") {
+                    self.advance();
+                    self.expect_graph_word("storage")?;
+                    return Ok(Stmt::GraphIndex(GraphIndexStmt {
+                        graph,
+                        name: None,
+                        action: GraphIndexAction::UpgradeStorage,
+                        location,
+                    }));
+                }
+                self.expect_graph_word("rebuild")?;
+                let action = if matches!(&self.peek().kind, TokenKind::Ident(word) if word == "storage")
+                {
+                    self.advance();
+                    GraphIndexAction::RebuildStorage
+                } else {
+                    self.expect_graph_word("access")?;
+                    GraphIndexAction::RebuildAccess
+                };
+                return Ok(Stmt::GraphIndex(GraphIndexStmt {
+                    graph,
+                    name: None,
+                    action,
+                    location,
+                }));
+            }
+            let name = self.col_id()?.0;
+            self.expect_kw(Keyword::On)?;
+            let graph = self.col_id()?.0;
+            self.expect_graph_word("rebuild")?;
+            return Ok(Stmt::GraphIndex(GraphIndexStmt {
+                graph,
+                name: Some(name),
+                action: GraphIndexAction::Rebuild,
+                location,
+            }));
+        }
         if self.eat_kw(Keyword::Session) {
             return self.variable_set(location);
         }
@@ -573,9 +922,18 @@ impl Parser<'_> {
             self.expect_kw(Keyword::Template)?;
             let (name, _) = self.name_text("模板名")?;
             self.expect_kw(Keyword::From)?;
+            let from = self.work_ref()?;
+            let graph_data = if self.eat_kw(Keyword::With) {
+                self.expect_kw(Keyword::Graph)?;
+                self.expect_graph_word("data")?;
+                true
+            } else {
+                false
+            };
             AlterDatabaseAction::AddTemplate {
                 name: name.into_bytes(),
-                from: self.work_ref()?,
+                from,
+                graph_data,
             }
         } else if self.eat_kw(Keyword::Drop) {
             self.expect_kw(Keyword::Template)?;
@@ -1325,18 +1683,107 @@ impl Parser<'_> {
         Ok(left)
     }
 
-    /// 连接的一侧：`relation_expr`（`GRAPH_TABLE` 随图域接入——响亮拒绝）。
+    /// A relation, attachment function or explicitly typed graph row source.
     fn table_primary(&mut self) -> Result<FromItem, ParseError> {
         let t = self.peek().clone();
-        if let TokenKind::Ident(ref s) = t.kind {
-            if s == "graph_table" {
-                return Err(ParseError {
-                    message: "`GRAPH_TABLE` 随图域接入（本切片未实现）".to_owned(),
-                    span: t.span,
+        if matches!(&t.kind, TokenKind::Ident(name) if name == "graph_table")
+            && matches!(self.peek2().kind, TokenKind::Punct(Punct::LParen))
+        {
+            let (_, location) = self.col_id()?;
+            self.expect_punct(Punct::LParen)?;
+            let (graph, _) = self.col_id()?;
+            self.expect_punct(Punct::Comma)?;
+            let query = self.graph_table_argument()?;
+            let parameters = if matches!(&self.peek().kind, TokenKind::Ident(name) if name == "parameters")
+            {
+                self.advance();
+                Some(self.graph_table_argument()?)
+            } else {
+                None
+            };
+            let budgets = if matches!(&self.peek().kind, TokenKind::Ident(name) if name == "budgets")
+            {
+                self.advance();
+                Some(self.graph_table_argument()?)
+            } else {
+                None
+            };
+            self.expect_graph_word("columns")?;
+            self.expect_punct(Punct::LParen)?;
+            let mut columns = Vec::new();
+            loop {
+                let (colname, location) = self.col_id()?;
+                let type_name = self.type_name()?;
+                columns.push(ColumnDef {
+                    colname,
+                    type_name,
+                    is_not_null: false,
+                    location,
                 });
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
             }
+            self.expect_punct(Punct::RParen)?;
+            let end = self.expect_punct(Punct::RParen)?.span;
+            let alias =
+                if self.eat_kw(Keyword::As) || matches!(self.peek().kind, TokenKind::Ident(_)) {
+                    Some(Alias {
+                        aliasname: self.col_id()?.0,
+                    })
+                } else {
+                    None
+                };
+            return Ok(FromItem::GraphTable(Box::new(GraphTable {
+                graph,
+                query,
+                parameters,
+                budgets,
+                columns,
+                alias,
+                location: location.merge(end),
+            })));
+        }
+        if matches!(&t.kind, TokenKind::Ident(name) if name == "attachment_grep")
+            && matches!(self.peek2().kind, TokenKind::Punct(Punct::LParen))
+        {
+            let (name, location) = self.col_id()?;
+            self.expect_punct(Punct::LParen)?;
+            let mut args = Vec::new();
+            if !self.at_punct(Punct::RParen) {
+                loop {
+                    args.push(self.expr()?);
+                    if !self.eat_punct(Punct::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(Punct::RParen)?;
+            let alias =
+                if self.eat_kw(Keyword::As) || matches!(self.peek().kind, TokenKind::Ident(_)) {
+                    Some(Alias {
+                        aliasname: self.col_id()?.0,
+                    })
+                } else {
+                    None
+                };
+            return Ok(FromItem::RangeFunction(RangeFunction {
+                name,
+                args,
+                alias,
+                location,
+            }));
         }
         Ok(FromItem::RangeVar(self.relation_expr()?))
+    }
+
+    fn graph_table_argument(&mut self) -> Result<Expr, ParseError> {
+        if !matches!(self.peek().kind, TokenKind::Str(_) | TokenKind::Param(_)) {
+            return Err(
+                self.err_here("GRAPH_TABLE arguments must be text literals or named parameters")
+            );
+        }
+        self.primary()
     }
 
     /// `sort_by`（PG `SortBy` 的裁剪）：`a_expr [ASC|DESC]`。
@@ -1868,6 +2315,8 @@ fn punct_text(p: Punct) -> &'static str {
     match p {
         Punct::LParen => "(",
         Punct::RParen => ")",
+        Punct::LBracket => "[",
+        Punct::RBracket => "]",
         Punct::Comma => ",",
         Punct::Dot => ".",
         Punct::Semi => ";",

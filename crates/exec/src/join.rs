@@ -104,7 +104,7 @@ impl Operator for NestedLoop<'_> {
                         None => return Ok(None),
                         Some(o) => {
                             // 对外层行求值内表参数并装入参数表。
-                            let mut params = Vec::with_capacity(self.inner_params.len());
+                            let mut params = self.base_params.clone();
                             for e in &self.inner_params {
                                 params.push(expr::eval(e, &o, cx.params())?);
                             }
@@ -119,6 +119,7 @@ impl Operator for NestedLoop<'_> {
             match self.inner.next(cx)? {
                 Some(inner_row) => {
                     let combined = Self::combine(&outer, &inner_row);
+                    // 内表参数追加在语句参数之后；ON 和上层表达式仍用原参数位。
                     if let Some(qual) = &self.qual {
                         if !expr::eval_where(qual, &combined, cx.params())? {
                             self.current_outer = Some(outer);

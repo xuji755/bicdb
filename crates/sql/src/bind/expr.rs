@@ -97,6 +97,7 @@ pub fn kind_name(k: bicdb_exec::ColKind) -> &'static str {
         bicdb_exec::ColKind::Number => "NUMBER",
         bicdb_exec::ColKind::Bool => "BOOLEAN",
         bicdb_exec::ColKind::Bytes => "BYTES",
+        bicdb_exec::ColKind::GraphElement => "GRAPH_ELEMENT",
     }
 }
 

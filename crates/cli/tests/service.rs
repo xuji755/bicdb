@@ -88,6 +88,7 @@ fn lifecycle_start_status_stop_restart() {
     let (_, out, _) = run(&["status", "-p", &d]);
     assert!(out.contains("运行中"), "{out}");
     assert!(out.contains("服务模式"), "{out}");
+    assert!(out.contains("DB Cache 128 MiB"), "{out}");
 
     // 第二个 start 被拒（实例锁）。
     let (code, _out, err) = start(dir.path());
@@ -185,15 +186,27 @@ fn parameter_file_drives_the_service() {
     // 改文件：池 64 帧 + 等锁 7 ms。
     let text = std::fs::read_to_string(&conf).expect("读");
     let text = text
-        .replace("pool_frames = 256", "pool_frames = 64")
-        .replace("park_ms               = 50", "park_ms               = 7");
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("pool_frames ") {
+                "pool_frames = 64"
+            } else if line.trim_start().starts_with("park_ms ") {
+                "park_ms = 7"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     std::fs::write(&conf, text).expect("写");
 
     // `params` 应报"文件"来源与文件里的值。
     let (code, out, err) = run(&["params", "-p", &d]);
     assert_eq!(code, 0, "{out}{err}");
     assert!(
-        out.contains("buffer.pool_frames") && out.contains("64"),
+        out.lines()
+            .any(|line| line.contains("buffer.pool_frames") && line.contains("64")),
         "{out}"
     );
     assert!(out.contains("文件"), "{out}");

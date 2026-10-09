@@ -17,6 +17,14 @@ pub type Location = Span;
 /// 一条语句（PG 的 `RawStmt`；每个变体自带 `location`）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    /// `SHOW TABLES`: current-workspace metadata, including dictionary names.
+    ShowTables(Location),
+    /// List current-workspace named graphs.
+    ShowGraphs(Location),
+    /// Execute bounded Cypher on a native graph with JSON parameters.
+    Cypher(CypherStmt),
+    /// Graph property-index lifecycle (separate from table column indexes).
+    GraphIndex(GraphIndexStmt),
     /// `SELECT`（`SelectStmt`）。
     Select(SelectStmt),
     /// `INSERT`（`InsertStmt`）。
@@ -62,6 +70,9 @@ impl Stmt {
     #[must_use]
     pub fn location(&self) -> Location {
         match self {
+            Stmt::ShowTables(location) | Stmt::ShowGraphs(location) => *location,
+            Stmt::Cypher(s) => s.location,
+            Stmt::GraphIndex(s) => s.location,
             Stmt::Select(s) => s.location,
             Stmt::Insert(s) => s.location,
             Stmt::Update(s) => s.location,
@@ -394,6 +405,10 @@ pub struct SelectStmt {
 pub enum FromItem {
     /// 表引用。
     RangeVar(RangeVar),
+    /// Read-only table-valued function (currently attachment_grep).
+    RangeFunction(RangeFunction),
+    /// Typed, read-only rows from a workspace-local Cypher query.
+    GraphTable(Box<GraphTable>),
     /// 连接（`JoinExpr`；盒装以允许递归）。
     Join(Box<JoinExpr>),
 }
@@ -404,9 +419,43 @@ impl FromItem {
     pub fn location(&self) -> Location {
         match self {
             FromItem::RangeVar(r) => r.location,
+            FromItem::RangeFunction(r) => r.location,
+            FromItem::GraphTable(r) => r.location,
             FromItem::Join(j) => j.location,
         }
     }
+}
+
+/// Workspace-local graph query with an explicit, positional scalar schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphTable {
+    /// Named graph (no workspace/schema qualification).
+    pub graph: String,
+    /// UTF-8 Cypher literal or named SQL parameter.
+    pub query: Expr,
+    /// JSON object literal or named SQL parameter; omitted means `{}`.
+    pub parameters: Option<Expr>,
+    /// Optional JSON request budgets, literal or named SQL parameter.
+    pub budgets: Option<Expr>,
+    /// SQL column aliases and types, in Cypher RETURN order.
+    pub columns: Vec<ColumnDef>,
+    /// Optional relation alias.
+    pub alias: Option<Alias>,
+    /// Source location.
+    pub location: Location,
+}
+
+/// A non-lateral, read-only table-valued function in FROM.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeFunction {
+    /// Function name.
+    pub name: String,
+    /// Literal or named input arguments.
+    pub args: Vec<Expr>,
+    /// Optional relation alias.
+    pub alias: Option<Alias>,
+    /// Source location.
+    pub location: Location,
 }
 
 /// 表引用（PG `RangeVar` 的裁剪：无 catalog/schema/inh/relpersistence）。
@@ -892,6 +941,8 @@ pub enum AlterDatabaseAction {
         name: Vec<u8>,
         /// 源工作区。
         from: WorkRef,
+        /// Explicitly include committed graph entities; business tables remain empty.
+        graph_data: bool,
     },
     /// `DROP TEMPLATE '<名>'`（克隆是复制、不建依赖 ⇒ 无前置）。
     DropTemplate {
@@ -935,4 +986,109 @@ pub enum AlterWorkspaceAction {
     SetName(Vec<u8>),
     /// `SET QUOTA (…)`（`DefElem` 列表——与 `WITH` 选项同形）。
     SetQuota(Vec<DefElem>),
+}
+
+/// CYPHER graph 'query' [PARAMETERS 'JSON object'] [BUDGETS 'JSON object'].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CypherStmt {
+    /// Current-workspace graph name.
+    pub graph: String,
+    /// PROFILE runs a read-only query and reports actual index access counters.
+    pub profile: bool,
+    /// Cypher source text, independent of the SQL lexer.
+    pub query: String,
+    /// JSON object containing typed named Cypher parameters.
+    pub parameters: String,
+    /// Request budgets may only tighten workspace configuration.
+    pub budgets: String,
+    /// Source location.
+    pub location: Location,
+}
+
+/// Fixed source path for a graph full-text field.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphTextPathPart {
+    /// Object property name; quoted names retain case.
+    Key(String),
+    /// Fixed JSON array position.
+    Index(usize),
+}
+/// Graph-owned index lifecycle and full-text search.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphIndexAction {
+    /// Create a typed composite or label-only property tree.
+    Create {
+        /// Nodes or relationships.
+        entity: String,
+        /// Label/type restriction, or every entity.
+        label: Option<String>,
+        /// Property paths (JSON object subfields use dotted paths).
+        fields: Vec<Vec<String>>,
+        /// Enforce unique scalar, non-null tuples.
+        unique: bool,
+    },
+    /// Drop a graph-owned property tree.
+    Drop,
+    /// Atomically rebuild into a fresh tree.
+    Rebuild,
+    /// Rebuild the graph's protected node and directional adjacency trees.
+    RebuildAccess,
+    /// Atomically migrate legacy heap edges to native adjacency storage.
+    UpgradeStorage,
+    /// Rebuild native physical routes, retaining old snapshot generations.
+    RebuildStorage,
+    /// List graph-owned property indexes.
+    Show,
+    /// Create a native full-text index; explicit maintenance policy is validated at execution.
+    FulltextCreate {
+        /// Nodes or relationships.
+        entity: String,
+        /// Any matching label/type.
+        labels: Vec<String>,
+        /// Fixed JSON object/array paths.
+        fields: Vec<Vec<GraphTextPathPart>>,
+        /// JSON maintenance options.
+        options: String,
+    },
+    /// List graph-owned full-text indexes.
+    FulltextShow,
+    /// Search a named full-text index with explicit domain and consistency options.
+    FulltextSearch {
+        /// UTF-8 query text.
+        query: String,
+        /// JSON query options.
+        options: String,
+    },
+    /// Reconcile changed documents and append postings in a native transaction.
+    FulltextSync,
+    /// Drive bounded batches toward a frozen source watermark; return explicit status.
+    FulltextWait {
+        /// Optional target_source_seq and timeout_ms as JSON.
+        options: String,
+    },
+    /// Full reanalysis and fresh native segments, distinct from incremental SYNC.
+    FulltextRebuild,
+    /// Persistently pause a managed full-text consumer, retaining pending markers.
+    FulltextPause,
+    /// Resume a paused managed full-text consumer.
+    FulltextResume,
+    /// Replace only the maintenance policy without rebuilding documents or trees.
+    FulltextConfigure {
+        /// Complete JSON policy: explicit update mode and optional overrides.
+        options: String,
+    },
+    /// Drop the full-text index and its protected document store.
+    FulltextDrop,
+}
+/// Raw graph-index statement: object resolution and field validation are later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphIndexStmt {
+    /// Current-workspace graph name.
+    pub graph: String,
+    /// Index name (absent for SHOW).
+    pub name: Option<String>,
+    /// Requested lifecycle action.
+    pub action: GraphIndexAction,
+    /// Source location.
+    pub location: Location,
 }

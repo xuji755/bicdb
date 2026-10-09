@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod adjacency;
 pub mod heap;
 pub mod index;
 

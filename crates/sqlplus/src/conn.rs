@@ -213,6 +213,12 @@ impl Conn {
             Conn::Local(inst) => {
                 let seq = inst.seq();
                 let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+                session
+                    .set_fulltext_defaults(
+                        inst.params.run.fulltext_interval_ms,
+                        inst.params.run.fulltext_batch_rows,
+                    )
+                    .map_err(|e| ConnError::Sql(e.to_string()))?;
                 // **接上管理面**（DCL 的落点：注册表在 `<BICDB_HOME>/control/`）。
                 session.set_dcl_context(
                     bicdb_cli::home::Home::locate().ok().map(|h| h.root),

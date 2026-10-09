@@ -244,15 +244,38 @@ pub fn recover(
     io: &dyn FileIo,
     groups: &[OnlineGroup],
     start_lsn: Lsn,
-    chain: &bicdb_storage::undo::UndoChain<'_, '_>,
+    chain: &mut bicdb_storage::undo::UndoChain<'_, '_>,
     writer: &mut crate::group::GroupWriter<'_, '_>,
     resolver: &mut BlockResolver<'_>,
 ) -> Result<RecoveryReport, RecoveryError> {
     // ① 分析（纯日志流判定）。
     let analysis = crate::analysis::analyze_from(io, groups, start_lsn)?;
 
+    // Track every replay target, including winner data files. A recovery
+    // checkpoint must sync all replayed writes before recycling their WAL.
+    let touched = std::cell::RefCell::new(Vec::new());
+    let mut tracked_resolver = |rdba| {
+        let target = resolver(rdba);
+        if let Some((handle, _)) = target {
+            let mut handles = touched.borrow_mut();
+            if !handles.contains(&handle) {
+                handles.push(handle);
+            }
+        }
+        target
+    };
     // ② 重做。
-    let redo = redo_from(io, groups, start_lsn, resolver)?;
+    let redo = redo_from(io, groups, start_lsn, &mut tracked_resolver)?;
+    // Undo segment extent metadata is no-force too. Redo may have extended the
+    // segment beyond the mapping cached when it was opened before replay.
+    // Refresh before resolving loser records, and keep that mapping for the
+    // subsequent runtime writer; otherwise valid new pages look unmapped.
+    chain.segment_mut().refresh_after_replay()?;
+    chain.note_rewind();
+    writer.seed_commit_seq(
+        bicdb_common::seq::CommitSeq::from_raw(analysis.highest_commit_seq)
+            .expect("48-bit sequence"),
+    );
 
     // ③ 事务表修复：胜者补标记 + 输家槽扫描（**在重做之后**——事务表页已被
     //    重放到崩溃前状态；补标记本身是从日志可重导的幂等动作，不需 redo）。
@@ -278,7 +301,50 @@ pub fn recover(
     }
 
     // ③ 撤销：输家整链回滚（补偿生成 redo 并刷盘后才写页）。
-    let undo = crate::undo_phase::rollback_losers(io, writer, chain, &losers, resolver)?;
+    let mut safe_point = |writer: &mut crate::group::GroupWriter<'_, '_>| {
+        if matches!(
+            writer.switch_blocked(),
+            Some(crate::group::SwitchBlocked::AwaitingCheckpoint)
+        ) {
+            let end = writer.appended_lsn();
+            writer.flush(end)?;
+            for &handle in touched.borrow().iter() {
+                io.sync_all(handle)?;
+            }
+            chain.segment().sync()?;
+            let current = writer.commit_watermark();
+            crate::checkpoint::publish_checkpoint(
+                writer,
+                bicdb_storage::controlfile::CheckpointProgress {
+                    checkpoint_commit_seq: current,
+                    checkpoint_lsn: end,
+                    current_commit_seq: current,
+                    oldest_snapshot_commit_seq: bicdb_common::seq::CommitSeq::from_raw(0)
+                        .expect("zero"),
+                    timestamp: 0,
+                },
+            )
+            .map_err(crate::undo_phase::UndoPhaseError::Checkpoint)?;
+        }
+        Ok(())
+    };
+    let undo = crate::undo_phase::rollback_losers_with_checkpoints(
+        io,
+        writer,
+        chain,
+        &losers,
+        &mut tracked_resolver,
+        &mut safe_point,
+    )?;
+
+    // Recovery writes bypass the new runtime buffer pool. Sync its remaining
+    // file writes before returning: a later runtime checkpoint cannot discover
+    // those dirty OS pages through pool.flush_workspace, and may recycle redo.
+    writer.flush(writer.appended_lsn())?;
+    for &handle in touched.borrow().iter() {
+        io.sync_all(handle)?;
+    }
+    chain.segment().sync()?;
 
     Ok(RecoveryReport {
         start_lsn,
@@ -736,7 +802,7 @@ mod recover_tests {
             3 => Some((data, r.block_id())),
             _ => None,
         };
-        let report = recover(&io, &groups, lsn(0), &chain, &mut writer, &mut resolve).unwrap();
+        let report = recover(&io, &groups, lsn(0), &mut chain, &mut writer, &mut resolve).unwrap();
 
         // ① 分析：胜者带序号、输家 = 全零 txn（第一个事务）。
         assert_eq!(report.analysis.committed(), vec![(winner_raw, 7)]);
@@ -778,7 +844,7 @@ mod recover_tests {
 
         // ---- 重跑恢复：幂等（无输家、重做全跳过） ----
         let groups2 = online_groups(&io, &cf_ro, Path::new(WAL), spec).unwrap();
-        let again = recover(&io, &groups2, lsn(0), &chain, &mut writer, &mut resolve).unwrap();
+        let again = recover(&io, &groups2, lsn(0), &mut chain, &mut writer, &mut resolve).unwrap();
         assert_eq!(again.undo.txns_rolled_back, 0, "已回滚的不再回滚");
         assert_eq!(again.redo.applied_blocks, 0, "重做全跳过");
         let page2 = pagefile::read_page_verified(&io, data, 0).unwrap();

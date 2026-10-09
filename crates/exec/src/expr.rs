@@ -347,6 +347,7 @@ pub fn compare_values(a: &Value, b: &Value) -> Result<Option<std::cmp::Ordering>
         (Value::Number(x), Value::Number(y)) => Ok(Some(x.cmp(y))),
         (Value::Bool(x), Value::Bool(y)) => Ok(Some(x.cmp(y))),
         (Value::Bytes(x), Value::Bytes(y)) => Ok(Some(x.as_slice().cmp(y.as_slice()))),
+        (Value::GraphElement(x), Value::GraphElement(y)) => Ok(Some(x.cmp(y))),
         (x, y) => Err(ExecError::TypeMismatch {
             expected: x.type_name(),
             got: y.type_name(),

@@ -18,3 +18,4 @@ pub mod lock;
 pub mod proto;
 pub mod provision;
 pub mod service;
+pub mod templates;

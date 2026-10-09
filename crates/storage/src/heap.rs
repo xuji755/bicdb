@@ -135,7 +135,7 @@ pub fn slot_index(row_no: u16) -> Option<usize> {
 
 fn require_data_page(page: &Page) -> Result<PageType, HeapError> {
     let header = page.header().ok_or(HeapError::NotADataPage)?;
-    if !header.page_type.uses_slot_directory() {
+    if !header.page_type.uses_slot_directory() || header.page_type == PageType::Adjacency {
         return Err(HeapError::NotADataPage);
     }
     if !page.is_initialized() {
@@ -197,11 +197,10 @@ fn find_free_slot(page: &Page) -> Option<usize> {
     })
 }
 
-/// **迁移到同页是否可行**（§6.2）：把 `row_no` 的旧行**收缩为 6B 转发指针**
-/// 后腾出的空间能否再放下 `new_len` 字节的新行（PCTFREE 与槽位目录照常记账；
-/// 旧槽位被转发指针复用，新行另占一个槽）。
+/// **迁移到同页是否可行**（§6.2）：新行必须能先插入当前连续空闲区。
 ///
-/// 迁移 = 旧行（`old_len` 字节）→ 6B 指针：净增 `new_len + slot − (old_len − 6)`。
+/// 旧行之后在原偏移改为 6B 指针，但旧字节不立即回收（回滚要在原位还原）；
+/// 未执行受 WAL 保护的 defrag 前，不得把旧行长度算成可插入的空间。
 #[must_use]
 pub fn can_migrate_in_page(
     page: &Page,
@@ -209,27 +208,12 @@ pub fn can_migrate_in_page(
     new_len: usize,
     policy: &InsertPolicy,
 ) -> bool {
-    let Ok(index) = slot_index(row_no).ok_or(HeapError::NoSuchRow) else {
-        return false;
-    };
-    let Some(entry) = page.slot(index) else {
-        return false;
-    };
-    if entry.status() == SlotStatus::Free {
-        return false;
-    }
-    let old_len = match entry.status() {
-        SlotStatus::Forwarding => crate::rowid::ROWID_LEN,
-        _ => match row(page, row_no) {
-            Some(r) => r.len(),
-            None => return false,
-        },
-    };
-    let freed = old_len.saturating_sub(crate::rowid::ROWID_LEN);
-    let need = new_len + slot_cost(page, policy);
-    require_data_page(page).is_ok()
-        && page.free_space() + freed >= need + policy.reserved_bytes()
-        && has_slot_room(page, policy)
+    row(page, row_no).is_some()
+        && can_insert(
+            page,
+            new_len.saturating_add(crate::page::ITL_ENTRY_LEN),
+            policy,
+        )
 }
 
 /// **把行迁移出去：原槽位改为转发指针**（§6.2——行体只放 6B 新 ROWID，
@@ -343,6 +327,9 @@ pub fn insert_record(
 /// 垃圾行）。跟随指针取真实行属行迁移切片；此处如实返回 `None`。
 #[must_use]
 pub fn row(page: &Page, row_no: u16) -> Option<&[u8]> {
+    if page.header().map(|h| h.page_type) == Some(PageType::Adjacency) {
+        return None;
+    }
     let index = slot_index(row_no)?;
     let slot = page.slot(index)?;
     if matches!(slot.status(), SlotStatus::Free | SlotStatus::Forwarding) {

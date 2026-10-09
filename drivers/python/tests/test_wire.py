@@ -79,6 +79,32 @@ def read_auth(payload: bytes) -> tuple[str, str]:
 
 
 class FrozenExample(unittest.TestCase):
+    def test_malformed_frame_lengths_match_rust(self):
+        import socket
+        for length in (b"", b"-1", b"-0", b"+1", b"1_0", b"67108865"):
+            with self.subTest(length=length):
+                a, b = socket.socketpair()
+                try:
+                    a.sendall(b"OK\n" + length + b"\n")
+                    a.close()
+                    with self.assertRaises(wire.ProtocolError):
+                        wire.read_frame(b)
+                finally:
+                    a.close()
+                    b.close()
+
+    def test_oversized_write_leaves_the_connection_frame_aligned(self):
+        import socket
+        a, b = socket.socketpair()
+        try:
+            with self.assertRaises(wire.ProtocolError):
+                wire.write_frame(a, "SQL", bytes(wire.MAX_FRAME + 1))
+            wire.write_frame(a, "SQL", b"ok")
+            self.assertEqual(wire.read_frame(b), ("SQL", b"ok"))
+        finally:
+            a.close()
+            b.close()
+
     def test_request_payload_matches_the_frozen_example(self):
         got = wire.encode_sql("SELECT id, name FROM t WHERE id = :id;", [("id", wire.Value("n", "7"))])
         self.assertEqual(len(got), 60, got)
@@ -167,10 +193,16 @@ class Framing(unittest.TestCase):
             wire.Value("o", "1"),
             wire.Value("b", ""),
             wire.Value("b", b"\x00\xff\n".hex()),
+            wire.Value("g", "42:n:7"),
         ]
         for v in cases:
             got = wire.Reader(wire.encode_cell(v)).cell()
             self.assertEqual(got, v)
+
+    def test_graph_element_payload_is_strict(self):
+        self.assertEqual(wire.Value("g", "42:e:9").as_graph_element(), (42, "e", 9))
+        self.assertIsNone(wire.Value("g", "42:x:9").as_graph_element())
+        self.assertIsNone(wire.Value("g", "broken").as_graph_element())
 
 
 class PythonValues(unittest.TestCase):

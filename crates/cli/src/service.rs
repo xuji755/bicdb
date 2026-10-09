@@ -22,12 +22,14 @@
 //! 停止走套接字请求，服务自己收尾。被 `kill -9` 打死属于"崩溃"，
 //! 下次打开由三阶段恢复兜底（这条路径有 e2e 用例）。
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use bicdb_sql::session::Session;
+use bicdb_sql::session::{FulltextScheduler, Session, SessionState};
 
 use bicdb_net::client::{call_once, ClientError};
 use bicdb_net::{frame, AuthOk, AuthRequest, Hello, SqlRequest, WIRE_VERSION};
@@ -35,6 +37,165 @@ use bicdb_net::{frame, AuthOk, AuthRequest, Hello, SqlRequest, WIRE_VERSION};
 use crate::boot::open_unlocked_with;
 use crate::lock::{self, InstanceLock, LockError, LockInfo, LockMode};
 use crate::proto;
+
+enum ServiceEvent {
+    Request {
+        id: u64,
+        verb: String,
+        payload: Vec<u8>,
+        reply: mpsc::SyncSender<WireReply>,
+    },
+    Closed(u64),
+}
+
+struct WireReply {
+    status: &'static str,
+    payload: Vec<u8>,
+    close: bool,
+}
+
+impl WireReply {
+    fn ok(payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status: "OK",
+            payload: payload.into(),
+            close: false,
+        }
+    }
+    fn error(payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status: "ERR",
+            payload: payload.into(),
+            close: false,
+        }
+    }
+}
+
+struct ConnectionSession {
+    state: SessionState,
+    sql_served: bool,
+    authed: Option<String>,
+    auth_failed: bool,
+}
+
+fn serve_connection(
+    id: u64,
+    mut stream: std::os::unix::net::UnixStream,
+    events: mpsc::Sender<ServiceEvent>,
+) {
+    while let Ok((verb, payload)) = frame::read_frame_bytes(&mut stream) {
+        let (reply, receive) = mpsc::sync_channel(0);
+        if events
+            .send(ServiceEvent::Request {
+                id,
+                verb,
+                payload,
+                reply,
+            })
+            .is_err()
+        {
+            break;
+        }
+        let Ok(response) = receive.recv() else {
+            break;
+        };
+        if frame::write_frame_bytes(&mut stream, response.status, &response.payload).is_err()
+            || response.close
+        {
+            break;
+        }
+    }
+    let _ = events.send(ServiceEvent::Closed(id));
+}
+
+struct PublicAuthenticator {
+    public_root: PathBuf,
+    private_root: PathBuf,
+    home: PathBuf,
+    io: &'static dyn bicdb_workspace::io::FileIo,
+}
+impl bicdb_sql::auth::PrivateAuthProvider for PublicAuthenticator {
+    fn authenticate_private(
+        &self,
+        name: &str,
+        password: &str,
+        workspace: [u8; 8],
+    ) -> Result<bicdb_sql::auth::PrivateLogin, String> {
+        let socket = bicdb_net::socket_for(Some(&self.public_root)).map_err(|e| e.to_string())?;
+        let mut last = String::new();
+        for attempt in 0..50 {
+            let mut public =
+                match bicdb_net::Client::connect_with_timeout(&socket, Duration::from_secs(5)) {
+                    Ok(client) => client,
+                    Err(ClientError::Busy) if attempt < 49 => {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    Err(e) => {
+                        last = e.to_string();
+                        break;
+                    }
+                };
+            public
+                .set_timeout(Duration::from_secs(30))
+                .map_err(|e| e.to_string())?;
+            if Path::new(&public.hello().instance)
+                .canonicalize()
+                .map_err(|e| e.to_string())?
+                != self.public_root.canonicalize().map_err(|e| e.to_string())?
+            {
+                return Err("认证失败：PUBLIC 服务路径不匹配".into());
+            }
+            let identity = public.auth(name, password).map_err(|e| e.to_string())?;
+            if identity.expired {
+                return Err("口令已过期，须先在 PUBLIC 修改口令".into());
+            }
+            let paths =
+                bicdb_sql::dcl_exec::DclContext::new(self.home.clone(), self.io).global_ctl_paths();
+            let registry =
+                bicdb_storage::globalctl::GlobalControlFile::open(self.io, &paths[0], &paths[1])
+                    .map_err(|e| e.to_string())?;
+            let root = self
+                .private_root
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let entry = registry
+                .workspaces()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|entry| {
+                    std::str::from_utf8(&entry.root)
+                        .ok()
+                        .and_then(|r| Path::new(r).canonicalize().ok())
+                        .as_ref()
+                        == Some(&root)
+                })
+                .ok_or("认证失败：工作区未注册")?;
+            let selection = entry.workspace_id.as_raw().to_string();
+            let route = public
+                .route_owned(Some(&selection))
+                .map_err(|e| e.to_string())?;
+            if identity.user_id != route.user_id
+                || route.workspace_id.to_string() != selection
+                || Path::new(&route.root)
+                    .canonicalize()
+                    .map_err(|e| e.to_string())?
+                    != self
+                        .private_root
+                        .canonicalize()
+                        .map_err(|e| e.to_string())?
+            {
+                return Err("认证失败：不能连接其他用户的工作区".into());
+            }
+            return Ok(bicdb_sql::auth::PrivateLogin {
+                user_id: identity.user_id,
+                name: identity.user,
+                workspace,
+            });
+        }
+        Err(format!("PUBLIC 认证服务不可用：{last}"))
+    }
+}
 
 /// 服务错误。
 #[derive(Debug)]
@@ -235,205 +396,387 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
         let _ = std::fs::remove_file(&opts.socket);
     }
     let listener = std::os::unix::net::UnixListener::bind(&opts.socket)?;
+    listener.set_nonblocking(true)?;
     log.line(&format!("控制套接字已就绪：{}", opts.socket.display()));
     log.line("READY");
 
+    let private_auth = crate::home::Home::locate()
+        .ok()
+        .map(|home| PublicAuthenticator {
+            public_root: home.public_dir(),
+            private_root: opts.dir.clone(),
+            home: home.root,
+            io: inst.io,
+        });
     let mut served: u64 = 0;
+    let mut sql_elapsed_us: u128 = 0;
     let started = Instant::now();
-    let mut stop_after: Option<StopMode> = None;
-    'accept: for conn in listener.incoming() {
-        let mut s = match conn {
-            Ok(s) => s,
-            Err(e) => {
-                log.line(&format!("接受连接失败：{e}"));
+    let mut fulltext = FulltextScheduler::new(
+        params.run.fulltext_interval_ms,
+        params.run.fulltext_batch_rows,
+    )
+    .map_err(|e| ServiceError::State(e.to_string()))?;
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut connections = BTreeMap::<u64, ConnectionSession>::new();
+    let mut next_connection = 1u64;
+    let stop_after = 'service: loop {
+        loop {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    log.line(&format!("接受连接失败：{error}"));
+                    break;
+                }
+            };
+            if connections.len() >= params.run.max_connections {
+                let mut stream = stream;
+                let _ = frame::write_frame_bytes(
+                    &mut stream,
+                    "ERR",
+                    format!(
+                        "实例正忙：活动连接已达到服务上限 {}",
+                        params.run.max_connections
+                    )
+                    .as_bytes(),
+                );
                 continue;
             }
+            let id = next_connection;
+            next_connection = next_connection
+                .checked_add(1)
+                .ok_or_else(|| ServiceError::State("服务连接号耗尽".into()))?;
+            connections.insert(
+                id,
+                ConnectionSession {
+                    state: SessionState::new(inst.seq()),
+                    sql_served: false,
+                    authed: None,
+                    auth_failed: false,
+                },
+            );
+            let events = event_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("bicdb-client-{id}"))
+                .spawn(move || serve_connection(id, stream, events))
+                .map_err(ServiceError::Io)?;
+        }
+
+        let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !connections
+                    .values()
+                    .any(|connection| connection.state.in_transaction())
+                {
+                    let seq = inst.seq();
+                    let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+                    session
+                        .set_fulltext_defaults(
+                            params.run.fulltext_interval_ms,
+                            params.run.fulltext_batch_rows,
+                        )
+                        .map_err(|e| ServiceError::State(e.to_string()))?;
+                    session
+                        .set_graph_limits(params.run.graph_limits())
+                        .map_err(|e| ServiceError::State(e.to_string()))?;
+                    maintain_fulltext(&mut session, &mut fulltext, &mut log);
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ServiceError::State("服务连接调度器意外关闭".into()));
+            }
         };
-        // **一个连接 = 一个会话**：事务（`BEGIN … COMMIT`）跨该连接的语句保持
-        // ——SQL*Plus 一句一发，事务语义必须绑在连接上，不能绑在单条语句上。
-        let seq = inst.seq();
-        let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
-        // **接上管理面**（DCL 的落点：`BICDB_HOME` 的注册表 + 实例 I/O）。
-        session.set_dcl_context(
-            crate::home::Home::locate().ok().map(|h| h.root),
-            Some(inst.io),
-        );
-        session.set_workspace_provisioner(Some(provisioner_static()));
-        session.set_pbkdf2_iterations(inst.params.run.pbkdf2_iterations);
-        // **固定表的内容源**（`file$` ← 控制文件的内存映像）。
-        session.set_fixed_table_source(Some(crate::fixed::CliFixedTables::new_static(
-            &opts.dir, inst.io,
-        )));
-        // **连接态**：`AUTH` 只认"第一个业务请求"这一条（见下）；
-        // `authed` 只用于自述与诊断，**资格判据在会话里**（身份是会话的属性）。
-        let mut sql_served = false;
-        let mut authed: Option<String> = None;
-        // **帧载荷按字节读**（`bicdb-net` 的读满纪律）：SQL 里可以有换行，
-        // 结果里可以有非 UTF-8 的字节串——按行读会在第一行就断错。
-        while let Ok((verb, payload)) = frame::read_frame_bytes(&mut s) {
-            // **正忙时把第二条连接明确挡回去**（尽力而为：只在"对方已经连上
-            // 并在等"时能看见它）。本版服务一次只服务一条连接（实例是单写者，
-            // 会话又借住实例），不挡的话第二条连接会被内核排进 backlog
-            // **无声干等**——那比"具名拒绝"糟得多。
-            reject_pending(&listener);
-            match verb.as_str() {
-                "HELLO" => {
-                    let hello = Hello {
-                        wire: WIRE_VERSION,
-                        version: env!("CARGO_PKG_VERSION").to_owned(),
-                        instance: opts.dir.display().to_string(),
-                    };
-                    let _ = frame::write_frame_bytes(&mut s, "OK", hello.encode().as_bytes());
+        match event {
+            ServiceEvent::Closed(id) => {
+                if let Some(mut connection) = connections.remove(&id) {
+                    let seq = inst.seq();
+                    let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+                    session.resume_state(&mut connection.state);
+                    drop(session); // rollback this connection's uncommitted transaction
                 }
-                "STATUS" => {
-                    let body = format!(
-                        "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\nidentity={}\n",
-                        opts.dir.display(),
-                        env!("CARGO_PKG_VERSION"),
-                        std::process::id(),
-                        started.elapsed().as_secs(),
-                        session.seq(),
-                        WIRE_VERSION,
-                        // 谁在连：管理面（本机/OS）还是某个认证过的主体。
-                        authed.as_deref().unwrap_or("管理面（本机/OS 身份）")
+            }
+            ServiceEvent::Request {
+                id,
+                verb,
+                payload,
+                reply,
+            } => {
+                let connection_count = connections.len();
+                let Some(connection) = connections.get_mut(&id) else {
+                    let _ = reply.send(WireReply::error(b"connection is closed".to_vec()));
+                    continue;
+                };
+                let seq = inst.seq();
+                connection.state.refresh_committed(seq);
+                let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+                session.resume_state(&mut connection.state);
+                session
+                    .set_fulltext_defaults(
+                        params.run.fulltext_interval_ms,
+                        params.run.fulltext_batch_rows,
+                    )
+                    .map_err(|e| ServiceError::State(e.to_string()))?;
+                session
+                    .set_graph_limits(params.run.graph_limits())
+                    .map_err(|e| ServiceError::State(e.to_string()))?;
+                session.set_dcl_context(
+                    crate::home::Home::locate().ok().map(|h| h.root),
+                    Some(inst.io),
+                );
+                session.set_workspace_provisioner(Some(provisioner_static()));
+                session.set_pbkdf2_iterations(inst.params.run.pbkdf2_iterations);
+                if !session.on_public_workspace() {
+                    session.set_private_authenticator(
+                        private_auth
+                            .as_ref()
+                            .map(|provider| provider as &dyn bicdb_sql::auth::PrivateAuthProvider),
                     );
-                    let _ = frame::write_frame_bytes(&mut s, "OK", body.as_bytes());
                 }
-                "AUTH" => {
-                    // **AUTH 必须是本连接上的第一个业务请求**：先跑过 SQL/DESCRIBE
-                    // 的连接再"变成"某个主体，等于"先以管理面身份做事、再冒名"。
-                    if sql_served {
-                        let _ = frame::write_frame_bytes(
-                            &mut s,
-                            "ERR",
-                            "AUTH 必须是本连接上的第一个业务请求（本连接已执行过语句）\
-                             ——重连再认证"
-                                .as_bytes(),
-                        );
-                        continue;
+                session.set_fixed_table_source(Some(crate::fixed::CliFixedTables::new_static(
+                    &opts.dir, inst.io,
+                )));
+
+                let mut requested_stop = None;
+                let response = match verb.as_str() {
+                    "HELLO" => WireReply::ok(
+                        Hello {
+                            wire: WIRE_VERSION,
+                            version: env!("CARGO_PKG_VERSION").to_owned(),
+                            instance: opts.dir.display().to_string(),
+                        }
+                        .encode()
+                        .into_bytes(),
+                    ),
+                    "STATUS" => {
+                        let cache = inst.pool.stats();
+                        WireReply::ok(format!(
+                            "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\nconnections={connection_count}\nmax_connections={}\nworkspace_kind={}\nidentity={}\ncache_frames={}\ncache_bytes={}\ncache_resident={}\ncache_hits={}\ncache_misses={}\ncache_evictions={}\ncache_writes={}\ncache_dirty_pages={}\ncache_free_buffer_waits={}\ncache_wal_syncs={}\ncache_run_reads={}\ncache_run_pages={}\ngraph_detach_edge_limit={}\ngraph_max_nodes={}\ngraph_max_edges={}\ngraph_max_rows={}\ngraph_max_expansions={}\ngraph_max_edge_expansions={}\ngraph_max_elapsed_ms={}\ngraph_max_depth={}\ngraph_max_text_bytes={}\nsql_elapsed_us={sql_elapsed_us}\n",
+                            opts.dir.display(), env!("CARGO_PKG_VERSION"), std::process::id(),
+                            started.elapsed().as_secs(), session.seq(), WIRE_VERSION,
+                            params.run.max_connections,
+                            if session.on_public_workspace() { "public" } else { "private" },
+                            connection.authed.as_deref().unwrap_or("管理面（本机/OS 身份）"),
+                            inst.pool.capacity() * inst.pool.partition_count(),
+                            inst.pool.capacity() * inst.pool.partition_count() * bicdb_storage::page::PAGE_SIZE,
+                            inst.pool.resident(), cache.hits, cache.misses, cache.evictions,
+                            cache.writes, inst.pool.dirty_len(inst.ws_ref), cache.fb_wait,
+                            cache.wal_syncs, cache.run_reads, cache.run_pages,
+                            params.run.graph_detach_edge_limit, params.run.graph_max_nodes,
+                            params.run.graph_max_edges, params.run.graph_max_rows,
+                            params.run.graph_max_expansions, params.run.graph_max_edge_expansions,
+                            params.run.graph_max_elapsed_ms, params.run.graph_max_depth,
+                            params.run.graph_max_text_bytes,
+                        ).into_bytes())
                     }
-                    let req = match AuthRequest::decode(&payload) {
-                        Ok(r) => r,
-                        // **不回报载荷内容**（它可能含口令）。
-                        Err(e) => {
-                            log.line(&format!("AUTH 载荷非法：{e}"));
-                            let _ = frame::write_frame_bytes(
-                                &mut s,
-                                "ERR",
-                                format!("AUTH 载荷非法：{e}（内容不回报——可能含口令）").as_bytes(),
+                    "AUTH" => {
+                        if connection.sql_served {
+                            WireReply::error("AUTH 必须是本连接上的第一个业务请求（本连接已执行过语句）——重连再认证".as_bytes().to_vec())
+                        } else {
+                            match AuthRequest::decode(&payload) {
+                                Err(error) => {
+                                    connection.auth_failed = true;
+                                    log.line(&format!("AUTH 载荷非法：{error}"));
+                                    WireReply::error(
+                                        format!("AUTH 载荷非法：{error}（内容不回报——可能含口令）")
+                                            .into_bytes(),
+                                    )
+                                }
+                                Ok(request) => {
+                                    match session.authenticate(&request.user, &request.password) {
+                                        Ok(identity) => {
+                                            log.line(&format!("认证成功：{}", identity.describe()));
+                                            connection.authed = Some(identity.name().to_owned());
+                                            connection.auth_failed = false;
+                                            WireReply::ok(
+                                                AuthOk {
+                                                    user: identity.name().to_owned(),
+                                                    user_id: identity.user_id(),
+                                                    expired: identity.is_expired(),
+                                                }
+                                                .encode()
+                                                .into_bytes(),
+                                            )
+                                        }
+                                        Err(error) => {
+                                            connection.auth_failed = true;
+                                            log.line(&format!(
+                                                "认证失败：主体 `{}`（口令不记录）——{error}",
+                                                request.user
+                                            ));
+                                            WireReply::error(error.to_string().into_bytes())
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "ROUTE" => {
+                        if connection.auth_failed {
+                            WireReply::error("认证失败的连接不能路由工作区".as_bytes().to_vec())
+                        } else {
+                            let result = std::str::from_utf8(&payload)
+                                .map_err(|_| "ROUTE 请求必须是 UTF-8".to_owned())
+                                .and_then(|selection| {
+                                    session
+                                        .route_owned_workspace(if selection.is_empty() {
+                                            None
+                                        } else {
+                                            Some(selection)
+                                        })
+                                        .map_err(|error| error.to_string())
+                                });
+                            match result {
+                                Ok((user_id, workspace_id, name, root)) => WireReply::ok(
+                                    bicdb_net::message::OwnedWorkspace {
+                                        user_id,
+                                        workspace_id,
+                                        name,
+                                        root,
+                                    }
+                                    .encode()
+                                    .into_bytes(),
+                                ),
+                                Err(error) => WireReply::error(error.into_bytes()),
+                            }
+                        }
+                    }
+                    "SQL" => {
+                        if connection.auth_failed {
+                            WireReply::error(
+                                "认证失败的连接不能执行语句；请重新认证或重连"
+                                    .as_bytes()
+                                    .to_vec(),
+                            )
+                        } else {
+                            served += 1;
+                            connection.sql_served = true;
+                            match SqlRequest::decode(&payload) {
+                                Err(error) => {
+                                    log.line(&format!("请求载荷非法：{error}"));
+                                    WireReply::error(format!("请求载荷非法：{error}").into_bytes())
+                                }
+                                Ok(request) => {
+                                    let named = proto::engine_params(&request.params);
+                                    let named_ref: Vec<(&str, bicdb_exec::Value)> = named
+                                        .iter()
+                                        .map(|(name, value)| (name.as_str(), value.clone()))
+                                        .collect();
+                                    let executing = Instant::now();
+                                    let result =
+                                        session.execute_with_params(&request.sql, &named_ref);
+                                    sql_elapsed_us += executing.elapsed().as_micros();
+                                    match result {
+                                        Ok(results) => {
+                                            WireReply::ok(bicdb_net::message::encode_statements(
+                                                &proto::statements(&results),
+                                            ))
+                                        }
+                                        Err(error) => {
+                                            log.line(&format!("语句失败：{error}"));
+                                            WireReply::error(error.to_string().into_bytes())
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "DESCRIBE" => {
+                        if connection.auth_failed {
+                            WireReply::error(
+                                "认证失败的连接不能执行语句；请重新认证或重连"
+                                    .as_bytes()
+                                    .to_vec(),
+                            )
+                        } else {
+                            connection.sql_served = true;
+                            let name = String::from_utf8_lossy(&payload).trim().to_owned();
+                            match session.describe_columns(&name) {
+                                Ok(columns) => {
+                                    let rows: Vec<bicdb_net::Column> = columns
+                                        .into_iter()
+                                        .map(|(name, nullable, type_code, length)| {
+                                            bicdb_net::Column {
+                                                name,
+                                                kind: proto::kind_char(bicdb_sql::plan::kind_of(
+                                                    type_code,
+                                                )),
+                                                nullable,
+                                                type_code,
+                                                length,
+                                                type_name: type_name(type_code, length),
+                                            }
+                                        })
+                                        .collect();
+                                    WireReply::ok(bicdb_net::message::encode_columns(&rows))
+                                }
+                                Err(error) => WireReply::error(error.to_string().into_bytes()),
+                            }
+                        }
+                    }
+                    "SHUTDOWN" => {
+                        if connection.auth_failed || !session.is_management_identity() {
+                            WireReply::error("停止服务需要本机管理面身份".as_bytes().to_vec())
+                        } else {
+                            let mode = StopMode::parse(String::from_utf8_lossy(&payload).trim())
+                                .unwrap_or(StopMode::Fast);
+                            requested_stop = Some(mode);
+                            log.line(&format!("收到停止请求（{}）", mode.as_str()));
+                            let mut response = WireReply::ok(
+                                format!("shutting down（{}）", mode.as_str()).into_bytes(),
                             );
-                            continue;
-                        }
-                    };
-                    match session.authenticate(&req.user, &req.password) {
-                        Ok(id) => {
-                            // **口令与散列不进日志**（只记主体与结果）。
-                            log.line(&format!("认证成功：{}", id.describe()));
-                            authed = Some(id.name().to_owned());
-                            let ok = AuthOk {
-                                user: id.name().to_owned(),
-                                user_id: id.user_id(),
-                                expired: id.is_expired(),
-                            };
-                            let _ = frame::write_frame_bytes(&mut s, "OK", ok.encode().as_bytes());
-                        }
-                        Err(e) => {
-                            // 失败只记**主体名与结果**（诊断用）；口令不记录。
-                            log.line(&format!("认证失败：主体 `{}`（口令不记录）——{e}", req.user));
-                            let _ =
-                                frame::write_frame_bytes(&mut s, "ERR", e.to_string().as_bytes());
+                            response.close = true;
+                            response
                         }
                     }
+                    other => WireReply::error(format!("未知动词 `{other}`").into_bytes()),
+                };
+                session.suspend_state(&mut connection.state);
+                drop(session);
+                let _ = reply.send(response);
+                if let Some(mode) = requested_stop {
+                    break 'service mode;
                 }
-                "SQL" => {
-                    served += 1;
-                    sql_served = true;
-                    let req = match SqlRequest::decode(&payload) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            log.line(&format!("请求载荷非法：{e}"));
-                            let _ = frame::write_frame_bytes(
-                                &mut s,
-                                "ERR",
-                                format!("请求载荷非法：{e}").as_bytes(),
-                            );
-                            continue;
-                        }
-                    };
-                    let named = proto::engine_params(&req.params);
-                    let named_ref: Vec<(&str, bicdb_exec::Value)> =
-                        named.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
-                    match session.execute_with_params(&req.sql, &named_ref) {
-                        Ok(results) => {
-                            let body =
-                                bicdb_net::message::encode_statements(&proto::statements(&results));
-                            let _ = frame::write_frame_bytes(&mut s, "OK", &body);
-                        }
-                        Err(e) => {
-                            log.line(&format!("语句失败：{e}"));
-                            let _ =
-                                frame::write_frame_bytes(&mut s, "ERR", e.to_string().as_bytes());
-                        }
-                    }
-                }
-                "DESCRIBE" => {
-                    sql_served = true;
-                    // **走会话**（它的目录借用）：不动事务状态——`DESC` 在
-                    // 显式事务里也该能用，不能为此把会话丢了（那会回滚事务）。
-                    let name = String::from_utf8_lossy(&payload).trim().to_owned();
-                    match session.describe_columns(&name) {
-                        Ok(cols) => {
-                            let rows: Vec<bicdb_net::Column> = cols
-                                .into_iter()
-                                .map(|(n, nul, code, len)| bicdb_net::Column {
-                                    name: n,
-                                    // 形态由类型码定（与结果集同一份口径：
-                                    // 驱动拿到 `desc` 就知道该把列转成什么）。
-                                    kind: proto::kind_char(bicdb_sql::plan::kind_of(code)),
-                                    nullable: nul,
-                                    type_code: code,
-                                    length: len,
-                                    type_name: type_name(code, len),
-                                })
-                                .collect();
-                            let body = bicdb_net::message::encode_columns(&rows);
-                            let _ = frame::write_frame_bytes(&mut s, "OK", &body);
-                        }
-                        Err(e) => {
-                            let _ =
-                                frame::write_frame_bytes(&mut s, "ERR", e.to_string().as_bytes());
-                        }
-                    }
-                }
-                "SHUTDOWN" => {
-                    let text = String::from_utf8_lossy(&payload);
-                    let mode = StopMode::parse(text.trim()).unwrap_or(StopMode::Fast);
-                    let _ = frame::write_frame_bytes(
-                        &mut s,
-                        "OK",
-                        format!("shutting down（{}）", mode.as_str()).as_bytes(),
-                    );
-                    log.line(&format!("收到停止请求（{}）", mode.as_str()));
-                    stop_after = Some(mode);
-                    break 'accept;
-                }
-                other => {
-                    let _ = frame::write_frame_bytes(
-                        &mut s,
-                        "ERR",
-                        format!("未知动词 `{other}`").as_bytes(),
-                    );
+                // Poll by elapsed time after every request as well as during
+                // idle periods. A client polling SHOW FULLTEXT every 40 ms
+                // must not starve a 100 ms maintenance interval forever.
+                // Any suspended explicit transaction pauses maintenance for
+                // the whole workspace, preserving the single-session rule.
+                if !connections
+                    .values()
+                    .any(|connection| connection.state.in_transaction())
+                {
+                    let seq = inst.seq();
+                    let mut maintenance =
+                        Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+                    maintenance
+                        .set_fulltext_defaults(
+                            params.run.fulltext_interval_ms,
+                            params.run.fulltext_batch_rows,
+                        )
+                        .map_err(|e| ServiceError::State(e.to_string()))?;
+                    maintenance
+                        .set_graph_limits(params.run.graph_limits())
+                        .map_err(|e| ServiceError::State(e.to_string()))?;
+                    maintain_fulltext(&mut maintenance, &mut fulltext, &mut log);
                 }
             }
         }
-        drop(session); // 会话落前把事务收尾（`Drop` 里回滚未提交的显式事务）
+    };
+
+    // Every suspended explicit transaction belongs to a connection. Roll all
+    // of them back before checkpointing so shutdown never publishes client work.
+    for (_, mut connection) in connections {
+        let seq = inst.seq();
+        let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
+        session.resume_state(&mut connection.state);
+        drop(session);
     }
 
     // **收尾**：fast 走完全检查点；immediate 直接退出（下次打开做恢复）。
     match stop_after {
-        Some(StopMode::Immediate) => {
-            log.line("immediate 停止：不做完全检查点（下次打开走崩溃恢复）")
-        }
+        StopMode::Immediate => log.line("immediate 停止：不做完全检查点（下次打开走崩溃恢复）"),
         _ => match inst.shutdown() {
             Ok(()) => log.line("完全检查点完成，实例已干净关闭"),
             Err(e) => log.line(&format!("关闭时出错：{e}")),
@@ -446,6 +789,18 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
         let _ = std::io::stdout().flush();
     }
     Ok(())
+}
+
+fn maintain_fulltext(
+    session: &mut Session<'_, '_, '_, '_>,
+    scheduler: &mut FulltextScheduler,
+    log: &mut LogFile,
+) {
+    match session.maintain_fulltext(scheduler) {
+        Ok(Some(receipt)) => log.line(&receipt),
+        Err(e) => log.line(&format!("全文后台维护失败（保留未处理事件）：{e}")),
+        Ok(None) => {}
+    }
 }
 
 /// 类型码 → SQL 类型名（与 `bicdbcli` 的 `DESCRIBE` 版面同源）。
@@ -607,25 +962,6 @@ pub fn start(opts: &StartOptions) -> Result<(), ServiceError> {
     }
 }
 
-/// **挡回一条已在等的连接**（尽力而为；没有等待者就什么都不做）。
-///
-/// 监听套接字临时切成非阻塞：有等待者就收下、回一帧 `ERR` 再关——客户端
-/// 因此拿到"实例正忙"的**具名错误**，而不是挂在那里等第一个连接结束。
-fn reject_pending(listener: &std::os::unix::net::UnixListener) {
-    if listener.set_nonblocking(true).is_err() {
-        return;
-    }
-    if let Ok((mut extra, _)) = listener.accept() {
-        let _ = extra.set_nonblocking(false);
-        let _ = frame::write_frame_bytes(
-            &mut extra,
-            "ERR",
-            "实例正忙：服务一次只服务一条连接（V1.0 单写者）——稍后重试".as_bytes(),
-        );
-    }
-    let _ = listener.set_nonblocking(false);
-}
-
 /// **`bicdb stop`**：请服务收尾（经套接字；`-m fast|immediate`），并等它退出。
 pub fn stop(
     dir: &Path,
@@ -709,6 +1045,16 @@ pub fn status(dir: &Path, params: &crate::config::InstanceParams) -> Result<(), 
                             "uptime_s" => println!("  运行    {} 秒", v),
                             "served" => println!("  已服务  {v} 次请求"),
                             "seq" => println!("  提交序号 {v}"),
+                            "cache_bytes" => println!(
+                                "  DB Cache {} MiB",
+                                v.parse::<u64>().unwrap_or(0) / (1024 * 1024)
+                            ),
+                            "cache_resident" => println!("  驻留页  {v}"),
+                            "cache_hits" => println!("  缓存命中 {v}"),
+                            "cache_misses" => println!("  缓存未命中 {v}"),
+                            "cache_evictions" => println!("  缓存淘汰 {v}"),
+                            "cache_writes" => println!("  数据页写回 {v}"),
+                            "cache_dirty_pages" => println!("  待写脏页 {v}"),
                             _ => {}
                         }
                     }

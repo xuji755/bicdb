@@ -44,6 +44,8 @@ impl Span {
 /// 只留我们用得到的——清单外构造在语法层没有产生式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
+    /// `SHOW` (`SHOW TABLES` metadata statement).
+    Show,
     // 语句起始
     /// `SELECT`
     Select,
@@ -254,6 +256,7 @@ impl Keyword {
     fn lookup(text: &str) -> Option<Self> {
         let up = text.to_ascii_uppercase();
         Some(match up.as_str() {
+            "SHOW" => Self::Show,
             "SELECT" => Self::Select,
             "INSERT" => Self::Insert,
             "UPDATE" => Self::Update,
@@ -362,6 +365,7 @@ impl Keyword {
     #[must_use]
     pub fn text(self) -> &'static str {
         match self {
+            Self::Show => "SHOW",
             Self::Select => "SELECT",
             Self::Insert => "INSERT",
             Self::Update => "UPDATE",
@@ -472,6 +476,10 @@ pub enum Punct {
     LParen,
     /// `)`
     RParen,
+    /// `[` (fixed full-text JSON path only).
+    LBracket,
+    /// `]` (fixed full-text JSON path only).
+    RBracket,
     /// `,`
     Comma,
     /// `.`
@@ -800,6 +808,8 @@ fn read_punct(bytes: &[u8], i: usize) -> Option<(Punct, usize)> {
     Some(match bytes[i] {
         b'(' => (Punct::LParen, 1),
         b')' => (Punct::RParen, 1),
+        b'[' => (Punct::LBracket, 1),
+        b']' => (Punct::RBracket, 1),
         b',' => (Punct::Comma, 1),
         b'.' => (Punct::Dot, 1),
         b';' => (Punct::Semi, 1),

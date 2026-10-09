@@ -89,6 +89,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod adjacency;
 pub mod bitmap;
 pub mod bootstrap;
 pub mod buffer;

@@ -22,6 +22,29 @@ pub enum ColKind {
     Bool,
     /// 未解码字节串（文本/JSON/等；比较按字节序）。
     Bytes,
+    /// 图表值函数产生的节点/边身份句柄；不包含属性快照。
+    GraphElement,
+}
+
+/// 图元素种类。数值编码是协议和瞬态行编码的一部分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum GraphElementKind {
+    /// 节点。
+    Node = 1,
+    /// 边。
+    Edge = 2,
+}
+
+/// 图元素身份句柄。`graph` 消除不同命名图中局部 ID 的碰撞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GraphElement {
+    /// 工作区内图对象号。
+    pub graph: u32,
+    /// 节点或边。
+    pub kind: GraphElementKind,
+    /// 图内局部元素 ID。
+    pub id: u64,
 }
 
 /// **值**（三值逻辑：NULL 是一等值，不是"缺省"）。
@@ -37,6 +60,8 @@ pub enum Value {
     Number(Number),
     /// 字节串（未解码；文本/二进制同形）。
     Bytes(Vec<u8>),
+    /// GRAPH_TABLE 节点或边的稳定身份，不携带属性。
+    GraphElement(GraphElement),
 }
 
 impl Value {
@@ -54,6 +79,7 @@ impl Value {
             Value::Bool(_) => "BOOLEAN",
             Value::Number(_) => "NUMBER",
             Value::Bytes(_) => "BYTES",
+            Value::GraphElement(_) => "GRAPH_ELEMENT",
         }
     }
 }
@@ -131,6 +157,7 @@ pub fn decode_row(bytes: &[u8], shape: &RowShape) -> Result<Row, ExecError> {
                     .map_err(|e| ExecError::BadStoredRow(e.to_string()))?,
             ),
             ColKind::Bytes => Value::Bytes(raw.to_vec()),
+            ColKind::GraphElement => Value::GraphElement(decode_graph_element(raw)?),
         };
         values.push(value);
     }
@@ -169,6 +196,11 @@ pub fn encode_row(row: &Row, shape: &RowShape) -> Result<Vec<u8>, ExecError> {
                 nulls.push(false);
                 var.push(bytes.clone());
             }
+            Value::GraphElement(element) => {
+                expect_kind(*kind, ColKind::GraphElement)?;
+                nulls.push(false);
+                var.push(encode_graph_element(*element).to_vec());
+            }
         }
     }
     let refs: Vec<&[u8]> = var.iter().map(Vec::as_slice).collect();
@@ -193,6 +225,7 @@ pub fn kind_name(kind: ColKind) -> &'static str {
         ColKind::Number => "NUMBER",
         ColKind::Bool => "BOOLEAN",
         ColKind::Bytes => "BYTES",
+        ColKind::GraphElement => "GRAPH_ELEMENT",
     }
 }
 
@@ -214,6 +247,7 @@ pub fn value_bytes(v: &Value) -> usize {
         Value::Bool(_) => 1,
         Value::Number(num) => num.encoded_len().max(8),
         Value::Bytes(b) => b.len().max(8),
+        Value::GraphElement(_) => 16,
     }
 }
 
@@ -244,10 +278,38 @@ pub fn cast_value(value: &Value, to: ColKind) -> Result<Value, ExecError> {
         }
         (Value::Number(n), ColKind::Bytes) => Ok(Value::Bytes(n.to_decimal_string().into_bytes())),
         (Value::Bytes(b), ColKind::Bytes) => Ok(Value::Bytes(b.clone())),
+        (Value::GraphElement(v), ColKind::GraphElement) => Ok(Value::GraphElement(*v)),
         (Value::Bool(b), ColKind::Bool) => Ok(Value::Bool(*b)),
         (v, k) => Err(ExecError::TypeMismatch {
             expected: kind_name(k),
             got: v.type_name(),
         }),
     }
+}
+
+/// 固定 13 字节的瞬态编码：图对象号、种类、局部元素 ID（均大端）。
+#[must_use]
+pub fn encode_graph_element(value: GraphElement) -> [u8; 13] {
+    let mut out = [0_u8; 13];
+    out[..4].copy_from_slice(&value.graph.to_be_bytes());
+    out[4] = value.kind as u8;
+    out[5..].copy_from_slice(&value.id.to_be_bytes());
+    out
+}
+
+/// 解码固定 13 字节图句柄，拒绝未知种类与错误长度。
+pub fn decode_graph_element(raw: &[u8]) -> Result<GraphElement, ExecError> {
+    if raw.len() != 13 {
+        return Err(ExecError::BadStoredRow(
+            "GRAPH_ELEMENT must be 13 bytes".into(),
+        ));
+    }
+    let graph = u32::from_be_bytes(raw[..4].try_into().expect("four bytes"));
+    let kind = match raw[4] {
+        1 => GraphElementKind::Node,
+        2 => GraphElementKind::Edge,
+        _ => return Err(ExecError::BadStoredRow("invalid GRAPH_ELEMENT kind".into())),
+    };
+    let id = u64::from_be_bytes(raw[5..].try_into().expect("eight bytes"));
+    Ok(GraphElement { graph, kind, id })
 }

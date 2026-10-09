@@ -91,6 +91,111 @@ fn feed(dir: &Path, input: &str, extra: &[&str]) -> (String, String, i32) {
 }
 
 #[test]
+fn graph_show_commands_reach_native_sql_in_direct_and_service_modes() {
+    for service in [false, true] {
+        let dir = TempDir::new(if service {
+            "graph-show-service"
+        } else {
+            "graph-show-direct"
+        });
+        init(dir.path());
+        if service {
+            let out = Command::new(bicdb_bin())
+                .args(["start", "-p"])
+                .arg(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let input="WHENEVER SQLERROR EXIT\nSET PAGESIZE 0\nSET LINESIZE 240\nCREATE GRAPH kg;\nCYPHER kg 'CREATE (:Entity {name:1,db_type:\"d1\",summary:\"buffer pool\"})';\nCREATE GRAPH INDEX names ON kg NODES LABEL \"Entity\" (name);\nSHOW GRAPHS\nSHOW GRAPH INDEXES ON kg;\nCREATE FULLTEXT GRAPH INDEX words ON kg NODES (summary) OPTIONS '{\"update\":\"manual\"}';\nSHOW FULLTEXT GRAPH INDEXES ON kg\nALTER FULLTEXT GRAPH INDEX words ON kg WAIT OPTIONS '{\"timeout_ms\":0}';\nSEARCH FULLTEXT GRAPH INDEX words ON kg FOR 'buffer' OPTIONS '{\"db_type\":\"d1\",\"consistency\":\"eventual\"}';\nCYPHER kg 'CALL db.index.fulltext.queryNodes(\"words\",\"buffer\",{db_type:\"d1\",consistency:\"eventual\"}) YIELD node,score RETURN node.name AS procedure_name,score AS procedure_score';\nSELECT graph_table_name FROM GRAPH_TABLE(kg, 'MATCH (n:Entity) RETURN n.name' COLUMNS (graph_table_name NUMBER));\nPROFILE CYPHER kg 'MATCH (n:Entity {name:1}) RETURN n.name AS name';\nSHOW LINESIZE\nHELP GRAPH\nEXIT 0\n";
+        let (out, err, code) = feed(dir.path(), input, &[]);
+        assert_eq!(code, 0, "{out}\n{err}");
+        for expected in [
+            "graph_name",
+            "graph_table_name",
+            "index_name",
+            "READY",
+            "PROPERTY_BTREE",
+            "FULLTEXT_BTREE",
+            "procedure_name",
+            "procedure_score",
+            "target_reached",
+            "source_complete",
+            "MANUAL",
+            "covered_commit",
+            "linesize",
+            "ALTER GRAPH INDEX",
+        ] {
+            assert!(out.contains(expected), "missing {expected}: {out}");
+        }
+    }
+}
+
+#[test]
+fn dictionary_select_describe_and_write_denials_in_direct_and_service_modes() {
+    for service in [false, true] {
+        let dir = TempDir::new(if service {
+            "dictionary-service"
+        } else {
+            "dictionary-direct"
+        });
+        init(dir.path());
+        if service {
+            let output = Command::new(bicdb_bin())
+                .args(["start", "-p"])
+                .arg(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let input = "\
+CREATE TABLE dictionary_probe (id NUMBER);
+SELECT name FROM obj$ WHERE name = 'dictionary_probe';
+SELECT name FROM col$ WHERE name = 'id';
+SELECT t.cols FROM tab$ t JOIN obj$ o ON t.\"obj#\" = o.\"obj#\" WHERE o.name = 'dictionary_probe';
+SELECT * FROM \"tab$\" WHERE \"obj#\" > 99;
+DESCRIBE tab$
+BEGIN;
+INSERT INTO dictionary_probe VALUES (7);
+SELECT * FROM seq$;
+DELETE FROM tab$ WHERE 1 = 0;
+UPDATE seq$ SET next_val = 0;
+INSERT INTO stat$ SELECT * FROM stat$;
+DROP TABLE col$;
+SELECT * FROM dictionary_probe;
+ROLLBACK;
+DROP INDEX i_col_pk;
+INSERT INTO dictionary_probe VALUES (9);
+DELETE FROM dictionary_probe WHERE id = 9;
+SELECT * FROM dictionary_probe;
+SELECT * FROM tab$ WHERE 1 = 0;
+EXIT 0
+";
+        let (out, err, code) = feed(dir.path(), input, if service { &[] } else { &["--direct"] });
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            out.contains("dictionary_probe") && out.contains("pctfree") && out.contains("next_val"),
+            "{out}"
+        );
+        assert!(out.contains("0 rows selected."), "{out}");
+        let messages = format!("{out}\n{err}");
+        assert!(!messages.contains("对象 `tab$` 不存在"), "{messages}");
+        assert!(
+            messages.contains("不可写") && messages.contains("i_col_pk"),
+            "{messages}"
+        );
+    }
+}
+
+#[test]
 fn buffer_slash_commands_and_reporting() {
     let dir = TempDir::new("buffer");
     init(dir.path());
@@ -305,4 +410,57 @@ EXIT
     );
     assert_eq!(code, 0, "直连失败：{err}");
     assert!(out.contains('1') && out.contains('a'), "数据应在：\n{out}");
+}
+
+#[test]
+fn show_tables_includes_actual_dictionary_fixed_and_user_tables_in_both_modes() {
+    for service in [false, true] {
+        let dir = TempDir::new(if service {
+            "tables-service"
+        } else {
+            "tables-direct"
+        });
+        init(dir.path());
+        if service {
+            assert!(Command::new(bicdb_bin())
+                .args(["start", "-p", dir.path().to_str().unwrap(), "-w", "30"])
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        let input = "WHENEVER SQLERROR EXIT\nSET PAGESIZE 0\nCREATE TABLE ordinary (id NUMBER);\nCREATE TABLE \"中文 Report\" (id NUMBER);\nCREATE INDEX ix_hidden ON ordinary(id);\nBEGIN;\nINSERT INTO ordinary VALUES (77);\nSHOW TABLES;\nROLLBACK;\nSELECT id FROM ordinary;\nSHOW LINESIZE\nDROP TABLE ordinary;\nSHOW TABLES\nEXIT 0\n";
+        let (out, err, code) = feed(dir.path(), input, &[]);
+        assert_eq!(code, 0, "{out}\n{err}");
+        for name in ["obj$", "tab$", "col$", "file$", "中文 Report"] {
+            assert!(out.contains(name), "missing {name}: {out}");
+        }
+        assert!(
+            out.contains("DICTIONARY") && out.contains("FIXED") && out.contains("USER"),
+            "{out}"
+        );
+        assert!(out.contains("object_id"), "{out}");
+        assert!(
+            !out.split("table_name").skip(1).any(|part| part
+                .split("rows selected.")
+                .next()
+                .unwrap()
+                .contains("ix_hidden")),
+            "index must not be listed: {out}"
+        );
+        assert!(
+            !out.contains("asset$"),
+            "unimplemented asset table must not be invented: {out}"
+        );
+        assert!(out.contains("linesize"), "SHOW settings regressed: {out}");
+        let last = out.rsplit("table_name").next().unwrap();
+        assert!(
+            !last.contains("ordinary"),
+            "dropped table persisted in listing: {out}"
+        );
+        assert!(
+            out.contains("0 rows selected."),
+            "SHOW TABLES lost transaction/rollback: {out}"
+        );
+    }
 }

@@ -35,8 +35,10 @@ use bicdb_storage::scan::HeapScanner;
 use bicdb_storage::segment::Segment;
 use bicdb_txn::engine::{Engine, TxnHandle};
 
+pub use bicdb_graph::{Limits as GraphLimits, DEFAULT_DETACH_EDGE_LIMIT, MAX_DETACH_EDGE_LIMIT};
+
 use crate::auth::{self, Identity};
-use crate::bind::{bind_statement, BindError, CatalogViewImpl, NameResolver};
+use crate::bind::{bind_statement, BindError, CatalogView, CatalogViewImpl, NameResolver};
 use crate::parser::parse_many as parse;
 use crate::plan::{ddl_summary, plan_statement, PhysicalPlan, PlanKind};
 
@@ -137,6 +139,9 @@ pub enum QueryResult {
     Txn(String),
 }
 
+/// Workspace-local timer state for automatic full-text maintenance.
+pub use crate::graph_sql::{FulltextScheduler, GraphSnapshot};
+
 impl QueryResult {
     /// 结果集的显示宽（诊断/CLI 对齐）。
     #[must_use]
@@ -150,18 +155,16 @@ impl QueryResult {
 
 /// **会话**：一个工作区的编译-执行通道。
 pub struct Session<'a, 'b, 'io, 'f> {
-    pool: &'a BufferPool<'b>,
-    engine: &'a Engine<'io, 'f, 'io, 'f>,
-    catalog: &'a mut bicdb_catalog::Catalog<'io>,
-    ws: [u8; 8],
+    pub(crate) pool: &'a BufferPool<'b>,
+    pub(crate) engine: &'a Engine<'io, 'f, 'io, 'f>,
+    pub(crate) catalog: &'a mut bicdb_catalog::Catalog<'io>,
+    pub(crate) ws: [u8; 8],
     /// 显式事务（`BEGIN` 后持有）。
-    txn: Option<TxnHandle>,
+    pub(crate) txn: Option<TxnHandle>,
     /// 当前提交序号（新语句的快照水位）。
-    seq: u64,
-    /// **本事务已写过的唯一键**（语句内/事务内的重复检测；`COMMIT`/`ROLLBACK` 清空）。
-    seen_keys: crate::dml_index::SeenKeys,
+    pub(crate) seq: u64,
     /// **本语句的参数值**（按绑定期给出的**出现序**摆好；空 = 无参数）。
-    exec_params: Vec<Value>,
+    pub(crate) exec_params: Vec<Value>,
     /// **管理面（DCL）的实例根**（`BICDB_HOME`；`None` = 没配 ⇒ DCL 具名拒绝）。
     dcl_home: Option<std::path::PathBuf>,
     /// **管理面（DCL）的 I/O**（全局控制文件走它；默认 OS 文件，测试注入内存）。
@@ -174,10 +177,67 @@ pub struct Session<'a, 'b, 'io, 'f> {
     /// **本会话的身份**（D6）：`None` = 管理面身份（本机/OS），`Some` = 认证过的主体。
     /// **私有 + 唯一的写口是 [`Session::authenticate`]**——身份不可能来自语句载荷。
     identity: Option<Identity>,
+    private_auth: Option<&'a dyn auth::PrivateAuthProvider>,
     /// **因日志压力推过的完全检查点次数**（诊断/用例观测：CKPT 触发 ② 是否生效）。
     log_checkpoints: u64,
     /// **固定表的内容源**（`file$`；`None` ⇒ 查询具名拒绝——不静默给空集）。
+    pub(crate) graph_internal: bool,
+    /// One immutable, workspace-local full-text generation; manifest digests invalidate it.
+    pub(crate) fulltext_cache: Option<(
+        u32,
+        [u8; 32],
+        std::sync::Arc<bicdb_graph::fulltext::Generation>,
+    )>,
+    pub(crate) fulltext_interval_ms: u64,
+    pub(crate) fulltext_batch_rows: usize,
+    pub(crate) fulltext_maintenance_documents_loaded: usize,
+    pub(crate) graph_limits: GraphLimits,
+    pub(crate) graph_deadline: Option<bicdb_graph::Deadline>,
     fixed_source: Option<&'a dyn FixedTableSource>,
+}
+
+/// Durable state owned by one network connection while the service lends the
+/// single catalog executor to other connections. It is deliberately opaque:
+/// identity can only enter through [`Session::authenticate`], and transaction
+/// handles can only enter through a live `Session`.
+#[derive(Default)]
+pub struct SessionState {
+    txn: Option<TxnHandle>,
+    seq: u64,
+    identity: Option<Identity>,
+    log_checkpoints: u64,
+    fulltext_cache: Option<(
+        u32,
+        [u8; 32],
+        std::sync::Arc<bicdb_graph::fulltext::Generation>,
+    )>,
+}
+
+impl SessionState {
+    /// Start one connection at the instance's current committed sequence.
+    #[must_use]
+    pub fn new(seq: u64) -> Self {
+        Self {
+            seq,
+            ..Self::default()
+        }
+    }
+
+    /// Whether this suspended connection owns an explicit transaction.
+    #[must_use]
+    pub fn in_transaction(&self) -> bool {
+        self.txn.is_some()
+    }
+
+    /// Advance an idle connection to the latest committed sequence before its
+    /// next request. Explicit transactions keep the sequence captured at
+    /// `BEGIN`, providing repeatable visibility until COMMIT/ROLLBACK.
+    pub fn refresh_committed(&mut self, seq: u64) {
+        if self.txn.is_none() && self.seq != seq {
+            self.seq = seq;
+            self.fulltext_cache = None;
+        }
+    }
 }
 
 impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
@@ -197,16 +257,112 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             ws,
             txn: None,
             seq,
-            seen_keys: crate::dml_index::SeenKeys::new(),
             exec_params: Vec::new(),
             dcl_home: None,
             dcl_io: None,
             dcl_provisioner: None,
             dcl_pbkdf2_iterations: bicdb_common::pbkdf2::DEFAULT_ITERATIONS,
             identity: None,
+            private_auth: None,
             log_checkpoints: 0,
+            graph_internal: false,
+            fulltext_cache: None,
+            fulltext_interval_ms: 5000,
+            fulltext_batch_rows: 256,
+            fulltext_maintenance_documents_loaded: 0,
+            graph_limits: GraphLimits::default(),
+            graph_deadline: None,
             fixed_source: None,
         }
+    }
+
+    /// Resume the opaque state of the same trusted service connection.
+    ///
+    /// # Panics
+    /// Panics if the temporary session already owns a transaction or identity;
+    /// mixing two connection states would violate isolation.
+    pub fn resume_state(&mut self, state: &mut SessionState) {
+        assert!(self.txn.is_none() && self.identity.is_none());
+        self.txn = state.txn.take();
+        self.seq = state.seq;
+        self.identity = state.identity.take();
+        self.log_checkpoints = state.log_checkpoints;
+        self.fulltext_cache = state.fulltext_cache.take();
+    }
+
+    /// Suspend this session without rolling back its explicit transaction.
+    /// The caller must later resume or close the state through a `Session`.
+    pub fn suspend_state(&mut self, state: &mut SessionState) {
+        assert!(state.txn.is_none() && state.identity.is_none());
+        state.txn = self.txn.take();
+        state.seq = self.seq;
+        state.identity = self.identity.take();
+        state.log_checkpoints = self.log_checkpoints;
+        state.fulltext_cache = self.fulltext_cache.take();
+    }
+
+    /// Set a trusted instance-wide statement DETACH budget. Zero permits only
+    /// isolated-node detachment; direct relationship DELETE remains available.
+    ///
+    /// # Errors
+    /// Rejects values above the native graph edge ceiling, without changing it.
+    pub fn set_graph_detach_edge_limit(&mut self, limit: usize) -> Result<(), SessionError> {
+        if limit > MAX_DETACH_EDGE_LIMIT {
+            return Err(SessionError::State(format!(
+                "graph.detach_edge_limit must be 0..={MAX_DETACH_EDGE_LIMIT}"
+            )));
+        }
+        self.graph_limits.max_detach_edges = limit;
+        Ok(())
+    }
+
+    /// Set validated workspace-wide graph ceilings. Requests may only tighten
+    /// them. Invalid configuration preserves all previously installed values.
+    pub fn set_graph_limits(&mut self, limits: GraphLimits) -> Result<(), SessionError> {
+        limits
+            .validate_workspace()
+            .map_err(|e| SessionError::State(e.to_string()))?;
+        self.graph_limits = limits;
+        self.fulltext_cache = None;
+        Ok(())
+    }
+
+    /// Set instance defaults used by manual SYNC and maintenance diagnostics.
+    ///
+    /// # Errors
+    /// Uses the same bounds as [`FulltextScheduler::new`].
+    pub fn set_fulltext_defaults(
+        &mut self,
+        interval_ms: u64,
+        batch_rows: usize,
+    ) -> Result<(), SessionError> {
+        FulltextScheduler::new(interval_ms, batch_rows)?;
+        self.fulltext_interval_ms = interval_ms;
+        self.fulltext_batch_rows = batch_rows;
+        Ok(())
+    }
+
+    /// Publish at most one due full-text maintenance batch between client requests.
+    /// This trusted service hook never executes inside a user transaction. Its
+    /// internal management scope is restored before returning, including errors.
+    ///
+    /// # Errors
+    /// Metadata, analysis or publication errors leave the failed batch pending.
+    pub fn maintain_fulltext(
+        &mut self,
+        scheduler: &mut FulltextScheduler,
+    ) -> Result<Option<String>, SessionError> {
+        if self.in_transaction() {
+            return Ok(None);
+        }
+        let identity = self.identity.take();
+        let params = std::mem::take(&mut self.exec_params);
+        let internal = std::mem::replace(&mut self.graph_internal, true);
+        let result = self.poll_fulltext_scheduler(scheduler);
+        self.graph_internal = internal;
+        self.exec_params = params;
+        self.identity = identity;
+        result
     }
 
     /// **配管理面上下文**（DCL 的执行落点：实例根 + 全局控制文件的 I/O）。
@@ -280,9 +436,9 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         self.catalog
     }
 
-    /// 本会话是不是在**管理面工作区**（`public`）上。
+    /// 本会话是否含 PUBLIC 管理字典；这是工作区事实，不是认证身份。
     #[must_use]
-    pub(crate) fn on_public_workspace(&self) -> bool {
+    pub fn on_public_workspace(&self) -> bool {
         self.catalog.is_public()
     }
 
@@ -299,7 +455,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
     /// # Errors
     /// 认证不通过（[`crate::auth::AuthError`]）或前提不满足（[`SessionError::Auth`]）。
     pub fn authenticate(&mut self, name: &str, password: &str) -> Result<Identity, SessionError> {
-        if !self.on_public_workspace() {
+        if !self.on_public_workspace() && self.private_auth.is_none() {
             return Err(SessionError::Auth(
                 "本实例不是 PUBLIC 工作区 ⇒ 不做口令认证（`user$` 在 PUBLIC 里）——\
                  普通工作区的本机访问按控制套接字的文件权限（OS 身份）判定"
@@ -312,10 +468,76 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 id.describe()
             )));
         }
-        let id = auth::authenticate(self.catalog, name, password, self.dcl_pbkdf2_iterations)
-            .map_err(|e| SessionError::Auth(e.to_string()))?;
+        let id = if self.on_public_workspace() {
+            auth::authenticate(self.catalog, name, password, self.dcl_pbkdf2_iterations)
+                .map_err(|e| SessionError::Auth(e.to_string()))?
+        } else {
+            auth::authenticate_private(self.private_auth.expect("checked"), name, password, self.ws)
+                .map_err(SessionError::Auth)?
+        };
         self.identity = Some(id.clone());
         Ok(id)
+    }
+
+    /// Install the native service's trusted PUBLIC authentication provider.
+    pub fn set_private_authenticator(
+        &mut self,
+        provider: Option<&'a dyn auth::PrivateAuthProvider>,
+    ) {
+        self.private_auth = provider;
+    }
+
+    /// Resolve only the authenticated principal's active private workspaces.
+    pub fn route_owned_workspace(
+        &mut self,
+        selection: Option<&str>,
+    ) -> Result<(u64, u64, String, String), SessionError> {
+        if !self.on_public_workspace() {
+            return Err(SessionError::Auth("ROUTE 仅由 PUBLIC 服务提供".into()));
+        }
+        let id = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| SessionError::Auth("ROUTE 必须先认证".into()))?;
+        if id.is_expired() {
+            return Err(SessionError::Auth(
+                "口令已过期，须先在 PUBLIC 修改口令".into(),
+            ));
+        }
+        let user_id = id.user_id();
+        let mut owned = bicdb_catalog::dcl::workspaces_of_user(self.catalog, user_id)
+            .map_err(|e| SessionError::Auth(e.to_string()))?;
+        owned.retain(|w| w.status == bicdb_catalog::dcl::ws_status::ACTIVE);
+        if let Some(selection) = selection {
+            owned.retain(|w| w.name == selection || w.workspace_id.to_string() == selection);
+        }
+        if owned.len() != 1 {
+            return Err(SessionError::Auth(
+                "工作区选择失败：必须选择本人唯一的有效私有工作区；有多个时请指定 dbworkspace"
+                    .into(),
+            ));
+        }
+        let ws = owned.remove(0);
+        let workspace = bicdb_workspace::WorkspaceId::from_raw(ws.workspace_id)
+            .ok_or_else(|| SessionError::Auth("工作区登记无效".into()))?;
+        let home = self
+            .dcl_home
+            .as_ref()
+            .ok_or_else(|| SessionError::Auth("缺少 PUBLIC 注册表".into()))?;
+        let io = self
+            .dcl_io
+            .ok_or_else(|| SessionError::Auth("缺少注册表 IO".into()))?;
+        let paths = crate::dcl_exec::DclContext::new(home.clone(), io).global_ctl_paths();
+        let registry = bicdb_storage::globalctl::GlobalControlFile::open(io, &paths[0], &paths[1])
+            .map_err(|e| SessionError::Auth(e.to_string()))?;
+        let entry = registry
+            .workspace_by_id(workspace)
+            .map_err(|e| SessionError::Auth(e.to_string()))?
+            .filter(|w| w.status == bicdb_storage::globalctl::WS_ACTIVE)
+            .ok_or_else(|| SessionError::Auth("工作区注册表不可用".into()))?;
+        let root = String::from_utf8(entry.root)
+            .map_err(|_| SessionError::Auth("工作区路径非 UTF-8".into()))?;
+        Ok((user_id, ws.workspace_id, ws.name, root))
     }
 
     /// **日志要切换而下一组未降级 ⇒ 推一次完全检查点**（CKPT 的"组满被迫"）。
@@ -326,14 +548,13 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
     /// 是挡就地推一次检查点：组降级 ⇒ 写者继续。Oracle 的"日志切换触发检查点"
     /// 与 PG 的 `max_wal_size` 触发检查点都是这条（证据包 `checkpoint-on-demand-*`）。
     ///
-    /// **只在没有显式事务时做**（与 `Instance::shutdown` 同一纪律：它也是先把
-    /// 未结束的事务回滚，再完全检查点）。显式事务里日志满了 ⇒ 语句照旧具名报错，
-    /// `COMMIT` 之后的下一条语句会把检查点补上。
+    /// 显式事务也可在完整语句之间推进检查点：同时保存数据、undo 和事务槽，
+    /// 并补齐已提交槽标记，崩溃恢复从持久化事务表识别跨检查点的输家。
     ///
     /// # Errors
     /// 检查点失败（写回/控制文件/日志）——**如实报出**，不吞。
     fn checkpoint_on_log_pressure(&mut self) -> Result<(), SessionError> {
-        if self.txn.is_some() || !self.engine.log_switch_blocked() {
+        if !self.engine.log_switch_blocked() {
             return Ok(());
         }
         self.engine
@@ -383,7 +604,9 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             };
         }
         // ② 管理面语句：主体只能对自己改密（Oracle 的"本人改密"口径）。
-        if crate::dcl_exec::is_management(stmt) {
+        if crate::dcl_exec::is_management(stmt)
+            || matches!(stmt, S::Drop(d) if d.remove_type == crate::ast::ObjectType::Workspace)
+        {
             return if crate::dcl_exec::is_self_password_change(stmt, id.name()) {
                 Ok(())
             } else {
@@ -394,9 +617,33 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 )))
             };
         }
+        // A private identity has been checked by PUBLIC against this exact ws.
+        if !self.on_public_workspace() {
+            return Ok(());
+        }
         // ③ 其余语句按类判：`public` 是共享内容，**对主体只读**（SELECT/事务随便）。
         match stmt {
-            S::Select(_) | S::Transaction(_) => Ok(()),
+            S::ShowTables(_) | S::ShowGraphs(_) | S::Select(_) | S::Transaction(_) => Ok(()),
+            S::GraphIndex(g)
+                if matches!(
+                    g.action,
+                    crate::ast::GraphIndexAction::Show
+                        | crate::ast::GraphIndexAction::FulltextShow
+                        | crate::ast::GraphIndexAction::FulltextSearch { .. }
+                ) =>
+            {
+                Ok(())
+            }
+            S::Cypher(c) => {
+                if bicdb_graph::parse(&c.query)
+                    .map_err(|e| SessionError::State(e.to_string()))?
+                    .is_read_only()
+                {
+                    Ok(())
+                } else {
+                    Err(SessionError::Auth("PUBLIC 图数据对主体只读".into()))
+                }
+            }
             S::VariableSet(_) => Ok(()), // 会话变量（白名单在绑定期判）
             S::Insert(_) | S::Update(_) | S::Delete(_) => Err(SessionError::Auth(format!(
                 "PUBLIC 工作区对所有主体**只读**——主体 `{}` 不能写它的数据\
@@ -412,7 +659,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 )))
             }
             // 建表/建索引/删表删索引/建图：都是写（含改字典）。
-            S::CreateTable(_) | S::Index(_) | S::Drop(_) | S::CreateGraph(_) => {
+            S::CreateTable(_) | S::Index(_) | S::Drop(_) | S::CreateGraph(_) | S::GraphIndex(_) => {
                 Err(SessionError::Auth(format!(
                     "PUBLIC 工作区对所有主体**只读**——主体 `{}` 不能改它的结构",
                     id.name()
@@ -458,15 +705,26 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         &mut self,
         name: &str,
     ) -> Result<Vec<(String, bool, u32, u32)>, SessionError> {
+        if let Some(id) = &self.identity {
+            if id.is_expired() {
+                return Err(SessionError::Auth(
+                    "口令已过期（EXPIRE）⇒ 受限会话：只允许本人改密".to_owned(),
+                ));
+            }
+        }
         let snapshot = self.snapshot();
-        let obj = self
-            .catalog
-            .resolve(snapshot, bicdb_catalog::dict::namespace::TABLE, name)
-            .map_err(|e| SessionError::State(e.to_string()))?;
-        let cols = self
-            .catalog
-            .columns(snapshot, obj.obj)
-            .map_err(|e| SessionError::State(e.to_string()))?;
+        let is_admin = self.is_management_identity();
+        let mut view =
+            CatalogViewImpl::new(self.catalog, snapshot).with_graph_access(self.graph_internal);
+        let mut resolver =
+            NameResolver::with_policy(&mut view, crate::bind::ResolvePolicy { is_admin });
+        let cols = match resolver.resolve_table(name)? {
+            crate::bind::ResolvedName::Object(obj) => resolver.view().columns(obj.obj)?,
+            crate::bind::ResolvedName::FixedTable(name) => resolver
+                .view()
+                .fixed_columns(name)?
+                .ok_or_else(|| SessionError::State(format!("固定表 `{name}` 缺列定义")))?,
+        };
         Ok(cols
             .into_iter()
             .map(|c| (c.name, c.nullable, c.type_code, c.length))
@@ -519,6 +777,39 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         named: &[(&str, Value)],
     ) -> Result<Vec<QueryResult>, SessionError> {
         let stmts = parse(sql)?;
+        // 多给/重复命名参数必须在任何写入之前拒绝，不能提交后才返回参数错误。
+        if !named.is_empty() {
+            let tokens =
+                crate::lexer::tokenize(sql).map_err(|e| SessionError::Params(e.to_string()))?;
+            let declared: std::collections::HashSet<&str> = tokens
+                .iter()
+                .filter_map(|t| match &t.kind {
+                    crate::lexer::TokenKind::Param(n) => Some(n.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let mut supplied = std::collections::HashSet::new();
+            for (name, _) in named {
+                if !supplied.insert(*name) {
+                    return Err(SessionError::Params(format!("参数 `:{name}` 给了多次")));
+                }
+            }
+            // 缺参优先于多给，沿 SQL 出现序报告，保持驱动已有的错误契约。
+            for token in &tokens {
+                if let crate::lexer::TokenKind::Param(name) = &token.kind {
+                    if !supplied.contains(name.as_str()) {
+                        return Err(SessionError::Params(format!("缺参数值 `:{name}`")));
+                    }
+                }
+            }
+            for (name, _) in named {
+                if !declared.contains(name) {
+                    return Err(SessionError::Params(format!(
+                        "整批语句都没用到参数 `:{name}`"
+                    )));
+                }
+            }
+        }
         let mut out = Vec::with_capacity(stmts.len());
         // **参数是"整批共用"的**：一条语句只用其中几个是正常的
         // （`BEGIN; INSERT … :p; COMMIT`）——"多给"只在**整批**都没用到时才报。
@@ -536,7 +827,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         Ok(out)
     }
 
-    fn snapshot(&self) -> CommitSeq {
+    pub(crate) fn snapshot(&self) -> CommitSeq {
         CommitSeq::from_raw(self.seq + 1).expect("48 位域内")
     }
 
@@ -552,6 +843,9 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         // ⓪.5 **日志要被挡就先推一次检查点**（§11.7 的 CKPT 触发 ②"组满被迫"；
         //      触发 ①"周期发布"随后台角色切片——`crates/daemon` 尚未接电）。
         self.checkpoint_on_log_pressure()?;
+        if let Some(result) = self.execute_graph_statement(stmt) {
+            return result;
+        }
         // ① 解析已完成（调用方）；② 绑定。
         let snapshot = self.snapshot();
         // **解析策略随会话身份**（先取出来：下面借 `self.catalog` 时不能再借 `self`）：
@@ -559,7 +853,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         // （`spec/SQL.md` 待冻结项 47）。
         let is_admin = self.is_management_identity();
         let bound = {
-            let mut view = CatalogViewImpl::new(self.catalog, snapshot);
+            let mut view =
+                CatalogViewImpl::new(self.catalog, snapshot).with_graph_access(self.graph_internal);
             let mut resolver =
                 NameResolver::with_policy(&mut view, crate::bind::ResolvePolicy { is_admin });
             bind_statement(&mut resolver, stmt)?
@@ -568,6 +863,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         self.exec_params = place_params(&bound, named, used)?;
 
         match bound {
+            crate::bind::BoundStatement::ShowTables => self.show_tables(),
             crate::bind::BoundStatement::Transaction(kind) => self.transaction(kind),
             // **DCL**：语义全在执行层（`dcl_exec`：资格 → 对象 → 两处写）。
             crate::bind::BoundStatement::Dcl(stmt) => self.execute_dcl(&stmt),
@@ -600,7 +896,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             | crate::bind::BoundStatement::SetOp(_)
             | crate::bind::BoundStatement::Insert(_) => {
                 let plan = {
-                    let mut view = CatalogViewImpl::new(self.catalog, snapshot);
+                    let mut view = CatalogViewImpl::new(self.catalog, snapshot)
+                        .with_graph_access(self.graph_internal);
                     plan_statement(&bound, &mut view)?
                 };
                 let Some(plan) = plan else {
@@ -614,7 +911,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             crate::bind::BoundStatement::Update(ref u) => {
                 let filter = u.filter.clone();
                 let plan = {
-                    let mut view = CatalogViewImpl::new(self.catalog, snapshot);
+                    let mut view = CatalogViewImpl::new(self.catalog, snapshot)
+                        .with_graph_access(self.graph_internal);
                     plan_statement(&bound, &mut view)?
                 };
                 let Some(plan) = plan else {
@@ -625,7 +923,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             crate::bind::BoundStatement::Delete(ref d) => {
                 let filter = d.filter.clone();
                 let plan = {
-                    let mut view = CatalogViewImpl::new(self.catalog, snapshot);
+                    let mut view = CatalogViewImpl::new(self.catalog, snapshot)
+                        .with_graph_access(self.graph_internal);
                     plan_statement(&bound, &mut view)?
                 };
                 let Some(plan) = plan else {
@@ -636,9 +935,86 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         }
     }
 
+    fn show_tables(&mut self) -> Result<QueryResult, SessionError> {
+        let tables = self
+            .catalog
+            .tables()
+            .map_err(|e| SessionError::State(format!("表目录：{e}")))?;
+        let attachment_virtual = self.identity.is_some()
+            && !self.on_public_workspace()
+            && [
+                "ag_schema_version",
+                "ag_attachment_schema",
+                "ag_attachment",
+                "ag_attachment_chunk",
+                "ag_session",
+            ]
+            .iter()
+            .all(|name| tables.iter().any(|table| table.name == *name));
+        let mut rows: Vec<Vec<Value>> = tables
+            .into_iter()
+            .map(|t| {
+                let kind = if bicdb_catalog::dict::DICT_TABLES
+                    .iter()
+                    .any(|d| d.name == t.name)
+                {
+                    "DICTIONARY"
+                } else {
+                    "USER"
+                };
+                vec![
+                    Value::Bytes(t.name.into_bytes()),
+                    Value::Bytes(kind.as_bytes().to_vec()),
+                    dict_to_value(&bicdb_catalog::row::DictValue::Num(u64::from(t.obj))),
+                ]
+            })
+            .collect();
+        if attachment_virtual {
+            rows.push(vec![
+                Value::Bytes(b"attachment$".to_vec()),
+                Value::Bytes(b"VIRTUAL".to_vec()),
+                Value::Null,
+            ]);
+        }
+        // Fixed tables have no obj$ row: only list a live provider, never invent
+        // unimplemented asset/graph tables from design documents.
+        if self
+            .fixed_source
+            .and_then(|s| s.fixed_table("file$"))
+            .is_some()
+        {
+            rows.push(vec![
+                Value::Bytes(b"file$".to_vec()),
+                Value::Bytes(b"FIXED".to_vec()),
+                Value::Null,
+            ]);
+        }
+        rows.sort_by(|a, b| match (&a[0], &b[0]) {
+            (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        });
+        Ok(QueryResult::Rows {
+            columns: vec![
+                ColumnMeta {
+                    name: "table_name".into(),
+                    kind: ColKind::Bytes,
+                },
+                ColumnMeta {
+                    name: "table_kind".into(),
+                    kind: ColKind::Bytes,
+                },
+                ColumnMeta {
+                    name: "object_id".into(),
+                    kind: ColKind::Number,
+                },
+            ],
+            rows,
+        })
+    }
+
     // ───────────────────────── 事务控制 ─────────────────────────
 
-    fn transaction(
+    pub(crate) fn transaction(
         &mut self,
         kind: crate::ast::TransactionStmtKind,
     ) -> Result<QueryResult, SessionError> {
@@ -659,7 +1035,6 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     .ok_or_else(|| SessionError::State("没有活动事务".to_owned()))?;
                 let seq = self.engine.commit(&mut txn)?;
                 self.seq = seq.as_raw();
-                self.seen_keys.clear();
                 Ok(QueryResult::Txn(format!("COMMIT（提交序号 {seq}）")))
             }
             K::Rollback => {
@@ -668,13 +1043,91 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     .take()
                     .ok_or_else(|| SessionError::State("没有活动事务".to_owned()))?;
                 let n = self.engine.rollback(&mut txn)?;
-                self.seen_keys.clear();
                 Ok(QueryResult::Txn(format!("ROLLBACK（撤销 {n} 条）")))
             }
         }
     }
 
     // ───────────────────────── 计划执行 ─────────────────────────
+
+    /// Materialize sanitized metadata before execution borrows the engine.
+    /// All references to a dictionary in this statement share the same image.
+    fn readonly_cursors(
+        &mut self,
+        plan: &PhysicalPlan,
+        snapshot: CommitSeq,
+    ) -> Result<Vec<Option<MemoryCursor>>, SessionError> {
+        if plan.sources.iter().any(|s| s.fixed == Some("graph_table")) {
+            self.with_graph_deadline(self.graph_limits.max_elapsed_ms, |s| {
+                s.readonly_cursors_scoped(plan, snapshot)
+            })
+        } else {
+            self.readonly_cursors_scoped(plan, snapshot)
+        }
+    }
+    fn readonly_cursors_scoped(
+        &mut self,
+        plan: &PhysicalPlan,
+        snapshot: CommitSeq,
+    ) -> Result<Vec<Option<MemoryCursor>>, SessionError> {
+        let mut images = std::collections::BTreeMap::new();
+        let mut cursors = Vec::with_capacity(plan.sources.len());
+        // Shared bound for all GRAPH_TABLE sources, including set-operation branches.
+        let mut graph_bytes = 0usize;
+        let mut remaining_edges = self.graph_limits.max_edge_expansions;
+        let mut remaining_work = self.graph_limits.max_expansions;
+        for source in &plan.sources {
+            let Some(name) = source.fixed else {
+                cursors.push(None);
+                continue;
+            };
+            if name == "graph_table" {
+                let source_query = source
+                    .graph_table
+                    .as_ref()
+                    .ok_or_else(|| SessionError::State("missing GRAPH_TABLE plan".into()))?;
+                let rows =
+                    self.graph_table_rows(source_query, &mut remaining_edges, &mut remaining_work)?;
+                let zero = bicdb_storage::rowid::RowId::from_bytes(&[0u8; 6]);
+                let mut encoded = Vec::with_capacity(rows.len());
+                for row in rows {
+                    self.check_graph_deadline("GRAPH_TABLE materialization")?;
+                    let bytes = bicdb_exec::encode_row(&Row::new(row), &source.shape)?;
+                    graph_bytes = graph_bytes.saturating_add(bytes.len()).saturating_add(32);
+                    if graph_bytes > self.graph_limits.max_text_bytes {
+                        return Err(SessionError::State(format!(
+                            "GRAPH_TABLE statement materialization exceeds {} bytes",
+                            self.graph_limits.max_text_bytes
+                        )));
+                    }
+                    encoded.push((zero, bytes));
+                }
+                self.check_graph_deadline("after GRAPH_TABLE materialization")?;
+                cursors.push(Some(MemoryCursor::new(encoded)));
+                continue;
+            }
+            if name == "attachment$" || name == "attachment_grep" {
+                let rows =
+                    self.attachment_virtual_rows(name, source.function_args.as_deref(), snapshot)?;
+                cursors.push(Some(values_cursor(&rows, &source.shape)?));
+                continue;
+            }
+            if !images.contains_key(name) {
+                let cursor = if crate::bind::dictionary_columns(name).is_some() {
+                    let rows = self
+                        .catalog
+                        .sql_dictionary_rows(snapshot, name)
+                        .map_err(|error| BindError::Catalog(error.to_string()))?;
+                    dictionary_cursor(&rows, &source.shape)?
+                } else {
+                    fixed_cursor(self.fixed_source, name, &source.shape)?
+                };
+                images.insert(name, cursor);
+            }
+            cursors.push(images.get(name).cloned());
+        }
+        Ok(cursors)
+    }
 
     fn execute_plan(
         &mut self,
@@ -739,7 +1192,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         let own = self.txn.as_ref().map(TxnHandle::id);
         let view = bicdb_storage::cr::ReadView::new(snapshot).with_own(own);
         // **固定表的内容源**（借用拷出来——闭包里再借 `self` 会与下面的 `self.engine` 冲突）。
-        let fixed_src = self.fixed_source;
+        let readonly = self.readonly_cursors(plan, snapshot)?;
         // 扫描期与 CR 共持撤销链（**读上下文**；语句内完成，不做长事务）。
         let rows = self.engine.with_read_context(|pool_ref, chain| {
             let mut open = |src: bicdb_exec::SourceId| {
@@ -748,15 +1201,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     bicdb_exec::ExecError::Spill(format!("行源 {src} 不在计划里"))
                 })?;
                 // **固定表**：行由引擎即时产生（内存游标，没有段、没有 RID）。
-                if let Some(name) = plan.sources.get(idx).and_then(|s| s.fixed) {
-                    let shape = plan
-                        .sources
-                        .get(idx)
-                        .map(|s| s.shape.clone())
-                        .unwrap_or_else(|| RowShape::new(Vec::new()));
-                    return Ok(
-                        Box::new(fixed_cursor(fixed_src, name, &shape)?) as Box<dyn RowCursor>
-                    );
+                if let Some(cursor) = readonly.get(idx).and_then(Option::as_ref) {
+                    return Ok(Box::new(cursor.clone()) as Box<dyn RowCursor>);
                 }
                 let (file_id, blocks) = entry
                     .as_ref()
@@ -823,7 +1269,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         let params_in = self.exec_params.clone();
         let own = self.txn.as_ref().map(TxnHandle::id);
         let view = bicdb_storage::cr::ReadView::new(snapshot).with_own(own);
-        let fixed_src = self.fixed_source;
+        let readonly = self.readonly_cursors(plan, snapshot)?;
         let node = node.clone();
         let rows = self.engine.with_read_context(|pool_ref, chain| {
             let mut open = |src: bicdb_exec::SourceId| {
@@ -832,15 +1278,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     bicdb_exec::ExecError::Spill(format!("行源 {src} 不在计划里"))
                 })?;
                 // **固定表**：行由引擎即时产生（内存游标，没有段、没有 RID）。
-                if let Some(name) = plan.sources.get(idx).and_then(|s| s.fixed) {
-                    let shape = plan
-                        .sources
-                        .get(idx)
-                        .map(|s| s.shape.clone())
-                        .unwrap_or_else(|| RowShape::new(Vec::new()));
-                    return Ok(
-                        Box::new(fixed_cursor(fixed_src, name, &shape)?) as Box<dyn RowCursor>
-                    );
+                if let Some(cursor) = readonly.get(idx).and_then(Option::as_ref) {
+                    return Ok(Box::new(cursor.clone()) as Box<dyn RowCursor>);
                 }
                 let (file_id, blocks) = entry
                     .as_ref()
@@ -895,14 +1334,51 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         let own = self.txn.as_ref().map(TxnHandle::id);
         // **物化目标行**（按语句快照 + 本会话未提交改动；命中行 = WHERE 放行）。
         let view = bicdb_storage::cr::ReadView::new(snapshot).with_own(own);
-        let (file_id, blocks) = {
+        let mut indexes = crate::dml_index::table_indexes(self.catalog, snapshot, table_obj)?;
+        let mut candidates = if self.graph_internal {
+            crate::dml_index::graph_storage_candidates(
+                self.catalog,
+                &indexes,
+                filter.as_ref(),
+                &params_in,
+            )?
+        } else {
+            None
+        };
+        if let Some(rids) = &mut candidates {
+            // Stable tree entries may point at forwarding slots after growth.
+            // Writers need the physical row ID, as the heap-scan fallback does.
+            for rid in rids.iter_mut() {
+                *rid = crate::dml_index::resolve_physical_rid(
+                    self.pool,
+                    self.catalog.file_mut(),
+                    self.ws,
+                    *rid,
+                )?;
+            }
+            rids.sort_unstable();
+            rids.dedup();
+        }
+        let (file_id, blocks) = if candidates.is_none() {
             let seg = Segment::open_pooled(self.pool, self.catalog.file_mut(), seg_block, self.ws)?;
             let fid = seg.file_id();
             let hwm = seg.hwm();
             (fid, seg.data_blocks(hwm))
+        } else {
+            (0, vec![])
         };
         let targets: Vec<(bicdb_storage::rowid::RowId, Vec<u8>)> =
             self.engine.with_read_context(|pool_ref, chain| {
+                if let Some(rids) = &candidates {
+                    let fetched = bicdb_storage::scan::fetch_rows(pool_ref, chain, view, rids)
+                        .map_err(|e| SessionError::State(format!("图索引回表失败：{e}")))?;
+                    return Ok(rids
+                        .iter()
+                        .copied()
+                        .zip(fetched)
+                        .filter_map(|(rid, bytes)| bytes.map(|bytes| (rid, bytes)))
+                        .collect());
+                }
                 let mut scanner = HeapScanner::new(pool_ref, chain, view, file_id, blocks.clone());
                 let mut out = Vec::new();
                 loop {
@@ -947,7 +1423,6 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         }
         // 索引清单（写前一次）。
         let ws = self.ws;
-        let mut indexes = crate::dml_index::table_indexes(self.catalog, snapshot, table_obj)?;
         let has_indexes = !indexes.is_empty();
         let opts = self
             .catalog
@@ -971,6 +1446,18 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 }
             }
         }
+        let constraints: Vec<bicdb_exec::writer::ColumnConstraint> = self
+            .catalog
+            .columns(snapshot, table_obj)
+            .map_err(|e| SessionError::State(format!("读列约束：{e}")))?
+            .into_iter()
+            .map(|c| bicdb_exec::writer::ColumnConstraint {
+                name: c.name,
+                nullable: c.nullable,
+                max_bytes: (crate::plan::kind_of(c.type_code) == ColKind::Bytes)
+                    .then_some(c.length as usize),
+            })
+            .collect();
         let own_txn = self.txn.is_none();
         let mut txn = match self.txn.take() {
             Some(t) => t,
@@ -992,6 +1479,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     t,
                 );
                 writer.set_table_options(opts.pctfree as u8, opts.itl_max as u16);
+                writer.set_column_constraints(constraints);
                 if has_indexes {
                     writer.set_indexes(&mut indexes);
                 }
@@ -1025,14 +1513,12 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 if own_txn {
                     let committed = self.engine.commit(&mut txn)?;
                     self.seq = committed.as_raw();
-                    self.seen_keys.clear();
                 } else {
                     self.txn = Some(txn);
                 }
                 Ok(QueryResult::Affected(affected))
             }
             Err(e) => {
-                self.seen_keys.clear();
                 let rolled = if own_txn {
                     self.engine.rollback(&mut txn).map(|_| ())
                 } else {
@@ -1090,7 +1576,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             // **用物化后的节点**（`INSERT … SELECT` 的行在 `node` 里，不在 `plan.node` 里
             // ——读错一个变量，唯一性预检就会看到"零行"而放行重复键。实测抓到的正是这条）。
             let rows = plan_row_bytes(&node, &self.exec_params)?;
-            let mut seen = std::mem::take(&mut self.seen_keys);
+            let mut seen = crate::dml_index::SeenKeys::new();
             let view = bicdb_storage::cr::ReadView::new(snapshot)
                 .with_own(self.txn.as_ref().map(TxnHandle::id));
             let checked = self.engine.with_read_context(|pool, chain| {
@@ -1104,10 +1590,21 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     &mut seen,
                 )
             });
-            self.seen_keys = seen;
             checked?;
         }
         let has_indexes = !indexes.is_empty();
+        let constraints: Vec<bicdb_exec::writer::ColumnConstraint> = self
+            .catalog
+            .columns(snapshot, table_obj)
+            .map_err(|e| SessionError::State(format!("读列约束：{e}")))?
+            .into_iter()
+            .map(|c| bicdb_exec::writer::ColumnConstraint {
+                name: c.name,
+                nullable: c.nullable,
+                max_bytes: (crate::plan::kind_of(c.type_code) == ColKind::Bytes)
+                    .then_some(c.length as usize),
+            })
+            .collect();
         let own_txn = self.txn.is_none();
         // 视角与读路径同一份（语句里若有求值读，也照"读己所写"）。
         let own = self.txn.as_ref().map(TxnHandle::id);
@@ -1133,6 +1630,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     t,
                 );
                 writer.set_table_options(opts.pctfree as u8, opts.itl_max as u16);
+                writer.set_column_constraints(constraints);
                 if has_indexes {
                     writer.set_indexes(&mut indexes);
                 }
@@ -1162,10 +1660,6 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 if own_txn {
                     let committed = self.engine.commit(&mut txn)?;
                     self.seq = committed.as_raw();
-                    // 键集随语句收尾清空：唯一性不再依赖它兜底——CR 的
-                    // "读己所写"让写前预检看得到本事务未提交的行（`check_unique`
-                    // 走同一视角）。
-                    self.seen_keys.clear();
                 } else {
                     // 显式事务：语句不提交（写侧 owns_txn = false 已挡住算子提交）。
                     self.txn = Some(txn);
@@ -1180,7 +1674,6 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                 // - 自动提交（`own_txn`）：整回滚——这个事务只含本语句；
                 // - **显式事务：语句级回滚**，事务与锁留着（`COMMIT` 照旧可用，
                 //   此前已成功的语句照旧生效）。整事务回滚是错的（会连坐）。
-                self.seen_keys.clear();
                 let rolled = if own_txn {
                     self.engine.rollback(&mut txn).map(|_| ())
                 } else {
@@ -1210,6 +1703,7 @@ enum DmlKind {
 }
 
 /// **内存行游标**（物化后的 DML 源；`rewind` 也支持——算子重开不致命）。
+#[derive(Clone)]
 struct MemoryCursor {
     rows: Vec<(bicdb_storage::rowid::RowId, Vec<u8>)>,
     at: usize,
@@ -1254,11 +1748,28 @@ fn fixed_cursor(
     let table = src.fixed_table(name).ok_or_else(|| {
         bicdb_exec::ExecError::BadStoredRow(format!("固定表 `{name}` 没有内容源"))
     })?;
+    dictionary_cursor(&table.rows, shape)
+}
+
+fn dictionary_cursor(
+    values: &[Vec<bicdb_catalog::row::DictValue>],
+    shape: &RowShape,
+) -> Result<MemoryCursor, bicdb_exec::ExecError> {
+    let rows: Vec<Vec<Value>> = values
+        .iter()
+        .map(|row| row.iter().map(dict_to_value).collect())
+        .collect();
+    values_cursor(&rows, shape)
+}
+
+fn values_cursor(
+    values: &[Vec<Value>],
+    shape: &RowShape,
+) -> Result<MemoryCursor, bicdb_exec::ExecError> {
     let zero = bicdb_storage::rowid::RowId::from_bytes(&[0u8; 6]);
-    let mut rows = Vec::with_capacity(table.rows.len());
-    for row in &table.rows {
-        let values: Vec<Value> = row.iter().map(dict_to_value).collect();
-        let bytes = bicdb_exec::encode_row(&Row::new(values), shape)?;
+    let mut rows = Vec::with_capacity(values.len());
+    for row in values {
+        let bytes = bicdb_exec::encode_row(&Row::new(row.clone()), shape)?;
         rows.push((zero, bytes));
     }
     Ok(MemoryCursor::new(rows))
@@ -1366,6 +1877,9 @@ fn place_params<'n>(
     let declared: Vec<(&str, bicdb_exec::ColKind)> = match bound {
         B::Select(s) => s.params.list(),
         B::Insert(i) => i.params.list(),
+        B::Update(u) => u.params.list(),
+        B::Delete(d) => d.params.list(),
+        B::SetOp(o) => return place_params(&o.left, named, used),
         _ => Vec::new(),
     };
     for (name, _) in named {
@@ -1406,6 +1920,7 @@ fn value_kind_name(v: &Value) -> &'static str {
         Value::Number(_) => "数值",
         Value::Bytes(_) => "字节串",
         Value::Bool(_) => "布尔",
+        Value::GraphElement(_) => "图元素",
     }
 }
 
@@ -1426,6 +1941,15 @@ pub fn format_value(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::Bytes(b) => String::from_utf8(b.clone()).unwrap_or_else(|_| format!("0x{}", hex(b))),
+        Value::GraphElement(v) => format!(
+            "{}:{}:{}",
+            v.graph,
+            match v.kind {
+                bicdb_exec::GraphElementKind::Node => 'n',
+                bicdb_exec::GraphElementKind::Edge => 'e',
+            },
+            v.id
+        ),
     }
 }
 
