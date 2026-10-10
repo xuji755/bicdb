@@ -205,6 +205,8 @@ pub struct RunParams {
     pub log: String,
     /// 同时保持的客户端连接上限。
     pub max_connections: usize,
+    /// One daemon may keep at most this many logical workspaces open, PUBLIC included.
+    pub max_bound_workspaces: usize,
     /// 实例级 SQL worker 数；控制面 worker 不计入其中。
     pub worker_threads: usize,
     /// 实例级等待执行队列容量。
@@ -353,6 +355,7 @@ impl Default for RunParams {
             socket: crate::lock::SOCKET_FILE.to_owned(),
             log: "bicdb.log".to_owned(),
             max_connections: json_u64(d("max_connections")) as usize,
+            max_bound_workspaces: json_u64(d("max_bound_workspaces")) as usize,
             worker_threads: json_u64(d("worker_threads")) as usize,
             execution_queue_capacity: json_u64(d("execution_queue_capacity")) as usize,
             max_active_per_workspace: json_u64(d("max_active_per_workspace")) as usize,
@@ -831,6 +834,13 @@ pub const SPECS: &[Spec] = &[
     },
     Spec {
         section: "service",
+        key: "max_bound_workspaces",
+        effect: Effect::Restart,
+        default: "1024",
+        doc: "单实例可同时打开的逻辑工作区上限（1–65536，包含 PUBLIC；与 DB Cache/KCBWDS 无关）",
+    },
+    Spec {
+        section: "service",
         key: "worker_threads",
         effect: Effect::Restart,
         default: "16",
@@ -1108,6 +1118,9 @@ impl InstanceParams {
             ("service", "log") => self.run.log = text(value)?,
             ("service", "max_connections") => {
                 self.run.max_connections = num(value, 2, 1024)? as usize
+            }
+            ("service", "max_bound_workspaces") => {
+                self.run.max_bound_workspaces = num(value, 1, 65_536)? as usize
             }
             ("service", "worker_threads") => self.run.worker_threads = num(value, 1, 256)? as usize,
             ("service", "execution_queue_capacity") => {
@@ -1468,6 +1481,7 @@ impl InstanceParams {
             ("service", "socket") => self.run.socket.clone(),
             ("service", "log") => self.run.log.clone(),
             ("service", "max_connections") => self.run.max_connections.to_string(),
+            ("service", "max_bound_workspaces") => self.run.max_bound_workspaces.to_string(),
             ("service", "worker_threads") => self.run.worker_threads.to_string(),
             ("service", "execution_queue_capacity") => {
                 self.run.execution_queue_capacity.to_string()
@@ -1827,6 +1841,7 @@ mod tests {
         let cases = [
             ("worker_threads", 1, 256, 16),
             ("execution_queue_capacity", 1, 1_048_576, 1024),
+            ("max_bound_workspaces", 1, 65_536, 1024),
             ("max_active_per_workspace", 1, 256, 10),
             ("workspace_queue_capacity", 1, 65_536, 128),
             ("control_workers", 1, 64, 2),

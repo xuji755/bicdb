@@ -184,6 +184,33 @@ fn validate_forced_write_transition(
     }
 }
 
+fn bound_workspace_capacity(
+    active_private: usize,
+    maximum: usize,
+    already_open: bool,
+) -> Result<(), String> {
+    if already_open || 1usize.saturating_add(active_private) < maximum {
+        Ok(())
+    } else {
+        Err(format!(
+            "实例已达到工作区绑定上限 {maximum}（包含 PUBLIC）；请提高 service.max_bound_workspaces 后重启"
+        ))
+    }
+}
+
+fn remember_recovery_failure(
+    registry: &mut RecoveryRequiredRegistry,
+    workspace: [u8; 8],
+    error: &crate::boot::BootError,
+) {
+    if matches!(
+        error,
+        crate::boot::BootError::Io(_) | crate::boot::BootError::Catalog(_)
+    ) {
+        registry.record(workspace, error.to_string());
+    }
+}
+
 struct WireReply {
     status: &'static str,
     payload: Vec<u8>,
@@ -1169,6 +1196,11 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                     }
 
                     if !is_public && !workspaces.contains_key(&ws) {
+                        bound_workspace_capacity(
+                            workspaces.len(),
+                            params.run.max_bound_workspaces,
+                            false,
+                        )?;
                         let ini = expected_root.join("bicdb.ini");
                         let (mut workspace_params, _) =
                             crate::config::InstanceParams::load_with_overrides(Some(&ini), &[])
@@ -1206,9 +1238,8 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                             )
                         };
                         let target = opened.map_err(|error| {
-                            let reason = error.to_string();
-                            recovery_required.record(ws, reason.clone());
-                            format!("工作区恢复失败，仍为 RECOVERY REQUIRED：{reason}")
+                            remember_recovery_failure(&mut recovery_required, ws, &error);
+                            format!("工作区打开失败：{error}")
                         })?;
                         if target.ws_ref != ws || target.catalog.is_public() {
                             return Err("实际工作区与 OPEN 目标不匹配".into());
@@ -1577,12 +1608,13 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                     continue;
                 }
                 if verb == "STATUS" {
+                    let bound_workspaces = workspaces.len() + 1;
                     let inst = selected_instance(&mut inst, &mut workspaces, connection.workspace);
                     let cache = inst.pool.stats();
                     let execution = scheduler.metrics();
                     let _ = reply.send(WireReply::ok({
                         let mut body = format!(
-                            "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\nconnections={connection_count}\nfile_handles={}\nrecovery_required_workspaces={}\nshutdown_state={}\nshutdown_elapsed_ms={}\nmax_connections={}\nworker_threads={}\nexecution_active={}\nexecution_queued={}\nexecution_parked={}\nexecution_ready_workspaces={}\nexecution_queue_capacity={}\nmax_active_per_workspace={}\nworkspace_queue_capacity={}\ncontrol_workers={}\nworkspace_kind={}\nidentity={}\ncache_frames={}\ncache_bytes={}\ncache_resident={}\ncache_hits={}\ncache_misses={}\ncache_evictions={}\ncache_writes={}\ncache_dirty_pages={}\ncache_free_buffer_waits={}\ncache_wal_syncs={}\ncache_run_reads={}\ncache_run_pages={}\ngraph_detach_edge_limit={}\ngraph_max_nodes={}\ngraph_max_edges={}\ngraph_max_rows={}\ngraph_max_expansions={}\ngraph_max_edge_expansions={}\ngraph_max_elapsed_ms={}\ngraph_max_depth={}\ngraph_max_text_bytes={}\nbackground_failures={}\nfault_audit_failures={}\nfault_audit_state={}\nsql_elapsed_us={sql_elapsed_us}\n",
+                            "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\nconnections={connection_count}\nfile_handles={}\nrecovery_required_workspaces={}\nshutdown_state={}\nshutdown_elapsed_ms={}\nmax_connections={}\nmax_bound_workspaces={}\nbound_workspaces={}\nworker_threads={}\nexecution_active={}\nexecution_queued={}\nexecution_parked={}\nexecution_ready_workspaces={}\nexecution_queue_capacity={}\nmax_active_per_workspace={}\nworkspace_queue_capacity={}\ncontrol_workers={}\nworkspace_kind={}\nidentity={}\ncache_frames={}\ncache_bytes={}\ncache_resident={}\ncache_hits={}\ncache_misses={}\ncache_evictions={}\ncache_writes={}\ncache_dirty_pages={}\ncache_free_buffer_waits={}\ncache_wal_syncs={}\ncache_run_reads={}\ncache_run_pages={}\ngraph_detach_edge_limit={}\ngraph_max_nodes={}\ngraph_max_edges={}\ngraph_max_rows={}\ngraph_max_expansions={}\ngraph_max_edge_expansions={}\ngraph_max_elapsed_ms={}\ngraph_max_depth={}\ngraph_max_text_bytes={}\nbackground_failures={}\nfault_audit_failures={}\nfault_audit_state={}\nsql_elapsed_us={sql_elapsed_us}\n",
                             opts.dir.display(), env!("CARGO_PKG_VERSION"), std::process::id(),
                             started.elapsed().as_secs(), inst.seq(), WIRE_VERSION,
                             inst.io.open_handle_count().to_string(),
@@ -1590,6 +1622,7 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                             if pending_fast_stop { "DRAINING" } else { "RUNNING" },
                             fast_stop_started.map_or(0, |started| started.elapsed().as_millis()),
                             params.run.max_connections,
+                            params.run.max_bound_workspaces, bound_workspaces,
                             params.run.worker_threads, execution.active, execution.queued, execution.parked,
                             execution.ready_workspaces, params.run.execution_queue_capacity,
                             params.run.max_active_per_workspace,
@@ -1692,6 +1725,11 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                                 .ok_or("工作区号无效")?,
                         );
                         if !workspaces.contains_key(&ws) {
+                            bound_workspace_capacity(
+                                workspaces.len(),
+                                params.run.max_bound_workspaces,
+                                false,
+                            )?;
                             if let Some(reason) = recovery_required.cause(&ws) {
                                 return Err(format!(
                                     "工作区处于 RECOVERY REQUIRED，须先修复或由实例管理员执行显式恢复命令：{reason}"
@@ -1733,10 +1771,8 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                                 Ok(target) => target,
                                 Err(error) => {
                                     let reason = error.to_string();
-                                    recovery_required.record(ws, reason.clone());
-                                    return Err(format!(
-                                        "工作区恢复失败，已隔离为 RECOVERY REQUIRED：{reason}"
-                                    ));
+                                    remember_recovery_failure(&mut recovery_required, ws, &error);
+                                    return Err(format!("工作区打开失败：{reason}"));
                                 }
                             };
                             if target.ws_ref != ws || target.catalog.is_public() {

@@ -504,3 +504,34 @@ fn fast_stop_drains_parked_auto_transaction_through_a_worker() {
     drop(work);
     handle.join().unwrap();
 }
+
+#[test]
+fn workspace_bind_limit_counts_open_workspaces_not_cache_capacity() {
+    assert!(bound_workspace_capacity(0, 1, true).is_ok());
+    assert!(bound_workspace_capacity(0, 1, false).is_err());
+    assert!(bound_workspace_capacity(2, 4, false).is_ok());
+    assert!(bound_workspace_capacity(3, 4, false).is_err());
+    assert!(bound_workspace_capacity(4, 4, true).is_ok());
+}
+
+#[test]
+fn parameter_or_lock_errors_do_not_become_recovery_required() {
+    let mut registry = RecoveryRequiredRegistry::default();
+    remember_recovery_failure(
+        &mut registry,
+        WS,
+        &crate::boot::BootError::Config("bad setting".into()),
+    );
+    remember_recovery_failure(
+        &mut registry,
+        WS,
+        &crate::boot::BootError::Occupied("busy".into()),
+    );
+    assert_eq!(registry.len(), 0);
+    remember_recovery_failure(
+        &mut registry,
+        WS,
+        &crate::boot::BootError::Catalog("recovery validation failed".into()),
+    );
+    assert_eq!(registry.len(), 1);
+}
