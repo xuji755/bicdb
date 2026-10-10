@@ -321,6 +321,15 @@ where
     pub fn queued_in(&self, workspace: W) -> usize {
         self.queues.get(&workspace).map_or(0, VecDeque::len)
     }
+
+    /// Whether this workspace has no executing, queued, or row-lock-waiting
+    /// request. Other workspaces deliberately do not affect this answer.
+    #[must_use]
+    pub fn idle_in(&self, workspace: W) -> bool {
+        self.active_in(workspace) == 0
+            && self.queued_in(workspace) == 0
+            && self.parked_in(workspace) == 0
+    }
 }
 
 #[cfg(test)]
@@ -371,6 +380,20 @@ mod tests {
         );
         assert!(scheduler.complete(1));
         assert_eq!(scheduler.dispatch().unwrap().request, 3);
+    }
+
+    #[test]
+    fn workspace_idle_state_is_isolated_from_other_workspaces() {
+        let mut scheduler = Scheduler::new(limits()).unwrap();
+        scheduler.enqueue(2, "private").unwrap();
+        assert!(scheduler.idle_in(1));
+        assert!(!scheduler.idle_in(2));
+
+        let dispatched = scheduler.dispatch().unwrap();
+        assert!(scheduler.idle_in(1));
+        assert!(!scheduler.idle_in(2));
+        assert!(scheduler.complete(dispatched.workspace));
+        assert!(scheduler.idle_in(2));
     }
 
     #[test]

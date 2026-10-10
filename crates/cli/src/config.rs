@@ -623,13 +623,13 @@ pub const SPECS: &[Spec] = &[
         key: "pool_frames",
         effect: Effect::Restart,
         default: "131072",
-        doc: "共享缓冲池帧数（16 KiB/帧；默认 2 GiB；每个激活工作区至少保障 2 GiB）",
+        doc: "实例共享缓冲池总帧数（16 KiB/帧；默认 2 GiB；所有工作区共同使用）",
     },
     Spec {
         section: "buffer",
         key: "kcbwds",
         effect: Effect::Restart,
-        default: "4",
+        default: "2",
         doc:
             "缓存工作集分区数（1–64，2 的幂；pool_frames 为总帧数且须整除分区数；每分区一个 DBWR）",
     },

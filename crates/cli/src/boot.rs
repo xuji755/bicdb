@@ -510,20 +510,6 @@ fn resolve(file0: FileHandle, undo: FileHandle, r: Rdba) -> Option<(FileHandle, 
     }
 }
 
-/// Minimum cache capacity reserved for each activated workspace (2 GiB).
-pub const MIN_WORKSPACE_CACHE_FRAMES: usize =
-    2 * 1024 * 1024 * 1024 / bicdb_storage::page::PAGE_SIZE;
-
-fn check_cache_admission(total_frames: usize, count: usize) -> Result<(), BootError> {
-    let required = count
-        .checked_mul(MIN_WORKSPACE_CACHE_FRAMES)
-        .ok_or_else(|| BootError::Config("工作区缓存保障容量溢出".into()))?;
-    if total_frames < required {
-        return Err(BootError::Config(format!("共享 DB Cache 容量不足：{count} 个工作区至少需要 {} GiB，当前 {} 帧；每工作区最低 2 GiB", count * 2, total_frames)));
-    }
-    Ok(())
-}
-
 /// One process-wide cache and file/WAL registry for all logical workspaces.
 /// Workspace-local engines retain independent undo and log streams.
 pub struct SharedInstanceCache {
@@ -536,7 +522,6 @@ pub struct SharedInstanceCache {
 }
 impl SharedInstanceCache {
     fn new(io: &'static OsFileIo, params: &InstanceParams) -> Result<Arc<Self>, BootError> {
-        check_cache_admission(params.run.pool_frames, 1)?;
         let files = Arc::new(RwLock::new(
             BTreeMap::<[u8; 8], (FileHandle, FileHandle)>::new(),
         ));
@@ -572,7 +557,7 @@ impl SharedInstanceCache {
         // Admission is serialized by the service control loop. Never hold the
         // file registry while acquiring cache structures: resolution uses the
         // reverse order during page selection.
-        let count = {
+        {
             let files = self
                 .files
                 .read()
@@ -580,13 +565,8 @@ impl SharedInstanceCache {
             if files.contains_key(&ws) {
                 return Err(BootError::Catalog("工作区已注册到共享缓存".into()));
             }
-            files.len() + 1
-        };
-        check_cache_admission(self.pool.capacity() * self.pool.partition_count(), count)?;
-        self.pool
-            .reserve_workspace(ws, MIN_WORKSPACE_CACHE_FRAMES)?;
+        }
         if let Err(error) = self.wal.register(ws, guard) {
-            let _ = self.pool.release_empty_workspace_reservation(ws);
             return Err(BootError::Io(error));
         }
         let inserted = match self.files.write() {
@@ -602,7 +582,6 @@ impl SharedInstanceCache {
         };
         if let Err(error) = inserted {
             let _ = self.wal.unregister_registration(ws);
-            let _ = self.pool.release_empty_workspace_reservation(ws);
             return Err(error);
         }
         Ok(())
@@ -1511,16 +1490,9 @@ fn open_unlocked_internal(
 mod cache_admission_tests {
     use super::*;
     #[test]
-    fn two_gib_is_guaranteed_per_activated_workspace() {
-        assert!(check_cache_admission(3 * MIN_WORKSPACE_CACHE_FRAMES, 3).is_ok());
-        assert!(check_cache_admission(3 * MIN_WORKSPACE_CACHE_FRAMES - 1, 3).is_err());
-        assert!(check_cache_admission(MIN_WORKSPACE_CACHE_FRAMES, 2).is_err());
-        assert!(check_cache_admission(usize::MAX, usize::MAX).is_err());
-    }
-    #[test]
     fn cache_frames_are_total_and_divided_between_writers() {
         let mut params = InstanceParams::default();
-        params.run.pool_frames = 3 * MIN_WORKSPACE_CACHE_FRAMES;
+        params.run.pool_frames = 393_216;
         params.run.kcbwds = 4;
         assert_eq!(
             cache_partition_capacity(&params).unwrap() * 4,

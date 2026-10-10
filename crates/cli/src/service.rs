@@ -216,6 +216,20 @@ struct ConnectionSession {
     workspace: Option<[u8; 8]>,
 }
 
+fn workspace_has_open_transaction(
+    connections: &BTreeMap<u64, ConnectionSession>,
+    public_workspace: [u8; 8],
+    workspace: [u8; 8],
+) -> bool {
+    connections.values().any(|connection| {
+        connection.workspace.unwrap_or(public_workspace) == workspace
+            && connection
+                .state
+                .as_ref()
+                .is_some_and(SessionState::in_transaction)
+    })
+}
+
 enum WorkerAction {
     Sql {
         sql: String,
@@ -1001,11 +1015,12 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
     let mut served: u64 = 0;
     let mut sql_elapsed_us: u128 = 0;
     let started = Instant::now();
-    let mut fulltext = FulltextScheduler::new(
+    let public_fulltext = FulltextScheduler::new(
         params.run.fulltext_interval_ms,
         params.run.fulltext_batch_rows,
     )
     .map_err(|e| ServiceError::State(e.to_string()))?;
+    let mut fulltext = BTreeMap::from([(inst.ws_ref, public_fulltext)]);
     let (event_tx, event_rx) = mpsc::channel();
     let (work_tx, work_rx) = mpsc::channel();
     let work_rx = Arc::new(Mutex::new(work_rx));
@@ -1104,27 +1119,17 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
         let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => event,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !connections.values().any(|connection| {
-                    connection
-                        .state
-                        .as_ref()
-                        .is_some_and(SessionState::in_transaction)
-                }) && scheduler.metrics().active == 0
-                    && scheduler.metrics().queued == 0
-                    && scheduler.metrics().parked == 0
+                if !workspace_has_open_transaction(&connections, inst.ws_ref, inst.ws_ref)
+                    && scheduler.idle_in(inst.ws_ref)
                 {
-                    let seq = inst.seq();
-                    let mut session = Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
-                    session
-                        .set_fulltext_defaults(
-                            params.run.fulltext_interval_ms,
-                            params.run.fulltext_batch_rows,
-                        )
-                        .map_err(|e| ServiceError::State(e.to_string()))?;
-                    session
-                        .set_graph_limits(params.run.graph_limits())
-                        .map_err(|e| ServiceError::State(e.to_string()))?;
-                    maintain_fulltext(&mut session, &mut fulltext, &mut log);
+                    maintain_workspace_fulltext(&mut inst, &mut fulltext, params, &mut log)?;
+                }
+                for (workspace, target) in &mut workspaces {
+                    if !workspace_has_open_transaction(&connections, inst.ws_ref, *workspace)
+                        && scheduler.idle_in(*workspace)
+                    {
+                        maintain_workspace_fulltext(target, &mut fulltext, params, &mut log)?;
+                    }
                 }
                 continue;
             }
@@ -1984,28 +1989,10 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                 // must not starve a 100 ms maintenance interval forever.
                 // Any suspended explicit transaction pauses maintenance for
                 // the whole workspace, preserving the single-session rule.
-                if !connections.values().any(|connection| {
-                    connection
-                        .state
-                        .as_ref()
-                        .is_some_and(SessionState::in_transaction)
-                }) && scheduler.metrics().active == 0
-                    && scheduler.metrics().queued == 0
-                    && scheduler.metrics().parked == 0
+                if !workspace_has_open_transaction(&connections, inst.ws_ref, inst.ws_ref)
+                    && scheduler.idle_in(inst.ws_ref)
                 {
-                    let seq = inst.seq();
-                    let mut maintenance =
-                        Session::new(inst.pool, inst.engine, &mut inst.catalog, seq);
-                    maintenance
-                        .set_fulltext_defaults(
-                            params.run.fulltext_interval_ms,
-                            params.run.fulltext_batch_rows,
-                        )
-                        .map_err(|e| ServiceError::State(e.to_string()))?;
-                    maintenance
-                        .set_graph_limits(params.run.graph_limits())
-                        .map_err(|e| ServiceError::State(e.to_string()))?;
-                    maintain_fulltext(&mut maintenance, &mut fulltext, &mut log);
+                    maintain_workspace_fulltext(&mut inst, &mut fulltext, params, &mut log)?;
                 }
             }
         }
@@ -2073,6 +2060,37 @@ fn maintain_fulltext(
         Err(e) => log.line(&format!("全文后台维护失败（保留未处理事件）：{e}")),
         Ok(None) => {}
     }
+}
+
+fn maintain_workspace_fulltext(
+    instance: &mut crate::boot::Instance,
+    schedulers: &mut BTreeMap<[u8; 8], FulltextScheduler>,
+    params: &crate::config::InstanceParams,
+    log: &mut LogFile,
+) -> Result<(), ServiceError> {
+    let scheduler = match schedulers.entry(instance.ws_ref) {
+        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+            FulltextScheduler::new(
+                params.run.fulltext_interval_ms,
+                params.run.fulltext_batch_rows,
+            )
+            .map_err(|error| ServiceError::State(error.to_string()))?,
+        ),
+    };
+    let seq = instance.seq();
+    let mut session = Session::new(instance.pool, instance.engine, &mut instance.catalog, seq);
+    session
+        .set_fulltext_defaults(
+            params.run.fulltext_interval_ms,
+            params.run.fulltext_batch_rows,
+        )
+        .map_err(|error| ServiceError::State(error.to_string()))?;
+    session
+        .set_graph_limits(params.run.graph_limits())
+        .map_err(|error| ServiceError::State(error.to_string()))?;
+    maintain_fulltext(&mut session, scheduler, log);
+    Ok(())
 }
 
 /// 类型码 → SQL 类型名（与 `bicdbcli` 的 `DESCRIBE` 版面同源）。
