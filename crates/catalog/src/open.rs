@@ -192,10 +192,20 @@ impl<'io> Catalog<'io> {
     /// **打开链**（第 ②③④ 步；`目录详设` §4.1）。
     pub fn open(io: &'io dyn FileIo, path: &Path) -> Result<Self, OpenError> {
         let mut file = DataFile::open(io, path)?;
-        if file.layout() != bicdb_storage::bitmap::FileLayout::meta() {
-            return Err(OpenError::NotMetaFile);
-        }
-        let (entries, _source) = bootstrap::read_with_heal(&mut file)?;
+        let checked = (|| {
+            if file.layout() != bicdb_storage::bitmap::FileLayout::meta() {
+                return Err(OpenError::NotMetaFile);
+            }
+            let (entries, _source) = bootstrap::read_with_heal(&mut file)?;
+            Ok(entries)
+        })();
+        let entries = match checked {
+            Ok(entries) => entries,
+            Err(error) => {
+                let _ = file.close();
+                return Err(error);
+            }
+        };
         Self::from_entries(file, entries)
     }
 
@@ -204,59 +214,69 @@ impl<'io> Catalog<'io> {
         mut file: DataFile<'io>,
         entries: Vec<BootstrapEntry>,
     ) -> Result<Self, OpenError> {
-        let normal = dict::bootstrap_plan(false).len();
-        let public = dict::bootstrap_plan(true).len();
-        let is_public = if entries.len() == normal {
-            false
-        } else if entries.len() == public {
-            true
-        } else {
-            return Err(OpenError::EntryCount {
-                got: entries.len(),
-                normal,
-                public,
-            });
-        };
-        let plan = dict::bootstrap_plan(is_public);
-        let ws = file.workspace_ref();
-        let mut tables = BTreeMap::new();
-        let mut indexes = BTreeMap::new();
-        for (i, (entry, (table, key))) in entries.iter().zip(plan.iter()).enumerate() {
-            // ① 段类型与计划一致。
-            let expect = if key.is_none() {
-                segment::SegType::Heap as u8
+        let checked = (|| {
+            let normal = dict::bootstrap_plan(false).len();
+            let public = dict::bootstrap_plan(true).len();
+            let is_public = if entries.len() == normal {
+                false
+            } else if entries.len() == public {
+                true
             } else {
-                segment::SegType::BTree as u8
+                return Err(OpenError::EntryCount {
+                    got: entries.len(),
+                    normal,
+                    public,
+                });
             };
-            if entry.seg_type != expect {
-                return Err(mismatch(format!(
-                    "第 {i} 条 {} 的段类型 {} ≠ 计划 {expect}",
-                    table.name, entry.seg_type
-                )));
-            }
-            // ② 段头自证（dataobj / seg_type）。
-            let block = entry.seg_header.block_id();
-            let seg = Segment::open(&mut file, block)?;
-            if seg.header().dataobj != entry.dataobj
-                || seg.header().seg_type as u8 != entry.seg_type
-            {
-                return Err(mismatch(format!(
-                    "第 {i} 条 {}：段头自证不符（dataobj {} / type {}）",
-                    table.name,
-                    seg.header().dataobj,
-                    seg.header().seg_type as u8
-                )));
-            }
-            drop(seg);
-            match key {
-                None => {
-                    tables.insert(table.name, (block, *table));
+            let plan = dict::bootstrap_plan(is_public);
+            let ws = file.workspace_ref();
+            let mut tables = BTreeMap::new();
+            let mut indexes = BTreeMap::new();
+            for (i, (entry, (table, key))) in entries.iter().zip(plan.iter()).enumerate() {
+                // ① 段类型与计划一致。
+                let expect = if key.is_none() {
+                    segment::SegType::Heap as u8
+                } else {
+                    segment::SegType::BTree as u8
+                };
+                if entry.seg_type != expect {
+                    return Err(mismatch(format!(
+                        "第 {i} 条 {} 的段类型 {} ≠ 计划 {expect}",
+                        table.name, entry.seg_type
+                    )));
                 }
-                Some(k) => {
-                    indexes.insert(k.name, (block, *k, table.name));
+                // ② 段头自证（dataobj / seg_type）。
+                let block = entry.seg_header.block_id();
+                let seg = Segment::open(&mut file, block)?;
+                if seg.header().dataobj != entry.dataobj
+                    || seg.header().seg_type as u8 != entry.seg_type
+                {
+                    return Err(mismatch(format!(
+                        "第 {i} 条 {}：段头自证不符（dataobj {} / type {}）",
+                        table.name,
+                        seg.header().dataobj,
+                        seg.header().seg_type as u8
+                    )));
+                }
+                drop(seg);
+                match key {
+                    None => {
+                        tables.insert(table.name, (block, *table));
+                    }
+                    Some(k) => {
+                        indexes.insert(k.name, (block, *k, table.name));
+                    }
                 }
             }
-        }
+            Ok((ws, is_public, tables, indexes))
+        })();
+        let (ws, is_public, tables, indexes) = match checked {
+            Ok(parts) => parts,
+            Err(error) => {
+                let _ = file.close();
+                return Err(error);
+            }
+        };
         Ok(Self {
             file,
             ws,
@@ -1231,6 +1251,40 @@ mod tests {
         assert!(rows > 0);
         drop(cat);
         Catalog::open(io, Path::new(path)).unwrap()
+    }
+
+    #[test]
+    fn rejected_catalog_open_and_bootstrap_release_handles() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let path = Path::new("/mem/not-meta.dat");
+        DataFile::create(&io, path, 3, 3, WS, 400)
+            .unwrap()
+            .close()
+            .unwrap();
+        for _ in 0..16 {
+            assert!(Catalog::open(&io, path).is_err());
+            assert_eq!(io.open_handle_count(), 0);
+            let file = DataFile::open(&io, path).unwrap();
+            assert!(Catalog::from_entries(file, vec![]).is_err());
+            assert_eq!(io.open_handle_count(), 0);
+        }
+        let path = Path::new("/mem/unseeded-meta.dat");
+        DataFile::create(
+            &io,
+            path,
+            0,
+            META_ROLE,
+            WS,
+            FileLayout::meta().min_file_blocks() + 512,
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        for _ in 0..16 {
+            assert!(Catalog::open(&io, path).is_err());
+            assert_eq!(io.open_handle_count(), 0);
+        }
     }
 
     #[test]

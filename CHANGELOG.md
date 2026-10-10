@@ -6,6 +6,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- Closed per-poll full-text catalogs on success and failure, fixing a descriptor
+  leak introduced by fresh maintenance catalog views in 0.3.2.
+- Released data-file and catalog handles when creation, temporary-file reset,
+  header or bootstrap validation fails.
+- Moved full-text maintenance into the bounded shared execution pool with
+  workspace-exclusive admission; maintenance no longer blocks the control loop.
+  Added STATUS `fulltext_active` and `fulltext_failures` counters.
+
 ## [0.3.2] — 2026-10-10
 
 ### Fixed
@@ -59,6 +69,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
   workspaces. PUBLIC remains subject to mandatory consistency recovery.
 - Added clean-shutdown gates that roll back active transactions, flush WAL and
   dirty pages, checkpoint every workspace and validate temporary-state cleanup.
+
 
 ## [0.3.0] — 2026-10-10
 

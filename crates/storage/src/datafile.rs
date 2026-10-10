@@ -334,43 +334,49 @@ impl<'a> DataFile<'a> {
             path,
             OpenOptions::new().read(true).write(true).create_new(true),
         )?;
-        io.set_len(handle, blocks * PAGE_SIZE as u64)?;
-        let mut file = Self {
-            io,
-            handle,
-            head: FileHead {
-                file_id,
-                role,
-                format_version: crate::page::FORMAT_VERSION,
-                flags: 0,
-                blocks,
-                workspace_ref,
-                // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
-                file_scn: 0,
-                checkpoint_commit_scn: 0,
-            },
-            runs: Vec::new(),
-        };
-        // **位图区全量预留**：自布局的位图起点起连续 40 区 × 8 页，一次建好、
-        // 永不搬移（标准布局自块 1；file 0 自块 512——副本带之后）。
-        let runs: Vec<u32> = (0..MAX_BITMAP_RUNS as u32)
-            .map(|k| layout.bitmap_first_block + k * BITMAP_PAGES_PER_RUN as u32)
-            .collect();
-        let mut header = Page::new(PageType::FileHeader, workspace_ref, file_id, 0);
-        write_file_head(&mut header, &file.head)?;
-        write_bitmap_runs(&mut header, &runs)?;
-        file.write_page(0, &mut header)?;
-        file.runs = runs;
-        for (k, &start) in file.runs.clone().iter().enumerate() {
-            let base = k as u16 * BITMAP_PAGES_PER_RUN as u16;
-            for i in 0..BITMAP_PAGES_PER_RUN {
-                let block = start + i as u32;
-                let mut page = Page::new(PageType::Bitmap, workspace_ref, file_id, block);
-                bitmap::init(&mut page, BitmapKind::ExtentMap, base + i as u16)?;
-                file.write_page(block, &mut page)?;
+        let result = (|| {
+            io.set_len(handle, blocks * PAGE_SIZE as u64)?;
+            let mut file = Self {
+                io,
+                handle,
+                head: FileHead {
+                    file_id,
+                    role,
+                    format_version: crate::page::FORMAT_VERSION,
+                    flags: 0,
+                    blocks,
+                    workspace_ref,
+                    // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
+                    file_scn: 0,
+                    checkpoint_commit_scn: 0,
+                },
+                runs: Vec::new(),
+            };
+            // **位图区全量预留**：自布局的位图起点起连续 40 区 × 8 页，一次建好、
+            // 永不搬移（标准布局自块 1；file 0 自块 512——副本带之后）。
+            let runs: Vec<u32> = (0..MAX_BITMAP_RUNS as u32)
+                .map(|k| layout.bitmap_first_block + k * BITMAP_PAGES_PER_RUN as u32)
+                .collect();
+            let mut header = Page::new(PageType::FileHeader, workspace_ref, file_id, 0);
+            write_file_head(&mut header, &file.head)?;
+            write_bitmap_runs(&mut header, &runs)?;
+            file.write_page(0, &mut header)?;
+            file.runs = runs;
+            for (k, &start) in file.runs.clone().iter().enumerate() {
+                let base = k as u16 * BITMAP_PAGES_PER_RUN as u16;
+                for i in 0..BITMAP_PAGES_PER_RUN {
+                    let block = start + i as u32;
+                    let mut page = Page::new(PageType::Bitmap, workspace_ref, file_id, block);
+                    bitmap::init(&mut page, BitmapKind::ExtentMap, base + i as u16)?;
+                    file.write_page(block, &mut page)?;
+                }
             }
+            Ok(file)
+        })();
+        if result.is_err() {
+            let _ = io.close(handle);
         }
-        Ok(file)
+        result
     }
 
     /// **打开（或创建）file 2 并重置为空**（§4.8 的"打开即重置"）：重写**文件头
@@ -399,86 +405,98 @@ impl<'a> DataFile<'a> {
                 .create(true)
                 .truncate(false),
         )?;
-        let size = io.size(handle)?;
-        let blocks = (size / PAGE_SIZE as u64).max(blocks);
-        let hard = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
-            + MAX_BITMAP_RUNS as u64
-                * crate::bitmap::BITS_PER_RUN as u64
-                * crate::bitmap::EXTENT_BLOCKS as u64;
-        if blocks > hard.min(1u64 << 28) {
-            return Err(DataFileError::BeyondCoverage {
-                requested: blocks,
-                limit: hard.min(1u64 << 28),
-            });
-        }
-        io.set_len(handle, blocks * PAGE_SIZE as u64)?;
-        let mut file = Self {
-            io,
-            handle,
-            head: FileHead {
-                file_id: TEMP_FILE_ID,
-                role: TEMP_FILE_ROLE,
-                format_version: crate::page::FORMAT_VERSION,
-                flags: 0,
-                blocks,
-                workspace_ref,
-                // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
-                file_scn: 0,
-                checkpoint_commit_scn: 0,
-            },
-            runs: Vec::new(),
-        };
-        // 与 `create` 同规：位图区全量预留（块 1 起连续 40 区 × 8 页）。
-        let runs: Vec<u32> = (0..MAX_BITMAP_RUNS as u32)
-            .map(|k| 1 + k * BITMAP_PAGES_PER_RUN as u32)
-            .collect();
-        let mut header = Page::new(PageType::FileHeader, workspace_ref, TEMP_FILE_ID, 0);
-        write_file_head(&mut header, &file.head)?;
-        write_bitmap_runs(&mut header, &runs)?;
-        file.write_page(0, &mut header)?;
-        file.runs = runs;
-        for (k, &start) in file.runs.clone().iter().enumerate() {
-            let base = k as u16 * BITMAP_PAGES_PER_RUN as u16;
-            for i in 0..BITMAP_PAGES_PER_RUN {
-                let block = start + i as u32;
-                let mut page = Page::new(PageType::Bitmap, workspace_ref, TEMP_FILE_ID, block);
-                bitmap::init(&mut page, BitmapKind::ExtentMap, base + i as u16)?;
-                file.write_page(block, &mut page)?;
+        let result = (|| {
+            let size = io.size(handle)?;
+            let blocks = (size / PAGE_SIZE as u64).max(blocks);
+            let hard = crate::bitmap::DATA_AREA_FIRST_BLOCK as u64
+                + MAX_BITMAP_RUNS as u64
+                    * crate::bitmap::BITS_PER_RUN as u64
+                    * crate::bitmap::EXTENT_BLOCKS as u64;
+            if blocks > hard.min(1u64 << 28) {
+                return Err(DataFileError::BeyondCoverage {
+                    requested: blocks,
+                    limit: hard.min(1u64 << 28),
+                });
             }
+            io.set_len(handle, blocks * PAGE_SIZE as u64)?;
+            let mut file = Self {
+                io,
+                handle,
+                head: FileHead {
+                    file_id: TEMP_FILE_ID,
+                    role: TEMP_FILE_ROLE,
+                    format_version: crate::page::FORMAT_VERSION,
+                    flags: 0,
+                    blocks,
+                    workspace_ref,
+                    // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
+                    file_scn: 0,
+                    checkpoint_commit_scn: 0,
+                },
+                runs: Vec::new(),
+            };
+            // 与 `create` 同规：位图区全量预留（块 1 起连续 40 区 × 8 页）。
+            let runs: Vec<u32> = (0..MAX_BITMAP_RUNS as u32)
+                .map(|k| 1 + k * BITMAP_PAGES_PER_RUN as u32)
+                .collect();
+            let mut header = Page::new(PageType::FileHeader, workspace_ref, TEMP_FILE_ID, 0);
+            write_file_head(&mut header, &file.head)?;
+            write_bitmap_runs(&mut header, &runs)?;
+            file.write_page(0, &mut header)?;
+            file.runs = runs;
+            for (k, &start) in file.runs.clone().iter().enumerate() {
+                let base = k as u16 * BITMAP_PAGES_PER_RUN as u16;
+                for i in 0..BITMAP_PAGES_PER_RUN {
+                    let block = start + i as u32;
+                    let mut page = Page::new(PageType::Bitmap, workspace_ref, TEMP_FILE_ID, block);
+                    bitmap::init(&mut page, BitmapKind::ExtentMap, base + i as u16)?;
+                    file.write_page(block, &mut page)?;
+                }
+            }
+            // 重置是"会话开始"的持久动作：落盘后再交用（否则崩溃后可能读到旧位图）。
+            file.sync()?;
+            Ok(file)
+        })();
+        if result.is_err() {
+            let _ = io.close(handle);
         }
-        // 重置是"会话开始"的持久动作：落盘后再交用（否则崩溃后可能读到旧位图）。
-        file.sync()?;
-        Ok(file)
+        result
     }
 
     /// **打开既有数据文件**（校验块 0 与位图空间头；不做完整性全扫）。
     pub fn open(io: &'a dyn FileIo, path: &Path) -> Result<Self, DataFileError> {
         let handle = io.open(path, OpenOptions::new().read(true).write(true))?;
-        let header = pagefile::read_page_verified(io, handle, 0).map_err(|e| match e {
-            pagefile::PageFileError::Io(e) => DataFileError::Io(e),
-            pagefile::PageFileError::Damaged { .. } => DataFileError::Malformed,
-        })?;
-        let head = read_file_head(&header)?;
-        let runs = read_bitmap_runs(&header)?;
-        // 预留式布局的形状校验：**40 区、自本 role 的位图起点起连续**
-        // （file 0 的位图起点是 512——副本带之后）。
-        let layout = crate::bitmap::FileLayout::for_role(head.role);
-        if runs.len() != MAX_BITMAP_RUNS {
-            return Err(DataFileError::Malformed);
-        }
-        for (k, &run) in runs.iter().enumerate() {
-            if run != layout.bitmap_first_block + k as u32 * BITMAP_PAGES_PER_RUN as u32
-                || u64::from(run) + BITMAP_PAGES_PER_RUN as u64 > head.blocks
-            {
+        let result = (|| {
+            let header = pagefile::read_page_verified(io, handle, 0).map_err(|e| match e {
+                pagefile::PageFileError::Io(e) => DataFileError::Io(e),
+                pagefile::PageFileError::Damaged { .. } => DataFileError::Malformed,
+            })?;
+            let head = read_file_head(&header)?;
+            let runs = read_bitmap_runs(&header)?;
+            // 预留式布局的形状校验：**40 区、自本 role 的位图起点起连续**
+            // （file 0 的位图起点是 512——副本带之后）。
+            let layout = crate::bitmap::FileLayout::for_role(head.role);
+            if runs.len() != MAX_BITMAP_RUNS {
                 return Err(DataFileError::Malformed);
             }
+            for (k, &run) in runs.iter().enumerate() {
+                if run != layout.bitmap_first_block + k as u32 * BITMAP_PAGES_PER_RUN as u32
+                    || u64::from(run) + BITMAP_PAGES_PER_RUN as u64 > head.blocks
+                {
+                    return Err(DataFileError::Malformed);
+                }
+            }
+            Ok(Self {
+                io,
+                handle,
+                head,
+                runs,
+            })
+        })();
+        if result.is_err() {
+            let _ = io.close(handle);
         }
-        Ok(Self {
-            io,
-            handle,
-            head,
-            runs,
-        })
+        result
     }
 
     /// 文件句柄（构建 `rdba → (句柄, 块号)` 解析器用）。
@@ -765,6 +783,45 @@ mod tests {
         let io = MemFileIo::new();
         io.add_dir("/mem");
         io
+    }
+
+    #[test]
+    fn failed_open_closes_handle_after_header_validation() {
+        let io = mem();
+        let h = io
+            .open(
+                Path::new(F),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        io.set_len(h, PAGE_SIZE as u64).unwrap();
+        io.close(h).unwrap();
+        for _ in 0..32 {
+            assert!(DataFile::open(&io, Path::new(F)).is_err());
+            assert_eq!(io.open_handle_count(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_create_and_temp_reset_release_handles() {
+        use bicdb_workspace::io::{FaultInjecting, FaultOp, FaultRule};
+        for op in [FaultOp::SetLen, FaultOp::Write] {
+            let io = FaultInjecting::new(mem());
+            io.add_rule(FaultRule::once(op, 1, std::io::ErrorKind::Other));
+            assert!(DataFile::create(&io, Path::new(F), 3, 3, WS, BLOCKS).is_err());
+            assert_eq!(io.inner().open_handle_count(), 0);
+        }
+        for op in [
+            FaultOp::Size,
+            FaultOp::SetLen,
+            FaultOp::Write,
+            FaultOp::SyncData,
+        ] {
+            let io = FaultInjecting::new(mem());
+            io.add_rule(FaultRule::once(op, 1, std::io::ErrorKind::Other));
+            assert!(DataFile::open_temp_reset(&io, Path::new(F), WS, BLOCKS).is_err());
+            assert_eq!(io.inner().open_handle_count(), 0);
+        }
     }
 
     #[test]

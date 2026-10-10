@@ -81,6 +81,11 @@ fn guard_daemon_launch() -> Result<(), ServiceError> {
 }
 
 enum ServiceEvent {
+    FulltextCompleted {
+        workspace: [u8; 8],
+        scheduler: FulltextScheduler,
+        result: Result<Option<String>, String>,
+    },
     WorkspaceOpen {
         workspace_id: u64,
         name: String,
@@ -258,6 +263,7 @@ fn workspace_has_open_transaction(
 }
 
 enum WorkerAction {
+    Fulltext(FulltextScheduler),
     Sql {
         sql: String,
         params: Vec<(String, bicdb_exec::Value)>,
@@ -687,6 +693,15 @@ fn run_sql_worker(
         let Ok(mut request) = request else {
             break;
         };
+        if let WorkerAction::Fulltext(mut scheduler) = request.action {
+            let result = poll_workspace_fulltext(&request.runtime, &mut scheduler, &params);
+            let _ = events.send(ServiceEvent::FulltextCompleted {
+                workspace: request.workspace,
+                scheduler,
+                result,
+            });
+            continue;
+        }
         let runtime = request.runtime.clone();
         let pool = runtime.pool;
         let engine = runtime.engine;
@@ -823,7 +838,9 @@ fn run_sql_worker(
                         &rows,
                     ))))
                 }
-                WorkerAction::Sql { .. } => unreachable!("parsed before SQL execution"),
+                WorkerAction::Sql { .. } | WorkerAction::Fulltext(_) => {
+                    unreachable!("prepared before SQL execution")
+                }
             });
         let (response, error) = match result {
             Ok(response) => (response, None),
@@ -1078,19 +1095,37 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
     let mut fast_stop_started: Option<Instant> = None;
     let mut fast_stop_reported = false;
     let mut next_maintenance = Instant::now();
+    let mut last_maintenance = None;
+    let mut fulltext_failures = 0u64;
     let stop_after = 'service: loop {
         resume_row_waits(&mut parked, &mut scheduler, &work_tx, pending_fast_stop)?;
         if !pending_fast_stop && Instant::now() >= next_maintenance {
-            if scheduler.idle_in(inst.ws_ref)
-                && !workspace_has_open_transaction(&connections, inst.ws_ref, inst.ws_ref)
-            {
-                maintain_workspace_fulltext(&mut inst, &mut fulltext, params, &mut log)?;
+            // Rotate admission order so a worker limit smaller than the number
+            // of workspaces does not repeatedly favor the smallest IDs.
+            let mut candidates: Vec<_> = std::iter::once(inst.ws_ref)
+                .chain(workspaces.keys().copied())
+                .collect();
+            candidates.sort_unstable();
+            if let Some(last) = last_maintenance {
+                let pivot = candidates.partition_point(|ws| *ws <= last);
+                candidates.rotate_left(pivot);
             }
-            for (workspace, target) in &mut workspaces {
-                if scheduler.idle_in(*workspace)
-                    && !workspace_has_open_transaction(&connections, inst.ws_ref, *workspace)
-                {
-                    maintain_workspace_fulltext(target, &mut fulltext, params, &mut log)?;
+            for workspace in candidates {
+                if !workspace_has_open_transaction(&connections, inst.ws_ref, workspace) {
+                    let target = if workspace == inst.ws_ref {
+                        &inst
+                    } else {
+                        &workspaces[&workspace]
+                    };
+                    if enqueue_workspace_fulltext(
+                        target,
+                        &mut fulltext,
+                        params,
+                        &mut scheduler,
+                        &work_tx,
+                    )? {
+                        last_maintenance = Some(workspace);
+                    }
                 }
             }
             next_maintenance = Instant::now() + Duration::from_millis(100);
@@ -1172,6 +1207,30 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
             }
         };
         match event {
+            ServiceEvent::FulltextCompleted {
+                workspace,
+                scheduler: fulltext_scheduler,
+                result,
+            } => {
+                if !scheduler.complete(workspace) {
+                    return Err(ServiceError::State(
+                        "fulltext completion accounting mismatch".into(),
+                    ));
+                }
+                fulltext.insert(workspace, fulltext_scheduler);
+                match result {
+                    Ok(Some(receipt)) => log.line(&receipt),
+                    Ok(None) => {}
+                    Err(error) => {
+                        fulltext_failures = fulltext_failures.saturating_add(1);
+                        log.line(&format!(
+                            "全文后台维护失败（工作区 {workspace:?}，保留未处理事件）：{error}"
+                        ));
+                    }
+                }
+                dispatch_ready(&mut scheduler, &work_tx)?;
+            }
+
             ServiceEvent::WorkspaceOpen {
                 workspace_id,
                 name,
@@ -1619,9 +1678,10 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                     let inst = selected_instance(&mut inst, &mut workspaces, connection.workspace);
                     let cache = inst.pool.stats();
                     let execution = scheduler.metrics();
+                    let fulltext_active = scheduler.exclusive_count();
                     let _ = reply.send(WireReply::ok({
                         let mut body = format!(
-                            "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\nconnections={connection_count}\nfile_handles={}\nrecovery_required_workspaces={}\nshutdown_state={}\nshutdown_elapsed_ms={}\nmax_connections={}\nmax_bound_workspaces={}\nbound_workspaces={}\nworker_threads={}\nexecution_active={}\nexecution_queued={}\nexecution_parked={}\nexecution_ready_workspaces={}\nexecution_queue_capacity={}\nmax_active_per_workspace={}\nworkspace_queue_capacity={}\ncontrol_workers={}\nworkspace_kind={}\nidentity={}\ncache_frames={}\ncache_bytes={}\ncache_resident={}\ncache_hits={}\ncache_misses={}\ncache_evictions={}\ncache_writes={}\ncache_dirty_pages={}\ncache_free_buffer_waits={}\ncache_wal_syncs={}\ncache_run_reads={}\ncache_run_pages={}\ngraph_detach_edge_limit={}\ngraph_max_nodes={}\ngraph_max_edges={}\ngraph_max_rows={}\ngraph_max_expansions={}\ngraph_max_edge_expansions={}\ngraph_max_elapsed_ms={}\ngraph_max_depth={}\ngraph_max_text_bytes={}\nbackground_failures={}\nfault_audit_failures={}\nfault_audit_state={}\nsql_elapsed_us={sql_elapsed_us}\n",
+                            "instance={}\nversion={}\npid={}\nuptime_s={}\nserved={served}\nseq={}\nmode=service\nwire={}\nconnections={connection_count}\nfile_handles={}\nrecovery_required_workspaces={}\nshutdown_state={}\nshutdown_elapsed_ms={}\nmax_connections={}\nmax_bound_workspaces={}\nbound_workspaces={}\nworker_threads={}\nexecution_active={}\nexecution_queued={}\nexecution_parked={}\nexecution_ready_workspaces={}\nexecution_queue_capacity={}\nmax_active_per_workspace={}\nworkspace_queue_capacity={}\ncontrol_workers={}\nworkspace_kind={}\nidentity={}\ncache_frames={}\ncache_bytes={}\ncache_resident={}\ncache_hits={}\ncache_misses={}\ncache_evictions={}\ncache_writes={}\ncache_dirty_pages={}\ncache_free_buffer_waits={}\ncache_wal_syncs={}\ncache_run_reads={}\ncache_run_pages={}\ngraph_detach_edge_limit={}\ngraph_max_nodes={}\ngraph_max_edges={}\ngraph_max_rows={}\ngraph_max_expansions={}\ngraph_max_edge_expansions={}\ngraph_max_elapsed_ms={}\ngraph_max_depth={}\ngraph_max_text_bytes={}\nbackground_failures={}\nfault_audit_failures={}\nfault_audit_state={}\nsql_elapsed_us={sql_elapsed_us}\nfulltext_active={fulltext_active}\nfulltext_failures={fulltext_failures}\n",
                             opts.dir.display(), env!("CARGO_PKG_VERSION"), std::process::id(),
                             started.elapsed().as_secs(), inst.seq(), WIRE_VERSION,
                             inst.io.open_handle_count().to_string(),
@@ -2082,56 +2142,91 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
     Ok(())
 }
 
-fn maintain_fulltext(
-    session: &mut Session<'_, '_, '_, '_>,
+fn poll_workspace_fulltext(
+    runtime: &WorkspaceExecution,
     scheduler: &mut FulltextScheduler,
-    log: &mut LogFile,
-) {
-    match session.maintain_fulltext(scheduler) {
-        Ok(Some(receipt)) => log.line(&receipt),
-        Err(e) => log.line(&format!("全文后台维护失败（保留未处理事件）：{e}")),
-        Ok(None) => {}
+    params: &crate::config::InstanceParams,
+) -> Result<Option<String>, String> {
+    let mut catalog = runtime.catalog().map_err(|error| error.to_string())?;
+    // Scope the session before closing its owned catalog, including failures
+    // configuring or executing maintenance. FileIo handles are not RAII files.
+    let result = (|| {
+        let mut session = Session::new(
+            runtime.pool,
+            runtime.engine,
+            &mut catalog,
+            runtime.engine.current_seq(),
+        );
+        session
+            .set_fulltext_defaults(
+                params.run.fulltext_interval_ms,
+                params.run.fulltext_batch_rows,
+            )
+            .map_err(|error| error.to_string())?;
+        session
+            .set_graph_limits(params.run.graph_limits())
+            .map_err(|error| error.to_string())?;
+        session
+            .maintain_fulltext(scheduler)
+            .map_err(|error| error.to_string())
+    })();
+    let closed = catalog.close().map_err(|error| error.to_string());
+    match (result, closed) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("关闭全文维护字典失败：{error}")),
+        (Err(error), Err(close)) => Err(format!("{error}；关闭全文维护字典失败：{close}")),
     }
 }
 
-fn maintain_workspace_fulltext(
-    instance: &mut crate::boot::Instance,
+fn enqueue_workspace_fulltext(
+    instance: &crate::boot::Instance,
     schedulers: &mut BTreeMap<[u8; 8], FulltextScheduler>,
     params: &crate::config::InstanceParams,
-    log: &mut LogFile,
-) -> Result<(), ServiceError> {
-    // Read-only and faulted workspaces must not start background write batches.
-    if instance.pool.workspace_fault(instance.ws_ref).is_some()
-        || instance.pool.workspace_read_only(instance.ws_ref).is_some()
+    execution: &mut crate::scheduler::Scheduler<[u8; 8], WorkerRequest>,
+    work: &mpsc::Sender<WorkerRequest>,
+) -> Result<bool, ServiceError> {
+    let workspace = instance.ws_ref;
+    if instance.pool.workspace_fault(workspace).is_some()
+        || instance.pool.workspace_read_only(workspace).is_some()
+        || !execution.idle_in(workspace)
     {
-        return Ok(());
+        return Ok(false);
     }
-    let scheduler = match schedulers.entry(instance.ws_ref) {
-        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+    if !schedulers.contains_key(&workspace) {
+        schedulers.insert(
+            workspace,
             FulltextScheduler::new(
                 params.run.fulltext_interval_ms,
                 params.run.fulltext_batch_rows,
             )
             .map_err(|error| ServiceError::State(error.to_string()))?,
-        ),
+        );
+    }
+    if !execution.reserve_exclusive(workspace) {
+        return Ok(false);
+    }
+    let scheduler = schedulers
+        .remove(&workspace)
+        .expect("idle maintenance scheduler");
+    let (reply, _receive) = mpsc::sync_channel(1);
+    let request = WorkerRequest {
+        cancelled: Arc::new(AtomicBool::new(false)),
+        id: 0,
+        workspace,
+        runtime: WorkspaceExecution::from_instance(instance),
+        state: SessionState::new(instance.seq()),
+        action: WorkerAction::Fulltext(scheduler),
+        reply,
     };
-    // SQL workers publish graph/segment metadata through independent catalogs.
-    // A retained control-plane catalog may still cache an old segment HWM.
-    let mut catalog = instance.open_worker_catalog()?;
-    let seq = instance.seq();
-    let mut session = Session::new(instance.pool, instance.engine, &mut catalog, seq);
-    session
-        .set_fulltext_defaults(
-            params.run.fulltext_interval_ms,
-            params.run.fulltext_batch_rows,
-        )
-        .map_err(|error| ServiceError::State(error.to_string()))?;
-    session
-        .set_graph_limits(params.run.graph_limits())
-        .map_err(|error| ServiceError::State(error.to_string()))?;
-    maintain_fulltext(&mut session, scheduler, log);
-    Ok(())
+    if let Err(error) = work.send(request) {
+        execution.complete(workspace);
+        if let WorkerAction::Fulltext(scheduler) = error.0.action {
+            schedulers.insert(workspace, scheduler);
+        }
+        return Err(ServiceError::State("SQL worker pool stopped".into()));
+    }
+    Ok(true)
 }
 
 /// 类型码 → SQL 类型名（与 `bicdbcli` 的 `DESCRIBE` 版面同源）。

@@ -3,10 +3,11 @@
 //! There is one queueing authority per database instance. Workspaces do not
 //! own private executors: they contribute requests to the shared ready set and
 //! receive a bounded share of active workers and queued slots. Control-plane
-//! requests (`HELLO`, `STATUS`, `AUTH`, `ROUTE`) use a separate reserved pool
-//! and therefore never enter this scheduler.
+//! requests (`HELLO`, `STATUS`, `AUTH`, `ROUTE`) run on the control loop
+//! and do not enter this scheduler. Idle-workspace maintenance shares workers
+//! while reserving exclusive execution only in its own workspace.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Immutable limits loaded from the instance parameter file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +104,7 @@ where
     queues: BTreeMap<W, VecDeque<(T, bool)>>,
     ready: VecDeque<W>,
     active_by_workspace: BTreeMap<W, usize>,
+    exclusive: BTreeSet<W>,
     active: usize,
     queued: usize,
     end_queued: usize,
@@ -131,6 +133,7 @@ where
             queues: BTreeMap::new(),
             ready: VecDeque::new(),
             active_by_workspace: BTreeMap::new(),
+            exclusive: BTreeSet::new(),
             active: 0,
             queued: 0,
             end_queued: 0,
@@ -257,7 +260,9 @@ where
                 .get(&workspace)
                 .copied()
                 .unwrap_or(0);
-            if workspace_active >= self.limits.active_per_workspace {
+            if self.exclusive.contains(&workspace)
+                || workspace_active >= self.limits.active_per_workspace
+            {
                 self.ready.push_back(workspace);
                 continue;
             }
@@ -279,6 +284,24 @@ where
         None
     }
 
+    /// Reserve one shared worker for maintenance in an otherwise idle workspace.
+    /// New SQL keeps normal queue admission but cannot dispatch in this workspace
+    /// until completion. Queued or parked SQL is never overtaken by maintenance.
+    pub fn reserve_exclusive(&mut self, workspace: W) -> bool {
+        if self.active >= self.limits.workers || !self.idle_in(workspace) {
+            return false;
+        }
+        self.exclusive.insert(workspace);
+        self.active += 1;
+        self.active_by_workspace.insert(workspace, 1);
+        true
+    }
+
+    /// Active maintenance jobs, included in the shared active-worker count.
+    pub fn exclusive_count(&self) -> usize {
+        self.exclusive.len()
+    }
+
     /// Release the active slot held by a completed worker request.
     /// Returns false for a duplicate or foreign completion.
     pub fn complete(&mut self, workspace: W) -> bool {
@@ -288,6 +311,7 @@ where
         if *count == 0 || self.active == 0 {
             return false;
         }
+        self.exclusive.remove(&workspace);
         *count -= 1;
         self.active -= 1;
         if *count == 0 {
@@ -491,5 +515,66 @@ mod tests {
         assert_eq!(foreign.metrics().queued, 0);
         owner.resume(slot, request).unwrap();
         assert_eq!(owner.dispatch().unwrap().request, "resume");
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_excludes_only_its_workspace_and_preserves_queue_bounds() {
+        let mut s = Scheduler::new(Limits {
+            workers: 2,
+            instance_queue: 2,
+            active_per_workspace: 2,
+            queue_per_workspace: 1,
+        })
+        .unwrap();
+        assert!(s.reserve_exclusive(1));
+        assert!(!s.reserve_exclusive(1));
+        s.enqueue(1, "after maintenance").unwrap();
+        assert_eq!(
+            s.enqueue(1, "overflow"),
+            Err((EnqueueError::WorkspaceQueueFull, "overflow"))
+        );
+        s.enqueue(2, "other workspace").unwrap();
+        assert_eq!(s.dispatch().unwrap().request, "other workspace");
+        assert!(s.dispatch().is_none());
+        assert_eq!(s.metrics().active, 2);
+        assert_eq!(s.exclusive_count(), 1);
+        assert!(s.complete(1));
+        assert_eq!(s.exclusive_count(), 0);
+        assert_eq!(s.dispatch().unwrap().request, "after maintenance");
+        assert!(s.complete(1));
+        assert!(s.complete(2));
+        assert_eq!(s.metrics().active, 0);
+        assert_eq!(s.metrics().queued, 0);
+    }
+
+    #[test]
+    fn maintenance_cannot_overtake_queued_or_parked_sql_or_exceed_workers() {
+        let mut s = Scheduler::new(Limits {
+            workers: 1,
+            instance_queue: 2,
+            active_per_workspace: 1,
+            queue_per_workspace: 2,
+        })
+        .unwrap();
+        s.enqueue(1, "row wait").unwrap();
+        assert!(!s.reserve_exclusive(1));
+        s.dispatch().unwrap();
+        assert!(!s.reserve_exclusive(2));
+        let token = s.suspend(1).unwrap();
+        assert!(!s.reserve_exclusive(1));
+        assert!(s.reserve_exclusive(2));
+        assert!(s.complete(2));
+        s.resume(token, "resumed").unwrap();
+        assert!(!s.reserve_exclusive(1));
+        s.dispatch().unwrap();
+        assert!(s.complete(1));
+        assert!(s.reserve_exclusive(1));
+        assert!(s.complete(1));
+        assert_eq!(s.metrics().active, 0);
     }
 }

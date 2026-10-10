@@ -535,3 +535,74 @@ fn parameter_or_lock_errors_do_not_become_recovery_required() {
     );
     assert_eq!(registry.len(), 1);
 }
+
+#[test]
+fn fulltext_idle_and_failed_polls_release_catalog_handles() {
+    let (runtime, work, _events, handle) = fixture_worker("fulltext-handle-lifetime");
+    let baseline = runtime.io.open_handle_count().unwrap();
+    let mut scheduler = FulltextScheduler::default();
+    let mut params = crate::config::InstanceParams::default();
+    for _ in 0..64 {
+        assert!(poll_workspace_fulltext(&runtime, &mut scheduler, &params)
+            .unwrap()
+            .is_none());
+        assert_eq!(runtime.io.open_handle_count().unwrap(), baseline);
+    }
+    params.run.fulltext_interval_ms = 0;
+    for _ in 0..16 {
+        assert!(poll_workspace_fulltext(&runtime, &mut scheduler, &params).is_err());
+        assert_eq!(runtime.io.open_handle_count().unwrap(), baseline);
+    }
+    drop(work);
+    handle.join().unwrap();
+}
+
+#[test]
+fn fulltext_worker_reports_failure_without_losing_pool_or_handles() {
+    let (mut runtime, work, events, handle) = fixture_worker("fulltext-worker-errors");
+    let real_dir = runtime.dir.clone();
+    let baseline = runtime.io.open_handle_count().unwrap();
+    let mut scheduler = FulltextScheduler::default();
+    for missing in [true, false] {
+        runtime.dir = if missing {
+            PathBuf::from("/mem/missing")
+        } else {
+            real_dir.clone()
+        };
+        let (reply, _receive) = mpsc::sync_channel(1);
+        work.send(WorkerRequest {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            id: 0,
+            workspace: WS,
+            runtime: runtime.clone(),
+            state: SessionState::new(runtime.engine.current_seq()),
+            action: WorkerAction::Fulltext(scheduler),
+            reply,
+        })
+        .unwrap();
+        match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+            ServiceEvent::FulltextCompleted {
+                workspace,
+                scheduler: returned,
+                result,
+            } => {
+                assert_eq!(workspace, WS);
+                assert_eq!(result.is_err(), missing);
+                scheduler = returned;
+            }
+            _ => panic!("maintenance must use its own completion event"),
+        }
+        assert_eq!(runtime.io.open_handle_count().unwrap(), baseline);
+    }
+    let reply = submit(
+        &work,
+        &runtime,
+        1,
+        SessionState::new(runtime.engine.current_seq()),
+        "SELECT * FROM obj$",
+    );
+    completed(&events, 1);
+    assert_eq!(reply.recv().unwrap().status, "OK");
+    drop(work);
+    handle.join().unwrap();
+}
