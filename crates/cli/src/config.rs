@@ -195,6 +195,8 @@ impl Default for InitParams {
 pub struct RunParams {
     /// 缓冲池帧数（16 KiB/帧）。
     pub pool_frames: usize,
+    /// Cache working-set partitions; one DBWR thread per partition.
+    pub kcbwds: usize,
     /// 段增长撞文件尾时的固定增量（块）。
     pub file_extend_blocks: u64,
     /// 控制套接字（相对根区目录；也接受绝对路径）。
@@ -203,6 +205,16 @@ pub struct RunParams {
     pub log: String,
     /// 同时保持的客户端连接上限。
     pub max_connections: usize,
+    /// 实例级 SQL worker 数；控制面 worker 不计入其中。
+    pub worker_threads: usize,
+    /// 实例级等待执行队列容量。
+    pub execution_queue_capacity: usize,
+    /// 单工作区同时执行的请求上限。
+    pub max_active_per_workspace: usize,
+    /// 单工作区在实例执行队列中占用的等待名额上限。
+    pub workspace_queue_capacity: usize,
+    /// 为 HELLO/STATUS/AUTH/ROUTE 保留的控制面 worker 数。
+    pub control_workers: usize,
     /// 等锁单次挂起时长（毫秒）。
     pub park_ms: u64,
     /// 死锁检测阈值（毫秒）。
@@ -234,6 +246,20 @@ pub struct RunParams {
     /// 一致性读重建的回溯轮数上限。
     pub cr_max_rounds: u32,
     // ── wal ──
+    /// 实例 LGWR 线程数。
+    pub lgwr_threads: usize,
+    /// LGWR 周期毫秒。
+    pub lgwr_interval_ms: u64,
+    /// Instance-wide CKPT worker limit.
+    pub checkpoint_threads: usize,
+    /// Independent undo maintenance worker limit.
+    pub undo_threads: usize,
+    /// Undo maintenance interval in milliseconds.
+    pub undo_interval_ms: u64,
+    /// 全局 CKPT 周期毫秒。
+    pub checkpoint_interval_ms: u64,
+    /// DBWR 周期毫秒。
+    pub dbwr_interval_ms: u64,
     /// 日志缓冲区页数。
     pub log_buffer_pages: usize,
     /// 未刷出占比达此千分数即建议刷盘。
@@ -322,10 +348,16 @@ impl Default for RunParams {
         let d = |k: &str| spec_default(k);
         Self {
             pool_frames: d("pool_frames").parse().expect("16 位以上"),
+            kcbwds: json_u64(d("kcbwds")) as usize,
             file_extend_blocks: bicdb_storage::segment::DEFAULT_FILE_EXTEND_BLOCKS,
             socket: crate::lock::SOCKET_FILE.to_owned(),
             log: "bicdb.log".to_owned(),
             max_connections: json_u64(d("max_connections")) as usize,
+            worker_threads: json_u64(d("worker_threads")) as usize,
+            execution_queue_capacity: json_u64(d("execution_queue_capacity")) as usize,
+            max_active_per_workspace: json_u64(d("max_active_per_workspace")) as usize,
+            workspace_queue_capacity: json_u64(d("workspace_queue_capacity")) as usize,
+            control_workers: json_u64(d("control_workers")) as usize,
             park_ms: bicdb_txn::write::WaitPolicy::default()
                 .park_timeout
                 .as_millis() as u64,
@@ -344,6 +376,13 @@ impl Default for RunParams {
             make_free_batch_divisor: json_u64(d("make_free_batch_divisor")) as usize,
             multiblock_read_pages: json_u64(d("multiblock_read_pages")) as u32,
             cr_max_rounds: json_u64(d("cr_max_rounds")) as u32,
+            lgwr_threads: json_u64(d("lgwr_threads")) as usize,
+            lgwr_interval_ms: json_u64(d("lgwr_interval_ms")),
+            checkpoint_threads: json_u64(d("checkpoint_threads")) as usize,
+            undo_threads: json_u64(d("undo_threads")) as usize,
+            undo_interval_ms: json_u64(d("undo_interval_ms")),
+            checkpoint_interval_ms: json_u64(d("checkpoint_interval_ms")),
+            dbwr_interval_ms: json_u64(d("dbwr_interval_ms")),
             log_buffer_pages: json_u64(d("log_buffer_pages")) as usize,
             flush_trigger_permille: json_u64(d("flush_trigger_permille")),
             row_cache_rows: json_u64(d("row_cache_rows")) as usize,
@@ -583,8 +622,16 @@ pub const SPECS: &[Spec] = &[
         section: "buffer",
         key: "pool_frames",
         effect: Effect::Restart,
-        default: "8192",
-        doc: "缓冲池帧数（16 KiB/帧；默认 128 MiB）",
+        default: "131072",
+        doc: "共享缓冲池帧数（16 KiB/帧；默认 2 GiB；每个激活工作区至少保障 2 GiB）",
+    },
+    Spec {
+        section: "buffer",
+        key: "kcbwds",
+        effect: Effect::Restart,
+        default: "4",
+        doc:
+            "缓存工作集分区数（1–64，2 的幂；pool_frames 为总帧数且须整除分区数；每分区一个 DBWR）",
     },
     Spec {
         section: "buffer",
@@ -672,6 +719,55 @@ pub const SPECS: &[Spec] = &[
     },
     Spec {
         section: "wal",
+        key: "lgwr_threads",
+        effect: Effect::Restart,
+        default: "2",
+        doc: "实例 LGWR 线程数（1–64）",
+    },
+    Spec {
+        section: "wal",
+        key: "lgwr_interval_ms",
+        effect: Effect::Restart,
+        default: "3000",
+        doc: "LGWR 周期毫秒（1–86400000）",
+    },
+    Spec {
+        section: "checkpoint",
+        key: "checkpoint_threads",
+        effect: Effect::Restart,
+        default: "1",
+        doc: "实例 CKPT 线程上限（1–64），工作区任务分配到共享线程",
+    },
+    Spec {
+        section: "undo",
+        key: "undo_threads",
+        effect: Effect::Restart,
+        default: "1",
+        doc: "实例 Undo 槽修复线程上限（1–64），不写数据文件",
+    },
+    Spec {
+        section: "undo",
+        key: "undo_interval_ms",
+        effect: Effect::Restart,
+        default: "1000",
+        doc: "Undo 槽修复休眠周期毫秒（1–86400000）",
+    },
+    Spec {
+        section: "checkpoint",
+        key: "checkpoint_interval_ms",
+        effect: Effect::Restart,
+        default: "5000",
+        doc: "全局 CKPT 周期毫秒（1–86400000）",
+    },
+    Spec {
+        section: "buffer",
+        key: "dbwr_interval_ms",
+        effect: Effect::Restart,
+        default: "3000",
+        doc: "DBWR 周期毫秒（1–86400000）",
+    },
+    Spec {
+        section: "wal",
         key: "log_buffer_pages",
         effect: Effect::Restart,
         default: "256",
@@ -731,7 +827,42 @@ pub const SPECS: &[Spec] = &[
         key: "max_connections",
         effect: Effect::Restart,
         default: "64",
-        doc: "同时保持的客户端连接上限（2–1024；语句由实例执行器串行调度）",
+        doc: "同时保持的客户端连接上限（2–1024；不等于执行并发数）",
+    },
+    Spec {
+        section: "service",
+        key: "worker_threads",
+        effect: Effect::Restart,
+        default: "16",
+        doc: "实例级 SQL worker 数（1–256；控制面 worker 独立）",
+    },
+    Spec {
+        section: "service",
+        key: "execution_queue_capacity",
+        effect: Effect::Restart,
+        default: "1024",
+        doc: "实例级等待执行队列容量（1–1048576）",
+    },
+    Spec {
+        section: "service",
+        key: "max_active_per_workspace",
+        effect: Effect::Restart,
+        default: "10",
+        doc: "单工作区同时执行的请求上限（1–256）",
+    },
+    Spec {
+        section: "service",
+        key: "workspace_queue_capacity",
+        effect: Effect::Restart,
+        default: "128",
+        doc: "单工作区在实例执行队列中占用的等待名额上限（1–65536）",
+    },
+    Spec {
+        section: "service",
+        key: "control_workers",
+        effect: Effect::Restart,
+        default: "2",
+        doc: "为 HELLO/STATUS/AUTH/ROUTE 保留的控制面 worker 数（1–64）",
     },
     Spec {
         section: "service",
@@ -963,6 +1094,13 @@ impl InstanceParams {
                 self.run.fulltext_batch_rows = num(value, 1, 4096)? as usize
             }
             ("buffer", "pool_frames") => self.run.pool_frames = num(value, 16, 1_000_000)? as usize,
+            ("buffer", "kcbwds") => {
+                let count = num(value, 1, 64)? as usize;
+                if !count.is_power_of_two() {
+                    return Err(bad("必须为 2 的幂"));
+                }
+                self.run.kcbwds = count;
+            }
             ("storage", "file_extend_blocks") => {
                 self.run.file_extend_blocks = num(value, 8, 1_048_576)?
             }
@@ -970,6 +1108,19 @@ impl InstanceParams {
             ("service", "log") => self.run.log = text(value)?,
             ("service", "max_connections") => {
                 self.run.max_connections = num(value, 2, 1024)? as usize
+            }
+            ("service", "worker_threads") => self.run.worker_threads = num(value, 1, 256)? as usize,
+            ("service", "execution_queue_capacity") => {
+                self.run.execution_queue_capacity = num(value, 1, 1_048_576)? as usize
+            }
+            ("service", "max_active_per_workspace") => {
+                self.run.max_active_per_workspace = num(value, 1, 256)? as usize
+            }
+            ("service", "workspace_queue_capacity") => {
+                self.run.workspace_queue_capacity = num(value, 1, 65_536)? as usize
+            }
+            ("service", "control_workers") => {
+                self.run.control_workers = num(value, 1, 64)? as usize
             }
             ("service", "start_wait_s") => self.run.start_wait_s = num(value, 1, 86_400)?,
             ("service", "stop_wait_s") => self.run.stop_wait_s = num(value, 1, 86_400)?,
@@ -1015,6 +1166,17 @@ impl InstanceParams {
                 self.run.multiblock_read_pages = num(value, 1, 64)? as u32
             }
             ("storage", "cr_max_rounds") => self.run.cr_max_rounds = num(value, 16, 4096)? as u32,
+            ("wal", "lgwr_threads") => self.run.lgwr_threads = num(value, 1, 64)? as usize,
+            ("wal", "lgwr_interval_ms") => self.run.lgwr_interval_ms = num(value, 1, 86400000)?,
+            ("checkpoint", "checkpoint_threads") => {
+                self.run.checkpoint_threads = num(value, 1, 64)? as usize
+            }
+            ("undo", "undo_threads") => self.run.undo_threads = num(value, 1, 64)? as usize,
+            ("undo", "undo_interval_ms") => self.run.undo_interval_ms = num(value, 1, 86400000)?,
+            ("checkpoint", "checkpoint_interval_ms") => {
+                self.run.checkpoint_interval_ms = num(value, 1, 86400000)?
+            }
+            ("buffer", "dbwr_interval_ms") => self.run.dbwr_interval_ms = num(value, 1, 86400000)?,
             ("wal", "log_buffer_pages") => {
                 // 下限 36 页 = 最坏单条记录的 footprint（改了会破"任何一条记录
                 // 必能落下"的不变式，见 `wal::buffer::MIN_CAPACITY_PAGES`）。
@@ -1080,6 +1242,7 @@ impl InstanceParams {
                 key: "instance.db_root".to_owned(),
             });
         }
+        p.validate_cache()?;
         Ok((p, table))
     }
 
@@ -1150,6 +1313,7 @@ impl InstanceParams {
             table.retain(|(tk, _, _)| tk != &full);
             table.push((full, v.clone(), Source::Cli));
         }
+        p.validate_cache()?;
         Ok((p, table))
     }
 
@@ -1171,7 +1335,19 @@ impl InstanceParams {
             p.set(&section, &key, v, 0)?;
         }
         p.db_root = db_root.to_path_buf(); // 命令行给的根区目录优先（唯一入口）
+        p.validate_cache()?;
         Ok(p)
+    }
+
+    fn validate_cache(&self) -> Result<(), ConfigError> {
+        if self.run.kcbwds == 0 || self.run.pool_frames % self.run.kcbwds != 0 {
+            return Err(ConfigError::BadValue {
+                key: "buffer.pool_frames".into(),
+                value: self.run.pool_frames.to_string(),
+                why: "总帧数必须整除 buffer.kcbwds，不静默截断缓存容量".into(),
+            });
+        }
+        Ok(())
     }
 
     /// 控制套接字的绝对路径。
@@ -1263,6 +1439,7 @@ impl InstanceParams {
             ("fulltext", "fulltext_interval_ms") => self.run.fulltext_interval_ms.to_string(),
             ("fulltext", "fulltext_batch_rows") => self.run.fulltext_batch_rows.to_string(),
             ("buffer", "pool_frames") => self.run.pool_frames.to_string(),
+            ("buffer", "kcbwds") => self.run.kcbwds.to_string(),
             ("buffer", "hash_buckets") => self.run.hash_buckets.to_string(),
             ("buffer", "bucket_latches") => self.run.bucket_latches.to_string(),
             ("buffer", "hot_fraction") => self.run.hot_fraction.to_string(),
@@ -1275,6 +1452,13 @@ impl InstanceParams {
             ("storage", "file_extend_blocks") => self.run.file_extend_blocks.to_string(),
             ("storage", "multiblock_read_pages") => self.run.multiblock_read_pages.to_string(),
             ("storage", "cr_max_rounds") => self.run.cr_max_rounds.to_string(),
+            ("wal", "lgwr_threads") => self.run.lgwr_threads.to_string(),
+            ("wal", "lgwr_interval_ms") => self.run.lgwr_interval_ms.to_string(),
+            ("checkpoint", "checkpoint_threads") => self.run.checkpoint_threads.to_string(),
+            ("undo", "undo_threads") => self.run.undo_threads.to_string(),
+            ("undo", "undo_interval_ms") => self.run.undo_interval_ms.to_string(),
+            ("checkpoint", "checkpoint_interval_ms") => self.run.checkpoint_interval_ms.to_string(),
+            ("buffer", "dbwr_interval_ms") => self.run.dbwr_interval_ms.to_string(),
             ("wal", "log_buffer_pages") => self.run.log_buffer_pages.to_string(),
             ("wal", "flush_trigger_permille") => self.run.flush_trigger_permille.to_string(),
             ("catalog", "row_cache_rows") => self.run.row_cache_rows.to_string(),
@@ -1284,6 +1468,17 @@ impl InstanceParams {
             ("service", "socket") => self.run.socket.clone(),
             ("service", "log") => self.run.log.clone(),
             ("service", "max_connections") => self.run.max_connections.to_string(),
+            ("service", "worker_threads") => self.run.worker_threads.to_string(),
+            ("service", "execution_queue_capacity") => {
+                self.run.execution_queue_capacity.to_string()
+            }
+            ("service", "max_active_per_workspace") => {
+                self.run.max_active_per_workspace.to_string()
+            }
+            ("service", "workspace_queue_capacity") => {
+                self.run.workspace_queue_capacity.to_string()
+            }
+            ("service", "control_workers") => self.run.control_workers.to_string(),
             ("service", "start_wait_s") => self.run.start_wait_s.to_string(),
             ("service", "stop_wait_s") => self.run.stop_wait_s.to_string(),
             ("service", "ready_poll_ms") => self.run.ready_poll_ms.to_string(),
@@ -1445,6 +1640,28 @@ mod tests {
     const MIN: &str = "[instance]\ndb_root = /tmp/x\n";
 
     #[test]
+    fn background_parameters_round_trip_and_reject_zero() {
+        let base = "[instance]\ndb_root=/unused\n";
+        for (section, key, value) in [
+            ("wal", "lgwr_threads", 3),
+            ("wal", "lgwr_interval_ms", 20),
+            ("checkpoint", "checkpoint_interval_ms", 30),
+            ("checkpoint", "checkpoint_threads", 2),
+            ("undo", "undo_threads", 2),
+            ("undo", "undo_interval_ms", 50),
+            ("buffer", "dbwr_interval_ms", 40),
+        ] {
+            let text = format!("{base}[{section}]\n{key}={value}\n");
+            let (params, _) = InstanceParams::from_text(&text, None).unwrap();
+            let rendered = params.render();
+            assert!(rendered.contains(&format!("{key}")));
+            assert!(
+                InstanceParams::from_text(&format!("{base}[{section}]\n{key}=0\n"), None).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn graph_workspace_budgets_have_bounds_rendering_and_cli_precedence() {
         assert_eq!(
             RunParams::default().graph_limits(),
@@ -1559,6 +1776,32 @@ mod tests {
     }
 
     #[test]
+    fn cache_partitions_round_trip_and_preserve_total_capacity() {
+        for partitions in [1, 2, 4, 8, 16, 32, 64] {
+            let (params, _) = InstanceParams::from_text(
+                &format!("{MIN}[buffer]\npool_frames=131072\nkcbwds={partitions}\n"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(params.run.kcbwds, partitions);
+            assert_eq!(params.run.pool_frames, 131072);
+            let (again, _) = InstanceParams::from_text(&params.render(), None).unwrap();
+            assert_eq!(again.run.kcbwds, partitions);
+        }
+        for value in ["0", "3", "65", "many"] {
+            assert!(
+                InstanceParams::from_text(&format!("{MIN}[buffer]\nkcbwds={value}\n"), None)
+                    .is_err()
+            );
+        }
+        assert!(InstanceParams::from_text(
+            &format!("{MIN}[buffer]\npool_frames=65\nkcbwds=4\n"),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn service_connection_limit_is_bounded_and_round_trips() {
         for value in [2, 64, 1024] {
             let (params, _) = InstanceParams::from_text(
@@ -1576,6 +1819,36 @@ mod tests {
                 None,
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn service_scheduler_limits_are_bounded_and_round_trip() {
+        let cases = [
+            ("worker_threads", 1, 256, 16),
+            ("execution_queue_capacity", 1, 1_048_576, 1024),
+            ("max_active_per_workspace", 1, 256, 10),
+            ("workspace_queue_capacity", 1, 65_536, 128),
+            ("control_workers", 1, 64, 2),
+        ];
+        for (key, minimum, maximum, default) in cases {
+            for value in [minimum, maximum, default] {
+                let (params, _) =
+                    InstanceParams::from_text(&format!("{MIN}[service]\n{key}={value}\n"), None)
+                        .unwrap();
+                assert_eq!(params.value_of("service", key), Some(value.to_string()));
+                let (again, _) = InstanceParams::from_text(&params.render(), None).unwrap();
+                assert_eq!(
+                    again.value_of("service", key),
+                    params.value_of("service", key)
+                );
+            }
+            for bad in ["0".to_owned(), (maximum + 1).to_string(), "many".into()] {
+                assert!(
+                    InstanceParams::from_text(&format!("{MIN}[service]\n{key}={bad}\n"), None,)
+                        .is_err()
+                );
+            }
         }
     }
 

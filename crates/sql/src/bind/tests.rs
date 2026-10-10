@@ -122,6 +122,17 @@ fn tier_two_fixed_tables_are_readable_but_never_writable() {
     // `session$`/`lock$` 同理（清单已占名，行随后续切片产生）。
     let err2 = r2.resolve_write_target("session$").unwrap_err();
     assert!(matches!(err2, BindError::NotFound { .. }), "{err2}");
+
+    let mut view3 = FakeView::default();
+    let mut r3 = NameResolver::new(&mut view3);
+    assert_eq!(
+        r3.resolve_table("recovery$").unwrap(),
+        ResolvedName::FixedTable("recovery$")
+    );
+    assert!(matches!(
+        r3.resolve_write_target("recovery$").unwrap_err(),
+        BindError::NotFound { .. }
+    ));
 }
 
 #[test]
@@ -151,21 +162,27 @@ fn not_found_is_indistinguishable_across_reasons() {
 }
 
 #[test]
-fn public_workspace_hides_file_from_ordinary_sessions() {
+fn public_workspace_hides_administrative_fixed_tables_from_ordinary_sessions() {
     let mut view = FakeView {
         public: true,
         ..FakeView::default()
     };
     // 普通会话（默认策略）：`file$` 不可见 ⇒ 不存在。
     let mut r = NameResolver::new(&mut view);
-    let err = r.resolve_table("file$").unwrap_err();
-    assert!(matches!(err, BindError::NotFound { .. }), "{err}");
+    for name in ["file$", "recovery$"] {
+        let err = r.resolve_table(name).unwrap_err();
+        assert!(matches!(err, BindError::NotFound { .. }), "{err}");
+    }
     drop(r);
     // admin 视角：可见。
     let mut r2 = NameResolver::with_policy(&mut view, ResolvePolicy { is_admin: true });
     assert_eq!(
         r2.resolve_table("file$").unwrap(),
         ResolvedName::FixedTable("file$")
+    );
+    assert_eq!(
+        r2.resolve_table("recovery$").unwrap(),
+        ResolvedName::FixedTable("recovery$")
     );
 }
 

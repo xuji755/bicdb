@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 struct TempDir(PathBuf);
 
@@ -88,7 +89,7 @@ fn lifecycle_start_status_stop_restart() {
     let (_, out, _) = run(&["status", "-p", &d]);
     assert!(out.contains("运行中"), "{out}");
     assert!(out.contains("服务模式"), "{out}");
-    assert!(out.contains("DB Cache 128 MiB"), "{out}");
+    assert!(out.contains("DB Cache 2048 MiB"), "{out}");
 
     // 第二个 start 被拒（实例锁）。
     let (code, _out, err) = start(dir.path());
@@ -125,6 +126,66 @@ fn lifecycle_start_status_stop_restart() {
     let (code, out, err) = run(&["sql", "-p", &d, "SELECT id, v FROM t"]);
     assert_eq!(code, 0, "直连：{out}{err}");
     assert!(out.contains('a'), "数据应在：{out}");
+}
+
+#[test]
+fn blocked_sql_does_not_block_control_plane_or_other_workers() {
+    let dir = TempDir::new("concurrent-service");
+    init(dir.path());
+    let (code, out, err) = start(dir.path());
+    assert_eq!(code, 0, "start: {out}{err}");
+    let d = dir.path().display().to_string();
+    assert_eq!(
+        run(&[
+            "sql",
+            "-p",
+            &d,
+            "CREATE TABLE queue_probe (id NUMBER NOT NULL, value NUMBER NOT NULL); INSERT INTO queue_probe VALUES (1,0)",
+        ])
+        .0,
+        0
+    );
+
+    let socket = dir.path().join("bicdb.sock");
+    let mut holder = bicdb_net::Client::connect(&socket).unwrap();
+    holder.sql("BEGIN", &[]).unwrap();
+    holder
+        .sql("UPDATE queue_probe SET value=1 WHERE id=1", &[])
+        .unwrap();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let waiter_socket = socket.clone();
+        let waiter = scope.spawn(move || {
+            let mut client = bicdb_net::Client::connect(&waiter_socket).unwrap();
+            entered_tx.send(()).unwrap();
+            client
+                .sql("UPDATE queue_probe SET value=2 WHERE id=1", &[])
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let began = Instant::now();
+        let (code, status, err) = run(&["status", "-p", &d]);
+        assert_eq!(code, 0, "status: {status}{err}");
+        assert!(began.elapsed() < Duration::from_secs(2), "{status}");
+        assert!(status.contains("运行中"), "{status}");
+
+        let began = Instant::now();
+        let (code, selected, err) = run(&[
+            "sql",
+            "-p",
+            &d,
+            "SELECT id, value FROM queue_probe WHERE id=1",
+        ]);
+        assert_eq!(code, 0, "select: {selected}{err}");
+        assert!(began.elapsed() < Duration::from_secs(2), "{selected}");
+
+        holder.sql("COMMIT", &[]).unwrap();
+        waiter.join().unwrap();
+    });
+    let _ = stop(dir.path(), "fast");
 }
 
 #[test]
@@ -189,7 +250,7 @@ fn parameter_file_drives_the_service() {
         .lines()
         .map(|line| {
             if line.trim_start().starts_with("pool_frames ") {
-                "pool_frames = 64"
+                "pool_frames = 131072"
             } else if line.trim_start().starts_with("park_ms ") {
                 "park_ms = 7"
             } else {
@@ -206,14 +267,14 @@ fn parameter_file_drives_the_service() {
     assert_eq!(code, 0, "{out}{err}");
     assert!(
         out.lines()
-            .any(|line| line.contains("buffer.pool_frames") && line.contains("64")),
+            .any(|line| line.contains("buffer.pool_frames") && line.contains("131072")),
         "{out}"
     );
     assert!(out.contains("文件"), "{out}");
 
     // 命令行覆盖优先。
-    let (_, out, _) = run(&["params", "-p", &d, "-c", "pool_frames=128"]);
-    assert!(out.contains("128") && out.contains("命令行"), "{out}");
+    let (_, out, _) = run(&["params", "-p", &d, "-c", "pool_frames=262144"]);
+    assert!(out.contains("262144") && out.contains("命令行"), "{out}");
 
     // 按参数起的服务应正常就绪（参数真的被用上，没炸）。
     let (code, out, err) = start(dir.path());

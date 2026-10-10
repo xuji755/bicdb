@@ -71,9 +71,9 @@ pub use ast::{
     CreateWorkspaceStmt, DefElem, DefElemArg, DeleteStmt, DropFilesystemStmt, DropStmt,
     DropUserStmt, Expr, FromItem, FsQuota, FsRef, FuncCall, IndexElem, IndexStmt, IndexTargetKind,
     InsertStmt, JoinExpr, JoinType, Location, NullTest, NullTestType, ObjectType, ParamRef,
-    QuotaAmount, RangeFunction, RangeVar, ResTarget, SelectStmt, SetOperation, SortBy, SortByDir,
-    SortByNulls, Stmt, TransactionStmt, TransactionStmtKind, TypeCast, TypeName, UpdateStmt,
-    VariableSetKind, VariableSetStmt, WorkRef,
+    QuotaAmount, RangeFunction, RangeVar, RecoveryVerifyScope, ResTarget, SelectStmt, SetOperation,
+    SortBy, SortByDir, SortByNulls, Stmt, TransactionStmt, TransactionStmtKind, TypeCast, TypeName,
+    UpdateStmt, VariableSetKind, VariableSetStmt, WorkRef, WorkspaceOpenMode,
 };
 pub use auth::{authenticate, AuthError, Identity};
 pub use bind::{

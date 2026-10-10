@@ -178,6 +178,17 @@ pub struct Catalog<'io> {
 }
 
 impl<'io> Catalog<'io> {
+    /// Close the catalog's owned metadata-file handle.
+    ///
+    /// A catalog opened for a short-lived request must call this after every
+    /// session borrowing it has been dropped.  `FileIo` deliberately keeps
+    /// opaque handles in its own table, so merely dropping `Catalog` is not a
+    /// close operation.
+    pub fn close(self) -> Result<(), OpenError> {
+        self.file.close()?;
+        Ok(())
+    }
+
     /// **打开链**（第 ②③④ 步；`目录详设` §4.1）。
     pub fn open(io: &'io dyn FileIo, path: &Path) -> Result<Self, OpenError> {
         let mut file = DataFile::open(io, path)?;
@@ -488,6 +499,66 @@ impl<'io> Catalog<'io> {
             Some(DictValue::Num(b)) => Ok(*b as u32),
             _ => Err(mismatch("seg$.block_id 形态非法")),
         }
+    }
+
+    /// Resolve a segment header by its durable data-object number.
+    pub fn segment_block_by_dataobj(&mut self, dataobj: u32) -> Result<u32, OpenError> {
+        let skey = comp_num(u64::from(dataobj));
+        let (_, seg_row) = self
+            .lookup("i_seg_pk", &[Some(&skey)])?
+            .ok_or_else(|| OpenError::NoSuchObject(format!("seg$ 无 dataobj# {dataobj}")))?;
+        match seg_row.get(2) {
+            Some(DictValue::Num(block)) => {
+                u32::try_from(*block).map_err(|_| mismatch("seg$.block_id 超出 u32 范围"))
+            }
+            _ => Err(mismatch("seg$.block_id 形态非法")),
+        }
+    }
+
+    /// Physical file number used by this workspace catalog and its segments.
+    #[must_use]
+    pub fn file_id(&self) -> u16 {
+        self.file.file_id()
+    }
+
+    /// Verify an object's durable segment image while the workspace is
+    /// offline.  This performs no repair and writes no page.
+    pub fn verify_segment_media(
+        &mut self,
+        object_id: u32,
+        dataobj: u32,
+    ) -> Result<usize, OpenError> {
+        let segment_block = self.segment_block_by_dataobj(dataobj)?;
+        let segment = Segment::open(&mut self.file, segment_block)?;
+        if segment.header().obj != object_id || segment.header().dataobj != dataobj {
+            return Err(mismatch(format!(
+                "对象段头身份不符：目录 obj/dataobj={object_id}/{dataobj}，段头={}/{}",
+                segment.header().obj,
+                segment.header().dataobj
+            )));
+        }
+        let append = segment.append_position()?;
+        let blocks = segment.data_blocks(segment.hwm().max(append));
+        drop(segment);
+        // Segment::open already verified the header. Every data page must have
+        // a valid checksum and match the catalog file/workspace identity.
+        for block in &blocks {
+            let page = self.file.read_page(*block)?;
+            let header = page
+                .header()
+                .ok_or(OpenError::NotAHeapPage { block: *block })?;
+            if header.file_id != self.file.file_id()
+                || header.block_id != *block
+                || header.workspace_ref != self.ws
+            {
+                return Err(mismatch(format!(
+                    "对象 {object_id} 的页面 {}:{} 身份不符",
+                    self.file.file_id(),
+                    block
+                )));
+            }
+        }
+        Ok(blocks.len())
     }
 
     /// 按名取表段（作用域内借用——段打开是廉价的：读一张段头页）。

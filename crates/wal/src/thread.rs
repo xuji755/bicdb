@@ -75,6 +75,7 @@ impl Lgwr {
         tick: Duration,
         prestart: impl FnOnce() + Send + 'static,
     ) -> Self {
+        assert!(!tick.is_zero(), "LGWR sleep interval must be positive");
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(StatsInner {
@@ -99,7 +100,9 @@ impl Lgwr {
                         let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
                         if !*pending {
                             let (guard, _) = cv
-                                .wait_timeout(pending, tick)
+                                .wait_timeout_while(pending, tick, |pending| {
+                                    !*pending && !stp.load(Ordering::SeqCst)
+                                })
                                 .unwrap_or_else(|e| e.into_inner());
                             pending = guard;
                         }
@@ -236,6 +239,27 @@ mod tests {
     }
 
     #[test]
+    fn idle_lgwr_ignores_notifications_without_work() {
+        let (wal, _writer) = setup();
+        let (ready, started) = std::sync::mpsc::channel();
+        let lgwr = Lgwr::start_scoped(wal, Duration::from_secs(5), move || {
+            ready.send(()).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..10 {
+            // Simulate a spurious notification without setting the work predicate.
+            let _guard = lgwr.signal.0.lock().unwrap();
+            lgwr.signal.1.notify_one();
+            drop(_guard);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(lgwr.stats().flushes, 0);
+        let start = std::time::Instant::now();
+        lgwr.shutdown();
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn lgwr_flushes_on_demand_and_on_shutdown() {
         let (wal, mut writer) = setup();
         let lgwr = Lgwr::start(Arc::clone(&wal), Duration::from_millis(50));
@@ -268,8 +292,7 @@ mod tests {
 
     #[test]
     fn dbwr_and_lgwr_share_the_real_wal_across_threads() {
-        // **真胶水**：池的 `WalGuard` = `WalShared` 的 `Arc`——后台 DBWR 写页
-        // 前的"WAL 规则 2"由真 WAL 承担（跨线程）；LGWR 与前台共享同一水位。
+        // 真 WAL + 独立 LGWR：DBWR 合并日志请求并唤醒 LGWR，不自行等待 fsync。
         use bicdb_storage::buffer::{BufferKey, BufferPool, CacheConfig, SystemClock};
         use bicdb_storage::dbwr::Dbwr;
         use bicdb_storage::page::{Page, PageType};
@@ -302,6 +325,23 @@ mod tests {
         let rec_lsn = writer.append(|l| RedoRecord::commit(l, 7, 1)).unwrap();
         assert!(wal.synced_lsn() < rec_lsn, "尚未刷盘");
 
+        let lgwr = Arc::new(Lgwr::start(Arc::clone(&wal), Duration::from_secs(60)));
+        let wake_lgwr = Arc::downgrade(&lgwr);
+        let router = Arc::new(bicdb_storage::wal_router::WorkspaceWalRouter::default());
+        router
+            .register(
+                [9u8; 8],
+                Arc::clone(&wal) as Arc<dyn bicdb_storage::buffer::WalGuard>,
+            )
+            .unwrap();
+        router
+            .set_flush_request_handler(Arc::new(move |_, _| {
+                if let Some(lgwr) = wake_lgwr.upgrade() {
+                    lgwr.wake();
+                }
+            }))
+            .unwrap();
+
         let pool = std::sync::Arc::new(
             BufferPool::with_config(
                 io,
@@ -313,7 +353,7 @@ mod tests {
                         None
                     }
                 },
-                std::sync::Arc::clone(&wal),
+                router,
                 SystemClock,
                 CacheConfig::for_capacity(8),
             )
@@ -343,6 +383,9 @@ mod tests {
         );
         assert!(wal.synced_lsn() > durable_before);
         dbwr.shutdown();
+        Arc::try_unwrap(lgwr)
+            .expect("测试回调仅保留弱引用")
+            .shutdown();
 
         let page = pagefile::read_page_verified(io, data_handle, 1).unwrap();
         assert_eq!(page.as_bytes()[4096], 0xAB, "页已落盘");

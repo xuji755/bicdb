@@ -111,7 +111,9 @@ pub enum TxnError {
         /// 已预约的序号。
         reserved: CommitSeq,
     },
-    /// **等待次数超限**（会话级参数；默认不设限 = 等到底，死锁检测兜底）。
+    /// The enq registration was explicitly cancelled or superseded.
+    LockWaitCancelled,
+    /// Row owner remained active past the configured waiting-round deadline.
     LockTimeout {
         /// 持锁者。
         holder: bicdb_storage::undo::TxnId,
@@ -154,6 +156,7 @@ impl std::fmt::Display for TxnError {
                     "死锁牺牲者：环 {cycle:?} 中本事务修改量最少，已语句级回滚（§5.4.2 ④）"
                 )
             }
+            TxnError::LockWaitCancelled => write!(f, "行锁等待已取消"),
             TxnError::LockTimeout { holder, row } => {
                 write!(f, "等行 {row:?} 超过等待次数上限（持锁者 {holder:?}）")
             }
@@ -249,6 +252,8 @@ pub fn begin(
     chain: &mut UndoChain<'_, '_>,
     snapshot: CommitSeq,
 ) -> Result<Txn, TxnError> {
+    pool.ensure_workspace_writable(chain.segment().workspace_ref())
+        .map_err(TxnError::Pool)?;
     require_pool_bound(chain, pool)?;
     checkpoint_safe_point(pool, log, chain)?;
     let header_before = chain.page(0)?;
@@ -288,6 +293,8 @@ pub fn insert_row(
     row: &[u8],
     policy: &InsertPolicy,
 ) -> Result<RowId, TxnError> {
+    pool.ensure_workspace_writable(chain.segment().workspace_ref())
+        .map_err(TxnError::Pool)?;
     require_pool_bound(chain, pool)?;
     // Deleted slots retain their original offset for undo/consistent reads.
     // Until slot retirement is tracked against the undo reclaim watermark,
@@ -352,6 +359,8 @@ pub fn delete_row(
     row_no: u16,
     policy: &InsertPolicy,
 ) -> Result<(), TxnError> {
+    pool.ensure_workspace_writable(chain.segment().workspace_ref())
+        .map_err(TxnError::Pool)?;
     require_pool_bound(chain, pool)?;
     let (data_before, mut local) = {
         let g = pool.pin(block)?;
@@ -433,6 +442,8 @@ pub fn update_row(
     policy: &InsertPolicy,
     alloc: &mut dyn FnMut(usize) -> Result<BufferKey, TxnError>,
 ) -> Result<UpdateOutcome, TxnError> {
+    pool.ensure_workspace_writable(chain.segment().workspace_ref())
+        .map_err(TxnError::Pool)?;
     require_pool_bound(chain, pool)?;
     // Deleted slots retain their original offset for undo/consistent reads.
     // Until slot retirement is tracked against the undo reclaim watermark,
@@ -443,8 +454,11 @@ pub fn update_row(
     };
     let policy = &safe_policy;
     let (src_before, mut src_local) = {
-        let g = pool.pin(block)?;
-        (*g.as_bytes(), Page::from_bytes(Box::new(*g.as_bytes())))
+        let guard = pool.pin(block)?;
+        (
+            *guard.as_bytes(),
+            Page::from_bytes(Box::new(*guard.as_bytes())),
+        )
     };
     let old_row = heap::row(&src_local, row_no)
         .ok_or(TxnError::Heap(HeapError::NoSuchRow))?
@@ -514,6 +528,58 @@ pub fn update_row(
     let fresh = Page::new(page_type, block.workspace, block.rdba.file_id(), 0);
     if new_row.len() > heap::capacity_for_row(&fresh, policy) {
         return Err(TxnError::UpdateTooLong { len: new_row.len() });
+    }
+
+    // The ordinary growth path keeps the same slot. Compacting the page lets
+    // UPDATE consume PCTFREE (which INSERT deliberately leaves available)
+    // without manufacturing a forwarding row. Reserve one ITL entry before
+    // locking so the post-lock replacement cannot discover a late space
+    // shortage. This is conservative when the transaction already owns an ITL.
+    if heap::can_replace_row(
+        &src_local,
+        row_no,
+        new_row.len(),
+        bicdb_storage::page::ITL_ENTRY_LEN,
+    ) {
+        let (slot, _) = lock_and_occupy(
+            pool,
+            log,
+            chain,
+            txn,
+            &mut src_local,
+            block,
+            row_no,
+            policy.itl_max,
+        )?;
+        let patches = row_patches(&old_row, new_row);
+        append_undo_via_pool(
+            pool,
+            log,
+            chain,
+            txn,
+            UndoOp::Update,
+            src_rid,
+            UndoPayload::Update {
+                old_itl_slot: old_row[1],
+                patches,
+            },
+        )?;
+        let mut patched = new_row.to_vec();
+        patched[1] = slot as u8;
+        heap::replace_row(&mut src_local, row_no, &patched)?;
+        write_page_change(
+            pool,
+            log,
+            txn.raw(),
+            block,
+            &src_before,
+            src_local.as_bytes(),
+            false,
+        )?;
+        return Ok(UpdateOutcome {
+            rowid: src_rid,
+            migrated: false,
+        });
     }
 
     // 目的页：同页放得下 ⇒ 同页（省一次随机 I/O）；否则向分配口要一页。
@@ -968,6 +1034,8 @@ pub fn commit(
     txn: &mut Txn,
     commit_seq: CommitSeq,
 ) -> Result<(), TxnError> {
+    pool.ensure_workspace_writable(chain.segment().workspace_ref())
+        .map_err(TxnError::Pool)?;
     require_pool_bound(chain, pool)?;
     checkpoint_safe_point(pool, log, chain)?;
     let lsn = log.append(|l| RedoRecord::commit(l, txn.raw(), commit_seq.as_raw()))?;
@@ -1074,6 +1142,8 @@ pub fn lock_row(
     row_no: u16,
     policy: &InsertPolicy,
 ) -> Result<bool, TxnError> {
+    pool.ensure_workspace_writable(chain.segment().workspace_ref())
+        .map_err(TxnError::Pool)?;
     require_pool_bound(chain, pool)?;
     let guard = pool.pin(block)?;
     let before = *guard.as_bytes();
@@ -1417,6 +1487,8 @@ pub fn reclaim(
     chain: &mut UndoChain<'_, '_>,
     oldest_snapshot: Option<CommitSeq>,
 ) -> Result<ReclaimReport, TxnError> {
+    pool.ensure_workspace_writable(chain.segment().workspace_ref())
+        .map_err(TxnError::Pool)?;
     require_pool_bound(chain, pool)?;
     let header_before = chain.page(0)?;
     let mut header_after = Page::from_bytes(Box::new(*header_before.as_bytes()));
@@ -1688,20 +1760,15 @@ pub fn write_page_change(
             vec![BlockRef {
                 flags: 0,
                 rdba: key.rdba,
-                changes: changes.clone(), // 闭包是 `Fn`（满则刷+重试）
+                changes: changes.clone(),
             }],
         )
     })?;
-
     let mut guard = if is_new {
-        // 新页：不经 read，直接装入（前像 = 该页的初始镜像，恢复重放时
-        // 磁盘上就是不存在的零页/未格式化页——重放会把差异叠上去）。
         pool.insert_new(key, Page::from_bytes(Box::new(*before)))?
     } else {
         pool.pin(key)?
     };
-    // 调用方给的（前像、后像）是**权威镜像**：池里纵有旧副本也被整体覆盖
-    // （单写者纪律；段扩展等直写路径在计划里已重读镜像）。
     guard.as_bytes_mut().copy_from_slice(after);
     let mut header = guard.header().ok_or(TxnError::StaleCache)?;
     header.page_lsn = lsn;
@@ -2669,7 +2736,7 @@ mod tests {
             &mut no_alloc,
         )
         .unwrap();
-        // **改长**更新：走**行迁移**（同页放得下——"bbb"→"ccccc" 只差 2 字节）。
+        // Ordinary growth consumes page reserve while preserving the same slot.
         let row_long = row_bytes(b"ccccc");
         let outcome = update_row(
             &pool,
@@ -2683,27 +2750,24 @@ mod tests {
             &mut no_alloc,
         )
         .unwrap();
-        assert!(outcome.migrated, "改长 ⇒ 迁移");
+        assert!(!outcome.migrated, "页内有空间的小幅改长不应产生行迁移");
         assert_eq!(outcome.rowid, rid2, "ROWID 稳定入口不变");
-        // 原槽位成了转发指针，指向新位置。
+        // The original slot remains the row; no forwarding entry is created.
         let src = page_snapshot(&pool, key);
-        assert_eq!(heap::row(&src, rid2.row_id()), None, "原槽位不再直接是行");
-        let target = heap::forwarding_target(&src, rid2.row_id()).expect("转发指针");
+        assert_eq!(heap::forwarding_target(&src, rid2.row_id()), None);
         // 新行的 `itl_slot` 由写路径回填为**目的页上本事务的 ITL 槽**（与 insert 同规）。
         let owner_slot = (0..bicdb_storage::itl::itl_count(&src).unwrap())
             .find(|&i| itl_of(&src, i).txn_id == t2.txn_id)
             .expect("t2 的 ITL 条目");
         assert_eq!(
-            heap::row(&src, target.row_id()),
+            heap::row(&src, rid2.row_id()),
             Some(&stored_row(&row_long, owner_slot as u8)[..]),
-            "新位置的完整行（itl_slot 已回填）"
+            "原 ROWID 上的完整行（itl_slot 已回填）"
         );
         commit(&pool, &mut log, &mut chain, &mut t2, seq(2)).unwrap();
         pool.flush_workspace(WS).unwrap();
         let page = pagefile::read_page_verified(&io, data_handle, 1).unwrap();
-        // 稳定入口是**转发指针**：读者沿它取到新位置的完整行（§6.2/§12.4）。
-        let target = heap::forwarding_target(&page, rid2.row_id()).expect("盘上转发指针");
-        let stored = heap::row(&page, target.row_id()).expect("更新后的行（经转发指针）");
+        let stored = heap::row(&page, rid2.row_id()).expect("更新后的原槽行");
         // 行头 itl_slot 指向 t2 的槽（写路径回填）；其余字节 = 改长后的新行。
         assert_eq!(
             usize::from(stored[1]),

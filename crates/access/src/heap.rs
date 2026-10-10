@@ -111,6 +111,33 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         }
     }
 
+    /// Resolve a stable heap ROWID through committed migration pointers.
+    ///
+    /// Indexes and scans retain the original ROWID after a growing update.
+    /// A later UPDATE/DELETE must therefore follow the forwarding chain before
+    /// entering the transactional row writer. Keeping this in the access
+    /// layer also covers multiple successive migrations without teaching SQL
+    /// operators about physical row placement.
+    fn resolve_forwarding(&self, mut rid: RowId) -> Result<RowId, TableAccessError> {
+        const MAX_HOPS: usize = 16;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..MAX_HOPS {
+            if !seen.insert(rid) {
+                return Err(TableAccessError::Txn(TxnError::StaleCache));
+            }
+            let key = self.key_of(rid.file_id(), rid.block_id())?;
+            let page = self.pool.pin(key)?;
+            let Some(next) = heap::forwarding_target(&page, rid.row_id()) else {
+                return Ok(rid);
+            };
+            if next.file_id() != rid.file_id() {
+                return Err(TableAccessError::Txn(TxnError::StaleCache));
+            }
+            rid = next;
+        }
+        Err(TableAccessError::Txn(TxnError::StaleCache))
+    }
+
     /// 工作区标识。
     #[must_use]
     pub fn workspace(&self) -> [u8; 8] {
@@ -298,6 +325,7 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         row: &[u8],
         policy: &InsertPolicy,
     ) -> Result<(), TableAccessError> {
+        let rid = self.resolve_forwarding(rid)?;
         // Keep allocation estimates consistent with transactional slot safety.
         let safe_policy = InsertPolicy {
             reuse_free_slots: false,
@@ -368,6 +396,7 @@ impl<'a, 'b> TableAccess<'a, 'b> {
         rid: RowId,
         policy: &InsertPolicy,
     ) -> Result<(), TableAccessError> {
+        let rid = self.resolve_forwarding(rid)?;
         write::delete_row(
             self.pool,
             log,

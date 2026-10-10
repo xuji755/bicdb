@@ -75,6 +75,30 @@ pub trait WorkspaceProvisioner {
     fn deprovision(&self, root: &Path) -> Result<(), String>;
 }
 
+/// Live daemon state transition used by `ALTER WORKSPACE ... OPEN`.
+/// Implementations must acknowledge an effective runtime change; updating a
+/// catalog flag alone is not a successful open.
+pub trait WorkspaceStateController {
+    /// Apply one access mode to a registered workspace.
+    fn open_workspace(
+        &self,
+        workspace_id: u64,
+        name: &str,
+        root: &Path,
+        mode: crate::ast::WorkspaceOpenMode,
+    ) -> Result<String, String>;
+
+    /// Verify one isolated recovery scope against durable media, append the
+    /// durable verification record, and only then release that exact scope.
+    fn verify_recovery(
+        &self,
+        workspace_id: u64,
+        name: &str,
+        root: &Path,
+        scope: crate::ast::RecoveryVerifyScope,
+    ) -> Result<String, String>;
+}
+
 /// 建工作区的文件面需要的事实（**不含参数**——参数由供给方按实例口径给）。
 #[derive(Debug, Clone)]
 pub struct ProvisionRequest {
@@ -101,6 +125,8 @@ pub struct DclContext<'a> {
     pub io: &'a dyn FileIo,
     /// 工作区文件面供给方（`None` ⇒ `CREATE/DROP WORKSPACE` 具名拒绝）。
     pub provisioner: Option<&'a dyn WorkspaceProvisioner>,
+    /// Live instance controller (`None` in offline/direct sessions).
+    pub controller: Option<&'a dyn WorkspaceStateController>,
     /// 口令散列迭代数（写进存储串；来自会话参数）。
     pub pbkdf2_iterations: u32,
 }
@@ -121,6 +147,7 @@ impl<'a> DclContext<'a> {
             home_root,
             io,
             provisioner: None,
+            controller: None,
             pbkdf2_iterations: bicdb_common::pbkdf2::DEFAULT_ITERATIONS,
         }
     }
@@ -129,6 +156,13 @@ impl<'a> DclContext<'a> {
     #[must_use]
     pub fn with_provisioner(mut self, p: &'a dyn WorkspaceProvisioner) -> Self {
         self.provisioner = Some(p);
+        self
+    }
+
+    /// Attach the live instance controller.
+    #[must_use]
+    pub fn with_controller(mut self, controller: &'a dyn WorkspaceStateController) -> Self {
+        self.controller = Some(controller);
         self
     }
 
@@ -311,6 +345,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             home_root: home.to_path_buf(),
             io,
             provisioner: self.dcl_provisioner(),
+            controller: self.dcl_controller(),
             pbkdf2_iterations: self.pbkdf2_iterations(),
         })
     }
@@ -486,6 +521,44 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             .map_err(|e| self.dcl_err(e))?;
 
         match &s.action {
+            crate::ast::AlterWorkspaceAction::Open(mode) => {
+                let controller = ctx.controller.ok_or_else(|| {
+                    self.dcl_err(DclExecError::Pending(
+                        "OPEN 必须经正在运行的 daemon 状态控制器执行".into(),
+                    ))
+                })?;
+                let wid = WorkspaceId::from_raw(id).expect("已解析工作区号");
+                let rec = gcf
+                    .workspace_by_id(wid)
+                    .map_err(|error| self.dcl_err(DclExecError::Registry(error.to_string())))?
+                    .ok_or_else(|| {
+                        self.dcl_err(DclExecError::Registry(format!("工作区 {id} 不在册")))
+                    })?;
+                let root = PathBuf::from(String::from_utf8_lossy(&rec.root).into_owned());
+                let result = controller
+                    .open_workspace(id, &name, &root, *mode)
+                    .map_err(|error| self.dcl_err(DclExecError::Path(error)))?;
+                Ok(QueryResult::Ddl(result))
+            }
+            crate::ast::AlterWorkspaceAction::VerifyRecovery(scope) => {
+                let controller = ctx.controller.ok_or_else(|| {
+                    self.dcl_err(DclExecError::Pending(
+                        "VERIFY RECOVERY 必须经正在运行的 daemon 状态控制器执行".into(),
+                    ))
+                })?;
+                let wid = WorkspaceId::from_raw(id).expect("已解析工作区号");
+                let rec = gcf
+                    .workspace_by_id(wid)
+                    .map_err(|error| self.dcl_err(DclExecError::Registry(error.to_string())))?
+                    .ok_or_else(|| {
+                        self.dcl_err(DclExecError::Registry(format!("工作区 {id} 不在册")))
+                    })?;
+                let root = PathBuf::from(String::from_utf8_lossy(&rec.root).into_owned());
+                let result = controller
+                    .verify_recovery(id, &name, &root, *scope)
+                    .map_err(|error| self.dcl_err(DclExecError::Path(error)))?;
+                Ok(QueryResult::Ddl(result))
+            }
             crate::ast::AlterWorkspaceAction::AddFilesystem { fs, quota } => {
                 let slot = resolve_fs(&mut gcf, fs).map_err(|e| self.dcl_err(e))?.0;
                 let bytes = quota.as_ref().map_or(u64::MAX, |q| match q.amount {

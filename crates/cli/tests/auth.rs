@@ -328,6 +328,8 @@ fn audit_describe_obeys_visibility_and_expired_identity() {
 #[test]
 fn owned_route_requires_auth_and_rejects_foreign_and_expired_workspaces() {
     let (_holder, home, mut inst) = setup("owned-route");
+    let io = inst.io;
+    let baseline_handles = io.open_handle_count();
     {
         let mut s = session(&mut inst, &home);
         assert!(s
@@ -343,7 +345,15 @@ fn owned_route_requires_auth_and_rejects_foreign_and_expired_workspaces() {
         assert!(Path::new(&root).is_dir());
         assert!(s.route_owned_workspace(Some("w2")).is_err());
         assert!(s.route_owned_workspace(Some("3")).is_err());
+        for _ in 0..50 {
+            assert_eq!(s.route_owned_workspace(Some("w1")).unwrap().2, "w1");
+        }
     }
+    assert_eq!(
+        io.open_handle_count(),
+        baseline_handles,
+        "ROUTE success/error paths must release both global control-file copies"
+    );
     run(&mut inst, &home, "CREATE WORKSPACE w3").unwrap();
     run(&mut inst, &home, "ALTER USER alice USING WORKSPACE w3").unwrap();
     {

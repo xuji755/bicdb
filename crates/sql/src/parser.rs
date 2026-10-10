@@ -834,7 +834,43 @@ impl Parser<'_> {
             ));
         }
         let workspace = self.work_ref()?;
-        let action = if self.eat_kw(Keyword::Add) {
+        let action = if self.eat_kw(Keyword::Open) {
+            self.expect_kw(Keyword::Read)?;
+            if self.eat_kw(Keyword::Only) {
+                AlterWorkspaceAction::Open(crate::ast::WorkspaceOpenMode::ReadOnly)
+            } else {
+                self.expect_kw(Keyword::Write)?;
+                AlterWorkspaceAction::Open(if self.eat_kw(Keyword::Force) {
+                    crate::ast::WorkspaceOpenMode::ReadWriteForce
+                } else {
+                    crate::ast::WorkspaceOpenMode::ReadWrite
+                })
+            }
+        } else if self.eat_kw(Keyword::Verify) {
+            self.expect_kw(Keyword::Recovery)?;
+            let scope = if self.eat_kw(Keyword::Page) {
+                let file_id = self.unsigned_integer("文件号")?;
+                let block_id = self.unsigned_integer("块号")?;
+                crate::ast::RecoveryVerifyScope::Page {
+                    file_id: file_id
+                        .try_into()
+                        .map_err(|_| self.err_here("恢复验证文件号超出 u16 范围"))?,
+                    block_id: block_id
+                        .try_into()
+                        .map_err(|_| self.err_here("恢复验证块号超出 u32 范围"))?,
+                }
+            } else if self.eat_kw(Keyword::Object) {
+                let object_id = self.unsigned_integer("对象号")?;
+                crate::ast::RecoveryVerifyScope::Object {
+                    object_id: object_id
+                        .try_into()
+                        .map_err(|_| self.err_here("恢复验证对象号超出 u32 范围"))?,
+                }
+            } else {
+                return Err(self.err_here("VERIFY RECOVERY 之后只能是 PAGE 或 OBJECT"));
+            };
+            AlterWorkspaceAction::VerifyRecovery(scope)
+        } else if self.eat_kw(Keyword::Add) {
             self.expect_kw(Keyword::Filesystem)?;
             let fs = self.fs_ref()?;
             // `ADD FILESYSTEM … [QUOTA <量> ON FILESYSTEM <fs_ref>]`（W3）
@@ -863,7 +899,9 @@ impl Parser<'_> {
                 AlterWorkspaceAction::SetQuota(self.quota_list()?)
             } else {
                 return Err(self.err_here(
-                    "`ALTER WORKSPACE` 只提供 `ADD FILESYSTEM` / `SET DEFAULT FILESYSTEM` / \
+                    "`ALTER WORKSPACE` 只提供 `OPEN READ ONLY|READ WRITE [FORCE]` / \
+                     `VERIFY RECOVERY PAGE|OBJECT` / \
+                     `ADD FILESYSTEM` / `SET DEFAULT FILESYSTEM` / \
                      `SET NAME = …` / `SET QUOTA (…)` / `TO TEMPLATE …`（W3–W7——闭集）",
                 ));
             }
@@ -873,6 +911,22 @@ impl Parser<'_> {
             action,
             location,
         }))
+    }
+
+    fn unsigned_integer(&mut self, what: &str) -> Result<u64, ParseError> {
+        let token = self.advance();
+        match token.kind {
+            TokenKind::Number(text) if !text.contains(['.', 'e', 'E']) => {
+                text.parse::<u64>().map_err(|_| ParseError {
+                    message: format!("{what}必须是无符号整数：`{text}`"),
+                    span: token.span,
+                })
+            }
+            _ => Err(ParseError {
+                message: format!("{what}必须是无符号整数"),
+                span: token.span,
+            }),
+        }
     }
 
     /// **`ALTER SESSION SET/CLEAR <参数>`**（S 组；白名单在 ② 判）。

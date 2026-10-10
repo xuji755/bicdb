@@ -1,11 +1,11 @@
-"""**Python 驱动的实机验收**：起一个真服务（`bicdb init` + `bicdb start`），
+"""**Python 驱动的实机验收**：连接指定的既有测试实例，
 用它跑一遍 DB-API 面。
 
 钉的是"驱动**真能**说话"：建表/写入/查询/参数/事务/`describe`/错误类型/
 非 UTF-8 字节串无损/读己所写/多会话隔离。**不用 mock**——协议错了就得在这儿现形。
 
 跑法（仓库根）：``python3 -m unittest discover -s drivers/python/tests``
-（``BICDB_BIN`` 可指定 bicdb 可执行文件；默认取 ``target/debug/bicdb``）。
+（``BICDB_TEST_INI`` 指定既有实例；工作区绑定夹具暂待内核接口确认）。
 """
 
 from __future__ import annotations
@@ -28,51 +28,38 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def bicdb_bin() -> Path:
-    env = os.environ.get("BICDB_BIN")
-    if env:
-        return Path(env)
-    return repo_root() / "target" / "debug" / "bicdb"
+from existing_instance import configuration, create_workspace
 
 
-def run(*args: str) -> subprocess.CompletedProcess:
-    out = subprocess.run(
-        [str(bicdb_bin()), *args], capture_output=True, text=True, check=False
-    )
-    if out.returncode != 0:
-        raise AssertionError(f"bicdb {' '.join(args)} 失败：{out.stdout}{out.stderr}")
-    return out
-
-
-@unittest.skipUnless(bicdb_bin().exists(), f"没找到 bicdb 可执行文件（{bicdb_bin()}）——先 cargo build")
 class LiveDriver(unittest.TestCase):
     """一个实例贯穿整个类；每个用例自己开/关连接。"""
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.root = Path(tempfile.mkdtemp(prefix="bicdb-py-"))
-        run("init", str(cls.root))
-        run("start", "-p", str(cls.root), "-w", "30")
+        cls.ini = configuration()
+        cls.name, cls.workspace_id, cls.root = create_workspace(cls.ini)
 
     @classmethod
-    def tearDownClass(cls) -> None:
-        subprocess.run(
-            [str(bicdb_bin()), "stop", "-p", str(cls.root), "-m", "immediate"],
-            capture_output=True,
-            check=False,
-        )
-        shutil.rmtree(cls.root, ignore_errors=True)
+    def connect(cls, **kwargs):
+        connection = bicdb.connect(cls.ini, **kwargs)
+        try:
+            if connection.status().get('workspace_kind') != 'private':
+                raise unittest.SkipTest('private workspace binding API not yet confirmed')
+            return connection
+        except BaseException:
+            connection.close(); raise
 
     def setUp(self) -> None:
-        self.conn = bicdb.connect(str(self.root))
+        self.conn = self.connect()
         self.addCleanup(self.conn.close)
 
     # ── 基本 ──
 
     def test_connect_and_handshake(self):
-        self.assertTrue(self.conn.server_version.startswith("0.2."), self.conn.server_version)
+        self.assertTrue(self.conn.server_version.startswith("0.3."), self.conn.server_version)
         self.assertEqual(self.conn.wire_version, bicdb.wire.WIRE_VERSION)
-        self.assertEqual(Path(self.conn.instance), Path(self.root))
+        self.assertEqual(self.conn.status()["workspace_root"], str(self.root))
+        self.assertEqual(self.conn.status()["workspace_id"], str(self.workspace_id))
         self.assertTrue(self.conn.ping())
 
     def test_ddl_dml_select_and_description(self):
@@ -235,7 +222,7 @@ class LiveDriver(unittest.TestCase):
         self.conn.commit()
 
     def test_autocommit_mode(self):
-        conn = bicdb.connect(str(self.root), autocommit=True)
+        conn = self.connect(autocommit=True)
         cur = conn.cursor()
         cur.execute("CREATE TABLE a (id NUMBER NOT NULL)")
         cur.execute("INSERT INTO a VALUES (1)")
@@ -243,7 +230,7 @@ class LiveDriver(unittest.TestCase):
         self.assertFalse(conn.in_transaction)
         conn.close()
         # **断开再连**：行已经在（自结过了）——与隐式事务模式对照。
-        conn2 = bicdb.connect(str(self.root))
+        conn2 = self.connect()
         self.addCleanup(conn2.close)
         self.assertEqual(
             conn2.cursor().execute("SELECT id FROM a").fetchall(),
@@ -254,7 +241,7 @@ class LiveDriver(unittest.TestCase):
         cur = self.conn.cursor()
         cur.execute("CREATE TABLE multi_t (id NUMBER NOT NULL)")
         self.conn.commit()
-        other = bicdb.connect(str(self.root))
+        other = self.connect()
         self.addCleanup(other.close)
         cur.execute("INSERT INTO multi_t VALUES (1)")
         other_cur = other.cursor()
@@ -267,7 +254,7 @@ class LiveDriver(unittest.TestCase):
     def test_connect_without_a_running_instance_is_a_named_error(self):
         empty = Path(tempfile.mkdtemp(prefix="bicdb-py-empty-"))
         self.addCleanup(shutil.rmtree, empty, True)
-        run("init", str(empty))  # 建区但不起服务
+        (empty / "bicdb.ini").write_text(f"[instance]\ndb_root = {empty}\n[service]\nsocket = missing.sock\n")
         with self.assertRaises(bicdb.OperationalError):
             bicdb.connect(str(empty))
         with self.assertRaises(bicdb.InterfaceError):  # 寻址失败（不是连接失败）

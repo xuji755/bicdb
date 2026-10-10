@@ -1074,6 +1074,10 @@ pub struct ControlFile<'a> {
 pub(crate) struct CfCore<'a> {
     io: &'a dyn FileIo,
     handles: [FileHandle; CF_COPIES],
+    /// A FileIo handle is an explicit resource rather than an OS-owned RAII
+    /// value.  Track each copy independently so explicit close can report an
+    /// error while Drop still closes every handle that remains live.
+    open: [bool; CF_COPIES],
     /// 当前生效副本（0 = A、1 = B）：读取与诊断以它为准。
     active: usize,
     /// 各副本的页 0 `seq`（内存镜像；发布成功即更新）。
@@ -1090,10 +1094,19 @@ impl<'a> CfCore<'a> {
         path_b: &Path,
         kind: u8,
     ) -> Result<Self, ControlFileError> {
-        let handles = [create_file(io, path_a)?, create_file(io, path_b)?];
+        let first = create_file(io, path_a)?;
+        let second = match create_file(io, path_b) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = io.close(first);
+                return Err(error.into());
+            }
+        };
+        let handles = [first, second];
         Ok(Self {
             io,
             handles,
+            open: [true; CF_COPIES],
             active: 0,
             seqs: [0; CF_COPIES],
             kind,
@@ -1109,11 +1122,29 @@ impl<'a> CfCore<'a> {
         kind: u8,
     ) -> Result<Self, ControlFileError> {
         let opts = OpenOptions::new().read(true).write(true);
-        let handles = [io.open(path_a, opts)?, io.open(path_b, opts)?];
+        let first = io.open(path_a, opts)?;
+        let second = match io.open(path_b, opts) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = io.close(first);
+                return Err(error.into());
+            }
+        };
+        let handles = [first, second];
+        // Build the owner before validation/healing. Every `?` and invalid-copy
+        // return below is then covered by Drop.
+        let mut core = Self {
+            io,
+            handles,
+            open: [true; CF_COPIES],
+            active: 0,
+            seqs: [0; CF_COPIES],
+            kind,
+        };
         let mut seqs = [0u32; CF_COPIES];
         let mut fails: [Option<String>; CF_COPIES] = [None, None];
         for copy in 0..CF_COPIES {
-            match heal_copy(io, handles[copy], copy as u8, kind) {
+            match heal_copy(io, core.handles[copy], copy as u8, kind) {
                 Ok(seq) => seqs[copy] = seq,
                 Err(reason) => fails[copy] = Some(reason),
             }
@@ -1121,12 +1152,12 @@ impl<'a> CfCore<'a> {
         let active = match (&fails[0], &fails[1]) {
             (None, None) => usize::from(seqs[1] > seqs[0]),
             (None, Some(_)) => {
-                rebuild_copy(io, handles[0], 0, handles[1], 1, kind)?;
+                rebuild_copy(io, core.handles[0], 0, core.handles[1], 1, kind)?;
                 seqs[1] = seqs[0];
                 0
             }
             (Some(_), None) => {
-                rebuild_copy(io, handles[1], 1, handles[0], 0, kind)?;
+                rebuild_copy(io, core.handles[1], 1, core.handles[0], 0, kind)?;
                 seqs[0] = seqs[1];
                 1
             }
@@ -1137,13 +1168,9 @@ impl<'a> CfCore<'a> {
                 })
             }
         };
-        Ok(Self {
-            io,
-            handles,
-            active,
-            seqs,
-            kind,
-        })
+        core.active = active;
+        core.seqs = seqs;
+        Ok(core)
     }
 
     /// 当前生效副本的页 0 `seq`（副本内更新序号；每次更新 +1）。
@@ -1167,9 +1194,12 @@ impl<'a> CfCore<'a> {
     }
 
     /// 关闭两副本句柄。
-    pub(crate) fn close(self) -> Result<(), ControlFileError> {
-        for h in self.handles {
-            self.io.close(h)?;
+    pub(crate) fn close(&mut self) -> Result<(), ControlFileError> {
+        for copy in 0..CF_COPIES {
+            if self.open[copy] {
+                self.io.close(self.handles[copy])?;
+                self.open[copy] = false;
+            }
         }
         Ok(())
     }
@@ -1279,6 +1309,19 @@ impl<'a> CfCore<'a> {
     }
 }
 
+impl Drop for CfCore<'_> {
+    fn drop(&mut self) {
+        // Drop cannot report I/O errors. Explicit durability paths still use
+        // `close()`; this is the safety net for read-only and early-error paths.
+        for copy in 0..CF_COPIES {
+            if self.open[copy] {
+                let _ = self.io.close(self.handles[copy]);
+                self.open[copy] = false;
+            }
+        }
+    }
+}
+
 impl<'a> ControlFile<'a> {
     /// 新建控制文件（两副本），写入初始内容：工作区条目、空检查点进度、
     /// 给定的 Redo 条目（新建时全 `UNUSED`）与归档记录。
@@ -1331,7 +1374,7 @@ impl<'a> ControlFile<'a> {
     }
 
     /// 关闭两副本句柄。
-    pub fn close(self) -> Result<(), ControlFileError> {
+    pub fn close(mut self) -> Result<(), ControlFileError> {
         self.core.close()
     }
 
@@ -1649,7 +1692,10 @@ fn create_file(io: &dyn FileIo, path: &Path) -> io::Result<FileHandle> {
         path,
         OpenOptions::new().read(true).write(true).create_new(true),
     )?;
-    io.set_len(handle, CF_SIZE as u64)?;
+    if let Err(error) = io.set_len(handle, CF_SIZE as u64) {
+        let _ = io.close(handle);
+        return Err(error);
+    }
     Ok(handle)
 }
 
@@ -1783,6 +1829,48 @@ mod tests {
             cf.close().unwrap();
         }
         FaultInjecting::new(mem)
+    }
+
+    #[test]
+    fn dropping_without_explicit_close_releases_both_handles() {
+        let io = new_mem();
+        assert_eq!(io.open_handle_count(), 0);
+        {
+            let _cf = format_cf(&io);
+            assert_eq!(io.open_handle_count(), 2);
+        }
+        assert_eq!(io.open_handle_count(), 0);
+    }
+
+    #[test]
+    fn second_copy_open_failure_releases_the_first_handle() {
+        let io = new_mem();
+        let only_a = io
+            .open(
+                Path::new(A),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        io.close(only_a).unwrap();
+        assert_eq!(io.open_handle_count(), 0);
+        assert!(ControlFile::open(&io, Path::new(A), Path::new(B)).is_err());
+        assert_eq!(io.open_handle_count(), 0);
+    }
+
+    #[test]
+    fn create_length_failure_releases_the_new_handle() {
+        let io = FaultInjecting::new(new_mem());
+        io.add_rule(FaultRule::once(FaultOp::SetLen, 1, ErrorKind::StorageFull));
+        assert!(ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &redo_default(),
+            &archive_default(),
+        )
+        .is_err());
+        assert_eq!(io.inner().open_handle_count(), 0);
     }
 
     // -- 布局钉住 ------------------------------------------------------------

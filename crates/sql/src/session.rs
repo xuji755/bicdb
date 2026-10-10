@@ -33,7 +33,7 @@ use bicdb_exec::{
 use bicdb_storage::buffer::BufferPool;
 use bicdb_storage::scan::HeapScanner;
 use bicdb_storage::segment::Segment;
-use bicdb_txn::engine::{Engine, TxnHandle};
+use bicdb_txn::engine::{Engine, RowOwnerWait, TxnHandle};
 
 pub use bicdb_graph::{Limits as GraphLimits, DEFAULT_DETACH_EDGE_LIMIT, MAX_DETACH_EDGE_LIMIT};
 
@@ -55,6 +55,8 @@ pub enum SessionError {
     Exec(bicdb_exec::ExecError),
     /// 事务引擎。
     Txn(bicdb_txn::write::TxnError),
+    /// Internal cooperative yield; execute_sql_step converts this to SqlStep.
+    RowWait(RowOwnerWait),
     /// 段层。
     Segment(bicdb_storage::segment::SegmentSpaceError),
     /// 会话状态非法（DDL 落在显式事务里 / 提交时无事务 …）。
@@ -75,6 +77,7 @@ impl std::fmt::Display for SessionError {
             SessionError::Ddl(e) => write!(f, "{e}"),
             SessionError::Exec(e) => write!(f, "执行：{e}"),
             SessionError::Txn(e) => write!(f, "事务：{e}"),
+            SessionError::RowWait(_) => write!(f, "SQL 等待行锁，已挂起"),
             SessionError::Segment(e) => write!(f, "段：{e}"),
             SessionError::State(why) => f.write_str(why),
             SessionError::Params(why) => write!(f, "参数：{why}"),
@@ -139,6 +142,93 @@ pub enum QueryResult {
     Txn(String),
 }
 
+/// Parsed, owned batch state. Completed statements/results are never replayed
+/// after a row-lock yield. Keep this together with its connection SessionState.
+#[derive(Debug)]
+pub struct SqlRequest {
+    statements: Vec<crate::ast::Stmt>,
+    params: Vec<(String, Value)>,
+    index: usize,
+    results: Vec<QueryResult>,
+    used: std::collections::HashSet<String>,
+    terminal: bool,
+    owner: Option<([u8; 8], usize)>,
+    pending_txn: Option<bicdb_storage::undo::TxnId>,
+}
+impl SqlRequest {
+    /// Parse and validate all named arguments before any business mutation.
+    pub fn parse(sql: &str, params: Vec<(String, Value)>) -> Result<Self, SessionError> {
+        let statements = parse(sql)?;
+        validate_argument_names(sql, params.iter().map(|(name, _)| name.as_str()))?;
+        Ok(Self {
+            statements,
+            params,
+            index: 0,
+            results: Vec::new(),
+            used: Default::default(),
+            terminal: false,
+            owner: None,
+            pending_txn: None,
+        })
+    }
+    /// Whether success, failure or cancellation has ended this batch.
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+    /// Already completed statement count, retained across worker reassignment.
+    pub fn completed_statements(&self) -> usize {
+        self.index
+    }
+}
+
+/// Cooperative execution outcome; Waiting must be stored outside the worker pool.
+#[derive(Debug)]
+pub enum SqlStep {
+    /// All statements completed; the batch cannot be executed again.
+    Complete(Vec<QueryResult>),
+    /// Current statement rolled back; retry after the owner ends.
+    Waiting(RowOwnerWait),
+}
+
+fn validate_argument_names<'n>(
+    sql: &str,
+    names: impl Iterator<Item = &'n str>,
+) -> Result<(), SessionError> {
+    let names: Vec<_> = names.collect();
+    if names.is_empty() && !sql.contains(':') {
+        return Ok(());
+    }
+    let tokens = crate::lexer::tokenize(sql).map_err(|e| SessionError::Params(e.to_string()))?;
+    let declared: std::collections::HashSet<&str> = tokens
+        .iter()
+        .filter_map(|t| match &t.kind {
+            crate::lexer::TokenKind::Param(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut supplied = std::collections::HashSet::new();
+    for name in &names {
+        if !supplied.insert(*name) {
+            return Err(SessionError::Params(format!("参数 `:{name}` 给了多次")));
+        }
+    }
+    for token in &tokens {
+        if let crate::lexer::TokenKind::Param(name) = &token.kind {
+            if !supplied.contains(name.as_str()) {
+                return Err(SessionError::Params(format!("缺参数值 `:{name}`")));
+            }
+        }
+    }
+    for name in names {
+        if !declared.contains(name) {
+            return Err(SessionError::Params(format!(
+                "整批语句都没用到参数 `:{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Workspace-local timer state for automatic full-text maintenance.
 pub use crate::graph_sql::{FulltextScheduler, GraphSnapshot};
 
@@ -161,6 +251,8 @@ pub struct Session<'a, 'b, 'io, 'f> {
     pub(crate) ws: [u8; 8],
     /// 显式事务（`BEGIN` 后持有）。
     pub(crate) txn: Option<TxnHandle>,
+    pending_dml_auto: Option<bool>,
+    yield_row_locks: bool,
     /// 当前提交序号（新语句的快照水位）。
     pub(crate) seq: u64,
     /// **本语句的参数值**（按绑定期给出的**出现序**摆好；空 = 无参数）。
@@ -171,6 +263,8 @@ pub struct Session<'a, 'b, 'io, 'f> {
     dcl_io: Option<&'a dyn bicdb_workspace::io::FileIo>,
     /// **工作区文件面的供给方**（`CREATE/DROP WORKSPACE` 用；CLI 实现）。
     dcl_provisioner: Option<&'a dyn crate::dcl_exec::WorkspaceProvisioner>,
+    /// Live daemon controller for effective workspace access-state changes.
+    dcl_controller: Option<&'a dyn crate::dcl_exec::WorkspaceStateController>,
     /// **口令散列的迭代数**（`[auth] pbkdf2_iterations`；默认见
     /// `bicdb_common::pbkdf2::DEFAULT_ITERATIONS`）。写进存储串，故可调。
     dcl_pbkdf2_iterations: u32,
@@ -203,6 +297,7 @@ pub struct Session<'a, 'b, 'io, 'f> {
 #[derive(Default)]
 pub struct SessionState {
     txn: Option<TxnHandle>,
+    pending_dml_auto: Option<bool>,
     seq: u64,
     identity: Option<Identity>,
     log_checkpoints: u64,
@@ -226,14 +321,14 @@ impl SessionState {
     /// Whether this suspended connection owns an explicit transaction.
     #[must_use]
     pub fn in_transaction(&self) -> bool {
-        self.txn.is_some()
+        self.txn.is_some() && self.pending_dml_auto != Some(true)
     }
 
     /// Advance an idle connection to the latest committed sequence before its
     /// next request. Explicit transactions keep the sequence captured at
     /// `BEGIN`, providing repeatable visibility until COMMIT/ROLLBACK.
     pub fn refresh_committed(&mut self, seq: u64) {
-        if self.txn.is_none() && self.seq != seq {
+        if (self.txn.is_none() || self.pending_dml_auto == Some(true)) && self.seq != seq {
             self.seq = seq;
             self.fulltext_cache = None;
         }
@@ -256,11 +351,14 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             catalog,
             ws,
             txn: None,
+            pending_dml_auto: None,
+            yield_row_locks: false,
             seq,
             exec_params: Vec::new(),
             dcl_home: None,
             dcl_io: None,
             dcl_provisioner: None,
+            dcl_controller: None,
             dcl_pbkdf2_iterations: bicdb_common::pbkdf2::DEFAULT_ITERATIONS,
             identity: None,
             private_auth: None,
@@ -284,6 +382,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
     pub fn resume_state(&mut self, state: &mut SessionState) {
         assert!(self.txn.is_none() && self.identity.is_none());
         self.txn = state.txn.take();
+        self.pending_dml_auto = state.pending_dml_auto.take();
         self.seq = state.seq;
         self.identity = state.identity.take();
         self.log_checkpoints = state.log_checkpoints;
@@ -295,6 +394,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
     pub fn suspend_state(&mut self, state: &mut SessionState) {
         assert!(state.txn.is_none() && state.identity.is_none());
         state.txn = self.txn.take();
+        state.pending_dml_auto = self.pending_dml_auto.take();
         state.seq = self.seq;
         state.identity = self.identity.take();
         state.log_checkpoints = self.log_checkpoints;
@@ -393,10 +493,26 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         self.dcl_provisioner = p;
     }
 
+    /// Attach the live daemon controller used by `ALTER WORKSPACE ... OPEN`.
+    pub fn set_workspace_state_controller(
+        &mut self,
+        controller: Option<&'a dyn crate::dcl_exec::WorkspaceStateController>,
+    ) {
+        self.dcl_controller = controller;
+    }
+
     /// 工作区供给方（`dcl_exec` 用）。
     #[must_use]
     pub(crate) fn dcl_provisioner(&self) -> Option<&'a dyn crate::dcl_exec::WorkspaceProvisioner> {
         self.dcl_provisioner
+    }
+
+    /// Live workspace state controller (`dcl_exec` use).
+    #[must_use]
+    pub(crate) fn dcl_controller(
+        &self,
+    ) -> Option<&'a dyn crate::dcl_exec::WorkspaceStateController> {
+        self.dcl_controller
     }
 
     /// **配口令散列的迭代数**（实例参数 `[auth] pbkdf2_iterations`）。
@@ -759,6 +875,25 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         self.txn.is_some()
     }
 
+    /// Roll back an unfinished connection transaction and report failures.
+    /// Service shutdown uses this instead of relying on `Drop`, whose best-
+    /// effort contract cannot make a clean-shutdown guarantee.
+    pub fn rollback_uncommitted(&mut self) -> Result<u64, SessionError> {
+        let Some(mut txn) = self.txn.take() else {
+            return Ok(0);
+        };
+        match self.engine.rollback(&mut txn) {
+            Ok(count) => {
+                self.pending_dml_auto = None;
+                Ok(count)
+            }
+            Err(error) => {
+                self.txn = Some(txn);
+                Err(error.into())
+            }
+        }
+    }
+
     /// **跑一条语句**（`sql` 可以是多条以 `;` 分隔；无参数）。
     ///
     /// 语句声明了参数（`:name`）而没有给值 ⇒ [`SessionError::Params`]——
@@ -777,39 +912,13 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         named: &[(&str, Value)],
     ) -> Result<Vec<QueryResult>, SessionError> {
         let stmts = parse(sql)?;
-        // 多给/重复命名参数必须在任何写入之前拒绝，不能提交后才返回参数错误。
-        if !named.is_empty() {
-            let tokens =
-                crate::lexer::tokenize(sql).map_err(|e| SessionError::Params(e.to_string()))?;
-            let declared: std::collections::HashSet<&str> = tokens
-                .iter()
-                .filter_map(|t| match &t.kind {
-                    crate::lexer::TokenKind::Param(n) => Some(n.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let mut supplied = std::collections::HashSet::new();
-            for (name, _) in named {
-                if !supplied.insert(*name) {
-                    return Err(SessionError::Params(format!("参数 `:{name}` 给了多次")));
-                }
-            }
-            // 缺参优先于多给，沿 SQL 出现序报告，保持驱动已有的错误契约。
-            for token in &tokens {
-                if let crate::lexer::TokenKind::Param(name) = &token.kind {
-                    if !supplied.contains(name.as_str()) {
-                        return Err(SessionError::Params(format!("缺参数值 `:{name}`")));
-                    }
-                }
-            }
-            for (name, _) in named {
-                if !declared.contains(name) {
-                    return Err(SessionError::Params(format!(
-                        "整批语句都没用到参数 `:{name}`"
-                    )));
-                }
-            }
+        if self.pending_dml_auto.is_some() && !stmts.iter().all(|stmt| matches!(stmt,
+            crate::ast::Stmt::Select(_) | crate::ast::Stmt::ShowTables(_) | crate::ast::Stmt::ShowGraphs(_)
+                | crate::ast::Stmt::VariableSet(_))
+            || matches!(stmt, crate::ast::Stmt::Transaction(t) if t.kind == crate::ast::TransactionStmtKind::Rollback)) {
+            return Err(SessionError::State("SQL 尚在等待续执行，请先恢复或取消该批次".into()));
         }
+        validate_argument_names(sql, named.iter().map(|(name, _)| *name))?;
         let mut out = Vec::with_capacity(stmts.len());
         // **参数是"整批共用"的**：一条语句只用其中几个是正常的
         // （`BEGIN; INSERT … :p; COMMIT`）——"多给"只在**整批**都没用到时才报。
@@ -827,6 +936,121 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         Ok(out)
     }
 
+    /// Run until completion/error/row-lock yield. On Waiting, save SessionState
+    /// and this request, release the worker, then resume on another worker.
+    pub fn execute_sql_step(&mut self, request: &mut SqlRequest) -> Result<SqlStep, SessionError> {
+        if request.terminal {
+            return Err(SessionError::State("SQL 批次已经结束，不能重放".into()));
+        }
+        self.check_sql_request_owner(request)?;
+        request.owner = Some((self.ws, self.pool as *const _ as usize));
+        let previous = std::mem::replace(&mut self.yield_row_locks, true);
+        let outcome = self.execute_sql_step_inner(request);
+        self.yield_row_locks = previous;
+        match outcome {
+            Ok(step) => Ok(step),
+            Err(SessionError::RowWait(wait)) => {
+                request.pending_txn = self.txn.as_ref().map(TxnHandle::id);
+                Ok(SqlStep::Waiting(wait))
+            }
+            Err(error) => {
+                request.terminal = true;
+                let main = error.to_string();
+                match self.abort_pending_sql() {
+                    Ok(()) => {
+                        request.pending_txn = None;
+                        Err(error)
+                    }
+                    Err(rollback) => {
+                        request.pending_txn = self.txn.as_ref().map(TxnHandle::id);
+                        Err(SessionError::Exec(bicdb_exec::ExecError::RollbackFailed {
+                            main,
+                            rollback: rollback.to_string(),
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    fn execute_sql_step_inner(
+        &mut self,
+        request: &mut SqlRequest,
+    ) -> Result<SqlStep, SessionError> {
+        while request.index < request.statements.len() {
+            if self.pending_dml_auto == Some(true) {
+                self.seq = self.engine.current_seq();
+                self.fulltext_cache = None;
+            }
+            let named: Vec<_> = request
+                .params
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect();
+            let mut used = std::collections::HashSet::new();
+            let result = self.execute_one(&request.statements[request.index], &named, &mut used);
+            request.used.extend(used.into_iter().map(str::to_owned));
+            let result = result?;
+            request.results.push(result);
+            request.index += 1;
+        }
+        for (name, _) in &request.params {
+            if !request.used.contains(name) {
+                return Err(SessionError::Params(format!(
+                    "整批语句都没用到参数 `:{name}`"
+                )));
+            }
+        }
+        request.terminal = true;
+        request.pending_txn = None;
+        Ok(SqlStep::Complete(std::mem::take(&mut request.results)))
+    }
+
+    /// End a yielded SQL batch, rolling back only its auto-commit transaction.
+    /// Explicit transactions keep pre-statement changes/locks for their caller.
+    pub fn cancel_sql_request(&mut self, request: &mut SqlRequest) -> Result<(), SessionError> {
+        if request.terminal && request.pending_txn.is_none() {
+            return Ok(());
+        }
+        self.check_sql_request_owner(request)?;
+        request.terminal = true;
+        self.abort_pending_sql()?;
+        request.pending_txn = None;
+        Ok(())
+    }
+
+    fn check_sql_request_owner(&self, request: &SqlRequest) -> Result<(), SessionError> {
+        let owner = (self.ws, self.pool as *const _ as usize);
+        if request.owner.is_some_and(|bound| bound != owner) {
+            return Err(SessionError::State(
+                "SQL 续执行状态不属于当前工作区/实例".into(),
+            ));
+        }
+        if request
+            .pending_txn
+            .is_some_and(|txn| self.txn.as_ref().map(TxnHandle::id) != Some(txn))
+            || (request.pending_txn.is_none() && self.pending_dml_auto.is_some())
+        {
+            return Err(SessionError::State(
+                "当前会话不拥有该 SQL 的续执行事务".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn abort_pending_sql(&mut self) -> Result<(), SessionError> {
+        if self.pending_dml_auto.take() == Some(true) {
+            if let Some(mut txn) = self.txn.take() {
+                if let Err(error) = self.engine.rollback(&mut txn) {
+                    self.txn = Some(txn);
+                    self.pending_dml_auto = Some(true);
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn snapshot(&self) -> CommitSeq {
         CommitSeq::from_raw(self.seq + 1).expect("48 位域内")
     }
@@ -840,9 +1064,60 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         // ⓪ **身份资格先于绑定与对象查找**（REQ-SQL-005 口径）：
         //    具名主体的只读/自助规则、过期会话的受限规则都在这里拦。
         self.check_identity(stmt)?;
-        // ⓪.5 **日志要被挡就先推一次检查点**（§11.7 的 CKPT 触发 ②"组满被迫"；
-        //      触发 ①"周期发布"随后台角色切片——`crates/daemon` 尚未接电）。
-        self.checkpoint_on_log_pressure()?;
+        let administrative_open = self.is_management_identity()
+            && matches!(
+                stmt,
+                crate::ast::Stmt::AlterWorkspace(crate::ast::AlterWorkspaceStmt {
+                    action: crate::ast::AlterWorkspaceAction::Open(_),
+                    ..
+                })
+            );
+        if !administrative_open {
+            if let Some(reason) = self.pool.workspace_read_only(self.ws) {
+                use crate::ast::{GraphIndexAction as G, Stmt as S, TransactionStmtKind as T};
+                let read_only = match stmt {
+                    S::ShowTables(_) | S::ShowGraphs(_) | S::Select(_) | S::VariableSet(_) => true,
+                    S::Transaction(t) => t.kind == T::Rollback,
+                    S::GraphIndex(g) => matches!(
+                        g.action,
+                        G::Show | G::FulltextShow | G::FulltextSearch { .. }
+                    ),
+                    S::Cypher(c) => bicdb_graph::parse(&c.query)
+                        .map_err(|e| SessionError::State(e.to_string()))?
+                        .is_read_only(),
+                    _ => false,
+                };
+                if !read_only {
+                    return Err(SessionError::State(format!(
+                        "工作区由实例管理员设为只读：{reason}"
+                    )));
+                }
+            }
+        }
+        if let Some(reason) = self.pool.workspace_fault(self.ws) {
+            use crate::ast::{GraphIndexAction as G, Stmt as S, TransactionStmtKind as T};
+            let read_only = match stmt {
+                S::ShowTables(_) | S::ShowGraphs(_) | S::Select(_) | S::VariableSet(_) => true,
+                S::Transaction(t) => t.kind == T::Rollback,
+                S::GraphIndex(g) => matches!(
+                    g.action,
+                    G::Show | G::FulltextShow | G::FulltextSearch { .. }
+                ),
+                S::Cypher(c) => bicdb_graph::parse(&c.query)
+                    .map_err(|e| SessionError::State(e.to_string()))?
+                    .is_read_only(),
+                _ => false,
+            };
+            if !read_only {
+                return Err(SessionError::State(format!("工作区已封锁写入：{reason}")));
+            }
+        }
+        // ⓪.5 **日志要被挡就先推一次检查点**（§11.7 的 CKPT 触发 ②"组满被迫"）。
+        //      正常的周期发布由实例级 `cli::background::Background` 中有界 CKPT
+        //      线程池负责；这里保留前台压力兜底，二者都只推进当前工作区的日志流。
+        if self.pool.workspace_fault(self.ws).is_none() {
+            self.checkpoint_on_log_pressure()?;
+        }
         if let Some(result) = self.execute_graph_statement(stmt) {
             return result;
         }
@@ -852,13 +1127,22 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         // 管理面身份（本机/OS）= admin——`public` 的管理元数据 `file$` 只有它看得见
         // （`spec/SQL.md` 待冻结项 47）。
         let is_admin = self.is_management_identity();
-        let bound = {
+        let (bound, refs) = {
             let mut view =
                 CatalogViewImpl::new(self.catalog, snapshot).with_graph_access(self.graph_internal);
             let mut resolver =
                 NameResolver::with_policy(&mut view, crate::bind::ResolvePolicy { is_admin });
-            bind_statement(&mut resolver, stmt)?
+            let bound = bind_statement(&mut resolver, stmt)?;
+            let refs = resolver.into_refs();
+            (bound, refs)
         };
+        for object_id in refs.objects().keys().chain(refs.indexes().keys()).copied() {
+            if let Some(reason) = self.pool.object_fault(self.ws, u64::from(object_id)) {
+                return Err(SessionError::State(format!(
+                    "对象 {object_id} 已由恢复管理隔离：{reason}"
+                )));
+            }
+        }
         // **参数摆位**（绑定期的清单 + 调用方按名给的值）。
         self.exec_params = place_params(&bound, named, used)?;
 
@@ -978,16 +1262,18 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         }
         // Fixed tables have no obj$ row: only list a live provider, never invent
         // unimplemented asset/graph tables from design documents.
-        if self
-            .fixed_source
-            .and_then(|s| s.fixed_table("file$"))
-            .is_some()
-        {
-            rows.push(vec![
-                Value::Bytes(b"file$".to_vec()),
-                Value::Bytes(b"FIXED".to_vec()),
-                Value::Null,
-            ]);
+        for fixed in ["file$", "recovery$"] {
+            if self
+                .fixed_source
+                .and_then(|source| source.fixed_table(fixed))
+                .is_some()
+            {
+                rows.push(vec![
+                    Value::Bytes(fixed.as_bytes().to_vec()),
+                    Value::Bytes(b"FIXED".to_vec()),
+                    Value::Null,
+                ]);
+            }
         }
         rows.sort_by(|a, b| match (&a[0], &b[0]) {
             (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
@@ -1033,7 +1319,14 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     .txn
                     .take()
                     .ok_or_else(|| SessionError::State("没有活动事务".to_owned()))?;
-                let seq = self.engine.commit(&mut txn)?;
+                let seq = match self.engine.commit(&mut txn) {
+                    Ok(seq) => seq,
+                    Err(error) => {
+                        self.txn = Some(txn);
+                        return Err(error.into());
+                    }
+                };
+                self.pending_dml_auto = None;
                 self.seq = seq.as_raw();
                 Ok(QueryResult::Txn(format!("COMMIT（提交序号 {seq}）")))
             }
@@ -1042,7 +1335,14 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     .txn
                     .take()
                     .ok_or_else(|| SessionError::State("没有活动事务".to_owned()))?;
-                let n = self.engine.rollback(&mut txn)?;
+                let n = match self.engine.rollback(&mut txn) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        self.txn = Some(txn);
+                        return Err(error.into());
+                    }
+                };
+                self.pending_dml_auto = None;
                 Ok(QueryResult::Txn(format!("ROLLBACK（撤销 {n} 条）")))
             }
         }
@@ -1319,10 +1619,119 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
     fn run_dml(
         &mut self,
         plan: &PhysicalPlan,
-        snapshot: CommitSeq,
+        mut snapshot: CommitSeq,
         kind: DmlKind,
         filter: Option<bicdb_exec::Expr>,
     ) -> Result<QueryResult, SessionError> {
+        let own_txn = self.pending_dml_auto.take().unwrap_or(self.txn.is_none());
+        let mut txn = match self.txn.take() {
+            Some(txn) => txn,
+            None => self.engine.begin()?,
+        };
+
+        loop {
+            let mark = self.engine.statement_mark(&txn)?;
+            match self.run_dml_attempt(plan, snapshot, kind, filter.clone(), &mut txn) {
+                Ok(affected) => {
+                    if own_txn {
+                        let committed = match self.engine.commit(&mut txn) {
+                            Ok(committed) => committed,
+                            Err(error) => {
+                                self.txn = Some(txn);
+                                self.pending_dml_auto = Some(true);
+                                return Err(error.into());
+                            }
+                        };
+                        self.seq = committed.as_raw();
+                    } else {
+                        self.txn = Some(txn);
+                    }
+                    return Ok(QueryResult::Affected(affected));
+                }
+                Err(e) => {
+                    let row_lock = match &e {
+                        SessionError::Exec(bicdb_exec::ExecError::TableAccess(
+                            bicdb_access::TableAccessError::Txn(
+                                bicdb_txn::write::TxnError::RowLocked { holder, row },
+                            ),
+                        )) => Some((*holder, *row)),
+                        _ => None,
+                    };
+                    if let Err(rb) = self.engine.rollback_statement(&mut txn, mark) {
+                        self.txn = Some(txn);
+                        self.pending_dml_auto = Some(own_txn);
+                        self.pool
+                            .quarantine_workspace(self.ws, format!("SQL 语句回滚失败：{rb}"));
+                        return Err(SessionError::Exec(bicdb_exec::ExecError::RollbackFailed {
+                            main: e.to_string(),
+                            rollback: rb.to_string(),
+                        }));
+                    }
+                    if let Some((holder, row)) = row_lock {
+                        if self.yield_row_locks {
+                            let wait = self.engine.enqueue_row_wait(&txn, holder, row);
+                            self.txn = Some(txn);
+                            self.pending_dml_auto = Some(own_txn);
+                            return Err(SessionError::RowWait(wait));
+                        }
+                        match self.engine.wait_for_row_owner(&txn, holder, row) {
+                            Ok(()) => {
+                                // READ COMMITTED auto-commit statements must observe the row
+                                // version that won the lock before rechecking their predicate.
+                                // Explicit transactions retain their existing session snapshot.
+                                if own_txn {
+                                    snapshot = CommitSeq::from_raw(self.engine.current_seq() + 1)
+                                        .expect("48 位提交序号域内");
+                                }
+                                continue;
+                            }
+                            Err(wait_error) => {
+                                if own_txn {
+                                    if let Err(error) = self.engine.rollback(&mut txn) {
+                                        self.txn = Some(txn);
+                                        self.pending_dml_auto = Some(true);
+                                        return Err(error.into());
+                                    }
+                                } else {
+                                    self.txn = Some(txn);
+                                }
+                                return Err(SessionError::Txn(wait_error));
+                            }
+                        }
+                    }
+                    if own_txn {
+                        // Statement rollback above retained the transaction so lock-wait
+                        // retries could use the same waiter identity. A terminal error ends it.
+                        if let Err(rb) = self.engine.rollback(&mut txn) {
+                            self.txn = Some(txn);
+                            self.pending_dml_auto = Some(true);
+                            return Err(SessionError::Exec(
+                                bicdb_exec::ExecError::RollbackFailed {
+                                    main: e.to_string(),
+                                    rollback: rb.to_string(),
+                                },
+                            ));
+                        }
+                    } else {
+                        self.txn = Some(txn);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Execute one UPDATE/DELETE attempt. A lock conflict is returned with its
+    /// structured owner identity; the caller rolls back this attempt, waits,
+    /// and invokes this method again so no stale row image or physical ROWID is reused.
+    fn run_dml_attempt(
+        &mut self,
+        plan: &PhysicalPlan,
+        snapshot: CommitSeq,
+        kind: DmlKind,
+        filter: Option<bicdb_exec::Expr>,
+        txn: &mut TxnHandle,
+    ) -> Result<u64, SessionError> {
         let source = plan
             .sources
             .first()
@@ -1331,7 +1740,7 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
         let params_in = self.exec_params.clone();
         let seg_block = source.seg_block;
         let table_obj = source.table_obj;
-        let own = self.txn.as_ref().map(TxnHandle::id);
+        let own = Some(txn.id());
         // **物化目标行**（按语句快照 + 本会话未提交改动；命中行 = WHERE 放行）。
         let view = bicdb_storage::cr::ReadView::new(snapshot).with_own(own);
         let mut indexes = crate::dml_index::table_indexes(self.catalog, snapshot, table_obj)?;
@@ -1346,16 +1755,11 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
             None
         };
         if let Some(rids) = &mut candidates {
-            // Stable tree entries may point at forwarding slots after growth.
-            // Writers need the physical row ID, as the heap-scan fallback does.
-            for rid in rids.iter_mut() {
-                *rid = crate::dml_index::resolve_physical_rid(
-                    self.pool,
-                    self.catalog.file_mut(),
-                    self.ws,
-                    *rid,
-                )?;
-            }
+            // Index entries own the stable/root ROWID. Keep it intact here:
+            // fetch_rows follows forwarding pointers for the row image, while
+            // TableAccess follows them again at write time. Replacing it with
+            // a transient physical address would make later migrations leak
+            // into secondary indexes and lock-wait retries.
             rids.sort_unstable();
             rids.dedup();
         }
@@ -1379,20 +1783,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                         .filter_map(|(rid, bytes)| bytes.map(|bytes| (rid, bytes)))
                         .collect());
                 }
-                let mut scanner = HeapScanner::new(pool_ref, chain, view, file_id, blocks.clone());
-                let mut out = Vec::new();
-                loop {
-                    match scanner.next_row() {
-                        Ok(Some((rid, bytes))) => out.push((rid, bytes)),
-                        Ok(None) => break,
-                        // 扫描出错：**不吞**——包成会话错误返回（物化阶段没有写，
-                        // 此时中止是干净的）。
-                        Err(e) => {
-                            return Err(SessionError::State(format!("DML 物化扫描失败：{e}")))
-                        }
-                    }
-                }
-                Ok::<_, SessionError>(out)
+                bicdb_storage::scan::stable_heap_rows(pool_ref, chain, view, file_id, &blocks)
+                    .map_err(|e| SessionError::State(format!("DML 物化扫描失败：{e}")))
             })?;
         // WHERE 在物化之后、写之前判（谓词按**表行**坐标：无 ROWID 偏移）。
         let shape_of = |n: &bicdb_exec::PlanNode| match n {
@@ -1458,17 +1850,10 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     .then_some(c.length as usize),
             })
             .collect();
-        let own_txn = self.txn.is_none();
-        let mut txn = match self.txn.take() {
-            Some(t) => t,
-            None => self.engine.begin()?,
-        };
-        let mark = self.engine.statement_mark(&txn)?;
         // 物化后喂给算子：**内存游标**（行 = (RID, 存储行字节)）。
         let cursor_rows = rows.clone();
-        let outcome = self
-            .engine
-            .with_write_context(&mut txn, |pool, log, chain, t| {
+        self.engine
+            .with_write_context(txn, |pool, log, chain, t| {
                 let mut writer = TableAccessWriter::with_txn(
                     pool,
                     chain,
@@ -1507,34 +1892,8 @@ impl<'a, 'b, 'io, 'f> Session<'a, 'b, 'io, 'f> {
                     DmlKind::Delete => "Delete",
                 };
                 Ok::<u64, bicdb_exec::ExecError>(cx.rows_affected_of(what))
-            });
-        match outcome {
-            Ok(affected) => {
-                if own_txn {
-                    let committed = self.engine.commit(&mut txn)?;
-                    self.seq = committed.as_raw();
-                } else {
-                    self.txn = Some(txn);
-                }
-                Ok(QueryResult::Affected(affected))
-            }
-            Err(e) => {
-                let rolled = if own_txn {
-                    self.engine.rollback(&mut txn).map(|_| ())
-                } else {
-                    let r = self.engine.rollback_statement(&mut txn, mark).map(|_| ());
-                    self.txn = Some(txn);
-                    r
-                };
-                match rolled {
-                    Ok(()) => Err(SessionError::Exec(e)),
-                    Err(rb) => Err(SessionError::Exec(bicdb_exec::ExecError::RollbackFailed {
-                        main: e.to_string(),
-                        rollback: rb.to_string(),
-                    })),
-                }
-            }
-        }
+            })
+            .map_err(SessionError::Exec)
     }
 
     /// **INSERT … VALUES**（写路径）。

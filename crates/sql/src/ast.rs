@@ -965,6 +965,11 @@ pub struct AlterWorkspaceStmt {
 /// `ALTER WORKSPACE` 的动作（闭集；W3–W7）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterWorkspaceAction {
+    /// Change the daemon's effective access state. Success requires an
+    /// instance-controller acknowledgement; this is not a catalog-only flag.
+    Open(WorkspaceOpenMode),
+    /// Verify actual media/catalog state and clear exactly one recovery scope.
+    VerifyRecovery(RecoveryVerifyScope),
     /// `ADD FILESYSTEM <fs_ref> [QUOTA …]`——**扩盘**（W3）。
     AddFilesystem {
         /// 目标文件系统。
@@ -986,6 +991,34 @@ pub enum AlterWorkspaceAction {
     SetName(Vec<u8>),
     /// `SET QUOTA (…)`（`DefElem` 列表——与 `WITH` 选项同形）。
     SetQuota(Vec<DefElem>),
+}
+
+/// Scope accepted by the online recovery verification command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryVerifyScope {
+    /// One physical page `(file_id, block_id)`.
+    Page {
+        /// Data-file number.
+        file_id: u16,
+        /// Block number within the file.
+        block_id: u32,
+    },
+    /// One workspace-local catalog object.
+    Object {
+        /// Catalog object number.
+        object_id: u32,
+    },
+}
+
+/// Runtime access state requested by `ALTER WORKSPACE ... OPEN ...`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceOpenMode {
+    /// Admit reads while rejecting every business write.
+    ReadOnly,
+    /// Re-run the normal recovery gate before admitting writes.
+    ReadWrite,
+    /// Private workspace only: audited, explicitly forced recovery.
+    ReadWriteForce,
 }
 
 /// CYPHER graph 'query' [PARAMETERS 'JSON object'] [BUDGETS 'JSON object'].

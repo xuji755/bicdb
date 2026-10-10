@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod background;
 pub mod boot;
 pub mod clientauth;
 pub mod config;
@@ -17,5 +18,7 @@ pub mod home;
 pub mod lock;
 pub mod proto;
 pub mod provision;
+pub mod recovery_admin;
+pub mod scheduler;
 pub mod service;
 pub mod templates;

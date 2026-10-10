@@ -998,6 +998,15 @@ impl Session<'_, '_, '_, '_> {
             }),
         )
     }
+
+    fn ensure_recovery_object_accessible(&self, object_id: u32) -> Result<(), SessionError> {
+        if let Some(reason) = self.pool.object_fault(self.ws, u64::from(object_id)) {
+            return Err(error(format!(
+                "对象 {object_id} 已由恢复管理隔离：{reason}"
+            )));
+        }
+        Ok(())
+    }
     fn execute_graph_statement_scoped(
         &mut self,
         stmt: &Stmt,
@@ -1371,6 +1380,7 @@ impl Session<'_, '_, '_, '_> {
             .catalog
             .resolve(self.snapshot(), dict::namespace::TABLE, &snapshot.name)
             .map_err(error)?;
+        self.ensure_recovery_object_accessible(obj.obj)?;
         if obj.type_code != dict::obj_kind::GRAPH || obj.status != 1 {
             return Err(error("snapshot target is not a ready graph"));
         }
@@ -1575,6 +1585,7 @@ impl Session<'_, '_, '_, '_> {
             .catalog
             .resolve(snapshot, dict::namespace::TABLE, &stmt.graph)
             .map_err(error)?;
+        self.ensure_recovery_object_accessible(graph.obj)?;
         if graph.type_code != dict::obj_kind::GRAPH || graph.status != 1 {
             return Err(error("object is not a native graph"));
         }
@@ -1746,6 +1757,7 @@ impl Session<'_, '_, '_, '_> {
             Err(bicdb_catalog::api::CatalogError::NotFound) => return Ok(None),
             Err(e) => return Err(error(e)),
         };
+        self.ensure_recovery_object_accessible(object.obj)?;
         if object.type_code != kind || object.status != 1 {
             return Err(error("invalid protected full-text record store"));
         }
@@ -2544,6 +2556,7 @@ impl Session<'_, '_, '_, '_> {
             .catalog
             .resolve(self.snapshot(), dict::namespace::TABLE, &name)
             .map_err(error)?;
+        self.ensure_recovery_object_accessible(object.obj)?;
         if object.type_code != dict::obj_kind::GRAPH_FULLTEXT_DATA || object.status != 1 {
             return Err(error("invalid full-text document store"));
         }
@@ -3738,6 +3751,7 @@ impl Session<'_, '_, '_, '_> {
             .catalog
             .resolve(self.snapshot(), dict::namespace::TABLE, name)
             .map_err(error)?;
+        self.ensure_recovery_object_accessible(obj.obj)?;
         let native = if obj.type_code == dict::obj_kind::GRAPH {
             Manifest::decode(
                 rows.get(&0).map(Vec::as_slice),
@@ -3886,6 +3900,7 @@ impl Session<'_, '_, '_, '_> {
             .catalog
             .resolve(self.snapshot(), dict::namespace::TABLE, name)
             .map_err(error)?;
+        self.ensure_recovery_object_accessible(obj.obj)?;
         if obj.type_code != dict::obj_kind::GRAPH {
             return Ok(None);
         }
@@ -4773,6 +4788,7 @@ impl Session<'_, '_, '_, '_> {
             .catalog
             .resolve(self.snapshot(), dict::namespace::TABLE, &c.graph)
             .map_err(error)?;
+        self.ensure_recovery_object_accessible(obj.obj)?;
         if obj.type_code != dict::obj_kind::GRAPH || obj.status != 1 {
             return Err(error("对象不是命名图"));
         }

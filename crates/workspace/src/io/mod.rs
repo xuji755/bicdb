@@ -176,6 +176,12 @@ pub(crate) enum HandleKind {
 ///
 /// 所有方法都是**句柄基**的；路径只在 `open` / `open_dir` 出现。
 pub trait FileIo: Send + Sync {
+    /// Current number of live opaque handles when the implementation can
+    /// report it. Used by service status and resource-leak regression tests.
+    fn open_handle_count(&self) -> Option<usize> {
+        None
+    }
+
     /// 打开（或创建）普通文件。实现须：不跟随符号链接，并在打开后校验
     /// 对象为普通文件（非目录、非设备）。
     fn open(&self, path: &Path, opts: OpenOptions) -> io::Result<FileHandle>;

@@ -25,6 +25,7 @@
 //! 文件清单只能去改控制文件（DDL/管理操作），下次查询自然反映。
 
 use bicdb_storage::controlfile::DataFileRecord;
+use bicdb_storage::recovery_journal::{RecoveryRecord, RecoveryScope, RecoveryState};
 
 use crate::dict::ColTypeCode;
 use crate::row::DictValue;
@@ -89,6 +90,128 @@ pub static FILE_COLUMNS: &[FixedColumn] = &[
     },
 ];
 
+/// `recovery$` columns, backed by the validated append-only audit journal.
+pub static RECOVERY_COLUMNS: &[FixedColumn] = &[
+    FixedColumn {
+        name: "sequence",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "state",
+        type_code: ColTypeCode::Varchar2,
+    },
+    FixedColumn {
+        name: "timestamp_ms",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "recovery_lsn",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "scope_kind",
+        type_code: ColTypeCode::Varchar2,
+    },
+    FixedColumn {
+        name: "scope_file",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "scope_block",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "scope_object",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "scope_txn",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "scope_lsn_start",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "scope_lsn_end",
+        type_code: ColTypeCode::Number,
+    },
+    FixedColumn {
+        name: "actor",
+        type_code: ColTypeCode::Varchar2,
+    },
+    FixedColumn {
+        name: "detail",
+        type_code: ColTypeCode::Varchar2,
+    },
+];
+
+/// Current workspace recovery history. Rows remain ordered by audit sequence.
+#[must_use]
+pub fn recovery_table(records: &[RecoveryRecord]) -> FixedTable {
+    let rows = records
+        .iter()
+        .map(|record| {
+            let state = match record.state {
+                RecoveryState::Recovering => "RECOVERING",
+                RecoveryState::Verified => "VERIFIED",
+                RecoveryState::Failed => "FAILED",
+                RecoveryState::RuntimeFault => "RUNTIME_FAULT",
+                RecoveryState::Forced => "FORCED",
+            };
+            let (scope_kind, scope_file, scope_block, scope_object, scope_txn, lsn_start, lsn_end) =
+                match record.scope {
+                    RecoveryScope::Workspace => ("WORKSPACE", None, None, None, None, None, None),
+                    RecoveryScope::Page { file_id, block_id } => (
+                        "PAGE",
+                        Some(u64::from(file_id)),
+                        Some(u64::from(block_id)),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    RecoveryScope::Object { object_id } => {
+                        ("OBJECT", None, None, Some(object_id), None, None, None)
+                    }
+                    RecoveryScope::Transaction { txn_id } => {
+                        ("TRANSACTION", None, None, None, Some(txn_id), None, None)
+                    }
+                    RecoveryScope::RedoRange { start_lsn, end_lsn } => (
+                        "REDO_RANGE",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(start_lsn),
+                        Some(end_lsn),
+                    ),
+                };
+            let number = |value: Option<u64>| value.map_or(DictValue::Null, DictValue::Num);
+            vec![
+                DictValue::Num(record.sequence),
+                DictValue::Text(state.into()),
+                DictValue::Num(record.timestamp_ms),
+                DictValue::Num(record.recovery_lsn),
+                DictValue::Text(scope_kind.into()),
+                number(scope_file),
+                number(scope_block),
+                number(scope_object),
+                number(scope_txn),
+                number(lsn_start),
+                number(lsn_end),
+                DictValue::Text(record.actor.clone()),
+                DictValue::Text(record.detail.clone()),
+            ]
+        })
+        .collect();
+    FixedTable {
+        name: "recovery$",
+        columns: RECOVERY_COLUMNS,
+        rows,
+    }
+}
+
 /// **`file$`：由控制文件的数据文件记录产生行**（调用方给"控制文件的内存映像"）。
 #[must_use]
 pub fn file_table(records: &[DataFileRecord]) -> FixedTable {
@@ -125,6 +248,7 @@ pub fn file_table(records: &[DataFileRecord]) -> FixedTable {
 pub fn columns(name: &str) -> Option<&'static [FixedColumn]> {
     match name {
         "file$" => Some(FILE_COLUMNS),
+        "recovery$" => Some(RECOVERY_COLUMNS),
         _ => None,
     }
 }
@@ -193,5 +317,44 @@ mod tests {
         rows2.push(DataFileRecord::new(5, 3));
         assert_eq!(table("file$", &rows).unwrap().cardinality(), 3);
         assert_eq!(table("file$", &rows2).unwrap().cardinality(), 4);
+    }
+
+    #[test]
+    fn recovery_table_maps_audit_states_without_losing_workspace_lsn() {
+        let records = vec![
+            RecoveryRecord {
+                sequence: 7,
+                state: RecoveryState::RuntimeFault,
+                timestamp_ms: 123,
+                recovery_lsn: 456,
+                scope: RecoveryScope::Page {
+                    file_id: 3,
+                    block_id: 99,
+                },
+                actor: "dbwr-2".into(),
+                detail: "datafile write failed".into(),
+            },
+            RecoveryRecord {
+                sequence: 8,
+                state: RecoveryState::Forced,
+                timestamp_ms: 124,
+                recovery_lsn: 457,
+                scope: RecoveryScope::Object { object_id: 17 },
+                actor: "admin".into(),
+                detail: "forced open".into(),
+            },
+        ];
+        let table = recovery_table(&records);
+        assert_eq!(table.name, "recovery$");
+        assert_eq!(table.columns, RECOVERY_COLUMNS);
+        assert_eq!(table.rows[0][0], DictValue::Num(7));
+        assert_eq!(table.rows[0][1], DictValue::Text("RUNTIME_FAULT".into()));
+        assert_eq!(table.rows[0][3], DictValue::Num(456));
+        assert_eq!(table.rows[0][4], DictValue::Text("PAGE".into()));
+        assert_eq!(table.rows[0][5], DictValue::Num(3));
+        assert_eq!(table.rows[0][6], DictValue::Num(99));
+        assert_eq!(table.rows[1][1], DictValue::Text("FORCED".into()));
+        assert_eq!(table.rows[1][4], DictValue::Text("OBJECT".into()));
+        assert_eq!(table.rows[1][7], DictValue::Num(17));
     }
 }

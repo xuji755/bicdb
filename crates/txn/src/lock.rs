@@ -57,6 +57,15 @@ impl WaitRegistry {
 
     /// **登记等待**：`waiter` 等 `holder` 释放 `row`。
     pub fn register(&mut self, waiter: TxnId, holder: TxnId, row: RowId, now_ms: u64) {
+        if self
+            .waiting
+            .get(&holder)
+            .is_some_and(|list| list.iter().any(|w| w.waiter == waiter && w.row == row))
+        {
+            return;
+        }
+        // One transaction can wait on only one owner/row at a time.
+        self.cancel(waiter);
         let list = self.waiting.entry(holder).or_default();
         if !list.iter().any(|w| w.waiter == waiter) {
             list.push(Waiter {
@@ -163,6 +172,16 @@ pub fn detect_deadlock_from(
     chain: &UndoChain<'_, '_>,
     threshold_ms: u64,
 ) -> Result<Option<Deadlock>, bicdb_storage::undo::UndoChainError> {
+    detect_deadlock_with_slots(graph, threshold_ms, |txn| chain.lookup(txn))
+}
+
+/// Detect from already available slots. The caller can use a pinned header
+/// image so deadlock polling never initiates disk I/O or takes the chain lock.
+pub fn detect_deadlock_with_slots<E>(
+    graph: &WaitGraph,
+    threshold_ms: u64,
+    mut lookup: impl FnMut(TxnId) -> Result<Option<TxnSlot>, E>,
+) -> Result<Option<Deadlock>, E> {
     let Some(oldest) = graph.oldest_wait_ms else {
         return Ok(None);
     };
@@ -176,7 +195,14 @@ pub fn detect_deadlock_from(
         edges.entry(*holder).or_default();
     }
     if let Some(cycle) = find_cycle(&edges) {
-        let victim = pick_victim(&cycle, chain)?;
+        let mut best = None;
+        for &txn in &cycle {
+            let work = lookup(txn)?.as_ref().map_or(0, slot_work);
+            if best.map_or(true, |(_, previous)| work < previous) {
+                best = Some((txn, work));
+            }
+        }
+        let victim = best.expect("nonempty cycle");
         return Ok(Some(Deadlock {
             cycle,
             victim: victim.0,
@@ -235,28 +261,6 @@ fn find_cycle(edges: &BTreeMap<TxnId, Vec<TxnId>>) -> Option<Vec<TxnId>> {
     None
 }
 
-/// **牺牲者选择**（D-03）：环中"已修改行数最少者"。
-///
-/// 修改量取事务表槽的 `rec_count`（撤销记录数）作**代理**——与行数同阶、
-/// 槽内即有、无需扫页；查不到（槽已回收）记 0（它已不持有任何锁）。
-fn pick_victim(
-    cycle: &[TxnId],
-    chain: &UndoChain<'_, '_>,
-) -> Result<(TxnId, u32), bicdb_storage::undo::UndoChainError> {
-    let mut best: Option<(TxnId, u32)> = None;
-    for &t in cycle {
-        let work = match chain.lookup(t)? {
-            Some(slot) => slot_work(&slot),
-            None => 0,
-        };
-        match best {
-            Some((_, w)) if w <= work => {}
-            _ => best = Some((t, work)),
-        }
-    }
-    Ok(best.expect("环非空"))
-}
-
 /// **等待图的冻结快照**：在门锁内取、**出锁后用**。
 ///
 /// 为什么必须冻结（《Oracle vs PG》§7.3 的教训 + 本库设计口径）：死锁检测要
@@ -307,8 +311,34 @@ pub struct WaitGate {
     cv: Condvar,
 }
 
+/// Identity of a particular enq registration, safe across waiter reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitTicket {
+    waiter: TxnId,
+    generation: u64,
+}
+impl WaitTicket {
+    /// Monotonic order within this gate, for FIFO re-admission of notifications.
+    pub fn registration_order(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Nonblocking notification state; a wake only permits retry, never transfers a lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketState {
+    /// Still registered with its owner.
+    Pending,
+    /// Owner finished; retry the statement and its predicate.
+    Woken,
+    /// Cancelled or superseded by another registration.
+    Cancelled,
+}
+
 struct GateState {
     registry: WaitRegistry,
+    tickets: BTreeMap<TxnId, u64>,
+    next_ticket: u64,
     /// 已唤醒但**尚未被 park 取走**的等待者（唤醒先于挂起时靠它兜底）。
     woken: BTreeSet<TxnId>,
 }
@@ -336,6 +366,8 @@ impl WaitGate {
         Self {
             inner: Mutex::new(GateState {
                 registry: WaitRegistry::new(),
+                tickets: BTreeMap::new(),
+                next_ticket: 0,
                 woken: BTreeSet::new(),
             }),
             cv: Condvar::new(),
@@ -348,16 +380,58 @@ impl WaitGate {
 
     /// **登记等待**：`waiter` 等 `holder` 释放 `row`。
     pub fn register(&self, waiter: TxnId, holder: TxnId, row: RowId, now_ms: u64) {
+        self.enqueue(waiter, holder, row, now_ms);
+    }
+
+    /// Enqueue once. The returned generation protects against stale callbacks.
+    pub fn enqueue(&self, waiter: TxnId, holder: TxnId, row: RowId, now_ms: u64) -> WaitTicket {
         let mut g = self.lock();
-        g.woken.remove(&waiter); // 新一轮等待：清掉上一轮可能残留的唤醒标记
+        g.woken.remove(&waiter);
         g.registry.register(waiter, holder, row, now_ms);
+        g.next_ticket = g
+            .next_ticket
+            .checked_add(1)
+            .expect("enq generation exhausted");
+        let generation = g.next_ticket;
+        g.tickets.insert(waiter, generation);
+        WaitTicket { waiter, generation }
+    }
+
+    /// Poll one registration without blocking or initiating I/O.
+    pub fn poll_ticket(&self, ticket: WaitTicket) -> TicketState {
+        let mut g = self.lock();
+        if g.tickets.get(&ticket.waiter) != Some(&ticket.generation) {
+            return TicketState::Cancelled;
+        }
+        if g.woken.remove(&ticket.waiter) {
+            g.tickets.remove(&ticket.waiter);
+            TicketState::Woken
+        } else {
+            TicketState::Pending
+        }
+    }
+
+    /// Cancel only the matching generation; stale cleanup cannot affect a new wait.
+    pub fn cancel_ticket(&self, ticket: WaitTicket) -> bool {
+        let mut g = self.lock();
+        if g.tickets.get(&ticket.waiter) != Some(&ticket.generation) {
+            return false;
+        }
+        g.tickets.remove(&ticket.waiter);
+        g.woken.remove(&ticket.waiter);
+        let removed = g.registry.cancel(ticket.waiter);
+        self.cv.notify_all();
+        removed
     }
 
     /// **取消等待**（REQ-TXN-002：只退出等待，不动已持有的锁）。
     pub fn cancel(&self, waiter: TxnId) -> bool {
         let mut g = self.lock();
         g.woken.remove(&waiter);
-        g.registry.cancel(waiter)
+        g.tickets.remove(&waiter);
+        let removed = g.registry.cancel(waiter);
+        self.cv.notify_all();
+        removed
     }
 
     /// **唤醒持锁事务名下的全部等待者**（事务结束的提交点副作用；
@@ -374,17 +448,46 @@ impl WaitGate {
         woken
     }
 
+    /// Wait on a ticket for the synchronous adapter, leaving its notification
+    /// unconsumed so the nonblocking poll can determine the final outcome.
+    pub fn park_ticket(&self, ticket: WaitTicket, timeout: Duration) -> TicketState {
+        let mut g = self.lock();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if g.tickets.get(&ticket.waiter) != Some(&ticket.generation) {
+                return TicketState::Cancelled;
+            }
+            if g.woken.contains(&ticket.waiter) {
+                return TicketState::Woken;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return TicketState::Pending;
+            }
+            g = self
+                .cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
     /// **挂起**直到"自己"被唤醒（返回 `true`）或超时（返回 `false`）。
     ///
     /// 超时**不是错误**：调用方去做死锁检测、再决定继续等还是放弃。
     /// 被别人的唤醒通知惊到但自己未被标记 ⇒ 继续等（循环内判断）。
     pub fn park(&self, waiter: TxnId, timeout: Duration) -> bool {
         let mut g = self.lock();
+        let generation = g.tickets.get(&waiter).copied();
         if g.woken.remove(&waiter) {
+            g.tickets.remove(&waiter);
             return true; // 唤醒已先行（登记后、挂起前的窗口）
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            if generation.is_none() || g.tickets.get(&waiter).copied() != generation {
+                return false;
+            }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 return false;
@@ -394,6 +497,7 @@ impl WaitGate {
                 .wait_timeout(g, left)
                 .unwrap_or_else(|e| e.into_inner());
             if guard.woken.remove(&waiter) {
+                guard.tickets.remove(&waiter);
                 return true;
             }
             g = guard;
@@ -535,6 +639,43 @@ mod tests {
         );
         assert_eq!(gate.wake(tid(9)), vec![tid(1)]);
         assert!(waiter.join().unwrap(), "被持锁者结束的唤醒叫醒");
+    }
+
+    #[test]
+    fn ticket_generation_rejects_stale_cleanup_and_preserves_fifo_wakes() {
+        let gate = WaitGate::new();
+        let old = gate.enqueue(tid(1), tid(9), row(1), 0);
+        let current = gate.enqueue(tid(1), tid(8), row(2), 1);
+        assert_eq!(gate.poll_ticket(old), TicketState::Cancelled);
+        assert!(!gate.cancel_ticket(old));
+        assert!(gate.waiters_of(tid(9)).is_empty());
+        let later = gate.enqueue(tid(2), tid(8), row(2), 2);
+        assert_eq!(gate.wake(tid(8)), vec![tid(1), tid(2)]);
+        assert_eq!(
+            gate.park_ticket(current, Duration::from_secs(5)),
+            TicketState::Woken
+        );
+        assert_eq!(gate.poll_ticket(current), TicketState::Woken);
+        assert_eq!(gate.poll_ticket(later), TicketState::Woken);
+        assert_eq!(gate.pending_wakes(), 0);
+    }
+
+    #[test]
+    fn cancelling_a_ticket_wakes_the_synchronous_adapter_without_waiting_for_timeout() {
+        let gate = std::sync::Arc::new(WaitGate::new());
+        let ticket = gate.enqueue(tid(1), tid(9), row(1), 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let copied = std::sync::Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            tx.send(copied.park_ticket(ticket, Duration::from_secs(5)))
+                .unwrap();
+        });
+        gate.cancel_ticket(ticket);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TicketState::Cancelled
+        );
+        handle.join().unwrap();
     }
 
     #[test]

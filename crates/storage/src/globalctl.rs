@@ -530,7 +530,7 @@ impl<'a> GlobalControlFile<'a> {
     }
 
     /// 关闭两副本句柄。
-    pub fn close(self) -> Result<(), GlobalCtlError> {
+    pub fn close(mut self) -> Result<(), GlobalCtlError> {
         self.core.close()?;
         Ok(())
     }

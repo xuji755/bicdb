@@ -17,7 +17,7 @@
 //!
 //! | 平台 | 该架构的 `O_NOFOLLOW` | 用另一架构的数值打开符号链接 |
 //! | --- | --- | --- |
-//! | x86_64（RHEL 7.6 / 内核 3.10，192.168.30.33 实测） | `0o400000` | `0o100000` **静默跟随**（当地是 `O_LARGEFILE`） |
+//! | x86_64（RHEL 7.6 / 内核 3.10 兼容性测试） | `0o400000` | `0o100000` **静默跟随**（该位是 `O_LARGEFILE`） |
 //! | aarch64（Ubuntu 24.04 / 内核 7.0，开发机实测） | `0o100000` | `0o400000` **静默跟随**（当地是 `O_LARGEFILE`） |
 //!
 //! 与 OS / 内核版本无关（上表两机年代相隔近十年），**只随架构**。
@@ -72,6 +72,19 @@ impl OsFileIo {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Number of handles currently owned by this I/O registry.
+    ///
+    /// This is intentionally a count rather than an fd escape hatch: status
+    /// and leak tests can observe resource use without bypassing FileIo.
+    #[must_use]
+    pub fn open_handle_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .handles
+            .len()
     }
 
     fn insert(&self, file: File, kind: HandleKind, read: bool, write: bool) -> FileHandle {
@@ -159,6 +172,10 @@ fn verify_open_identity(path: &Path, opened: &fs::Metadata) -> io::Result<()> {
 }
 
 impl FileIo for OsFileIo {
+    fn open_handle_count(&self) -> Option<usize> {
+        Some(self.open_handle_count())
+    }
+
     fn open(&self, path: &Path, opts: OpenOptions) -> io::Result<FileHandle> {
         opts.validate()?;
         reject_symlink(path)?;

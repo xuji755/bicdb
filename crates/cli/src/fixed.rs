@@ -52,7 +52,22 @@ impl FixedTableSource for CliFixedTables {
         let b = self.dir.join(boot::CF_B);
         // 读不到控制文件 ⇒ `None`（调用方**具名拒绝**，不静默给空集）。
         let cf = ControlFile::open(self.io, &a, &b).ok()?;
-        let records = cf.data_file_records().ok()?;
-        bicdb_catalog::fixed::table(name, &records)
+        let result = if name == "recovery$" {
+            let workspace = cf.workspace_entry().ok()?.workspace_id;
+            let records = bicdb_storage::recovery_journal::read_records(
+                self.io,
+                &self.dir.join("recovery.audit"),
+                bicdb_workspace::workspace_ref(workspace),
+            )
+            .ok()?;
+            Some(bicdb_catalog::fixed::recovery_table(&records))
+        } else {
+            cf.data_file_records()
+                .ok()
+                .and_then(|records| bicdb_catalog::fixed::table(name, &records))
+        };
+        // Close eagerly; ControlFile's Drop remains the error-path safety net.
+        let _ = cf.close();
+        result
     }
 }

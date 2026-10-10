@@ -61,6 +61,8 @@ pub enum Keyword {
     Drop,
     /// `ALTER`
     Alter,
+    /// `OPEN`
+    Open,
     /// `BEGIN`
     Begin,
     /// `COMMIT`
@@ -177,6 +179,22 @@ pub enum Keyword {
     Quota,
     /// `WITH`
     With,
+    /// `READ`
+    Read,
+    /// `ONLY`
+    Only,
+    /// `WRITE`
+    Write,
+    /// `FORCE`
+    Force,
+    /// `VERIFY`
+    Verify,
+    /// `RECOVERY`
+    Recovery,
+    /// `PAGE`
+    Page,
+    /// `OBJECT`
+    Object,
     // 仅用于"响亮拒绝"（闭集外构造；词法保留使错误文案更准）
     /// `LIKE`
     Like,
@@ -264,6 +282,7 @@ impl Keyword {
             "CREATE" => Self::Create,
             "DROP" => Self::Drop,
             "ALTER" => Self::Alter,
+            "OPEN" => Self::Open,
             "BEGIN" => Self::Begin,
             "COMMIT" => Self::Commit,
             "ROLLBACK" => Self::Rollback,
@@ -321,6 +340,14 @@ impl Keyword {
             "OF" => Self::Of,
             "QUOTA" => Self::Quota,
             "WITH" => Self::With,
+            "READ" => Self::Read,
+            "ONLY" => Self::Only,
+            "WRITE" => Self::Write,
+            "FORCE" => Self::Force,
+            "VERIFY" => Self::Verify,
+            "RECOVERY" => Self::Recovery,
+            "PAGE" => Self::Page,
+            "OBJECT" => Self::Object,
             "LIKE" => Self::Like,
             "RIGHT" => Self::Right,
             "FULL" => Self::Full,
@@ -373,6 +400,7 @@ impl Keyword {
             Self::Create => "CREATE",
             Self::Drop => "DROP",
             Self::Alter => "ALTER",
+            Self::Open => "OPEN",
             Self::Begin => "BEGIN",
             Self::Commit => "COMMIT",
             Self::Rollback => "ROLLBACK",
@@ -430,6 +458,14 @@ impl Keyword {
             Self::Of => "OF",
             Self::Quota => "QUOTA",
             Self::With => "WITH",
+            Self::Read => "READ",
+            Self::Only => "ONLY",
+            Self::Write => "WRITE",
+            Self::Force => "FORCE",
+            Self::Verify => "VERIFY",
+            Self::Recovery => "RECOVERY",
+            Self::Page => "PAGE",
+            Self::Object => "OBJECT",
             Self::Like => "LIKE",
             Self::Right => "RIGHT",
             Self::Full => "FULL",

@@ -48,8 +48,8 @@
 //! 临界区纪律（**闩锁内不做 I/O**等四条）与闩锁统计口径见 §5.10"闩锁形态与纪律"。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bicdb_common::latch::{Latch, LatchGuard, LatchStats};
 use bicdb_common::seq::Lsn;
@@ -64,6 +64,8 @@ use crate::rowid::Rdba;
 /// 带上工作区是因为**池是实例级共享**的：不同工作区各有自己的文件句柄。
 pub type PoolResolver<'io> =
     dyn Fn(&[u8; 8], Rdba) -> Option<(FileHandle, u32)> + Send + Sync + 'io;
+
+type FaultHandler<'io> = dyn Fn([u8; 8], String) + Send + Sync + 'io;
 
 /// **工作区 → 分区**的稳定哈希（§5.10 的 `H`）：FNV-1a 起步 + splitmix64 收尾。
 ///
@@ -247,7 +249,7 @@ fn prime_at_least(n: usize) -> usize {
 }
 
 /// WAL 协调口（**WAL 规则 2** 的落点，Oracle `KCBB_REDO` 的对应物）。
-pub trait WalGuard: Send {
+pub trait WalGuard: Send + Sync {
     /// 当前**已持久化**的 LSN 水位。
     fn durable_lsn(&self) -> Lsn;
     /// 把 redo 持久化到 `target`；**失败即错误**——页不得写出。
@@ -255,6 +257,19 @@ pub trait WalGuard: Send {
     /// `&self`（而非 `&mut self`）：池把它放在 `redo_write` 闩锁里，**WAL 自己
     /// 是线程安全的**——同一个口可交给后台 DBWR 线程用（P4 线程化）。
     fn ensure_durable(&self, target: Lsn) -> std::io::Result<()>;
+    /// Workspace-scoped durability. Single-stream guards retain their existing
+    /// behavior; shared instances install a routing guard.
+    fn durable_lsn_for(&self, _workspace: [u8; 8]) -> std::io::Result<Lsn> {
+        Ok(self.durable_lsn())
+    }
+    /// Persist a target in the specified workspace log stream.
+    fn ensure_durable_for(&self, _workspace: [u8; 8], target: Lsn) -> std::io::Result<()> {
+        self.ensure_durable(target)
+    }
+    /// Nonblocking request to the owning LGWR; legacy guards rely on its timer.
+    fn request_durable_for(&self, _workspace: [u8; 8], _target: Lsn) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 缓冲池错误。
@@ -303,6 +318,13 @@ pub enum BufferError {
         /// 仍被钉住的帧数。
         pinned: usize,
     },
+    /// A recovery/repair decision has isolated this exact physical page.
+    QuarantinedPage {
+        /// Isolated page key.
+        key: BufferKey,
+        /// Persisted diagnostic reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for BufferError {
@@ -314,6 +336,12 @@ impl std::fmt::Display for BufferError {
                 "缓冲池目标页损坏（文件 {} 块 {}）——按损坏处理",
                 rdba.file_id(),
                 rdba.block_id()
+            ),
+            BufferError::QuarantinedPage { key, reason } => write!(
+                f,
+                "工作区页面已隔离（文件 {} 块 {}）：{reason}",
+                key.rdba.file_id(),
+                key.rdba.block_id()
             ),
             BufferError::Unresolved { rdba } => write!(
                 f,
@@ -356,6 +384,15 @@ impl<T: WalGuard + Sync + ?Sized> WalGuard for std::sync::Arc<T> {
     }
     fn ensure_durable(&self, target: Lsn) -> std::io::Result<()> {
         (**self).ensure_durable(target)
+    }
+    fn durable_lsn_for(&self, workspace: [u8; 8]) -> std::io::Result<Lsn> {
+        (**self).durable_lsn_for(workspace)
+    }
+    fn ensure_durable_for(&self, workspace: [u8; 8], target: Lsn) -> std::io::Result<()> {
+        (**self).ensure_durable_for(workspace, target)
+    }
+    fn request_durable_for(&self, workspace: [u8; 8], target: Lsn) -> std::io::Result<()> {
+        (**self).request_durable_for(workspace, target)
     }
 }
 
@@ -538,6 +575,8 @@ const ST_LSN_SHIFT: u32 = 16;
 struct FrameSlot {
     /// 原子 pin 计数（卫兵的增减**不经过**分区闩锁）。
     pins: AtomicU32,
+    writeback: AtomicBool,
+    dirty_epoch: AtomicU64,
     /// **脏状态 + 首次变脏 LSN**（O4：写路径的记账不再经结构闩锁）。
     state: AtomicU64,
     /// **TCH（触摸计数）**（O3：命中路径直接原子更新，不再进结构闩锁）。
@@ -557,6 +596,8 @@ impl FrameSlot {
     fn empty() -> Self {
         Self {
             pins: AtomicU32::new(0),
+            writeback: AtomicBool::new(false),
+            dirty_epoch: AtomicU64::new(0),
             state: AtomicU64::new(0),
             touches: AtomicU32::new(0),
             last_touch_ms: AtomicU64::new(0),
@@ -567,6 +608,7 @@ impl FrameSlot {
     /// **标脏**（O4；写路径：一次 CAS，无闩锁）。首次变脏的 LSN 只记一次
     /// （已脏 ⇒ 不动排序键——与写列表时代的语义一致）。
     fn mark_dirty_state(&self, lsn: Lsn) {
+        self.dirty_epoch.fetch_add(1, Ordering::AcqRel);
         let mut cur = self.state.load(Ordering::Relaxed);
         loop {
             if cur & ST_DIRTY != 0 {
@@ -641,11 +683,20 @@ impl FrameMeta {
     }
 }
 
-/// **分区（工作集）的结构面**：帧元数据 + 替换链 + 桶 + 写列表 + 统计——
-/// 由分区的具名闩锁（`db_cache`）保护。**页内容与 pin 不在其中**（O2）。
+/// Instance-wide workspace reservation and resident accounting.
+#[derive(Default)]
+struct CacheQuotas {
+    minimum: std::collections::BTreeMap<[u8; 8], usize>,
+    resident: std::collections::BTreeMap<[u8; 8], usize>,
+}
+
+/// Partition structures are protected by db_cache; quota locking never waits
+/// for another partition latch or disk I/O. Page content and pins are separate.
 struct Structure {
     /// 帧元数据（下标与 [`Partition::slots`] 一一对应）。
     meta: Vec<FrameMeta>,
+    resident_by_workspace: std::collections::BTreeMap<[u8; 8], usize>,
+    quotas: std::sync::Arc<Mutex<CacheQuotas>>,
     /// 从未用过的帧（首次装入后帧就长期挂在链上）。
     virgin: Vec<usize>,
     /// 热段（头 = 最热）。
@@ -712,18 +763,20 @@ struct Partition {
     stats: StatsShards,
 }
 
-/// 写回目标（`flush` / 写列表头 / 全局最老头）。
+/// 写回目标（指定页、工作区头、分区排空与可复用候选）。
 #[derive(Debug, Clone, Copy)]
 enum WriteTarget {
     /// 指定页（`flush(key)`）。
     Key(BufferKey),
     /// 某工作区写列表的头。
     WorkspaceHead([u8; 8]),
-    /// 所有工作区里"最老首次变脏 LSN"最小的头（Make Free）。
+    /// Workspace-ordered dirty heads, for partition draining.
     OldestHead,
+    /// Dirty pages that can actually supply space to the requesting workspace.
+    ReusableHead([u8; 8]),
 }
 
-/// **脏帧快照**（O4；调用者持结构闩）：`(首次变脏 LSN, 键, 帧号)` 按 LSN 升序
+/// **脏帧快照**（O4；调用者持结构闩）：先按工作区，再按流内首次变脏 LSN 排序
 /// ——"最老优先"由**快照后排序**给出（对照 PG 检查点的 `CkptSortItem` 预扫描，
 /// bufmgr.c:3407；我们不再维护 per-DML 的有序脏表）。`only` 限某工作区
 /// （`None` = 全部）。
@@ -742,7 +795,7 @@ fn dirty_snapshot(
             out.push((l, k, i));
         }
     }
-    out.sort_unstable_by_key(|(l, k, _)| (*l, k.rdba.file_id(), k.rdba.block_id()));
+    out.sort_unstable_by_key(|(l, k, _)| (k.workspace, *l, k.rdba));
     out
 }
 
@@ -752,6 +805,8 @@ enum Detach {
     Done(Option<BufferKey>),
     /// 被并发钉住：放弃候选（调用方重选）。
     Pinned,
+    /// Another partition consumed the last frame above the workspace minimum.
+    Protected,
 }
 
 /// 选页结果（O4：没有独立脏表条目 ⇒ 不存在"失步条目已清理"这一态）。
@@ -777,9 +832,38 @@ struct WriteJob {
     image: Page,
     /// 快照时的 `mod_seq`（收尾比对：变了 = 期间被再改脏）。
     mod_seq: u8,
+    dirty_epoch: u64,
     page_lsn: Lsn,
     /// 快照时的**首次变脏 LSN**（O4：收尾清状态字的"期待值"）。
     first_dirty: Lsn,
+}
+
+/// Why a background writer should revisit a page later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackDeferred {
+    /// A session holds a pin or content latch.
+    Pinned,
+    /// Another writer owns this frame's disk I/O.
+    InFlight,
+    /// The page's own log stream has not persisted its redo.
+    RedoPending(Lsn),
+}
+/// Result of an attempt that never waits for a pin or WAL flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackOutcome {
+    /// Key is absent or already clean.
+    Clean,
+    /// A frozen page image was written; concurrent changes may remain dirty.
+    Written,
+    /// Retain the key in the temporary revisit list.
+    Deferred(WritebackDeferred),
+}
+struct WritebackClaim<'a>(&'a FrameSlot);
+impl Drop for WritebackClaim<'_> {
+    fn drop(&mut self) {
+        self.0.pins.fetch_sub(1, Ordering::AcqRel);
+        self.0.writeback.store(false, Ordering::Release);
+    }
 }
 
 /// **DB Cache**（§5.10；本切片 N = 1 分区）。
@@ -793,14 +877,26 @@ pub struct BufferPool<'io> {
     /// **O2（2026-10-05）**：帧的内容与 pin 在 `Partition::slots`（不经闩锁），
     /// 闩锁只护结构面。
     partitions: Vec<Partition>,
+    quotas: std::sync::Arc<Mutex<CacheQuotas>>,
     /// 共享的块定位器（跨分区同一份；`Fn + Send + Sync`）。
     resolve: Box<PoolResolver<'io>>,
     /// 共享时钟（touch-count 三秒规则）。
     clock: Box<dyn Clock + 'io>,
-    /// **redo 写闩锁**：串行化 WAL 刷盘——`ensure_durable` 的 fsync 在闩内
-    /// （"一次 fsync"的串行点；Oracle `redo writing latch` 的对应物），
-    /// 它是全库唯一允许在闩锁内做 I/O 的地方（且只做这一件）。
-    wal: Latch<Box<dyn WalGuard + 'io>>,
+    /// Thread-safe WAL routing. I/O serialization belongs to each workspace
+    /// WAL, never to an instance-wide buffer latch.
+    wal: Box<dyn WalGuard + 'io>,
+    published_checkpoint_headers:
+        Mutex<std::collections::BTreeMap<[u8; 8], (Lsn, bicdb_common::seq::CommitSeq)>>,
+    pending_checkpoint_sync: Mutex<std::collections::BTreeSet<BufferKey>>,
+    checkpoint_files: Mutex<std::collections::BTreeMap<[u8; 8], Vec<BufferKey>>>,
+    quarantine_present: AtomicBool,
+    critical_workspace: Mutex<Option<[u8; 8]>>,
+    workspace_faults: Mutex<std::collections::BTreeMap<[u8; 8], String>>,
+    workspace_read_only: Mutex<std::collections::BTreeMap<[u8; 8], String>>,
+    quarantined_pages: Mutex<std::collections::BTreeMap<BufferKey, String>>,
+    quarantined_objects: Mutex<std::collections::BTreeMap<([u8; 8], u64), String>>,
+    fault_handler: Mutex<Option<std::sync::Arc<FaultHandler<'io>>>>,
+    written_files: Mutex<std::collections::BTreeMap<[u8; 8], Vec<FileHandle>>>,
 }
 
 impl std::fmt::Debug for BufferPool<'_> {
@@ -856,10 +952,8 @@ impl<'io> BufferPool<'io> {
     /// 每个自带一条替换链（含 AUX）、一套桶、写列表与**自己的闩锁**；
     /// `capacity` 是**每个分区**的帧数。
     ///
-    /// - **映射**：`H(工作区标识) mod partitions`（稳定哈希；2 的幂 ⇒ 按位与）
-    ///   ——同一个工作区每次都落同一个工作集（否则写列表会在写线程之间搬家）；
-    /// - **一个工作区不被拆分**：它的全部缓冲、写列表都在一个分区里
-    ///   ⇒ 检查点推进只碰一个闩锁，零跨分区协调；
+    /// - 页键 `(workspace, file, block)` 稳定映射到分区；同一工作区可以使用多个分区；
+    /// - 工作区脏页计数和检查点低水位汇总全部分区，配额在实例统一核算；
     /// - `partitions` 必须是 1 或 2 的幂（取模退化为按位与）。
     #[allow(clippy::too_many_arguments)]
     pub fn with_partitions(
@@ -877,6 +971,7 @@ impl<'io> BufferPool<'io> {
         if partitions == 0 || !partitions.is_power_of_two() {
             return Err(BufferError::BadPartitionCount { partitions });
         }
+        let quotas = std::sync::Arc::new(Mutex::new(CacheQuotas::default()));
         let mk = |_| Partition {
             cfg,
             slots: (0..capacity).map(|_| FrameSlot::empty()).collect(),
@@ -894,6 +989,8 @@ impl<'io> BufferPool<'io> {
                 "db_cache",
                 Structure {
                     meta: (0..capacity).map(|_| FrameMeta::empty()).collect(),
+                    resident_by_workspace: std::collections::BTreeMap::new(),
+                    quotas: std::sync::Arc::clone(&quotas),
                     virgin: (0..capacity).rev().collect(),
                     hot: VecDeque::new(),
                     cold: VecDeque::new(),
@@ -907,17 +1004,89 @@ impl<'io> BufferPool<'io> {
             io,
             capacity,
             partitions: (0..partitions).map(mk).collect(),
+            quotas,
             resolve: Box::new(resolve),
             clock: Box::new(clock),
-            wal: Latch::new("redo_write", Box::new(wal)),
+            wal: Box::new(wal),
+            published_checkpoint_headers: Mutex::new(std::collections::BTreeMap::new()),
+            pending_checkpoint_sync: Mutex::new(std::collections::BTreeSet::new()),
+            checkpoint_files: Mutex::new(std::collections::BTreeMap::new()),
+            quarantine_present: AtomicBool::new(false),
+            critical_workspace: Mutex::new(None),
+            workspace_faults: Mutex::new(std::collections::BTreeMap::new()),
+            workspace_read_only: Mutex::new(std::collections::BTreeMap::new()),
+            quarantined_pages: Mutex::new(std::collections::BTreeMap::new()),
+            quarantined_objects: Mutex::new(std::collections::BTreeMap::new()),
+            fault_handler: Mutex::new(None),
+            written_files: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
-    /// **工作区 → 分区**（§5.10：`H(工作区标识) mod N`，稳定哈希；2 的幂
-    /// ⇒ 按位与）。同一个工作区每次都落同一个工作集——写列表不在写线程间搬家。
+    /// Preferred workspace partition for NUMA affinity planning only.
+    /// Page placement uses `partition_for`; a workspace can occupy all partitions.
     #[must_use]
     pub fn partition_of(&self, workspace: &[u8; 8]) -> usize {
         (hash_workspace(workspace) as usize) & (self.partitions.len() - 1)
+    }
+
+    /// Stable page placement across instance cache working sets.
+    #[must_use]
+    pub fn partition_for(&self, key: BufferKey) -> usize {
+        let mut h = hash_workspace(&key.workspace)
+            ^ (u64::from(key.rdba.file_id()) << 32)
+            ^ u64::from(key.rdba.block_id());
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 27;
+        h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        (h as usize) & (self.partitions.len() - 1)
+    }
+
+    /// Guarantee workspace capacity by protecting its occupied frames from
+    /// other workspaces until its minimum is exceeded. Empty capacity can be borrowed.
+    pub fn reserve_workspace(&self, workspace: [u8; 8], frames: usize) -> std::io::Result<()> {
+        let mut quotas = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        if quotas.minimum.contains_key(&workspace) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "cache reservation exists",
+            ));
+        }
+        let used = quotas
+            .minimum
+            .values()
+            .try_fold(0usize, |sum, value| sum.checked_add(*value))
+            .ok_or_else(|| std::io::Error::other("cache reservation overflow"))?;
+        let capacity = self
+            .capacity
+            .checked_mul(self.partition_count())
+            .ok_or_else(|| std::io::Error::other("cache capacity overflow"))?;
+        if frames > capacity.saturating_sub(used) {
+            return Err(std::io::Error::other("cache reservation exceeds capacity"));
+        }
+        quotas.minimum.insert(workspace, frames);
+        Ok(())
+    }
+
+    /// Roll back a reservation that has not admitted any cache frame yet.
+    /// Runtime workspace eviction uses a different, checkpointed protocol;
+    /// this narrow API exists only for transactional registration failure.
+    pub fn release_empty_workspace_reservation(&self, workspace: [u8; 8]) -> std::io::Result<()> {
+        let mut quotas = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        if quotas.resident.get(&workspace).copied().unwrap_or(0) != 0 {
+            return Err(std::io::Error::other(
+                "cannot release workspace reservation with resident frames",
+            ));
+        }
+        if quotas.minimum.remove(&workspace).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cache reservation not found",
+            ));
+        }
+        quotas.resident.remove(&workspace);
+        Ok(())
     }
 
     /// 分区数（诊断）。
@@ -1004,16 +1173,9 @@ impl<'io> BufferPool<'io> {
     /// 某工作区的**脏块数**（O4：扫描状态字——诊断/测试口径，语义不变）。
     #[must_use]
     pub fn dirty_len(&self, workspace: [u8; 8]) -> usize {
-        let partition = self.partition_of(&workspace);
-        let st = self.lock(partition);
-        let slots = self.slots(partition);
-        st.meta
-            .iter()
-            .enumerate()
-            .filter(|(i, m)| {
-                m.key.is_some_and(|k| k.workspace == workspace) && slots[*i].is_dirty_state()
-            })
-            .count()
+        (0..self.partition_count())
+            .map(|p| self.dirty_len_in(workspace, p))
+            .sum()
     }
 
     /// 某分区里某工作区的**脏块数**（分区口径的诊断/测试；O4 扫描）。
@@ -1037,6 +1199,8 @@ impl<'io> BufferPool<'io> {
         for p in 0..self.partitions.len() {
             out.extend(self.dirty_workspaces_in(p));
         }
+        out.sort_unstable();
+        out.dedup();
         out
     }
 
@@ -1062,14 +1226,15 @@ impl<'io> BufferPool<'io> {
     /// O4：扫描求 min（写列表时代的"链头"——语义不变，WAL 检查点口径照旧）。
     #[must_use]
     pub fn low_water(&self, workspace: [u8; 8]) -> Option<Lsn> {
-        let partition = self.partition_of(&workspace);
-        let st = self.lock(partition);
-        let slots = self.slots(partition);
         let mut best: Option<Lsn> = None;
-        for (i, m) in st.meta.iter().enumerate() {
-            if m.key.is_some_and(|k| k.workspace == workspace) {
-                if let Some(l) = slots[i].first_dirty_lsn() {
-                    best = Some(best.map_or(l, |b: Lsn| b.min(l)));
+        for partition in 0..self.partition_count() {
+            let st = self.lock(partition);
+            let slots = self.slots(partition);
+            for (i, m) in st.meta.iter().enumerate() {
+                if m.key.is_some_and(|k| k.workspace == workspace) {
+                    if let Some(l) = slots[i].first_dirty_lsn() {
+                        best = Some(best.map_or(l, |b: Lsn| b.min(l)));
+                    }
                 }
             }
         }
@@ -1080,7 +1245,7 @@ impl<'io> BufferPool<'io> {
     /// Oracle 侧即"TCH 越高，块被访问越频繁"）。
     #[must_use]
     pub fn touch_count(&self, key: BufferKey) -> Option<u32> {
-        let partition = self.partition_of(&key.workspace);
+        let partition = self.partition_for(key);
         let idx = {
             let (_s, local, g) = self.lock_bucket(partition, key);
             Self::chain_find(&g, local, key)?
@@ -1091,7 +1256,7 @@ impl<'io> BufferPool<'io> {
     /// 某帧在哪条链上（`hot` / `cold` / `aux`；诊断与测试）。
     #[must_use]
     pub fn chain_of(&self, key: BufferKey) -> Option<&'static str> {
-        let partition = self.partition_of(&key.workspace);
+        let partition = self.partition_for(key);
         let st = self.lock(partition);
         let idx = {
             let (_s, local, g) = self.lock_bucket(partition, key);
@@ -1115,7 +1280,8 @@ impl<'io> BufferPool<'io> {
     /// 内容锁串行（卫兵 ≠ 持锁）。未命中时读盘 + 身份核对（串页防线）同样
     /// 在闩外（两阶段；证据包 `latch-mech-20261005/` 结论 1）。
     pub fn pin(&self, key: BufferKey) -> Result<PageGuard<'_>, BufferError> {
-        let partition = self.partition_of(&key.workspace);
+        self.ensure_page_accessible(key)?;
+        let partition = self.partition_for(key);
         let slots = self.slots(partition);
         let stats = self.stats_of(partition);
         // **命中路径（O3）**：只要这把桶闩锁——结构闩锁不再参与。
@@ -1168,7 +1334,10 @@ impl<'io> BufferPool<'io> {
     /// **共享钉住（命中即取；不触发读盘）**：`pins` 递增 + 内容**读**锁——
     /// 同一热块的并发读互不串行（§5.10 O2 的目标之一）。未驻留 ⇒ `None`。
     pub fn pin_shared(&self, key: BufferKey) -> Option<PageReadGuard<'_>> {
-        let partition = self.partition_of(&key.workspace);
+        if self.page_fault(key).is_some() {
+            return None;
+        }
+        let partition = self.partition_for(key);
         let slots = self.slots(partition);
         // **命中路径（O3）**：桶闩锁 + 原子（不碰结构闩锁）。
         let (idx, hot) = {
@@ -1209,13 +1378,13 @@ impl<'io> BufferPool<'io> {
                 return Ok(idx);
             }
             // ② 选候选帧 + **声明**（旧键桶闩下复核 pins==0；被并发钉住则重选）。
-            if let Some(victim) = st.find_reusable(slots, stats) {
-                match self.detach_for_reuse(partition, &mut st, victim) {
-                    Detach::Pinned => {
+            if let Some(victim) = st.find_reusable(slots, stats, key.workspace) {
+                match self.detach_for_reuse(partition, &mut st, victim, Some(key.workspace)) {
+                    Detach::Pinned | Detach::Protected => {
                         claim_misses += 1;
                         if claim_misses >= 4 {
                             drop(st);
-                            self.make_free(partition)?; // 腾干净页给下一轮
+                            self.make_free_for(partition, Some(key.workspace))?;
                             claim_misses = 0;
                             made_free = true;
                         }
@@ -1239,7 +1408,7 @@ impl<'io> BufferPool<'io> {
                 stats.inc(|s| &s.fb_wait);
                 return Err(BufferError::FreeBufferWait);
             }
-            self.make_free(partition)?; // I/O 在闩外
+            self.make_free_for(partition, Some(key.workspace))?; // I/O 在闩外
             made_free = true;
         }
     }
@@ -1259,7 +1428,13 @@ impl<'io> BufferPool<'io> {
     /// 在**旧键的桶闩**下复核 `pins == 0`（命中路径的 `pins++` 也在这把闩下
     /// ⇒ 两者串行——这是 O3 新增的竞态关），随后摘替换链与旧桶链。
     /// 被并发钉住 ⇒ [`Detach::Pinned`]（放弃候选，调用方重选）。
-    fn detach_for_reuse(&self, partition: usize, st: &mut Structure, idx: usize) -> Detach {
+    fn detach_for_reuse(
+        &self,
+        partition: usize,
+        st: &mut Structure,
+        idx: usize,
+        requester: Option<[u8; 8]>,
+    ) -> Detach {
         let old = st.meta[idx].key;
         match old {
             // 未用过的帧：不在任何链上（命中路径不可达） ⇒ 无并发窗口。
@@ -1272,9 +1447,11 @@ impl<'io> BufferPool<'io> {
                 if self.slots(partition)[idx].pins.load(Ordering::Acquire) != 0 {
                     return Detach::Pinned;
                 }
+                if !st.clear_for_reuse(idx, requester) {
+                    return Detach::Protected;
+                }
                 Structure::detach_from_chains(&mut st.hot, &mut st.cold, &mut st.aux, idx);
                 Self::chain_remove(&mut g, local, k, idx);
-                st.meta[idx].key = None;
                 Detach::Done(Some(k))
             }
         }
@@ -1308,7 +1485,7 @@ impl<'io> BufferPool<'io> {
             !slots[idx].is_dirty_state(),
             "复用候选必为净帧（find_reusable 的判据）"
         );
-        st.meta[idx] = FrameMeta { key: Some(key) };
+        st.set_meta(idx, Some(key));
         slots[idx].reset_touch(cfg.cool_count, self.clock.now_ms());
         slots[idx].pins.store(1, Ordering::Release); // 装入者持有（`pin` 语义）
         Self::chain_push(&mut g, local, key, idx);
@@ -1329,7 +1506,7 @@ impl<'io> BufferPool<'io> {
             *content = None;
         }
         slots[idx].state.store(0, Ordering::Relaxed);
-        st.meta[idx] = FrameMeta::empty();
+        st.set_meta(idx, None);
         st.virgin.push(idx);
     }
 
@@ -1360,7 +1537,7 @@ impl<'io> BufferPool<'io> {
                 .expect("pins=0 ⇒ 内容锁必空闲（O2 不变量）");
             *content = Some(page);
         }
-        st.meta[idx] = FrameMeta { key: Some(key) };
+        st.set_meta(idx, Some(key));
         slots[idx].reset_touch(cfg.cool_count, self.clock.now_ms());
         slots[idx].pins.store(1, Ordering::Release);
     }
@@ -1371,9 +1548,9 @@ impl<'io> BufferPool<'io> {
         let slots = self.slots(partition);
         debug_assert!(!slots[idx].is_dirty_state());
         debug_assert_eq!(slots[idx].pins.load(Ordering::Acquire), 0);
-        match self.detach_for_reuse(partition, st, idx) {
+        match self.detach_for_reuse(partition, st, idx, None) {
             Detach::Done(_) => {}
-            Detach::Pinned => return, // 防御：调用方已体检，不应发生
+            Detach::Pinned | Detach::Protected => return, // 防御：调用方已体检，不应发生
         }
         {
             let mut content = slots[idx]
@@ -1383,7 +1560,7 @@ impl<'io> BufferPool<'io> {
             *content = None; // 释放 16 KiB（重绑定后按新绑定重新分配）
         }
         slots[idx].state.store(0, Ordering::Relaxed);
-        st.meta[idx] = FrameMeta::empty();
+        st.set_meta(idx, None);
         st.virgin.push(idx);
     }
 
@@ -1411,11 +1588,12 @@ impl<'io> BufferPool<'io> {
     /// 调用方随后应自行生成 redo（新页的"前像" = 全零页）并 `mark_dirty`。
     /// 返回的卫兵已钉住该帧。
     pub fn insert_new(&self, key: BufferKey, page: Page) -> Result<PageGuard<'_>, BufferError> {
+        self.ensure_page_accessible(key)?;
         // **该键仍在池中 ⇒ 原位替换**：页被重置/复用（段回卷、重置复用的撤销页）
         // 时调用方给的镜像就是权威内容——若走 `find_reusable`/`attach`，
         // 桶里会留下**两个同键帧**，`find_frame` 命中的仍是旧的干净帧 ⇒
         // 写回被静默跳过（新内容永远到不了盘上；实测的撤销页丢失即此）。
-        let partition = self.partition_of(&key.workspace);
+        let partition = self.partition_for(key);
         let idx = self.install_authoritative(partition, key, page)?;
         let slots = self.slots(partition);
         let slot = &slots[idx];
@@ -1460,9 +1638,9 @@ impl<'io> BufferPool<'io> {
                     continue;
                 }
             }
-            if let Some(victim) = st.find_reusable(slots, stats) {
+            if let Some(victim) = st.find_reusable(slots, stats, key.workspace) {
                 if !matches!(
-                    self.detach_for_reuse(partition, &mut st, victim),
+                    self.detach_for_reuse(partition, &mut st, victim, Some(key.workspace)),
                     Detach::Done(_)
                 ) {
                     continue;
@@ -1481,7 +1659,7 @@ impl<'io> BufferPool<'io> {
                 stats.inc(|s| &s.fb_wait);
                 return Err(BufferError::FreeBufferWait);
             }
-            self.make_free(partition)?; // I/O 在闩外
+            self.make_free_for(partition, Some(key.workspace))?; // I/O 在闩外
             made_free = true;
         }
     }
@@ -1491,7 +1669,10 @@ impl<'io> BufferPool<'io> {
     /// 不该污染热段"由此在 API 上显式化）。
     #[must_use]
     pub fn copy_if_resident(&self, key: BufferKey) -> Option<Page> {
-        let partition = self.partition_of(&key.workspace);
+        if self.page_fault(key).is_some() {
+            return None;
+        }
+        let partition = self.partition_for(key);
         let slots = self.slots(partition);
         let idx = {
             // **pin 必须在（桶）闩锁内递增**：闩外取内容锁的窗口里，帧可能已被
@@ -1504,6 +1685,452 @@ impl<'io> BufferPool<'io> {
         drop(content);
         slot.pins.fetch_sub(1, Ordering::AcqRel);
         copy
+    }
+
+    /// Try to acquire a resident page for modification without waiting for its
+    /// content latch or initiating file I/O. The caller must preserve redo rules.
+    pub fn try_pin(&self, key: BufferKey) -> Option<PageGuard<'_>> {
+        if self.page_fault(key).is_some() {
+            return None;
+        }
+        let partition = self.partition_for(key);
+        let idx = self.pin_existing(partition, key)?;
+        let slot = &self.slots(partition)[idx];
+        let content = match slot.content.try_write() {
+            Ok(content) => content,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                slot.pins.fetch_sub(1, Ordering::AcqRel);
+                return None;
+            }
+        };
+        Some(PageGuard {
+            content: Some(content),
+            pins: &slot.pins,
+            slot,
+            key,
+            idx,
+        })
+    }
+
+    /// Resident identity check without taking a content latch or doing I/O.
+    pub fn is_resident(&self, key: BufferKey) -> bool {
+        let partition = self.partition_for(key);
+        let (_, local, bucket) = self.lock_bucket(partition, key);
+        Self::chain_find(&bucket, local, key).is_some()
+    }
+
+    /// Current dirty status of a key. Eviction is only possible after cleaning.
+    pub fn is_dirty(&self, key: BufferKey) -> bool {
+        let partition = self.partition_for(key);
+        let (_, local, bucket) = self.lock_bucket(partition, key);
+        Self::chain_find(&bucket, local, key)
+            .is_some_and(|idx| self.slots(partition)[idx].is_dirty_state())
+    }
+
+    /// PUBLIC's authoritative metadata is required for all business writes.
+    pub fn set_critical_workspace(&self, workspace: [u8; 8]) {
+        *self
+            .critical_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(workspace);
+    }
+
+    /// Sticky workspace write quarantine after a background durability failure.
+    /// Normal retries must never silently turn this back into read/write.
+    pub fn quarantine_workspace(&self, workspace: [u8; 8], reason: String) {
+        let fresh = {
+            let mut faults = self
+                .workspace_faults
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match faults.entry(workspace) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(reason.clone());
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(_) => false,
+            }
+        };
+        self.quarantine_present.store(true, Ordering::Release);
+        if fresh {
+            let handler = self
+                .fault_handler
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(handler) = handler {
+                handler(workspace, reason);
+            }
+        }
+    }
+
+    /// Install one nonblocking fault sink. It must enqueue only, never do I/O.
+    /// Existing first faults are replayed outside pool mutexes; sinks coalesce.
+    pub fn set_fault_handler(
+        &self,
+        handler: std::sync::Arc<dyn Fn([u8; 8], String) + Send + Sync + 'io>,
+    ) -> std::io::Result<()> {
+        {
+            let mut current = self.fault_handler.lock().unwrap_or_else(|e| e.into_inner());
+            if current.is_some() {
+                return Err(std::io::Error::other("fault handler already installed"));
+            }
+            *current = Some(std::sync::Arc::clone(&handler));
+        }
+        let faults = self
+            .workspace_faults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for (workspace, reason) in faults {
+            handler(workspace, reason);
+        }
+        Ok(())
+    }
+
+    /// First durability failure, retained until validated recovery/new pool.
+    pub fn workspace_fault(&self, workspace: [u8; 8]) -> Option<String> {
+        if !self.quarantine_present.load(Ordering::Acquire) {
+            return None;
+        }
+        let critical = *self
+            .critical_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let faults = self
+            .workspace_faults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(reason) = critical.and_then(|ws| faults.get(&ws)) {
+            return Some(format!("PUBLIC 系统元数据故障：{reason}"));
+        }
+        faults.get(&workspace).cloned()
+    }
+
+    /// Set an administrator-controlled, reversible read-only gate. This does
+    /// not suppress DBWR/CKPT/undo maintenance and is distinct from sticky I/O
+    /// quarantine.
+    pub fn set_workspace_read_only(&self, workspace: [u8; 8], reason: String) {
+        self.workspace_read_only
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(workspace, reason);
+    }
+
+    /// Clear only the manual read-only gate. Durability quarantine remains.
+    pub fn clear_workspace_read_only(&self, workspace: [u8; 8]) {
+        self.workspace_read_only
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&workspace);
+    }
+
+    /// Current manual read-only reason.
+    pub fn workspace_read_only(&self, workspace: [u8; 8]) -> Option<String> {
+        self.workspace_read_only
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&workspace)
+            .cloned()
+    }
+
+    /// Isolate one physical page. The first reason is sticky until a new pool
+    /// is built after explicit repair and verified recovery.
+    pub fn quarantine_page(&self, key: BufferKey, reason: String) {
+        self.quarantined_pages
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key)
+            .or_insert(reason);
+    }
+
+    /// First persisted isolation reason for one physical page.
+    pub fn page_fault(&self, key: BufferKey) -> Option<String> {
+        self.quarantined_pages
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+    }
+
+    /// Read and validate an isolated page directly from durable media without
+    /// admitting it to the cache.  The caller must keep the workspace read
+    /// only and ensure that it has no dirty buffers while this check runs.
+    pub fn verify_quarantined_page(&self, key: BufferKey) -> Result<(), BufferError> {
+        if self.page_fault(key).is_none() {
+            return Err(BufferError::Io(std::io::Error::other(format!(
+                "页面 {}:{} 不在恢复隔离清单中",
+                key.rdba.file_id(),
+                key.rdba.block_id()
+            ))));
+        }
+        let (handle, block) = (self.resolve)(&key.workspace, key.rdba)
+            .ok_or(BufferError::Unresolved { rdba: key.rdba })?;
+        let page =
+            pagefile::read_page_verified(self.io, handle, block).map_err(|error| match error {
+                PageFileError::Damaged { .. } => BufferError::Damaged { rdba: key.rdba },
+                PageFileError::Io(error) => BufferError::Io(error),
+            })?;
+        self.verify_identity(&page, key)
+    }
+
+    /// Remove exactly one page isolation item after a durable `Verified`
+    /// recovery record has been acknowledged by the audit writer.
+    pub fn clear_verified_page_quarantine(&self, key: BufferKey) -> bool {
+        self.quarantined_pages
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key)
+            .is_some()
+    }
+
+    /// Refuse access to a page in the persistent isolation list.
+    pub fn ensure_page_accessible(&self, key: BufferKey) -> Result<(), BufferError> {
+        if let Some(reason) = self.page_fault(key) {
+            return Err(BufferError::QuarantinedPage { key, reason });
+        }
+        Ok(())
+    }
+
+    /// Isolate a workspace-local catalog object. The first reason is sticky.
+    pub fn quarantine_object(&self, workspace: [u8; 8], object_id: u64, reason: String) {
+        self.quarantined_objects
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry((workspace, object_id))
+            .or_insert(reason);
+    }
+
+    /// First persisted isolation reason for a workspace-local object.
+    pub fn object_fault(&self, workspace: [u8; 8], object_id: u64) -> Option<String> {
+        self.quarantined_objects
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(workspace, object_id))
+            .cloned()
+    }
+
+    /// Remove exactly one object isolation item after durable verification.
+    pub fn clear_verified_object_quarantine(&self, workspace: [u8; 8], object_id: u64) -> bool {
+        self.quarantined_objects
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(workspace, object_id))
+            .is_some()
+    }
+
+    /// Number of isolated physical pages in one workspace.
+    pub fn quarantined_page_count(&self, workspace: [u8; 8]) -> usize {
+        self.quarantined_pages
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .filter(|key| key.workspace == workspace)
+            .count()
+    }
+
+    /// Number of isolated catalog objects in one workspace.
+    pub fn quarantined_object_count(&self, workspace: [u8; 8]) -> usize {
+        self.quarantined_objects
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .filter(|(ws, _)| *ws == workspace)
+            .count()
+    }
+
+    /// Gate transaction begin, DML and commit before any new business mutation.
+    pub fn ensure_workspace_writable(&self, workspace: [u8; 8]) -> Result<(), BufferError> {
+        if let Some(reason) = self.workspace_fault(workspace) {
+            return Err(BufferError::Io(std::io::Error::other(format!(
+                "工作区因耐久性故障被封锁写入：{reason}"
+            ))));
+        }
+        if let Some(reason) = self.workspace_read_only(workspace) {
+            return Err(BufferError::Io(std::io::Error::other(format!(
+                "工作区由实例管理员设为只读：{reason}"
+            ))));
+        }
+        Ok(())
+    }
+
+    /// Register a persistent file header for CKPT metadata publication. Temp
+    /// files must not be registered. Registration belongs to workspace open.
+    pub fn register_checkpoint_file(&self, key: BufferKey) {
+        let mut registry = self
+            .checkpoint_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let keys = registry.entry(key.workspace).or_default();
+        if !keys.contains(&key) {
+            keys.push(key);
+            self.published_checkpoint_headers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key.workspace);
+        }
+    }
+
+    fn checkpoint_files(&self, workspace: [u8; 8]) -> Vec<BufferKey> {
+        self.checkpoint_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&workspace)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Load header images outside CKPT (workspace open / undo maintenance).
+    /// Loading may invoke cache-pressure writeback; CKPT itself never does.
+    pub fn load_checkpoint_headers(&self, workspace: [u8; 8]) -> Result<(), BufferError> {
+        for key in self.checkpoint_files(workspace) {
+            drop(self.pin(key)?);
+        }
+        Ok(())
+    }
+
+    /// Hold clean resident header images across CF publication. Missing, busy
+    /// or dirty headers defer; CKPT cannot allocate frames or trigger writeback.
+    pub fn prepare_checkpoint_headers(
+        &self,
+        workspace: [u8; 8],
+    ) -> Result<Option<Vec<PageGuard<'_>>>, BufferError> {
+        let mut guards = Vec::new();
+        for key in self.checkpoint_files(workspace) {
+            let Some(guard) = self.try_pin(key) else {
+                return Ok(None);
+            };
+            if self.is_dirty(key) {
+                return Ok(None);
+            }
+            crate::datafile::read_file_head(&guard)
+                .map_err(|error| BufferError::Io(std::io::Error::other(error)))?;
+            guards.push(guard);
+        }
+        Ok(Some(guards))
+    }
+
+    /// Inspect header readiness without loading pages or performing writeback.
+    pub fn checkpoint_headers_ready(&self, workspace: [u8; 8]) -> Result<bool, BufferError> {
+        Ok(self.prepare_checkpoint_headers(workspace)?.is_some())
+    }
+
+    /// Update only checkpoint metadata on clean file-header images. Caller
+    /// excludes foreground workspace writers and has synced DBWR output. CF is
+    /// published first: a crash may leave an older file-header watermark, never
+    /// a file header ahead of the authoritative CF (startup rejects that case).
+    pub fn publish_file_checkpoints(
+        &self,
+        workspace: [u8; 8],
+        lsn: Lsn,
+        checkpoint_scn: bicdb_common::seq::CommitSeq,
+    ) -> Result<(), BufferError> {
+        let mut guards = self
+            .prepare_checkpoint_headers(workspace)?
+            .ok_or(BufferError::FreeBufferWait)?;
+        self.publish_prepared_file_checkpoints(workspace, lsn, checkpoint_scn, &mut guards)
+    }
+
+    /// Publish file-header metadata using the already held clean pins.
+    pub fn publish_prepared_file_checkpoints(
+        &self,
+        workspace: [u8; 8],
+        lsn: Lsn,
+        checkpoint_scn: bicdb_common::seq::CommitSeq,
+        guards: &mut [PageGuard<'_>],
+    ) -> Result<(), BufferError> {
+        if self
+            .published_checkpoint_headers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&workspace)
+            .is_some_and(|published| *published == (lsn, checkpoint_scn))
+        {
+            return Ok(());
+        }
+        for guard in guards {
+            let key = guard.key();
+            if key.workspace != workspace || self.is_dirty(key) {
+                return Err(BufferError::Io(std::io::Error::other(
+                    "CKPT cannot write a dirty file header",
+                )));
+            }
+            let (handle, block) = (self.resolve)(&workspace, key.rdba)
+                .ok_or(BufferError::Unresolved { rdba: key.rdba })?;
+            let mut page = pagefile::read_page_verified(self.io, handle, block)
+                .map_err(|error| BufferError::Io(std::io::Error::other(error)))?;
+            let mut head = crate::datafile::read_file_head(&page)
+                .map_err(|error| BufferError::Io(std::io::Error::other(error)))?;
+            if head.workspace_ref != workspace || head.role == crate::datafile::TEMP_FILE_ROLE {
+                return Err(BufferError::Io(std::io::Error::other(
+                    "invalid checkpoint file identity/role",
+                )));
+            }
+            if head.file_scn > lsn.as_raw() || head.checkpoint_commit_scn > checkpoint_scn.as_raw()
+            {
+                return Err(BufferError::Io(std::io::Error::other(
+                    "file checkpoint watermark ahead of CF",
+                )));
+            }
+            if head.file_scn == lsn.as_raw()
+                && head.checkpoint_commit_scn == checkpoint_scn.as_raw()
+            {
+                let pending = self
+                    .pending_checkpoint_sync
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&key);
+                if pending {
+                    self.io.sync_data(handle).map_err(BufferError::Io)?;
+                    self.pending_checkpoint_sync
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                }
+                guard.as_bytes_mut().copy_from_slice(page.as_bytes());
+                continue;
+            }
+            head.file_scn = lsn.as_raw();
+            head.checkpoint_commit_scn = checkpoint_scn.as_raw();
+            crate::datafile::write_file_head(&mut page, &head)
+                .map_err(|error| BufferError::Io(std::io::Error::other(error)))?;
+            self.pending_checkpoint_sync
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key);
+            pagefile::write_page(self.io, handle, block, &mut page).map_err(BufferError::Io)?;
+            // Keep the resident clean copy coherent even if the subsequent
+            // sync fails. A retry will still sync this file before publication.
+            guard.as_bytes_mut().copy_from_slice(page.as_bytes());
+            self.io.sync_data(handle).map_err(BufferError::Io)?;
+            self.pending_checkpoint_sync
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
+        self.published_checkpoint_headers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(workspace, (lsn, checkpoint_scn));
+        Ok(())
+    }
+
+    /// Persist every file written by this workspace's cache since pool creation.
+    /// Caller freezes its recovery lower bound before syncing. Retaining handles
+    /// covers clean pages already evicted and writes concurrent with this sync.
+    pub fn sync_workspace(&self, workspace: [u8; 8]) -> Result<(), BufferError> {
+        let handles = self
+            .written_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&workspace)
+            .cloned()
+            .unwrap_or_default();
+        for handle in handles {
+            self.io.sync_data(handle).map_err(BufferError::Io)?;
+        }
+        Ok(())
     }
 
     /// **装入一页"净页"**（从文件读来的盘上内容）：不标脏、不生成 redo；
@@ -1519,7 +2146,7 @@ impl<'io> BufferPool<'io> {
     /// **装入净页（两阶段）**：闩锁内 attach；需腾帧则在闩外 Make Free 后重试。
     /// 已驻留 ⇒ 保留先到者（传入副本丢弃）。
     fn insert_clean(&self, key: BufferKey, page: Page) -> Result<(), BufferError> {
-        let partition = self.partition_of(&key.workspace);
+        let partition = self.partition_for(key);
         // 净页装入 = 空 pin 的通用装入（已驻留 ⇒ 先到者为准，副本丢弃）。
         let idx = self.install(partition, key, page)?;
         self.slots(partition)[idx]
@@ -1544,7 +2171,7 @@ impl<'io> BufferPool<'io> {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let partition = self.partition_of(&workspace);
+        let partition = self.partition_for(BufferKey::new(workspace, first));
         let key_at = |i: u32| -> Option<BufferKey> {
             let block = first.block_id().checked_add(i)?;
             let rdba = Rdba::from_parts(first.file_id(), block)?;
@@ -1601,23 +2228,45 @@ impl<'io> BufferPool<'io> {
 
     /// 写回某一页（若脏）。返回是否真的写了。
     pub fn flush(&self, key: BufferKey) -> Result<bool, BufferError> {
-        let partition = self.partition_of(&key.workspace);
+        let partition = self.partition_for(key);
         Ok(matches!(
             self.write_back_step(partition, WriteTarget::Key(key))?,
             Some(true)
         ))
     }
 
+    /// Try a page write without waiting for session pins or redo durability.
+    pub fn try_flush(&self, key: BufferKey) -> Result<WritebackOutcome, BufferError> {
+        self.write_back_attempt(self.partition_for(key), WriteTarget::Key(key), true)
+    }
+
+    /// Request redo durability without performing log I/O in a DBWR scan.
+    pub fn request_redo_flush(&self, workspace: [u8; 8], target: Lsn) -> Result<(), BufferError> {
+        self.wal
+            .request_durable_for(workspace, target)
+            .map_err(BufferError::WalFlush)
+    }
+
+    /// Snapshot dirty keys in one DBWR partition, ordered within each log stream.
+    /// Returned keys hold no pin and remain valid even if their frames are reused.
+    pub fn dirty_keys_in(&self, partition: usize) -> Vec<BufferKey> {
+        let st = self.lock(partition);
+        let mut candidates = dirty_snapshot(&st, self.slots(partition), None);
+        candidates.sort_unstable_by_key(|(lsn, key, _)| (key.workspace, *lsn, key.rdba));
+        candidates.into_iter().map(|(_, key, _)| key).collect()
+    }
+
     /// **按序写回一个工作区的全部脏页**（写列表头 → 尾）。
     pub fn flush_workspace(&self, workspace: [u8; 8]) -> Result<FlushReport, BufferError> {
-        let partition = self.partition_of(&workspace);
         let mut report = FlushReport::default();
-        loop {
-            match self.write_back_step(partition, WriteTarget::WorkspaceHead(workspace))? {
-                None => break,
-                Some(wrote) => {
-                    if wrote {
-                        report.pages_written += 1;
+        for partition in 0..self.partition_count() {
+            loop {
+                match self.write_back_step(partition, WriteTarget::WorkspaceHead(workspace))? {
+                    None => break,
+                    Some(wrote) => {
+                        if wrote {
+                            report.pages_written += 1;
+                        }
                     }
                 }
             }
@@ -1634,7 +2283,7 @@ impl<'io> BufferPool<'io> {
     /// **首次触碰落在新节点**——**不搬内存**（缓冲是副本，可重建）。
     pub fn drain_partition(&self, partition: usize) -> Result<DrainReport, BufferError> {
         let mut report = DrainReport::default();
-        // ① 刷尽：写列表按（首次变脏 LSN, rdba）升序——循环取最老头即全序。
+        // ① 刷尽：工作区间按键遍历，工作区内按首次变脏 LSN 排序。
         loop {
             match self.write_back_step(partition, WriteTarget::OldestHead)? {
                 None => break,
@@ -1693,7 +2342,15 @@ impl<'io> BufferPool<'io> {
 
     /// **Make Free**（§5.10 的 MKFREE 流程内联版）：写列表头按序写回一批；
     /// **闩锁内只选页与收尾，I/O 在闩外**。返回是否实际写过页。
+    #[cfg(test)]
     fn make_free(&self, partition: usize) -> Result<bool, BufferError> {
+        self.make_free_for(partition, None)
+    }
+    fn make_free_for(
+        &self,
+        partition: usize,
+        requester: Option<[u8; 8]>,
+    ) -> Result<bool, BufferError> {
         let batch = {
             let st = self.lock(partition);
             // 配置在**分区**里（`Partition::cfg` 与 `structure.cfg` 同源）。
@@ -1702,7 +2359,8 @@ impl<'io> BufferPool<'io> {
         let mut steps = 0usize;
         let mut wrote_any = false;
         while steps < batch {
-            match self.write_back_step(partition, WriteTarget::OldestHead)? {
+            let target = requester.map_or(WriteTarget::OldestHead, WriteTarget::ReusableHead);
+            match self.write_back_step(partition, target)? {
                 None => break,
                 Some(wrote) => {
                     wrote_any |= wrote;
@@ -1724,89 +2382,168 @@ impl<'io> BufferPool<'io> {
         partition: usize,
         target: WriteTarget,
     ) -> Result<Option<bool>, BufferError> {
+        let mut delay = std::time::Duration::from_millis(1);
+        loop {
+            match self.write_back_attempt(partition, target, false)? {
+                WritebackOutcome::Clean => return Ok(None),
+                WritebackOutcome::Written => return Ok(Some(true)),
+                WritebackOutcome::Deferred(_) => {
+                    // Another DBWR may own this page's I/O claim. Yielding
+                    // repeatedly burns CPU while disk I/O is pending.
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(32));
+                }
+            }
+        }
+    }
+
+    fn write_back_attempt(
+        &self,
+        partition: usize,
+        target: WriteTarget,
+        nonblocking: bool,
+    ) -> Result<WritebackOutcome, BufferError> {
         let slots = self.slots(partition);
-        // ① 闩内选页（不取内容锁——"持结构闩不等待内容锁"）。
-        let (idx, key, handle, block) = {
+        let (idx, key, handle, block, _claim) = {
             let mut st = self.lock(partition);
             let mut lookup = |k: BufferKey| {
                 let (_s, local, g) = self.lock_bucket(partition, k);
                 Self::chain_find(&g, local, k)
             };
-            match st.pick_for_write(slots, target, &*self.resolve, &mut lookup)? {
-                Pick::None => return Ok(None),
-                Pick::Ready {
-                    idx,
-                    key,
-                    handle,
-                    block,
-                } => (idx, key, handle, block),
+            let Pick::Ready {
+                idx,
+                key,
+                handle,
+                block,
+            } = st.pick_for_write(slots, target, &*self.resolve, &mut lookup)?
+            else {
+                return Ok(WritebackOutcome::Clean);
+            };
+            if nonblocking && slots[idx].writeback.load(Ordering::Acquire) {
+                return Ok(WritebackOutcome::Deferred(WritebackDeferred::InFlight));
             }
+            if nonblocking && slots[idx].pins.load(Ordering::Acquire) != 0 {
+                return Ok(WritebackOutcome::Deferred(WritebackDeferred::Pinned));
+            }
+            if slots[idx]
+                .writeback
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(WritebackOutcome::Deferred(WritebackDeferred::InFlight));
+            }
+            slots[idx].pins.fetch_add(1, Ordering::AcqRel);
+            (idx, key, handle, block, WritebackClaim(&slots[idx]))
         };
-        // ② 闩外：内容**读**锁下冻结快照。脏帧不会被腾出（腾帧只挑干净未钉住者），
-        //    但仍核对页头身份——帧可能在本轮与上一轮之间被原位重装（同键镜像）。
         let job = {
-            let content = content_read(&slots[idx].content);
+            let content = if nonblocking {
+                match slots[idx].content.try_read() {
+                    Ok(content) => content,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        return Ok(WritebackOutcome::Deferred(WritebackDeferred::Pinned))
+                    }
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                }
+            } else {
+                content_read(&slots[idx].content)
+            };
             let Some(page) = content.as_ref() else {
-                return Ok(Some(false));
+                return Ok(WritebackOutcome::Clean);
             };
-            let Some(header) = page.header() else {
-                return Ok(Some(false)); // 页头缺失（不该发生）：不写回，留完整性路径
-            };
+            let header = page
+                .header()
+                .ok_or(BufferError::Damaged { rdba: key.rdba })?;
             if header.file_id != key.rdba.file_id()
                 || header.block_id != key.rdba.block_id()
                 || header.workspace_ref != key.workspace
             {
-                return Ok(Some(false)); // 帧已换内容（本轮与上轮之间被重装）：失步条目
+                return Err(BufferError::IdentityMismatch {
+                    expected: key,
+                    found_file: header.file_id,
+                    found_block: header.block_id,
+                    found_workspace: header.workspace_ref,
+                });
             }
-            let page_lsn = header.page_lsn;
-            let mod_seq = header.mod_seq;
-            let first_dirty = slots[idx]
-                .first_dirty_lsn()
-                .ok_or(BufferError::FreeBufferWait)?; // 已在选页时复核；防御
+            let Some(first_dirty) = slots[idx].first_dirty_lsn() else {
+                return Ok(WritebackOutcome::Clean);
+            };
+            if nonblocking
+                && header.page_lsn
+                    > self
+                        .wal
+                        .durable_lsn_for(key.workspace)
+                        .map_err(BufferError::WalFlush)?
+            {
+                return Ok(WritebackOutcome::Deferred(WritebackDeferred::RedoPending(
+                    header.page_lsn,
+                )));
+            }
             WriteJob {
                 idx,
                 key,
                 handle,
                 block,
                 image: page.clone(),
-                mod_seq,
-                page_lsn,
+                mod_seq: header.mod_seq,
+                dirty_epoch: slots[idx].dirty_epoch.load(Ordering::Acquire),
+                page_lsn: header.page_lsn,
                 first_dirty,
             }
         };
         let wal_synced = self.perform_write(&job)?;
-        // ③ 闩内收尾：读当前 `mod_seq`（内容读锁——顺序：内容 → 结构）。
-        let current_mod_seq = {
-            let content = content_read(&slots[idx].content);
-            content
-                .as_ref()
-                .and_then(|p| p.header())
-                .map_or(0, |h| h.mod_seq)
+        // Keep the read latch through clearing dirty state. Releasing it after
+        // observing mod_seq would let a writer change the page before clear.
+        let current = if nonblocking {
+            match slots[idx].content.try_read() {
+                Ok(content) => content,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.stats_of(partition).inc(|s| &s.writes);
+                    return Ok(WritebackOutcome::Written); // leave dirty for the new version
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            }
+        } else {
+            content_read(&slots[idx].content)
         };
-        let mut st = self.lock(partition);
-        st.finish_write(
+        let current_mod_seq = current
+            .as_ref()
+            .and_then(|p| p.header())
+            .map_or(0, |h| h.mod_seq);
+        self.lock(partition).finish_write(
             slots,
             &job,
             current_mod_seq,
             wal_synced,
             self.stats_of(partition),
         );
-        Ok(Some(true))
+        Ok(WritebackOutcome::Written)
     }
 
     /// 写回作业的闩锁外阶段：**WAL 规则 2 → 页文件写**（§11.1；Oracle
     /// `KCBB_REDO` 的"推迟到日志同步"）。失败 ⇒ 脏状态保留（调用方不收尾）。
     fn perform_write(&self, job: &WriteJob) -> Result<bool, BufferError> {
+        self.ensure_workspace_writable(job.key.workspace)?;
         let mut wal_synced = false;
         {
-            let wal = self.wal.lock();
-            if job.page_lsn > wal.durable_lsn() {
-                wal.ensure_durable(job.page_lsn)
+            let wal = &self.wal;
+            if job.page_lsn
+                > wal
+                    .durable_lsn_for(job.key.workspace)
+                    .map_err(BufferError::WalFlush)?
+            {
+                wal.ensure_durable_for(job.key.workspace, job.page_lsn)
                     .map_err(BufferError::WalFlush)?;
                 wal_synced = true;
             }
         }
         let mut image = job.image.clone();
+        {
+            let mut files = self.written_files.lock().unwrap_or_else(|e| e.into_inner());
+            let handles = files.entry(job.key.workspace).or_default();
+            if !handles.contains(&job.handle) {
+                handles.push(job.handle);
+            }
+        }
         pagefile::write_page(self.io, job.handle, job.block, &mut image)
             .map_err(BufferError::Io)?;
         Ok(wal_synced)
@@ -1907,6 +2644,53 @@ impl<'io> BufferPool<'io> {
 }
 
 impl Structure {
+    fn set_meta(&mut self, idx: usize, key: Option<BufferKey>) {
+        let quotas = std::sync::Arc::clone(&self.quotas);
+        let mut quotas = quotas.lock().unwrap_or_else(|e| e.into_inner());
+        self.set_meta_accounted(idx, key, &mut quotas);
+    }
+    fn set_meta_accounted(&mut self, idx: usize, key: Option<BufferKey>, quotas: &mut CacheQuotas) {
+        if let Some(old) = self.meta[idx].key {
+            if let Some(count) = self.resident_by_workspace.get_mut(&old.workspace) {
+                *count -= 1;
+            }
+            *quotas
+                .resident
+                .get_mut(&old.workspace)
+                .expect("global resident count") -= 1;
+        }
+        if let Some(new) = key {
+            *self.resident_by_workspace.entry(new.workspace).or_default() += 1;
+            *quotas.resident.entry(new.workspace).or_default() += 1;
+        }
+        self.meta[idx] = FrameMeta { key };
+    }
+    fn may_evict(&self, idx: usize, requester: [u8; 8]) -> bool {
+        let Some(key) = self.meta[idx].key else {
+            return true;
+        };
+        if key.workspace == requester {
+            return true;
+        }
+        let quotas = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        quotas.resident.get(&key.workspace).copied().unwrap_or(0)
+            > quotas.minimum.get(&key.workspace).copied().unwrap_or(0)
+    }
+    fn clear_for_reuse(&mut self, idx: usize, requester: Option<[u8; 8]>) -> bool {
+        let quotas = std::sync::Arc::clone(&self.quotas);
+        let mut quotas = quotas.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(key), Some(requester)) = (self.meta[idx].key, requester) {
+            if key.workspace != requester
+                && quotas.resident.get(&key.workspace).copied().unwrap_or(0)
+                    <= quotas.minimum.get(&key.workspace).copied().unwrap_or(0)
+            {
+                return false;
+            }
+        }
+        // Atomic quota check and decrement across all partition writers.
+        self.set_meta_accounted(idx, None, &mut quotas);
+        true
+    }
     fn capacity_used(&self) -> usize {
         self.meta.len() - self.virgin.len()
     }
@@ -1946,7 +2730,12 @@ impl Structure {
     /// 把帧丢在任何链之外——容量不会随失败单调泄漏。（选与摘同处**一个**
     /// 闩锁临界区——读盘的 I/O 在闩外，但"选空闲帧 → attach"不再跨临界区，
     /// 之间没有并发窗口。）
-    fn find_reusable(&mut self, slots: &[FrameSlot], stats: &StatsShards) -> Option<usize> {
+    fn find_reusable(
+        &mut self,
+        slots: &[FrameSlot],
+        stats: &StatsShards,
+        requester: [u8; 8],
+    ) -> Option<usize> {
         // 0) 从未用过的帧最便宜（不在任何链上，attach 时无需摘链）。
         if let Some(idx) = self.virgin.pop() {
             return Some(idx);
@@ -1955,19 +2744,25 @@ impl Structure {
         //    **脏帧必须排除**：AUX 的语义是"写完的干净候选"，而 pin 命中与
         //    `mark_dirty` 都不会把帧移出 AUX——漏了这个判据，再次改脏的帧会被
         //    前台无写回直接覆盖（已提交更新静默丢失 + 写列表孤儿）。
-        if let Some(&idx) = self
-            .aux
-            .iter()
-            .find(|&&i| slots[i].pins.load(Ordering::Acquire) == 0 && !slots[i].is_dirty_state())
-        {
+        if let Some(&idx) = self.aux.iter().find(|&&i| {
+            slots[i].pins.load(Ordering::Acquire) == 0
+                && !slots[i].is_dirty_state()
+                && self.may_evict(i, requester)
+        }) {
             stats.inc(|s| &s.free_inspected);
             stats.inc(|s| &s.evictions);
             return Some(idx);
         }
         // 2) 冷段尾：遇到脏帧计数跳过（它们在写列表里排队），上限 = 容量/分数。
         let limit = (self.meta.len() / self.cfg.max_scan_fraction).max(1);
-        for k in 0..self.cold.len().min(limit) {
-            let idx = self.cold[self.cold.len() - 1 - k];
+        for idx in self
+            .cold
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&idx| self.may_evict(idx, requester))
+            .take(limit)
+        {
             stats.inc(|s| &s.free_inspected);
             if slots[idx].pins.load(Ordering::Acquire) > 0 {
                 stats.inc(|s| &s.pinned_inspected);
@@ -2016,6 +2811,17 @@ impl Structure {
                 dirty_snapshot(self, slots, Some(ws)).into_iter().next()
             }
             WriteTarget::OldestHead => dirty_snapshot(self, slots, None).into_iter().next(),
+            WriteTarget::ReusableHead(requester) => {
+                let mut pages = dirty_snapshot(self, slots, None);
+                // Prefer own pages; do not spend a bounded Make Free batch on
+                // another workspace's protected frames that cannot be reused.
+                pages.sort_by_key(|(lsn, key, _)| {
+                    (key.workspace != requester, key.workspace, *lsn, key.rdba)
+                });
+                pages.into_iter().find(|(_, _, idx)| {
+                    slots[*idx].pins.load(Ordering::Acquire) == 0 && self.may_evict(*idx, requester)
+                })
+            }
         };
         let Some((lsn, key, idx)) = candidate else {
             return Ok(Pick::None);
@@ -2062,12 +2868,14 @@ impl Structure {
         if self.meta[idx].key != Some(job.key) {
             return; // 帧已换人（脏帧不可被淘汰；防御）
         }
-        if current_mod_seq != job.mod_seq {
+        if current_mod_seq != job.mod_seq
+            || slots[idx].dirty_epoch.load(Ordering::Acquire) != job.dirty_epoch
+        {
             return; // 期间被再改脏：保持脏
         }
         // O4：清状态字（带"期待的首脏 LSN"——与权威重装互斥）。
         let _ = slots[idx].clear_dirty_state(job.first_dirty);
-        if slots[idx].pins.load(Ordering::Acquire) == 0 && !self.aux.contains(&idx) {
+        if slots[idx].pins.load(Ordering::Acquire) == 1 && !self.aux.contains(&idx) {
             if let Some(p) = self.hot.iter().position(|&i| i == idx) {
                 self.hot.remove(p);
             }
@@ -2523,6 +3331,260 @@ mod tests {
             h.page_lsn = lsn(v);
             page.write_header(&h);
         }
+    }
+
+    #[test]
+    fn try_pin_never_waits_or_reads_a_missing_page() {
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        let key = BufferKey::new(WS_A, rdba(7, 0));
+        let held = pool.pin(key).unwrap();
+        assert!(pool.try_pin(key).is_none());
+        drop(held);
+        assert!(pool.try_pin(key).is_some());
+        h.clear_events();
+        assert!(pool.try_pin(BufferKey::new(WS_A, rdba(7, 1))).is_none());
+        assert!(h.events().is_empty());
+        assert_eq!(
+            pool.drop_clean_frames(0).unwrap(),
+            1,
+            "失败的非阻塞获取不能泄漏 pin"
+        );
+    }
+
+    #[test]
+    fn page_quarantine_blocks_cached_and_uncached_access_without_looking_missing() {
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        let cached = BufferKey::new(WS_A, rdba(7, 0));
+        let uncached = BufferKey::new(WS_A, rdba(7, 1));
+        drop(pool.pin(cached).unwrap());
+        pool.quarantine_page(cached, "checksum repair pending".into());
+        pool.quarantine_page(uncached, "media recovery pending".into());
+
+        let error = pool.pin(cached).unwrap_err().to_string();
+        assert!(error.contains("页面已隔离") && error.contains("checksum"));
+        assert!(pool.pin_shared(cached).is_none());
+        assert!(pool.try_pin(cached).is_none());
+        let error = pool.pin(uncached).unwrap_err().to_string();
+        assert!(error.contains("页面已隔离") && error.contains("media recovery"));
+        assert!(pool.pin(BufferKey::new(WS_B, rdba(8, 0))).is_ok());
+    }
+
+    #[test]
+    fn quarantined_page_is_verified_from_media_before_exact_clear() {
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        let key = BufferKey::new(WS_A, rdba(7, 1));
+        assert!(pool.verify_quarantined_page(key).is_err());
+        pool.quarantine_page(key, "repair pending".into());
+        pool.verify_quarantined_page(key).unwrap();
+        assert!(pool.page_fault(key).is_some(), "验证本身不得解除隔离");
+        assert!(pool.clear_verified_page_quarantine(key));
+        assert!(pool.page_fault(key).is_none());
+        assert!(!pool.clear_verified_page_quarantine(key));
+        drop(pool.pin(key).unwrap());
+    }
+
+    #[test]
+    fn first_fault_sink_is_reentrant_and_replays_existing_quarantine() {
+        let h = harness();
+        let pool = Arc::new(h.pool(2, h.fake_wal()));
+        pool.quarantine_workspace(WS_A, "first".into());
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&recorded);
+        let weak = Arc::downgrade(&pool);
+        pool.set_fault_handler(Arc::new(move |workspace, reason| {
+            let pool = weak.upgrade().unwrap();
+            assert_eq!(pool.workspace_fault(workspace), Some(reason.clone()));
+            output.lock().unwrap().push((workspace, reason));
+        }))
+        .unwrap();
+        pool.quarantine_workspace(WS_A, "duplicate".into());
+        pool.quarantine_workspace(WS_B, "second workspace".into());
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec![(WS_A, "first".into()), (WS_B, "second workspace".into())]
+        );
+        assert!(pool.set_fault_handler(Arc::new(|_, _| {})).is_err());
+    }
+
+    #[test]
+    fn faults_are_sticky_and_private_faults_do_not_block_other_workspaces() {
+        let h = harness();
+        let pool = h.pool(4, h.fake_wal());
+        pool.quarantine_workspace(WS_A, "first failure".into());
+        pool.quarantine_workspace(WS_A, "later observation".into());
+        assert_eq!(pool.workspace_fault(WS_A).as_deref(), Some("first failure"));
+        assert!(pool.ensure_workspace_writable(WS_A).is_err());
+        assert!(pool.ensure_workspace_writable(WS_B).is_ok());
+        let key = BufferKey::new(WS_A, Rdba::from_parts(7, 0).unwrap());
+        {
+            let mut page = pool.pin(key).unwrap();
+            page.mark_dirty(lsn(1));
+        }
+        assert!(pool.flush_workspace(WS_A).is_err());
+        assert_eq!(pool.dirty_len(WS_A), 1);
+        // Cache reads remain available; no fault reset occurs.
+        assert!(pool.pin(key).is_ok());
+        pool.set_critical_workspace(WS_A);
+        assert!(
+            pool.ensure_workspace_writable(WS_B).is_err(),
+            "PUBLIC failure must gate all business writes"
+        );
+    }
+
+    #[test]
+    fn checkpoint_metadata_preserves_extended_header_and_never_flushes_dirty_pages() {
+        let io = MemFileIo::new();
+        io.add_dir("/mem");
+        let mut file =
+            crate::datafile::DataFile::create(&io, Path::new("/mem/header"), 7, 3, WS_A, 512)
+                .unwrap();
+        let handle = file.handle();
+        let pool = BufferPool::new(
+            &io,
+            4,
+            move |_, rdba| Some((handle, rdba.block_id())),
+            FakeWal {
+                durable: std::sync::atomic::AtomicU64::new(100),
+                fail: false,
+                log: Arc::new(Mutex::new(Vec::new())),
+            },
+        )
+        .unwrap();
+        let key = BufferKey::new(WS_A, Rdba::from_parts(7, 0).unwrap());
+        pool.register_checkpoint_file(key);
+        pool.load_checkpoint_headers(WS_A).unwrap();
+        assert!(pool.checkpoint_headers_ready(WS_A).unwrap());
+        // An independent DataFile handle extends while the cache holds an old
+        // clean image. CKPT must preserve the actual on-disk file size.
+        file.extend(600).unwrap();
+        pool.publish_file_checkpoints(
+            WS_A,
+            lsn(50),
+            bicdb_common::seq::CommitSeq::from_raw(3).unwrap(),
+        )
+        .unwrap();
+        let head =
+            crate::datafile::read_file_head(&pagefile::read_page_verified(&io, handle, 0).unwrap())
+                .unwrap();
+        assert_eq!(
+            (head.blocks, head.file_scn, head.checkpoint_commit_scn),
+            (600, 50, 3)
+        );
+        assert_eq!(
+            crate::datafile::read_file_head(&pool.pin(key).unwrap())
+                .unwrap()
+                .blocks,
+            600
+        );
+        // A stale DataFile object's next extension must preserve CKPT's field.
+        file.extend(700).unwrap();
+        assert_eq!(
+            crate::datafile::read_file_head(&file.read_page(0).unwrap())
+                .unwrap()
+                .file_scn,
+            50
+        );
+        {
+            let mut guard = pool.pin(key).unwrap();
+            guard.mark_dirty(lsn(60));
+        }
+        assert!(!pool.checkpoint_headers_ready(WS_A).unwrap());
+        assert!(pool
+            .publish_file_checkpoints(
+                WS_A,
+                lsn(70),
+                bicdb_common::seq::CommitSeq::from_raw(4).unwrap()
+            )
+            .is_err());
+        assert_eq!(pool.dirty_len(WS_A), 1);
+        assert_eq!(
+            crate::datafile::read_file_head(&file.read_page(0).unwrap())
+                .unwrap()
+                .file_scn,
+            50
+        );
+    }
+
+    #[test]
+    fn workspace_sync_covers_written_files_after_page_eviction() {
+        let h = harness();
+        let pool = h.pool(1, h.fake_wal());
+        let key = BufferKey::new(WS_A, rdba(7, 0));
+        {
+            let mut page = pool.pin(key).unwrap();
+            page.mark_dirty(lsn(1));
+        }
+        pool.flush(key).unwrap();
+        drop(pool.pin(BufferKey::new(WS_B, rdba(8, 0))).unwrap());
+        assert!(pool.copy_if_resident(key).is_none());
+        h.clear_events();
+        pool.sync_workspace(WS_B).unwrap();
+        assert!(h.events().is_empty(), "B 无写入，不应同步 A 的文件");
+        pool.sync_workspace(WS_A).unwrap();
+        assert_eq!(h.events(), vec!["io:sync"]);
+    }
+
+    #[test]
+    fn shared_cache_flush_checks_the_page_workspace_log() {
+        let h = harness();
+        let router = Arc::new(crate::wal_router::WorkspaceWalRouter::default());
+        let a = Arc::new(h.fake_wal());
+        let b = Arc::new(h.fake_wal());
+        a.durable.store(100, std::sync::atomic::Ordering::SeqCst);
+        router.register(WS_A, a).unwrap();
+        router.register(WS_B, b.clone()).unwrap();
+        let pool = h.pool(4, router);
+        {
+            let mut g = pool.pin(BufferKey::new(WS_B, rdba(8, 0))).unwrap();
+            h.set_page_lsn(&mut g, 100);
+            g.mark_dirty(lsn(100));
+        }
+        h.clear_events();
+        pool.flush_workspace(WS_B).unwrap();
+        assert_eq!(b.durable.load(std::sync::atomic::Ordering::SeqCst), 100);
+        assert!(
+            h.events().iter().any(|event| event == "wal:ensure:100"),
+            "A durability cannot authorize B's page write"
+        );
+    }
+
+    #[test]
+    fn reserved_frames_are_protected_and_idle_capacity_can_be_borrowed() {
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        pool.reserve_workspace(WS_A, 1).unwrap();
+        pool.reserve_workspace(WS_B, 1).unwrap();
+        assert!(pool.reserve_workspace([3; 8], 1).is_err());
+        drop(pool.pin(BufferKey::new(WS_A, rdba(7, 0))).unwrap());
+        drop(pool.pin(BufferKey::new(WS_A, rdba(7, 1))).unwrap());
+        assert_eq!(pool.resident(), 2, "A borrows B's empty capacity");
+        drop(pool.pin(BufferKey::new(WS_B, rdba(8, 0))).unwrap());
+        assert_eq!(pool.lock(0).resident_by_workspace.get(&WS_A), Some(&1));
+        let a_key = if pool.chain_of(BufferKey::new(WS_A, rdba(7, 0))).is_some() {
+            rdba(7, 0)
+        } else {
+            rdba(7, 1)
+        };
+        drop(pool.pin(BufferKey::new(WS_B, rdba(8, 1))).unwrap());
+        assert!(
+            pool.chain_of(BufferKey::new(WS_A, a_key)).is_some(),
+            "B cannot evict A below its floor"
+        );
+        assert_eq!(pool.lock(0).resident_by_workspace.get(&WS_B), Some(&1));
+    }
+
+    #[test]
+    fn empty_registration_reservation_can_be_rolled_back_but_live_one_cannot() {
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        pool.reserve_workspace(WS_A, 2).unwrap();
+        pool.release_empty_workspace_reservation(WS_A).unwrap();
+        pool.reserve_workspace(WS_B, 2).unwrap();
+        drop(pool.pin(BufferKey::new(WS_B, rdba(8, 0))).unwrap());
+        assert!(pool.release_empty_workspace_reservation(WS_B).is_err());
     }
 
     #[test]
@@ -3030,14 +4092,17 @@ mod tests {
     }
 
     #[test]
-    fn partitions_map_workspaces_by_stable_hash() {
+    fn partitions_map_pages_by_stable_hash() {
         // §5.10：`H(工作区标识) mod N`——稳定、确定、2 的幂按位与。
         let h = harness();
         let pool = h.pool_partitioned(4, 2, h.fake_wal());
         assert_eq!(pool.partition_count(), 4);
-        // 同一个工作区永远落同一个分区（写列表不在写线程间搬家）。
+        // 同一页键始终落同一分区；工作区可以使用多个分区。
         for _ in 0..3 {
-            assert_eq!(pool.partition_of(&WS_A), pool.partition_of(&WS_A));
+            assert_eq!(
+                pool.partition_for(BufferKey::new(WS_A, rdba(7, 0))),
+                pool.partition_for(BufferKey::new(WS_A, rdba(7, 0)))
+            );
         }
         // 结构可见：容量是**每分区**的（总帧数 = N × 容量）。
         assert_eq!(pool.capacity(), 2);
@@ -3106,8 +4171,8 @@ mod tests {
             CacheConfig::for_capacity(1),
         )
         .unwrap();
-        let pa = pool.partition_of(&WS_A);
-        let pc = pool.partition_of(&WS_C);
+        let pa = pool.partition_for(BufferKey::new(WS_A, rdba(7, 0)));
+        let pc = pool.partition_for(BufferKey::new(WS_C, rdba(9, 0)));
         assert_ne!(pa, pc, "夹具的两个工作区必须落不同分区");
         let ka = BufferKey::new(WS_A, rdba(7, 0));
         let kc = BufferKey::new(WS_C, rdba(9, 0));
@@ -3127,41 +4192,125 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_is_never_split_across_partitions() {
-        // §5.10：**一个工作区不被拆分**——它的全部缓冲与写列表都在同一个
-        // 工作集里（检查点推进只碰一个闩锁，零跨分区协调）。
+    fn allocation_flushes_own_dirty_page_instead_of_another_workspace_minimum() {
+        let h = harness();
+        let pool = h.pool(2, h.fake_wal());
+        pool.reserve_workspace(WS_A, 1).unwrap();
+        pool.reserve_workspace(WS_B, 1).unwrap();
+        let protected = BufferKey::new(WS_A, rdba(7, 0));
+        let own = BufferKey::new(WS_B, rdba(8, 0));
+        for (key, first) in [(protected, 1), (own, 100)] {
+            let mut guard = pool.pin(key).unwrap();
+            guard.mark_dirty(lsn(first));
+        }
+        drop(pool.pin(BufferKey::new(WS_B, rdba(8, 1))).unwrap());
+        assert_eq!(
+            pool.dirty_len(WS_A),
+            1,
+            "不能为无法借用的其他工作区保护页浪费腾帧批次"
+        );
+        assert_eq!(pool.dirty_len(WS_B), 0);
+        assert_eq!(pool.quotas.lock().unwrap().resident[&WS_A], 1);
+        assert_eq!(pool.quotas.lock().unwrap().resident[&WS_B], 1);
+    }
+
+    #[test]
+    fn concurrent_partition_evictions_cannot_cross_workspace_minimum() {
+        let mut h = harness();
+        h.io.set_len(h.a, 32 * crate::page::PAGE_SIZE as u64)
+            .unwrap();
+        for block in 2..32 {
+            h.put_page(WS_A, 7, block, 0xA0);
+        }
+        let pool = h.pool_partitioned(2, 2, h.fake_wal());
+        pool.reserve_workspace(WS_A, 2).unwrap();
+        pool.reserve_workspace(WS_B, 2).unwrap();
+        assert!(pool.reserve_workspace([3; 8], 1).is_err());
+        let keys: Vec<_> = (0..32)
+            .map(|block| BufferKey::new(WS_A, rdba(7, block)))
+            .collect();
+        let left: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|key| pool.partition_for(*key) == 0)
+            .take(2)
+            .collect();
+        let right = *keys
+            .iter()
+            .find(|key| pool.partition_for(**key) == 1)
+            .unwrap();
+        for key in left.iter().copied().chain([right]) {
+            drop(pool.pin(key).unwrap());
+        }
+        assert_eq!(pool.quotas.lock().unwrap().resident[&WS_A], 3);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let run = |key| {
+                let partition = pool.partition_for(key);
+                let mut st = pool.lock(partition);
+                let idx = {
+                    let (_, local, bucket) = pool.lock_bucket(partition, key);
+                    BufferPool::chain_find(&bucket, local, key).unwrap()
+                };
+                assert!(st.may_evict(idx, WS_B), "两候选检查时只剩一帧可借用");
+                barrier.wait();
+                matches!(
+                    pool.detach_for_reuse(partition, &mut st, idx, Some(WS_B)),
+                    Detach::Done(_)
+                )
+            };
+            let first = scope.spawn(move || run(left[0]));
+            let second = scope.spawn(move || run(right));
+            assert_eq!(
+                usize::from(first.join().unwrap()) + usize::from(second.join().unwrap()),
+                1,
+                "跨分区淘汰必须在统一配额下原子复核"
+            );
+        });
+        assert_eq!(pool.quotas.lock().unwrap().resident[&WS_A], 2);
+        assert_eq!(
+            (0..pool.partition_count())
+                .map(|p| pool
+                    .lock(p)
+                    .resident_by_workspace
+                    .get(&WS_A)
+                    .copied()
+                    .unwrap_or(0))
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn workspace_pages_span_partitions_and_checkpoint_uses_all_of_them() {
         let h = harness();
         let pool = h.pool_partitioned(8, 2, h.fake_wal());
-        let p = pool.partition_of(&WS_A);
-        for block in 0..2u32 {
-            let mut g = pool.pin(BufferKey::new(WS_A, rdba(7, block))).unwrap();
-            g.as_bytes_mut()[4096] = 0x11;
-            g.mark_dirty(lsn(1 + u64::from(block)));
+        let keys = [
+            BufferKey::new(WS_A, rdba(7, 0)),
+            BufferKey::new(WS_A, rdba(7, 1)),
+        ];
+        let parts = keys.map(|key| pool.partition_for(key));
+        assert_ne!(parts[0], parts[1], "同一工作区页必须能够跨分区");
+        for (key, first) in keys.into_iter().zip([1, 2]) {
+            let mut guard = pool.pin(key).unwrap();
+            guard.as_bytes_mut()[4096] = 0x11;
+            guard.mark_dirty(lsn(first));
         }
         assert_eq!(pool.dirty_len(WS_A), 2);
-        // 该工作区的两个帧都在同一个分区里（其它分区没有任何属于它的脏帧）。
+        assert_eq!(pool.dirty_len_in(WS_A, parts[0]), 1);
+        assert_eq!(pool.dirty_len_in(WS_A, parts[1]), 1);
+        assert_eq!(pool.dirty_workspaces(), vec![WS_A]);
+        assert_eq!(pool.low_water(WS_A), Some(lsn(1)));
+        pool.flush(keys[0]).unwrap();
         assert_eq!(
-            dirty_snapshot(
-                &pool.partitions[p].structure.lock(),
-                &pool.partitions[p].slots,
-                Some(WS_A)
-            )
-            .len(),
-            2,
-            "脏帧整体落在一个分区"
+            pool.low_water(WS_A),
+            Some(lsn(2)),
+            "不能漏掉另一分区的恢复下界"
         );
-        for i in 0..pool.partitions.len() {
-            if i != p {
-                assert_eq!(
-                    pool.dirty_len_in(WS_A, i),
-                    0,
-                    "分区 {i} 不该有该工作区的脏帧"
-                );
-            }
-        }
-        // 按分区刷该工作区：一次 flush_workspace 只碰一个分区、按序写两页。
         let report = pool.flush_workspace(WS_A).unwrap();
-        assert_eq!(report.pages_written, 2);
+        assert_eq!(report.pages_written, 1);
+        assert_eq!(pool.dirty_len(WS_A), 0);
+        assert_eq!(pool.low_water(WS_A), None);
     }
 
     /// **O3 竞态关**：腾帧候选被并发钉住 ⇒ 声明失败（`Detach::Pinned`），
@@ -3171,7 +4320,7 @@ mod tests {
         let h = harness();
         let pool = h.pool(4, h.fake_wal());
         let key = BufferKey::new(WS_A, rdba(7, 0));
-        let partition = pool.partition_of(&WS_A);
+        let partition = pool.partition_for(BufferKey::new(WS_A, rdba(7, 0)));
         let g = pool.pin(key).unwrap(); // pins = 1
         let st = pool.lock(partition);
         let idx = {
@@ -3181,7 +4330,7 @@ mod tests {
         let mut st = st;
         assert!(
             matches!(
-                pool.detach_for_reuse(partition, &mut st, idx),
+                pool.detach_for_reuse(partition, &mut st, idx, None),
                 Detach::Pinned
             ),
             "被钉住的帧不得被声明复用"
@@ -3189,7 +4338,7 @@ mod tests {
         drop(g);
         // 卫兵退场后可以声明（帧仍在池里）。
         assert!(matches!(
-            pool.detach_for_reuse(partition, &mut st, idx),
+            pool.detach_for_reuse(partition, &mut st, idx, None),
             Detach::Done(Some(_))
         ));
     }
@@ -3351,6 +4500,15 @@ mod tests {
 
     #[test]
     fn re_dirtied_during_write_window_stays_dirty() {
+        re_dirtied_write_window(1);
+    }
+
+    #[test]
+    fn wrapped_mod_seq_during_write_window_stays_dirty() {
+        re_dirtied_write_window(256);
+    }
+
+    fn re_dirtied_write_window(modifications: usize) {
         // 两阶段写回：写盘窗口内页被**再改脏**（`mod_seq` 推进）⇒ 收尾不得
         // 清脏——绝不把"更新过的版本"当"已落盘"（PG `BM_JUST_DIRTIED` 同款）。
         let mem = MemFileIo::new();
@@ -3392,6 +4550,11 @@ mod tests {
                 io.release();
             }
             assert!(entered, "写回已进入闩锁外的写盘窗口");
+            assert_eq!(
+                pool.try_flush(key).unwrap(),
+                WritebackOutcome::Deferred(WritebackDeferred::InFlight),
+                "在途写回期间不能启动第二个页写者"
+            );
 
             // 窗口内再改脏（闩锁可用 = O1 的又一体现）。
             let (tx, rx) = std::sync::mpsc::channel();
@@ -3399,8 +4562,10 @@ mod tests {
             let modifier = scope.spawn(move || {
                 let mut g = p2.pin(key).unwrap();
                 g.as_bytes_mut()[4096] = 0x88;
-                g.bump_mod_seq();
-                g.mark_dirty(lsn(9));
+                for _ in 0..modifications {
+                    g.bump_mod_seq();
+                    g.mark_dirty(lsn(9));
+                }
                 tx.send(()).unwrap();
             });
             let modified = rx.recv_timeout(std::time::Duration::from_secs(5));
@@ -3434,7 +4599,7 @@ mod tests {
         // 节点），Draining ② 释放它——重绑定后下次装入按新绑定重新落位。
         let h = harness();
         let pool = h.pool(4, h.fake_wal());
-        let p = pool.partition_of(&WS_A);
+        let p = pool.partition_for(BufferKey::new(WS_A, rdba(7, 0)));
         assert_eq!(pool.allocated_frames(p), 0, "空池不分配任何页缓冲");
         {
             let _g = pool.pin(BufferKey::new(WS_A, rdba(7, 0))).unwrap();
@@ -3454,7 +4619,7 @@ mod tests {
     fn drain_partition_flushes_dirty_pages_then_drops_clean_frames() {
         let h = harness();
         let pool = h.pool(4, h.fake_wal());
-        let p = pool.partition_of(&WS_A);
+        let p = pool.partition_for(BufferKey::new(WS_A, rdba(7, 0)));
         for (block, byte, l) in [(0u32, 0x11u8, 5u64), (1, 0x22, 3)] {
             let mut g = pool.pin(BufferKey::new(WS_A, rdba(7, block))).unwrap();
             g.as_bytes_mut()[4096] = byte;
@@ -3475,7 +4640,7 @@ mod tests {
         // 丢净帧**不静默丢脏帧**（那就是数据丢失）——先 flush，再丢。
         let h = harness();
         let pool = h.pool(4, h.fake_wal());
-        let p = pool.partition_of(&WS_A);
+        let p = pool.partition_for(BufferKey::new(WS_A, rdba(7, 0)));
         {
             let mut g = pool.pin(BufferKey::new(WS_A, rdba(7, 0))).unwrap();
             g.as_bytes_mut()[4096] = 0x33;
@@ -3500,7 +4665,7 @@ mod tests {
         // 夹具：WS_A（[1;8]）与 WS_D（[4;8]）在 N=2 下不同分区（实测哈希）。
         let mem = MemFileIo::new();
         mem.add_dir("/mem");
-        const WS_D: [u8; 8] = [4u8; 8];
+        const WS_D: [u8; 8] = [8u8; 8];
         let da = mem
             .open(
                 Path::new("/mem/da.dat"),
@@ -3541,7 +4706,10 @@ mod tests {
             CacheConfig::for_capacity(2),
         )
         .unwrap();
-        let (pa, pd) = (pool.partition_of(&WS_A), pool.partition_of(&WS_D));
+        let (pa, pd) = (
+            pool.partition_for(BufferKey::new(WS_A, rdba(7, 0))),
+            pool.partition_for(BufferKey::new(WS_D, rdba(9, 0))),
+        );
         assert_ne!(pa, pd, "夹具的两个工作区必须落不同分区");
         let ka = BufferKey::new(WS_A, rdba(7, 0));
         let kd = BufferKey::new(WS_D, rdba(9, 0));
@@ -3659,7 +4827,7 @@ mod tests {
         // O2 起 `pinned` 判据是**真判据**（旧形态下持卫兵即持闩锁，别人进不来）。
         let h = harness();
         let pool = h.pool(4, h.fake_wal());
-        let p = pool.partition_of(&WS_A);
+        let p = pool.partition_for(BufferKey::new(WS_A, rdba(7, 0)));
         let guard = pool.pin(BufferKey::new(WS_A, rdba(7, 0))).unwrap();
         assert!(matches!(
             pool.drain_partition(p),

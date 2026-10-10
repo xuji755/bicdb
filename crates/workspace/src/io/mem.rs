@@ -55,9 +55,23 @@ impl MemFileIo {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.files.get(path).cloned()
     }
+
+    /// Number of currently live opaque handles (test/diagnostic aid).
+    #[must_use]
+    pub fn open_handle_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .handles
+            .len()
+    }
 }
 
 impl FileIo for MemFileIo {
+    fn open_handle_count(&self) -> Option<usize> {
+        Some(self.open_handle_count())
+    }
+
     fn open(&self, path: &Path, opts: OpenOptions) -> io::Result<FileHandle> {
         opts.validate()?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

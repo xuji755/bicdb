@@ -92,6 +92,8 @@ fn serving(tag: &str) -> TempDir {
             "30",
             "-c",
             "auth.pbkdf2_iterations=1000",
+            "-c",
+            "buffer.pool_frames=262144",
         ],
     );
     assert!(ok, "start：{out}");
@@ -124,6 +126,14 @@ fn a_subject_authenticates_reads_and_may_change_its_own_password() {
     let home = serving("subject");
     let public = public_of(home.path());
 
+    // Put one shared graph in PUBLIC so the wire-level check covers graph reads
+    // as well as rejecting every graph mutation class before name binding.
+    let mut setup = Connection::connect(&public).expect("management connection");
+    setup
+        .execute("CREATE GRAPH shared_kg", &[])
+        .expect("shared graph");
+    drop(setup);
+
     // 管理面（不认证）能管；**认证的连接**不能管、不能写，只能读。
     let mut conn = Connection::connect_as(&public, "alice", "pw-one").expect("认证并连上");
     assert_eq!(conn.user(), Some("alice"));
@@ -132,8 +142,26 @@ fn a_subject_authenticates_reads_and_may_change_its_own_password() {
     // 读：随便。
     let rs = conn.query("SELECT 2 + 3 * 4 AS n", &[]).expect("读");
     assert_eq!(rs.row(0).expect("行").i64(0).expect("值"), 14);
+    conn.query("CYPHER shared_kg 'RETURN 1 AS n'", &[])
+        .expect("PUBLIC read-only Cypher is shared with named subjects");
     // 写/管理：**服务端原文透传**（具名拒绝）。
     server_err(conn.execute("CREATE TABLE t (id NUMBER)", &[]), "只读");
+    server_err(conn.execute("CREATE GRAPH another_kg", &[]), "只读");
+    server_err(
+        conn.execute("CYPHER shared_kg 'CREATE (:N {key:1})'", &[]),
+        "只读",
+    );
+    server_err(
+        conn.execute(
+            "CREATE GRAPH INDEX graph_keys ON shared_kg NODES LABEL \"N\" (key)",
+            &[],
+        ),
+        "只读",
+    );
+    server_err(
+        conn.execute("ALTER FULLTEXT GRAPH INDEX words ON shared_kg SYNC", &[]),
+        "只读",
+    );
     server_err(conn.execute("DROP USER bob", &[]), "管理面身份");
     server_err(
         conn.execute("ALTER USER bob IDENTIFIED BY 'x' REPLACE 'pw-bob'", &[]),
@@ -242,4 +270,71 @@ fn pause_refuses_new_sessions_and_expire_restricts_them() {
     drop(conn);
     let conn = Connection::connect_as(&public, "alice", "pw-fresh").expect("新口令");
     assert_eq!(conn.password_expired(), Some(false));
+}
+
+#[test]
+fn administrator_changes_effective_private_workspace_open_mode() {
+    let home = serving("workspace-open-mode");
+    let public = public_of(home.path());
+
+    let mut admin = Connection::connect(&public).expect("管理面连接");
+    admin
+        .execute("ALTER WORKSPACE w1 OPEN READ ONLY", &[])
+        .expect("打开私有工作区为只读");
+    server_err(
+        admin.execute("ALTER WORKSPACE public OPEN READ WRITE FORCE", &[]),
+        "PUBLIC 禁止 FORCE",
+    );
+    admin
+        .execute("ALTER WORKSPACE public OPEN READ ONLY", &[])
+        .expect("PUBLIC 可由管理员显式设为只读");
+    server_err(
+        admin.execute("CREATE TABLE public_blocked (id NUMBER)", &[]),
+        "管理员设为只读",
+    );
+    admin
+        .execute("ALTER WORKSPACE public OPEN READ WRITE", &[])
+        .expect("OPEN 管理命令本身可解除 PUBLIC 只读");
+    admin
+        .execute("CREATE TABLE public_writable (id NUMBER)", &[])
+        .expect("PUBLIC 恢复读写");
+    drop(admin);
+
+    let mut user = Connection::connect_as(&public, "alice", "pw-one").expect("认证");
+    let route = user.bind_workspace(None).expect("绑定本人工作区");
+    assert_eq!(route.name, "w1");
+    user.query("SELECT 1", &[]).expect("只读工作区可查询");
+    server_err(
+        user.execute("CREATE TABLE blocked (id NUMBER)", &[]),
+        "管理员设为只读",
+    );
+    let status = user.status().expect("状态");
+    assert!(status
+        .iter()
+        .any(|(key, value)| { key == "workspace_write_state" && value == "READ_ONLY" }));
+    assert!(status
+        .iter()
+        .any(|(key, value)| key == "shutdown_state" && value == "RUNNING"));
+    assert!(status
+        .iter()
+        .any(|(key, value)| key == "quarantined_pages" && value == "0"));
+    assert!(status
+        .iter()
+        .any(|(key, value)| key == "quarantined_objects" && value == "0"));
+    drop(user);
+
+    let mut admin = Connection::connect(&public).expect("管理面重连");
+    admin
+        .execute("ALTER WORKSPACE w1 OPEN READ WRITE", &[])
+        .expect("正常恢复门后重新开放写入");
+    drop(admin);
+
+    let mut user = Connection::connect_as(&public, "alice", "pw-one").expect("再次认证");
+    user.bind_workspace(None).expect("再次绑定");
+    user.execute("CREATE TABLE writable (id NUMBER)", &[])
+        .expect("恢复读写后应可建表");
+    let status = user.status().expect("状态");
+    assert!(status
+        .iter()
+        .any(|(key, value)| { key == "workspace_write_state" && value == "READ_WRITE" }));
 }

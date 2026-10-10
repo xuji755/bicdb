@@ -216,6 +216,92 @@ pub fn can_migrate_in_page(
         )
 }
 
+/// Whether a growing row can keep its slot (and therefore its ROWID) by
+/// compacting the page and replacing the bytes behind that same slot.
+/// `reserve_bytes` lets the transactional caller conservatively reserve room
+/// for a new ITL entry before it acquires the row lock.
+#[must_use]
+pub fn can_replace_row(page: &Page, row_no: u16, new_len: usize, reserve_bytes: usize) -> bool {
+    if require_data_page(page).is_err() || row(page, row_no).is_none() {
+        return false;
+    }
+    let mut live = 0_usize;
+    for index in 0..page.slot_count() as usize {
+        let Some(slot) = page.slot(index) else {
+            return false;
+        };
+        let len = if index + 1 == usize::from(row_no) {
+            new_len
+        } else if slot.status() == SlotStatus::Forwarding {
+            crate::rowid::ROWID_LEN
+        } else {
+            let start = usize::from(slot.offset());
+            let Ok(header) = RowHeader::read_from(page.as_bytes().get(start..).unwrap_or(&[]))
+            else {
+                return false;
+            };
+            header.row_len as usize
+        };
+        let Some(next) = live.checked_add(len) else {
+            return false;
+        };
+        live = next;
+    }
+    page.row_area_floor().saturating_sub(page.free_start()) >= live.saturating_add(reserve_bytes)
+}
+
+/// Replace a normal row while preserving its slot number. The page is
+/// compacted as part of the operation, so ordinary row growth consumes the
+/// space reserved by PCTFREE without creating a forwarding pointer. Free-slot
+/// row images are copied too: delete undo may still target those bytes.
+pub fn replace_row(page: &mut Page, row_no: u16, new_row: &[u8]) -> Result<(), HeapError> {
+    require_data_page(page)?;
+    crate::row::RowView::new(new_row).map_err(|_| HeapError::BadRow)?;
+    let target = slot_index(row_no).ok_or(HeapError::NoSuchRow)?;
+    if page.slot(target).map(|s| s.status()) != Some(SlotStatus::Normal) {
+        return Err(HeapError::NoSuchRow);
+    }
+    let mut live: Vec<(usize, SlotStatus, Vec<u8>)> = Vec::new();
+    for index in 0..page.slot_count() as usize {
+        let slot = page.slot(index).ok_or(HeapError::BadRow)?;
+        let bytes = if index == target {
+            new_row.to_vec()
+        } else {
+            let start = usize::from(slot.offset());
+            let len = if slot.status() == SlotStatus::Forwarding {
+                crate::rowid::ROWID_LEN
+            } else {
+                RowHeader::read_from(page.as_bytes().get(start..).ok_or(HeapError::BadRow)?)
+                    .map_err(|_| HeapError::BadRow)?
+                    .row_len as usize
+            };
+            page.as_bytes()
+                .get(start..start.checked_add(len).ok_or(HeapError::BadRow)?)
+                .ok_or(HeapError::BadRow)?
+                .to_vec()
+        };
+        live.push((index, slot.status(), bytes));
+    }
+    let mut cursor = page.row_area_floor();
+    for (_, _, bytes) in &live {
+        cursor = cursor.checked_sub(bytes.len()).ok_or(HeapError::PageFull)?;
+    }
+    if cursor < page.free_start() {
+        return Err(HeapError::PageFull);
+    }
+    cursor = page.row_area_floor();
+    for (index, status, bytes) in &live {
+        cursor -= bytes.len();
+        page.as_bytes_mut()[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+        page.set_slot(
+            *index,
+            SlotEntry::new(cursor as u16, *status).ok_or(HeapError::BadRow)?,
+        );
+    }
+    page.set_free_end(cursor);
+    Ok(())
+}
+
 /// **把行迁移出去：原槽位改为转发指针**（§6.2——行体只放 6B 新 ROWID，
 /// 槽位状态 2；原 ROWID 是稳定入口，索引不动）。
 ///
@@ -367,9 +453,11 @@ pub fn delete_row(page: &mut Page, row_no: u16) -> Result<(), HeapError> {
     Ok(())
 }
 
-/// 页内整理：把活动记录按槽位下标升序重排到页底，合并空闲区。
+/// 页内整理：把所有已分配槽位的记录按槽位下标升序重排到页底。
 ///
-/// 返回回收的字节数。转发指针与片段头等其他槽位状态**一并搬运**
+/// Free 槽的旧像仍可能被 delete undo 引用，因此也一并搬运；在尚无
+/// undo-retention 水位判定时不得回收。返回值通常为碎片合并所得字节数。
+/// 转发指针与片段头等其他槽位状态**一并搬运**
 /// （它们也是页里的记录）——但**按各自的长度形态**：普通行/片段头是
 /// "行头 + 行体"（长度由 `row_len` 给出），**转发指针是裸的 6B 目标**
 /// （没有行头——把它当带行头的记录读，会按垃圾 `row_len` 搬运或越界）。
@@ -380,9 +468,6 @@ pub fn defrag(page: &mut Page) -> Result<usize, HeapError> {
     let mut live: Vec<(usize, Vec<u8>)> = Vec::new();
     for i in 0..slots {
         let slot = page.slot(i).ok_or(HeapError::BadRow)?;
-        if slot.status() == SlotStatus::Free {
-            continue;
-        }
         let start = usize::from(slot.offset());
         let bytes = page.as_bytes();
         let len = match slot.status() {
@@ -725,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn defrag_compacts_live_rows_and_reclaims_space() {
+    fn defrag_preserves_free_slot_images_until_undo_retirement() {
         let mut page = Page::new(PageType::HeapTable, [1; 8], 1, 1);
         let policy = InsertPolicy::append_only(); // 不复用槽：制造碎片
         let rows: Vec<Vec<u8>> = (0..6u8).map(|i| tiny_row(&[b'a' + i; 64])).collect();
@@ -737,7 +822,7 @@ mod tests {
         }
         let before = page.free_space();
         let reclaimed = defrag(&mut page).unwrap();
-        assert!(reclaimed > 0, "删除产生的碎片应被回收");
+        assert_eq!(reclaimed, 0, "无 undo 水位时不得回收删除旧像");
         assert_eq!(page.free_space(), before + reclaimed);
         // 活动行仍可读、内容不变。
         for (i, r) in rows.iter().enumerate() {
@@ -748,15 +833,16 @@ mod tests {
                 assert_eq!(row(&page, row_no), Some(&r[..]), "行 {row_no} 内容不变");
             }
         }
-        // 紧凑性：活动记录紧密排列在页底。
-        let live_offsets: Vec<u16> = (1..=6)
+        // 紧凑性：包括 Free 旧像在内的全部记录紧密排列在页底。
+        let allocated_offsets: Vec<u16> = (1..=6)
             .filter_map(|n| page.slot(slot_index(n).unwrap()))
-            .filter(|s| s.status() != SlotStatus::Free)
             .map(|s| s.offset())
             .collect();
-        let total: usize = 4 * rows[0].len();
+        let total: usize = 6 * rows[0].len();
         assert_eq!(page.free_end(), page.row_area_floor() - total);
-        assert!(live_offsets.iter().all(|&o| o >= page.free_end() as u16));
+        assert!(allocated_offsets
+            .iter()
+            .all(|&o| o >= page.free_end() as u16));
         page.seal();
         assert_eq!(page.verify(), PageCheck::Ok);
     }

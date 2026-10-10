@@ -711,3 +711,371 @@ fn an_in_list_over_an_indexed_column_becomes_point_lookups() {
         "SELECT tag FROM t WHERE id NOT IN (1, 3)",
     ));
 }
+
+#[test]
+fn fault_quarantine_gates_sql_before_mutation_and_keeps_reads_and_rollback_available() {
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "fault-quarantine");
+    let mut cat = open(io, &ws);
+    ddl::init_dictionary_tables(&mut cat, ws.engine).unwrap();
+    ddl::create_table(&mut cat, ws.engine, &table_spec("t")).unwrap();
+    let mut session =
+        bicdb_sql::session::Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+    session
+        .execute("INSERT INTO t (id, tag) VALUES (1, 'kept')")
+        .unwrap();
+    session
+        .execute("BEGIN; UPDATE t SET tag='pending' WHERE id=1")
+        .unwrap();
+    ws.pool
+        .quarantine_workspace(WS, "synthetic DBWR failure".into());
+    for sql in [
+        "BEGIN",
+        "COMMIT",
+        "INSERT INTO t (id) VALUES (2)",
+        "UPDATE t SET tag='blocked'",
+        "DELETE FROM t",
+        "CREATE TABLE blocked (id NUMBER)",
+        "CREATE GRAPH blocked",
+    ] {
+        let error = session.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("封锁写入"), "{sql}: {error}");
+    }
+    assert!(session.execute("SHOW TABLES").is_ok());
+    assert_eq!(
+        session.execute("SELECT id FROM t").unwrap()[0].row_count(),
+        1
+    );
+    session.execute("ROLLBACK").unwrap();
+    let rows = session.execute("SELECT tag FROM t WHERE id=1").unwrap();
+    let bicdb_sql::session::QueryResult::Rows { rows, .. } = &rows[0] else {
+        panic!("rows expected")
+    };
+    assert_eq!(rows[0][0], bicdb_exec::Value::Bytes(b"kept".to_vec()));
+    assert!(ws.pool.workspace_fault(WS).is_some());
+}
+
+#[test]
+fn administrator_read_only_gate_is_reversible_and_does_not_stop_reads() {
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "administrator-read-only");
+    let mut cat = open(io, &ws);
+    ddl::init_dictionary_tables(&mut cat, ws.engine).unwrap();
+    ddl::create_table(&mut cat, ws.engine, &table_spec("t")).unwrap();
+    let mut session =
+        bicdb_sql::session::Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+    session.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+    ws.pool
+        .set_workspace_read_only(WS, "maintenance window".into());
+    assert!(session.execute("SELECT id FROM t").is_ok());
+    assert!(session.execute("SHOW TABLES").is_ok());
+    for sql in [
+        "BEGIN",
+        "INSERT INTO t (id) VALUES (2)",
+        "UPDATE t SET id=3",
+        "DELETE FROM t",
+        "CREATE TABLE blocked (id NUMBER)",
+        "CREATE GRAPH blocked",
+    ] {
+        let error = session.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("管理员设为只读"), "{sql}: {error}");
+    }
+    ws.pool.clear_workspace_read_only(WS);
+    session.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+    assert_eq!(
+        session.execute("SELECT id FROM t").unwrap()[0].row_count(),
+        2
+    );
+}
+
+#[test]
+fn quarantined_object_is_a_named_error_instead_of_an_empty_result() {
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "object-quarantine");
+    let mut cat = open(io, &ws);
+    ddl::init_dictionary_tables(&mut cat, ws.engine).unwrap();
+    ddl::create_table(&mut cat, ws.engine, &table_spec("damaged_t")).unwrap();
+    ddl::create_table(&mut cat, ws.engine, &table_spec("healthy_t")).unwrap();
+    let damaged = cat
+        .resolve(
+            seq(ws.engine.current_seq()),
+            bicdb_catalog::dict::namespace::TABLE,
+            "damaged_t",
+        )
+        .unwrap()
+        .obj;
+    ws.pool
+        .quarantine_object(WS, u64::from(damaged), "segment validation failed".into());
+
+    let mut session =
+        bicdb_sql::session::Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+    for sql in [
+        "SELECT * FROM damaged_t",
+        "INSERT INTO damaged_t (id) VALUES (1)",
+        "UPDATE damaged_t SET id=2",
+        "DELETE FROM damaged_t",
+    ] {
+        let error = session.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("已由恢复管理隔离"), "{sql}: {error}");
+        assert!(
+            error.contains("segment validation failed"),
+            "{sql}: {error}"
+        );
+    }
+    assert!(session.execute("SELECT * FROM healthy_t").is_ok());
+}
+
+#[test]
+fn quarantined_graph_is_rejected_before_cypher_reads_its_storage() {
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "graph-object-quarantine");
+    let mut cat = open(io, &ws);
+    ddl::init_dictionary_tables(&mut cat, ws.engine).unwrap();
+    {
+        let mut session =
+            bicdb_sql::session::Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+        session.execute("CREATE GRAPH damaged_g").unwrap();
+    }
+    let graph = cat
+        .resolve(
+            seq(ws.engine.current_seq()),
+            bicdb_catalog::dict::namespace::TABLE,
+            "damaged_g",
+        )
+        .unwrap();
+    ws.pool
+        .quarantine_object(WS, u64::from(graph.obj), "graph heap damaged".into());
+    let mut session =
+        bicdb_sql::session::Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+    let error = session
+        .execute("CYPHER damaged_g 'MATCH (n) RETURN count(n)'")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("已由恢复管理隔离"), "{error}");
+    assert!(error.contains("graph heap damaged"), "{error}");
+}
+
+#[test]
+fn cooperative_batch_resumes_on_another_session_without_replaying_completed_statements() {
+    use bicdb_sql::session::{Session, SessionState, SqlRequest, SqlStep};
+    use bicdb_txn::engine::RowWaitStatus;
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "cooperative-batch");
+    let mut initial = open(io, &ws);
+    ddl::init_dictionary_tables(&mut initial, ws.engine).unwrap();
+    ddl::create_table(&mut initial, ws.engine, &table_spec("t")).unwrap();
+    Session::new(ws.pool, ws.engine, &mut initial, ws.engine.current_seq())
+        .execute("INSERT INTO t (id, tag) VALUES (1, 'old')")
+        .unwrap();
+    let mut owner_cat = open(io, &ws);
+    let mut owner = Session::new(ws.pool, ws.engine, &mut owner_cat, ws.engine.current_seq());
+    owner
+        .execute("BEGIN; UPDATE t SET tag='owner' WHERE id=1")
+        .unwrap();
+    let mut request = SqlRequest::parse(
+        "INSERT INTO t (id, tag) VALUES (:id, 'once'); UPDATE t SET tag=:tag WHERE id=1; SELECT id, tag FROM t ORDER BY id",
+        vec![("id".into(), bicdb_exec::Value::Number(bicdb_types::Number::parse("2").unwrap())),
+             ("tag".into(), bicdb_exec::Value::Bytes(b"resumed".to_vec()))]).unwrap();
+    let mut state = SessionState::new(ws.engine.current_seq());
+    let mut cat = open(io, &ws);
+    let mut session = Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+    session.resume_state(&mut state);
+    let SqlStep::Waiting(mut wait) = session.execute_sql_step(&mut request).unwrap() else {
+        panic!("must yield")
+    };
+    assert_eq!(request.completed_statements(), 1);
+    session.suspend_state(&mut state);
+    drop(session);
+    assert!(
+        !state.in_transaction(),
+        "auto-commit wait is not an explicit transaction"
+    );
+    assert_eq!(
+        ws.engine.poll_row_wait(&mut wait).unwrap(),
+        RowWaitStatus::Pending
+    );
+    // The same workspace's other connection cannot adopt this request.
+    let mut foreign_cat = open(io, &ws);
+    let mut foreign = Session::new(
+        ws.pool,
+        ws.engine,
+        &mut foreign_cat,
+        ws.engine.current_seq(),
+    );
+    assert!(foreign.execute_sql_step(&mut request).is_err());
+    assert!(!request.is_terminal());
+    owner.execute("COMMIT").unwrap();
+    assert_eq!(
+        ws.engine.poll_row_wait(&mut wait).unwrap(),
+        RowWaitStatus::Ready
+    );
+    state.refresh_committed(ws.engine.current_seq());
+    let mut resumed_cat = open(io, &ws);
+    let mut resumed = Session::new(
+        ws.pool,
+        ws.engine,
+        &mut resumed_cat,
+        ws.engine.current_seq(),
+    );
+    resumed.resume_state(&mut state);
+    let SqlStep::Complete(results) = resumed.execute_sql_step(&mut request).unwrap() else {
+        panic!("must finish")
+    };
+    assert_eq!(results.len(), 3);
+    assert!(matches!(
+        results[0],
+        bicdb_sql::session::QueryResult::Affected(1)
+    ));
+    assert!(matches!(
+        results[1],
+        bicdb_sql::session::QueryResult::Affected(1)
+    ));
+    let bicdb_sql::session::QueryResult::Rows { rows, .. } = &results[2] else {
+        panic!("rows expected")
+    };
+    assert_eq!(rows.len(), 2, "the earlier INSERT must not execute again");
+    assert_eq!(rows[0][1], bicdb_exec::Value::Bytes(b"resumed".to_vec()));
+    assert!(
+        !resumed.in_transaction(),
+        "resumed auto-commit DML must commit"
+    );
+    assert!(resumed.execute_sql_step(&mut request).is_err());
+}
+
+#[test]
+fn cooperative_retry_rechecks_predicate_after_owner_commit() {
+    use bicdb_sql::session::{Session, SessionState, SqlRequest, SqlStep};
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "cooperative-predicate");
+    let mut initial = open(io, &ws);
+    ddl::init_dictionary_tables(&mut initial, ws.engine).unwrap();
+    ddl::create_table(&mut initial, ws.engine, &table_spec("t")).unwrap();
+    Session::new(ws.pool, ws.engine, &mut initial, ws.engine.current_seq())
+        .execute("INSERT INTO t (id, tag) VALUES (1, 'old')")
+        .unwrap();
+    let mut owner_cat = open(io, &ws);
+    let mut owner = Session::new(ws.pool, ws.engine, &mut owner_cat, ws.engine.current_seq());
+    owner
+        .execute("BEGIN; UPDATE t SET tag='owner' WHERE id=1")
+        .unwrap();
+    let mut request = SqlRequest::parse(
+        "UPDATE t SET tag='incorrect' WHERE id=1 AND tag='old'",
+        vec![],
+    )
+    .unwrap();
+    let mut state = SessionState::new(ws.engine.current_seq());
+    let mut cat = open(io, &ws);
+    let mut session = Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+    let SqlStep::Waiting(wait) = session.execute_sql_step(&mut request).unwrap() else {
+        panic!("must yield")
+    };
+    session.suspend_state(&mut state);
+    drop(session);
+    owner.execute("COMMIT").unwrap();
+    drop(wait);
+    let mut resumed_cat = open(io, &ws);
+    let mut resumed = Session::new(
+        ws.pool,
+        ws.engine,
+        &mut resumed_cat,
+        ws.engine.current_seq(),
+    );
+    resumed.resume_state(&mut state);
+    let SqlStep::Complete(results) = resumed.execute_sql_step(&mut request).unwrap() else {
+        panic!("must finish")
+    };
+    assert!(matches!(
+        results[0],
+        bicdb_sql::session::QueryResult::Affected(0)
+    ));
+}
+
+#[test]
+fn cancelling_cooperative_dml_preserves_prior_explicit_work_and_releases_statement_locks() {
+    use bicdb_sql::session::{Session, SqlRequest, SqlStep};
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "cooperative-cancel");
+    let mut cat = open(io, &ws);
+    ddl::init_dictionary_tables(&mut cat, ws.engine).unwrap();
+    ddl::create_table(&mut cat, ws.engine, &table_spec("t")).unwrap();
+    Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq())
+        .execute("INSERT INTO t (id, tag) VALUES (1, 'old'); INSERT INTO t (id, tag) VALUES (2, 'old'); INSERT INTO t (id, tag) VALUES (3, 'old')").unwrap();
+    let mut owner_cat = open(io, &ws);
+    let mut owner = Session::new(ws.pool, ws.engine, &mut owner_cat, ws.engine.current_seq());
+    owner
+        .execute("BEGIN; UPDATE t SET tag='owner' WHERE id=2")
+        .unwrap();
+    let mut waiting_cat = open(io, &ws);
+    let mut waiting = Session::new(
+        ws.pool,
+        ws.engine,
+        &mut waiting_cat,
+        ws.engine.current_seq(),
+    );
+    waiting
+        .execute("BEGIN; UPDATE t SET tag='prior' WHERE id=3")
+        .unwrap();
+    let mut request =
+        SqlRequest::parse("UPDATE t SET tag='statement' WHERE id<=2", vec![]).unwrap();
+    let SqlStep::Waiting(wait) = waiting.execute_sql_step(&mut request).unwrap() else {
+        panic!("must yield after touching row 1")
+    };
+    let mut other_cat = open(io, &ws);
+    let mut other = Session::new(ws.pool, ws.engine, &mut other_cat, ws.engine.current_seq());
+    assert!(other.cancel_sql_request(&mut request).is_err());
+    assert!(!request.is_terminal());
+    waiting.cancel_sql_request(&mut request).unwrap();
+    drop(wait);
+    assert!(
+        waiting.in_transaction(),
+        "earlier explicit work is still owned"
+    );
+    other
+        .execute("UPDATE t SET tag='released' WHERE id=1")
+        .unwrap();
+    let mut prior_lock =
+        SqlRequest::parse("UPDATE t SET tag='incorrect' WHERE id=3", vec![]).unwrap();
+    let SqlStep::Waiting(wait) = other.execute_sql_step(&mut prior_lock).unwrap() else {
+        panic!("prior statement lock must remain")
+    };
+    other.cancel_sql_request(&mut prior_lock).unwrap();
+    drop(wait);
+    assert!(
+        !other.in_transaction(),
+        "cancelled auto transaction must be rolled back"
+    );
+    waiting.execute("COMMIT").unwrap();
+    owner.execute("ROLLBACK").unwrap();
+    let result = other.execute("SELECT tag FROM t WHERE id=3").unwrap();
+    let bicdb_sql::session::QueryResult::Rows { rows, .. } = &result[0] else {
+        panic!("rows expected")
+    };
+    assert_eq!(rows[0][0], bicdb_exec::Value::Bytes(b"prior".to_vec()));
+    assert!(ws.engine.gate().snapshot(0).edges.is_empty());
+}
+
+#[test]
+fn missing_arguments_reject_the_entire_batch_before_its_first_insert() {
+    use bicdb_sql::session::{Session, SqlRequest};
+    let io: &'static MemFileIo = Box::leak(Box::new(MemFileIo::new()));
+    io.add_dir("/mem");
+    let ws = workspace(io, "cooperative-arguments");
+    let mut cat = open(io, &ws);
+    ddl::init_dictionary_tables(&mut cat, ws.engine).unwrap();
+    ddl::create_table(&mut cat, ws.engine, &table_spec("t")).unwrap();
+    let mut session = Session::new(ws.pool, ws.engine, &mut cat, ws.engine.current_seq());
+    let sql = "INSERT INTO t (id) VALUES (1); UPDATE t SET tag=:missing";
+    assert!(SqlRequest::parse(sql, vec![]).is_err());
+    assert!(session.execute(sql).is_err());
+    assert_eq!(
+        session.execute("SELECT id FROM t").unwrap()[0].row_count(),
+        0
+    );
+}

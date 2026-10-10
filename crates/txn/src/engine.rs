@@ -22,14 +22,15 @@
 //! 终态的持久化侧随 #63 细则与协议层对账落地；`commit` 已返回**提交序号**
 //! （终态查询的输入）。
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bicdb_common::seq::CommitSeq;
 use bicdb_storage::buffer::{BufferKey, BufferPool};
+use bicdb_storage::rowid::RowId;
 use bicdb_storage::undo::{TxnId, TxnState, UndoChain, UndoError};
 use bicdb_wal::group::GroupWriter;
 
-use crate::lock::{Deadlock, WaitGate};
+use crate::lock::{Deadlock, TicketState, WaitGate, WaitTicket};
 use crate::snapshot::{SnapshotHandle, SnapshotRegistry};
 use crate::write::{self, StatementContext, StatementMark, Txn, TxnError, WaitPolicy};
 
@@ -50,6 +51,63 @@ impl TxnHandle {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.txn.state == TxnState::Active
+    }
+}
+
+/// Result of a nonblocking row-owner wait probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowWaitStatus {
+    /// No lock is transferred; rescan the original statement and predicate.
+    Ready,
+    /// Retain the request outside the SQL execution pool.
+    Pending,
+    /// Explicitly cancelled or superseded by another wait generation.
+    Cancelled,
+}
+
+/// Owned enq registration. Contains no page pin, catalog cursor, undo/WAL lock
+/// or OS thread. Dropping a disconnected request cancels only this generation.
+#[derive(Debug)]
+pub struct RowOwnerWait {
+    gate: Arc<WaitGate>,
+    ticket: WaitTicket,
+    holder: TxnId,
+    waiter: TxnId,
+    row: RowId,
+    next_check: std::time::Instant,
+    deadline: Option<std::time::Instant>,
+    period: std::time::Duration,
+    needs_header: bool,
+    terminal: Option<RowWaitStatus>,
+}
+impl RowOwnerWait {
+    /// FIFO order within this engine's enq registry; not a global transaction ID.
+    pub fn registration_order(&self) -> u64 {
+        self.ticket.registration_order()
+    }
+    /// Suggested timer delay; owner completion can wake the request earlier.
+    pub fn retry_after(&self) -> std::time::Duration {
+        self.next_check
+            .saturating_duration_since(std::time::Instant::now())
+    }
+    /// Header loading belongs to a worker, never to the control/lock poll loop.
+    pub fn needs_header(&self) -> bool {
+        self.needs_header
+    }
+    /// Cancel the registration without rolling back the transaction or its locks.
+    pub fn cancel(&mut self) {
+        self.gate.cancel_ticket(self.ticket);
+        self.terminal = Some(RowWaitStatus::Cancelled);
+    }
+    fn finish(&mut self, outcome: RowWaitStatus) -> RowWaitStatus {
+        self.gate.cancel_ticket(self.ticket);
+        self.terminal = Some(outcome);
+        outcome
+    }
+}
+impl Drop for RowOwnerWait {
+    fn drop(&mut self) {
+        self.gate.cancel_ticket(self.ticket);
     }
 }
 
@@ -88,7 +146,8 @@ pub struct Engine<'a, 'b, 'io, 'f> {
     /// 快照注册表（最老快照封顶 undo 保留，§12.7）。
     snapshots: Mutex<SnapshotRegistry>,
     /// 行锁的等待门（§5.4.2）。
-    gate: WaitGate,
+    gate: Arc<WaitGate>,
+    undo_header: BufferKey,
     /// 当前提交序号（**已发布**的最大值；`begin` 的语句快照取它）。
     current_seq: Mutex<CommitSeq>,
     /// At most 128 complete graph validation receipts for this process/epoch.
@@ -130,12 +189,22 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         initial_seq: CommitSeq,
     ) -> Self {
         wal.seed_commit_seq(initial_seq);
+        let segment = chain.segment();
+        let undo_header = BufferKey::new(
+            segment.workspace_ref(),
+            bicdb_storage::rowid::Rdba::from_parts(
+                segment.file_id(),
+                segment.logical_block(0).expect("undo header block"),
+            )
+            .expect("undo header address"),
+        );
         Self {
             pool,
             wal: Mutex::new(wal),
             chain: Mutex::new(chain),
             snapshots: Mutex::new(SnapshotRegistry::new()),
-            gate: WaitGate::new(),
+            gate: Arc::new(WaitGate::new()),
+            undo_header,
             current_seq: Mutex::new(initial_seq),
             graph_authorities: Mutex::new(Vec::new()),
             next_seq: Mutex::new(initial_seq),
@@ -270,6 +339,25 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         workspace: [u8; 8],
     ) -> Result<bicdb_wal::checkpoint::CheckpointReport, bicdb_wal::checkpoint::CheckpointError>
     {
+        self.checkpoint_full_impl(workspace, false)
+    }
+
+    /// Final shutdown checkpoint rejects any unresolved undo transaction slot.
+    pub fn checkpoint_shutdown(
+        &self,
+        workspace: [u8; 8],
+    ) -> Result<bicdb_wal::checkpoint::CheckpointReport, bicdb_wal::checkpoint::CheckpointError>
+    {
+        self.checkpoint_full_impl(workspace, true)
+    }
+
+    fn checkpoint_full_impl(
+        &self,
+        workspace: [u8; 8],
+        shutdown: bool,
+    ) -> Result<bicdb_wal::checkpoint::CheckpointReport, bicdb_wal::checkpoint::CheckpointError>
+    {
+        self.pool.ensure_workspace_writable(workspace)?;
         let oldest = self.oldest_snapshot();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -283,13 +371,95 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
             ));
         }
         let current = wal.commit_watermark();
-        bicdb_wal::checkpoint::transaction_checkpoint(
+        let checkpoint = if shutdown {
+            bicdb_wal::checkpoint::shutdown_checkpoint
+        } else {
+            bicdb_wal::checkpoint::transaction_checkpoint
+        };
+        checkpoint(
             &mut wal,
             self.pool,
             &chain,
             oldest.unwrap_or(current),
             timestamp,
         )
+    }
+
+    /// Incremental checkpoint; busy operation/page boundaries defer instead of
+    /// blocking the instance coordinator. No data-page writeback is performed.
+    pub fn checkpoint_incremental(
+        &self,
+        workspace: [u8; 8],
+    ) -> Result<
+        Option<bicdb_wal::checkpoint::CheckpointReport>,
+        bicdb_wal::checkpoint::CheckpointError,
+    > {
+        if self.pool.workspace_fault(workspace).is_some() {
+            return Ok(None);
+        }
+        use std::sync::TryLockError;
+        let mut wal = match self.wal.try_lock() {
+            Ok(wal) => wal,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let chain = match self.chain.try_lock() {
+            Ok(chain) => chain,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        if workspace != chain.segment().workspace_ref() {
+            return Err(bicdb_wal::checkpoint::CheckpointError::InvalidUndo(
+                "workspace mismatch",
+            ));
+        }
+        let current = wal.commit_watermark();
+        let oldest = self.oldest_snapshot().unwrap_or(current);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        bicdb_wal::checkpoint::transaction_checkpoint_incremental(
+            &mut wal, self.pool, &chain, oldest, timestamp,
+        )
+    }
+
+    /// Nonblocking maintenance for the independent undo worker. No checkpoint
+    /// metadata or data-file writes are performed here.
+    pub fn repair_undo_slots(
+        &self,
+        workspace: [u8; 8],
+    ) -> Result<Option<bool>, bicdb_wal::checkpoint::CheckpointError> {
+        if self.pool.workspace_fault(workspace).is_some() {
+            return Ok(None);
+        }
+        match self.pool.load_checkpoint_headers(workspace) {
+            Ok(()) => {}
+            Err(bicdb_storage::buffer::BufferError::FreeBufferWait) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        use std::sync::TryLockError;
+        let mut wal = match self.wal.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let chain = match self.chain.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        if workspace != chain.segment().workspace_ref() {
+            return Err(bicdb_wal::checkpoint::CheckpointError::InvalidUndo(
+                "workspace mismatch",
+            ));
+        }
+        bicdb_wal::checkpoint::repair_transaction_slots(&mut wal, self.pool, &chain)
+    }
+
+    /// Shared durability endpoint for instance-level LGWR scheduling.
+    pub fn wal_shared(&self) -> std::sync::Arc<bicdb_wal::group::WalShared<'io>> {
+        self.wal.lock().unwrap_or_else(|e| e.into_inner()).shared()
     }
 
     /// **下一次日志切换会不会被挡**（CKPT 的"组满被迫"触发条件，§11.7）。
@@ -463,6 +633,145 @@ impl<'a, 'b, 'io, 'f> Engine<'a, 'b, 'io, 'f> {
         )
     }
 
+    /// Wait for the owner reported by a failed row-write attempt to finish.
+    ///
+    /// The caller must first roll the whole SQL statement back to its mark.
+    /// Stable root ROWIDs survive migration. Waiting does not preserve an old
+    /// materialized row image or target position: after owner release the
+    /// caller must rescan and re-evaluate the original predicate.
+    pub fn wait_for_row_owner(
+        &self,
+        txn: &TxnHandle,
+        holder: TxnId,
+        row: RowId,
+    ) -> Result<(), TxnError> {
+        let mut wait = self.enqueue_row_wait(txn, holder, row);
+        loop {
+            match self.poll_row_wait(&mut wait)? {
+                RowWaitStatus::Ready => return Ok(()),
+                RowWaitStatus::Cancelled => return Err(TxnError::LockWaitCancelled),
+                RowWaitStatus::Pending => {
+                    if wait.needs_header() {
+                        self.load_row_wait_header(&mut wait)?;
+                    }
+                    wait.gate.park_ticket(wait.ticket, wait.retry_after());
+                }
+            }
+        }
+    }
+
+    /// Register once after statement rollback. Owner release before or after
+    /// registration is handled by a notification or the resident slot probe.
+    pub fn enqueue_row_wait(&self, txn: &TxnHandle, holder: TxnId, row: RowId) -> RowOwnerWait {
+        let now = std::time::Instant::now();
+        let period = self
+            .policy
+            .park_timeout
+            .max(std::time::Duration::from_millis(1));
+        let deadline = self
+            .policy
+            .max_waits
+            .map(|max| now.checked_add(period.saturating_mul(max)).unwrap_or(now));
+        RowOwnerWait {
+            gate: Arc::clone(&self.gate),
+            ticket: self.gate.enqueue(txn.id(), holder, row, now_ms()),
+            holder,
+            waiter: txn.id(),
+            row,
+            next_check: now,
+            deadline,
+            period,
+            needs_header: false,
+            terminal: None,
+        }
+    }
+
+    /// Probe without any WAL/undo mutex, disk I/O or blocking content latch.
+    /// A pending result lets the instance scheduler release its SQL worker.
+    pub fn poll_row_wait(&self, wait: &mut RowOwnerWait) -> Result<RowWaitStatus, TxnError> {
+        if !Arc::ptr_eq(&self.gate, &wait.gate) {
+            return Err(TxnError::UnboundUndoChain);
+        }
+        if let Some(status) = wait.terminal {
+            return Ok(status);
+        }
+        let result = self.poll_row_wait_inner(wait);
+        if result.is_err() {
+            wait.cancel();
+        }
+        result
+    }
+
+    fn poll_row_wait_inner(&self, wait: &mut RowOwnerWait) -> Result<RowWaitStatus, TxnError> {
+        self.pool
+            .ensure_workspace_writable(self.undo_header.workspace)
+            .map_err(TxnError::Pool)?;
+        match self.gate.poll_ticket(wait.ticket) {
+            TicketState::Woken => return Ok(wait.finish(RowWaitStatus::Ready)),
+            TicketState::Cancelled => return Ok(wait.finish(RowWaitStatus::Cancelled)),
+            TicketState::Pending => {}
+        }
+        let now = std::time::Instant::now();
+        if now < wait.next_check {
+            return Ok(RowWaitStatus::Pending);
+        }
+        wait.next_check = now + wait.period;
+        let expired = wait.deadline.is_some_and(|deadline| now >= deadline);
+        let Some(header) = self.pool.try_pin(self.undo_header) else {
+            wait.needs_header = !self.pool.is_resident(self.undo_header);
+            if expired {
+                return Err(TxnError::LockTimeout {
+                    holder: wait.holder,
+                    row: wait.row,
+                });
+            }
+            return Ok(RowWaitStatus::Pending);
+        };
+        wait.needs_header = false;
+        let active = bicdb_storage::undo::find_slot(&header, wait.holder)?
+            .is_some_and(|slot| matches!(slot.state, TxnState::Active | TxnState::PendingRollback));
+        if !active {
+            return Ok(wait.finish(RowWaitStatus::Ready));
+        }
+        let graph = self.gate.snapshot(now_ms());
+        let deadlock = crate::lock::detect_deadlock_with_slots(
+            &graph,
+            self.policy.deadlock_threshold_ms,
+            |txn| bicdb_storage::undo::find_slot(&header, txn),
+        )?;
+        if let Some(deadlock) = deadlock {
+            if deadlock.victim == wait.waiter {
+                return Err(TxnError::DeadlockVictim {
+                    cycle: deadlock.cycle,
+                });
+            }
+        }
+        if expired {
+            return Err(TxnError::LockTimeout {
+                holder: wait.holder,
+                row: wait.row,
+            });
+        }
+        Ok(RowWaitStatus::Pending)
+    }
+
+    /// Explicit cache-miss preparation by a worker/synchronous adapter.
+    pub fn load_row_wait_header(&self, wait: &mut RowOwnerWait) -> Result<(), TxnError> {
+        if !Arc::ptr_eq(&self.gate, &wait.gate) {
+            return Err(TxnError::UnboundUndoChain);
+        }
+        if wait.terminal.is_some() {
+            return Ok(());
+        }
+        self.pool
+            .ensure_workspace_writable(self.undo_header.workspace)
+            .map_err(TxnError::Pool)?;
+        drop(self.pool.pin(self.undo_header).map_err(TxnError::Pool)?);
+        wait.needs_header = false;
+        wait.next_check = std::time::Instant::now();
+        Ok(())
+    }
+
     /// 引擎内的 DML 入口（**过渡形态**：正式入口是"存储服务"（REQ-ENG-003），
     /// 本口供本 crate 的用例与最近的执行器切片使用）。
     ///
@@ -539,10 +848,12 @@ impl<'a, 'b, 'io, 'f> StatementContext for LockCtx<'_, 'a, 'b, 'io, 'f> {
 
 /// 单调毫秒时钟（死锁阈值与等待时长；标准库）。
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -590,6 +901,25 @@ mod tests {
     fn engine() -> (
         &'static Engine<'static, 'static, 'static, 'static>,
         BufferKey,
+    ) {
+        let (engine, key, _) = engine_with_io();
+        (engine, key)
+    }
+
+    fn engine_with_io() -> (
+        &'static Engine<'static, 'static, 'static, 'static>,
+        BufferKey,
+        &'static MemFileIo,
+    ) {
+        engine_with_policy(WaitPolicy::default())
+    }
+
+    fn engine_with_policy(
+        policy: WaitPolicy,
+    ) -> (
+        &'static Engine<'static, 'static, 'static, 'static>,
+        BufferKey,
+        &'static MemFileIo,
     ) {
         let io: &'static MemFileIo = Box::leak(Box::new({
             let io = MemFileIo::new();
@@ -650,16 +980,494 @@ mod tests {
             bicdb_common::seq::Lsn::from_raw(0).unwrap(),
         )
         .unwrap();
-        let engine = Box::leak(Box::new(Engine::new(
-            pool,
-            wal,
-            UndoChain::open(segment).with_pool(pool),
-            seq(0),
-        )));
-        (engine, BufferKey::new(WS, Rdba::from_parts(3, 1).unwrap()))
+        let mut engine = Engine::new(pool, wal, UndoChain::open(segment).with_pool(pool), seq(0));
+        engine.set_policy(policy);
+        let engine = Box::leak(Box::new(engine));
+        (
+            engine,
+            BufferKey::new(WS, Rdba::from_parts(3, 1).unwrap()),
+            io,
+        )
     }
 
     use bicdb_storage::heap::InsertPolicy;
+
+    #[test]
+    fn incremental_checkpoint_recovery_preserves_winner_and_rolls_back_loser() {
+        let (engine, key, io) = engine_with_io();
+        for file_id in [1, 3] {
+            engine.pool.register_checkpoint_file(BufferKey::new(
+                WS,
+                Rdba::from_parts(file_id, 0).unwrap(),
+            ));
+        }
+        engine.pool.load_checkpoint_headers(WS).unwrap();
+        let mut winner = engine.begin().unwrap();
+        let kept = engine
+            .insert_row(
+                &mut winner,
+                key,
+                &row_bytes(b"kept"),
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+        engine.commit(&mut winner).unwrap();
+        let mut loser = engine.begin().unwrap();
+        let removed = engine
+            .insert_row(
+                &mut loser,
+                key,
+                &row_bytes(b"loser"),
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+        {
+            let mut wal = engine.wal.lock().unwrap();
+            let end = wal.appended_lsn();
+            wal.flush(end).unwrap();
+        }
+        let checkpoint = engine.checkpoint_incremental(WS).unwrap().unwrap();
+        assert_eq!(checkpoint.pages_written, 0);
+        assert!(engine.pool.dirty_len(WS) > 0);
+        for file in [UNDO_F, DATA_F] {
+            let head = DataFile::open(io, Path::new(file)).unwrap();
+            assert_eq!(head.file_scn(), checkpoint.progress.checkpoint_lsn.as_raw());
+            assert_eq!(
+                head.checkpoint_commit_scn(),
+                checkpoint.progress.checkpoint_commit_seq.as_raw()
+            );
+            head.close().unwrap();
+        }
+        // Discard all live cache/transaction state; recovery reads only the
+        // persisted in-memory filesystem, never the old BufferPool.
+        let mut undo = DataFile::open(io, Path::new(UNDO_F)).unwrap();
+        let undo_handle = undo.handle();
+        let data = DataFile::open(io, Path::new(DATA_F)).unwrap();
+        let data_handle = data.handle();
+        let mut chain = UndoChain::open(
+            bicdb_storage::segment::Segment::open(
+                &mut undo,
+                engine.chain.lock().unwrap().segment().page0_block(),
+            )
+            .unwrap(),
+        );
+        let mut control = ControlFile::open(io, Path::new(A), Path::new(B)).unwrap();
+        assert_eq!(control.checkpoint_progress().unwrap(), checkpoint.progress);
+        let spec = bicdb_wal::group::GroupSpec::new(2, 1, 64).unwrap();
+        let groups = bicdb_wal::group::online_groups(io, &control, Path::new(WAL), spec).unwrap();
+        let mut writer = GroupWriter::open(io, &mut control, Path::new(WAL), spec).unwrap();
+        let mut resolve = |rdba: Rdba| match rdba.file_id() {
+            1 => Some((undo_handle, rdba.block_id())),
+            3 => Some((data_handle, rdba.block_id())),
+            _ => None,
+        };
+        let recovered = bicdb_wal::recovery::recover(
+            io,
+            &groups,
+            checkpoint.progress.checkpoint_lsn,
+            &mut chain,
+            &mut writer,
+            &mut resolve,
+        )
+        .unwrap();
+        assert_eq!(recovered.undo.txns_rolled_back, 1);
+        let page = pagefile::read_page_verified(io, data_handle, 1).unwrap();
+        let bytes = bicdb_storage::heap::row(&page, kept.row_id()).expect("committed row survives");
+        assert!(bytes.ends_with(b"kept"));
+        assert!(bicdb_storage::heap::row(&page, removed.row_id()).is_none());
+    }
+
+    #[test]
+    fn cold_wait_probe_never_loads_a_header_or_allocates_cache_frames() {
+        let (engine, key) = engine();
+        let mut owner = engine.begin().unwrap();
+        let mut waiter = engine.begin().unwrap();
+        engine.checkpoint_full(WS).unwrap();
+        engine.pool.drop_clean_frames(0).unwrap();
+        assert_eq!(engine.pool.resident(), 0);
+        let row =
+            bicdb_storage::rowid::RowId::from_parts(key.rdba.file_id(), key.rdba.block_id(), 1)
+                .unwrap();
+        let mut ticket = engine.enqueue_row_wait(&waiter, owner.id(), row);
+        assert_eq!(
+            engine.poll_row_wait(&mut ticket).unwrap(),
+            RowWaitStatus::Pending
+        );
+        assert!(ticket.needs_header());
+        assert_eq!(
+            engine.pool.resident(),
+            0,
+            "reactor poll must not read from the file"
+        );
+        engine.load_row_wait_header(&mut ticket).unwrap();
+        assert_eq!(
+            engine.poll_row_wait(&mut ticket).unwrap(),
+            RowWaitStatus::Pending
+        );
+        engine.commit(&mut owner).unwrap();
+        assert_eq!(
+            engine.poll_row_wait(&mut ticket).unwrap(),
+            RowWaitStatus::Ready
+        );
+        engine.rollback(&mut waiter).unwrap();
+    }
+
+    #[test]
+    fn nonblocking_wait_timeout_and_deadlock_cancel_their_generation() {
+        let (engine, key, _) = engine_with_policy(WaitPolicy {
+            max_waits: Some(0),
+            ..WaitPolicy::default()
+        });
+        let mut owner = engine.begin().unwrap();
+        let mut waiter = engine.begin().unwrap();
+        let row =
+            bicdb_storage::rowid::RowId::from_parts(key.rdba.file_id(), key.rdba.block_id(), 1)
+                .unwrap();
+        let mut ticket = engine.enqueue_row_wait(&waiter, owner.id(), row);
+        let held = engine.pool.pin(engine.undo_header).unwrap();
+        assert!(matches!(
+            engine.poll_row_wait(&mut ticket),
+            Err(TxnError::LockTimeout { .. })
+        ));
+        drop(held);
+        assert!(engine.gate.waiters_of(owner.id()).is_empty());
+        engine.rollback(&mut owner).unwrap();
+        engine.rollback(&mut waiter).unwrap();
+
+        let (engine, key, _) = engine_with_policy(WaitPolicy {
+            deadlock_threshold_ms: 0,
+            ..WaitPolicy::default()
+        });
+        let mut a = engine.begin().unwrap();
+        let mut b = engine.begin().unwrap();
+        let row =
+            bicdb_storage::rowid::RowId::from_parts(key.rdba.file_id(), key.rdba.block_id(), 1)
+                .unwrap();
+        let mut a_wait = engine.enqueue_row_wait(&a, b.id(), row);
+        let b_wait = engine.enqueue_row_wait(&b, a.id(), row);
+        engine.with_read_context(|_, _| {
+            assert!(matches!(
+                engine.poll_row_wait(&mut a_wait),
+                Err(TxnError::DeadlockVictim { .. })
+            ));
+        });
+        assert!(engine.gate.waiters_of(b.id()).is_empty());
+        drop(b_wait);
+        engine.rollback(&mut a).unwrap();
+        engine.rollback(&mut b).unwrap();
+    }
+
+    #[test]
+    fn row_wait_poll_does_not_take_wal_or_undo_mutexes_and_release_is_not_lost() {
+        let (engine, key) = engine();
+        let mut holder = engine.begin().unwrap();
+        let mut waiter = engine.begin().unwrap();
+        let row =
+            bicdb_storage::rowid::RowId::from_parts(key.rdba.file_id(), key.rdba.block_id(), 1)
+                .unwrap();
+        let mut ticket = engine.enqueue_row_wait(&waiter, holder.id(), row);
+        engine.with_write_context(&mut holder, |_, _, _, _| {
+            assert_eq!(
+                engine.poll_row_wait(&mut ticket).unwrap(),
+                RowWaitStatus::Pending
+            );
+        });
+        // Owner completion before reactor polling must be remembered.
+        engine.commit(&mut holder).unwrap();
+        assert_eq!(
+            engine.poll_row_wait(&mut ticket).unwrap(),
+            RowWaitStatus::Ready
+        );
+        assert!(engine.gate.waiters_of(holder.id()).is_empty());
+        assert_eq!(engine.gate.pending_wakes(), 0);
+        engine.rollback(&mut waiter).unwrap();
+    }
+
+    #[test]
+    fn stale_wait_drop_cannot_cancel_new_owner_and_foreign_engine_cannot_poll() {
+        let (other_engine, _) = engine();
+        let (engine, key) = engine();
+        let mut first = engine.begin().unwrap();
+        let mut second = engine.begin().unwrap();
+        let mut waiter = engine.begin().unwrap();
+        let row =
+            bicdb_storage::rowid::RowId::from_parts(key.rdba.file_id(), key.rdba.block_id(), 1)
+                .unwrap();
+        let old = engine.enqueue_row_wait(&waiter, first.id(), row);
+        let mut current = engine.enqueue_row_wait(&waiter, second.id(), row);
+        drop(old);
+        assert_eq!(engine.gate.waiters_of(second.id()).len(), 1);
+        assert!(other_engine.poll_row_wait(&mut current).is_err());
+        assert_eq!(
+            engine.poll_row_wait(&mut current).unwrap(),
+            RowWaitStatus::Pending
+        );
+        engine.rollback(&mut first).unwrap();
+        engine.rollback(&mut second).unwrap();
+        assert_eq!(
+            engine.poll_row_wait(&mut current).unwrap(),
+            RowWaitStatus::Ready
+        );
+        engine.rollback(&mut waiter).unwrap();
+    }
+
+    #[test]
+    fn dropped_wait_cancels_registration_without_ending_transaction() {
+        let (engine, key) = engine();
+        let mut owner = engine.begin().unwrap();
+        let mut waiter = engine.begin().unwrap();
+        let row =
+            bicdb_storage::rowid::RowId::from_parts(key.rdba.file_id(), key.rdba.block_id(), 1)
+                .unwrap();
+        let ticket = engine.enqueue_row_wait(&waiter, owner.id(), row);
+        drop(ticket);
+        assert!(engine.gate.waiters_of(owner.id()).is_empty());
+        assert!(waiter.is_active());
+        engine.rollback(&mut owner).unwrap();
+        engine.rollback(&mut waiter).unwrap();
+    }
+
+    #[test]
+    fn quarantined_workspace_rejects_new_writes_and_commit_but_allows_rollback() {
+        let (engine, key) = engine();
+        let mut txn = engine.begin().unwrap();
+        engine
+            .insert_row(
+                &mut txn,
+                key,
+                &row_bytes(b"pending"),
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+        engine
+            .pool
+            .quarantine_workspace(WS, "synthetic data I/O failure".into());
+        assert!(engine.begin().is_err());
+        assert!(engine
+            .insert_row(
+                &mut txn,
+                key,
+                &row_bytes(b"blocked"),
+                &InsertPolicy::in_place(0)
+            )
+            .is_err());
+        assert!(engine.commit(&mut txn).is_err());
+        assert!(engine.checkpoint_full(WS).is_err());
+        assert!(engine.checkpoint_incremental(WS).unwrap().is_none());
+        engine.rollback(&mut txn).unwrap();
+        assert!(
+            engine.begin().is_err(),
+            "rollback must not clear quarantine"
+        );
+    }
+
+    #[test]
+    fn idle_incremental_ticks_do_not_generate_checkpoint_redo() {
+        let (engine, _) = engine();
+        engine.checkpoint_full(WS).unwrap();
+        let end = {
+            let mut wal = engine.wal.lock().unwrap();
+            let end = wal.appended_lsn();
+            wal.flush(end).unwrap();
+            end
+        };
+        for _ in 0..10 {
+            assert!(engine.checkpoint_incremental(WS).unwrap().is_none());
+        }
+        assert_eq!(engine.wal.lock().unwrap().appended_lsn(), end);
+    }
+
+    #[test]
+    fn clean_shutdown_rejects_unfinished_slots_without_publishing_checkpoint() {
+        let (engine, key) = engine();
+        for file_id in [1, 3] {
+            engine.pool.register_checkpoint_file(BufferKey::new(
+                WS,
+                Rdba::from_parts(file_id, 0).unwrap(),
+            ));
+        }
+        engine.pool.load_checkpoint_headers(WS).unwrap();
+        let mut txn = engine.begin().unwrap();
+        engine
+            .insert_row(
+                &mut txn,
+                key,
+                &row_bytes(b"unfinished"),
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+        let before = {
+            let wal = engine.wal.lock().unwrap();
+            (wal.appended_lsn(), wal.checkpoint_progress().unwrap())
+        };
+        let slot_no = u16::from(txn.id().slot());
+        for state in [
+            bicdb_storage::undo::TxnState::Active,
+            bicdb_storage::undo::TxnState::PendingRollback,
+        ] {
+            {
+                let mut header = engine.pool.pin(engine.undo_header).unwrap();
+                let mut slot = bicdb_storage::undo::read_slot(&header, slot_no).unwrap();
+                slot.state = state;
+                bicdb_storage::undo::write_slot(&mut header, slot_no, &slot).unwrap();
+                header.mark_dirty(bicdb_common::seq::Lsn::from_raw(0).unwrap());
+            }
+            assert!(matches!(engine.checkpoint_shutdown(WS),
+                Err(bicdb_wal::checkpoint::CheckpointError::OutstandingTransaction { slot, state: actual })
+                if slot == slot_no && actual == state));
+            let wal = engine.wal.lock().unwrap();
+            assert_eq!(wal.appended_lsn(), before.0);
+            assert_eq!(wal.checkpoint_progress().unwrap(), before.1);
+            assert_ne!(engine.pool.dirty_len(WS), 0);
+        }
+        engine.rollback(&mut txn).unwrap();
+        engine.checkpoint_shutdown(WS).unwrap();
+        assert_eq!(engine.pool.dirty_len(WS), 0);
+    }
+
+    #[test]
+    fn clean_shutdown_accepts_durable_known_commit_with_stale_active_slot() {
+        let (engine, key) = engine();
+        for file_id in [1, 3] {
+            engine.pool.register_checkpoint_file(BufferKey::new(
+                WS,
+                Rdba::from_parts(file_id, 0).unwrap(),
+            ));
+        }
+        engine.pool.load_checkpoint_headers(WS).unwrap();
+        let mut txn = engine.begin().unwrap();
+        engine
+            .insert_row(
+                &mut txn,
+                key,
+                &row_bytes(b"committed"),
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+        engine.commit(&mut txn).unwrap();
+        let slot_no = u16::from(txn.id().slot());
+        {
+            let mut header = engine.pool.pin(engine.undo_header).unwrap();
+            let mut slot = bicdb_storage::undo::read_slot(&header, slot_no).unwrap();
+            slot.state = bicdb_storage::undo::TxnState::Active;
+            bicdb_storage::undo::write_slot(&mut header, slot_no, &slot).unwrap();
+            header.mark_dirty(bicdb_common::seq::Lsn::from_raw(0).unwrap());
+        }
+        engine.checkpoint_shutdown(WS).unwrap();
+        let header = engine.pool.pin(engine.undo_header).unwrap();
+        assert_eq!(
+            bicdb_storage::undo::read_slot(&header, slot_no)
+                .unwrap()
+                .state,
+            bicdb_storage::undo::TxnState::Committed
+        );
+        assert_eq!(engine.pool.dirty_len(WS), 0);
+    }
+
+    #[test]
+    fn checkpoint_does_not_repair_undo_slots_but_independent_maintenance_does() {
+        let (engine, key) = engine();
+        let mut txn = engine.begin().unwrap();
+        engine
+            .insert_row(
+                &mut txn,
+                key,
+                &row_bytes(b"committed"),
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+        let id = txn.id();
+        engine.commit(&mut txn).unwrap();
+        let undo_key = {
+            let chain = engine.chain.lock().unwrap();
+            BufferKey::new(
+                WS,
+                Rdba::from_parts(
+                    chain.segment().file_id(),
+                    chain.segment().logical_block(0).unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let before = {
+            let mut guard = engine.pool.pin(undo_key).unwrap();
+            let mut slot = bicdb_storage::undo::read_slot(&guard, u16::from(id.slot())).unwrap();
+            slot.state = bicdb_storage::undo::TxnState::Active;
+            bicdb_storage::undo::write_slot(&mut guard, u16::from(id.slot()), &slot).unwrap();
+            guard.mark_dirty(bicdb_common::seq::Lsn::from_raw(0).unwrap());
+            *guard.as_bytes()
+        };
+        {
+            let mut wal = engine.wal.lock().unwrap();
+            let end = wal.appended_lsn();
+            wal.flush(end).unwrap();
+        }
+        let _ = engine.checkpoint_incremental(WS).unwrap();
+        assert_eq!(*engine.pool.pin(undo_key).unwrap().as_bytes(), before);
+        assert_eq!(engine.repair_undo_slots(WS).unwrap(), Some(true));
+        let slot = bicdb_storage::undo::read_slot(
+            &engine.pool.pin(undo_key).unwrap(),
+            u16::from(id.slot()),
+        )
+        .unwrap();
+        assert_eq!(slot.state, bicdb_storage::undo::TxnState::Committed);
+        assert!(engine.pool.is_dirty(undo_key));
+        assert_eq!(engine.repair_undo_slots(WS).unwrap(), Some(false));
+        engine.with_write_context(&mut txn, |_, _, _, _| {
+            assert_eq!(engine.repair_undo_slots(WS).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn incremental_checkpoint_defers_busy_operation_boundaries() {
+        let (engine, _) = engine();
+        let mut txn = engine.begin().unwrap();
+        engine.with_write_context(&mut txn, |_, _, _, _| {
+            assert!(engine.checkpoint_incremental(WS).unwrap().is_none());
+        });
+        engine.with_read_context(|_, _| {
+            assert!(engine.checkpoint_incremental(WS).unwrap().is_none());
+        });
+        engine.rollback(&mut txn).unwrap();
+    }
+
+    #[test]
+    fn incremental_checkpoint_keeps_busy_dirty_pages_and_advances_after_dbwr() {
+        let (engine, key) = engine();
+        let mut txn = engine.begin().unwrap();
+        engine
+            .insert_row(
+                &mut txn,
+                key,
+                &row_bytes(b"durable"),
+                &InsertPolicy::in_place(0),
+            )
+            .unwrap();
+        engine.commit(&mut txn).unwrap();
+        {
+            let mut wal = engine.wal.lock().unwrap();
+            let end = wal.appended_lsn();
+            wal.flush(end).unwrap();
+        }
+        let held = engine.pool.pin(key).unwrap();
+        let dirty = engine.pool.dirty_len(WS);
+        let report = engine
+            .checkpoint_incremental(WS)
+            .unwrap()
+            .expect("publish partial progress");
+        assert_eq!(report.pages_written, 0);
+        assert_eq!(engine.pool.dirty_len(WS), dirty);
+        assert!(report.progress.checkpoint_lsn <= engine.pool.low_water(WS).unwrap());
+        drop(held);
+        engine.pool.flush_workspace(WS).unwrap();
+        let next = engine
+            .checkpoint_incremental(WS)
+            .unwrap()
+            .expect("publish DBWR progress");
+        assert!(next.progress.checkpoint_lsn > report.progress.checkpoint_lsn);
+        assert_eq!(next.progress.checkpoint_commit_seq, seq(1));
+        assert_eq!(engine.pool.dirty_len(WS), 0);
+    }
 
     #[test]
     fn reserved_commit_seq_is_honored_and_blocks_later_commits() {

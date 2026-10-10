@@ -15,7 +15,7 @@
 //!    返回 `None` 表示"该行在快照下不存在"（已删/未提交/槽复用）——与
 //!    点查的语义完全相同。
 
-use crate::buffer::{BufferError, BufferPool};
+use crate::buffer::{BufferError, BufferKey, BufferPool};
 use crate::cr::{self, CrError, ReadView};
 use crate::heap;
 use crate::page::Page;
@@ -403,6 +403,69 @@ impl<'a, 'b, 'io, 'f> HeapScanner<'a, 'b, 'io, 'f> {
     }
 }
 
+/// Materialize a heap with canonical/root ROWIDs. Ordinary heap pages contain
+/// relocated row bodies as normal slots and retain the original slot as a
+/// forwarding entry. Writers and secondary indexes must receive the original
+/// slot, never the transient destination. This helper reconstructs both views
+/// at the same snapshot and reverses forwarding chains before returning rows.
+pub fn stable_heap_rows(
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+    view: ReadView,
+    file_id: u16,
+    blocks: &[u32],
+) -> Result<Vec<(RowId, Vec<u8>)>, ScanError> {
+    let mut scanner = HeapScanner::new(pool, chain, view, file_id, blocks.to_vec());
+    let mut physical = Vec::new();
+    while let Some(row) = scanner.next_row()? {
+        physical.push(row);
+    }
+
+    let mut parent = BTreeMap::<RowId, RowId>::new();
+    for &block in blocks {
+        let rdba = Rdba::from_parts(file_id, block).ok_or(ScanError::BadBlock { block })?;
+        let current = pool.pin(BufferKey::new(chain.segment().workspace_ref(), rdba))?;
+        let snapshot = cr::reconstruct(&current, view, chain)?;
+        for row_no in 1..=snapshot.slot_count() {
+            let Some(target) = heap::forwarding_target(&snapshot, row_no) else {
+                continue;
+            };
+            let source = RowId::from_parts(file_id, block, row_no)
+                .map_err(|_| ScanError::BadBlock { block })?;
+            if parent.insert(target, source).is_some() {
+                return Err(ScanError::BadForwarding {
+                    rowid: source,
+                    why: "多个入口指向同一迁移目标",
+                });
+            }
+        }
+    }
+
+    let mut stable = BTreeMap::<RowId, Vec<u8>>::new();
+    for (physical_rid, bytes) in physical {
+        let mut root = physical_rid;
+        for hop in 0..=FORWARD_MAX_HOPS {
+            match parent.get(&root).copied() {
+                Some(previous) if hop < FORWARD_MAX_HOPS => root = previous,
+                Some(_) => {
+                    return Err(ScanError::BadForwarding {
+                        rowid: physical_rid,
+                        why: "反向转发链超过上限或存在环",
+                    })
+                }
+                None => break,
+            }
+        }
+        if stable.insert(root, bytes).is_some() {
+            return Err(ScanError::BadForwarding {
+                rowid: root,
+                why: "同一稳定 ROWID 对应多条物理行",
+            });
+        }
+    }
+    Ok(stable.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -487,6 +550,26 @@ mod tests {
             fetch_rows(&pool, &chain, ReadView::new(seq(0)), &[rid(1, 1)]).is_err(),
             "转发环属于损坏，不能返回空行"
         );
+    }
+
+    #[test]
+    fn stable_heap_scan_returns_the_root_rowid_after_migration() {
+        let io = CountingIo::new();
+        io.inner.add_dir("/mem");
+        let data = pagefile::create(&io, Path::new(DATA_F), 16).unwrap();
+        let mut page = Page::new(PageType::HeapTable, WS, 3, 1);
+        let root = heap::insert_row(&mut page, &row(b"old"), &InsertPolicy::in_place(0)).unwrap();
+        let physical =
+            heap::insert_row(&mut page, &row(b"new-longer"), &InsertPolicy::in_place(0)).unwrap();
+        heap::migrate_row(&mut page, root, rid(1, physical)).unwrap();
+        pagefile::write_page(&io, data, 1, &mut page).unwrap();
+        let pool = pool_over(&io, data, 8);
+        let mut undo_file = DataFile::create(&io, Path::new(UNDO_F), 1, 1, WS, 512).unwrap();
+        let chain = UndoChain::open(create_undo_segment(&mut undo_file, 2, 3, 4).unwrap());
+
+        let rows = stable_heap_rows(&pool, &chain, ReadView::new(seq(0)), 3, &[1]).unwrap();
+        assert_eq!(rows, vec![(rid(1, root), row(b"new-longer"))]);
+        assert_ne!(rows[0].0, rid(1, physical), "物理迁移目标不得泄漏为 ROWID");
     }
 
     /// 假 WAL：水位视为已全落盘（扫描路径不触发 WAL）。

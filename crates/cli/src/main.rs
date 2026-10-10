@@ -35,13 +35,19 @@ bicdb —— 带撤销/日志的页式数据库（V1.0 单工作区）
                                 给名字 ⇒ <BICDB_HOME>/<名字>；给路径 ⇒ 原样
   bicdb home                    BICDB_HOME 在哪：程序/数据/日志/备份四条路径
   bicdb list                    <BICDB_HOME> 下的工作区与状态
-  bicdb start   [-p 参数文件] [-s 套接字] [-l 日志] [-w 秒] [-c 键=值]
+  bicdb start   [-p 参数文件] [-s 套接字] [-l 日志] [-w 秒] [--force] [-c 键=值]
                                 后台起服务（分离进程 + 实例锁 + 控制套接字）
+                                --force 仅允许非 PUBLIC 跳过可识别的检查点水位不一致
   bicdb stop    [-p 参数文件] [-m fast|immediate] [-w 秒]  停服务（fast = 完全检查点；
                                 -w 等它退出，默认 300 秒）
   bicdb status  [-p 参数文件]    服务/实例状态
   bicdb restart [-p 参数文件]    重启服务
   bicdb params  [-p 参数文件] [-c 键=值]   有效参数表（默认/文件/命令行三来源）
+  bicdb recovery verify [-p 参数文件] page <file_id> <block_id>
+  bicdb recovery verify [-p 参数文件] object <object_id>
+                                实例停止时验证隔离介质并追加同范围 Verified 审计
+  bicdb recovery archive [-p 参数文件]
+                                停机归档完整恢复审计，并原子保留未验证范围
   bicdb sql     [-p 参数文件] [-U 主体] <SQL>…
                                 执行 SQL（服务在跑时经套接字）；`-U` 以某个主体
                                 认证（口令取 $BICDB_PASSWORD 或终端提示）
@@ -197,6 +203,57 @@ fn run(args: &[String]) -> Result<(), Exit> {
         "start" => {
             let opts = service_opts(&args[1..])?;
             service::start(&opts)?;
+            Ok(())
+        }
+        "recovery" => {
+            if args.get(1).map(String::as_str) == Some("archive") {
+                let opts = service_opts(&args[2..])?;
+                let (path, active) =
+                    bicdb_cli::recovery_admin::archive(&opts.params).map_err(Exit::Failed)?;
+                println!(
+                    "恢复审计已归档：{}（当前审计保留 {} 个未验证范围）",
+                    path.display(),
+                    active
+                );
+                return Ok(());
+            }
+            if args.get(1).map(String::as_str) != Some("verify") {
+                return Err(Exit::Usage(
+                    "recovery 支持 verify page|object 或 archive".into(),
+                ));
+            }
+            let opts = service_opts(&args[2..])?;
+            let (index, kind) = args[2..]
+                .iter()
+                .enumerate()
+                .find(|(_, value)| matches!(value.as_str(), "page" | "object"))
+                .ok_or_else(|| Exit::Usage("recovery verify 缺少 page|object 范围".into()))?;
+            let index = index + 2;
+            let number = |at: usize, what: &str| -> Result<u64, Exit> {
+                args.get(at)
+                    .ok_or_else(|| Exit::Usage(format!("缺少{what}")))?
+                    .parse::<u64>()
+                    .map_err(|_| Exit::Usage(format!("{what}必须是无符号整数")))
+            };
+            let scope = if kind == "page" {
+                let file_id = number(index + 1, "文件号")?;
+                let block_id = number(index + 2, "块号")?;
+                bicdb_cli::recovery_admin::VerifyScope::Page {
+                    file_id: u16::try_from(file_id)
+                        .map_err(|_| Exit::Usage("文件号超出 u16 范围".into()))?,
+                    block_id: u32::try_from(block_id)
+                        .map_err(|_| Exit::Usage("块号超出 u32 范围".into()))?,
+                }
+            } else {
+                let object_id = number(index + 1, "对象号")?;
+                bicdb_cli::recovery_admin::VerifyScope::Object {
+                    object_id: u32::try_from(object_id)
+                        .map_err(|_| Exit::Usage("对象号超出 u32 范围".into()))?,
+                }
+            };
+            let detail =
+                bicdb_cli::recovery_admin::verify(&opts.params, scope).map_err(Exit::Failed)?;
+            println!("恢复范围验证完成：{detail}");
             Ok(())
         }
         "stop" => {
@@ -628,14 +685,10 @@ fn service_opts_for(args: &[String], stop_side: bool) -> Result<StartOptions, Ex
         })
         .transpose()?;
     let overrides = config::parse_cli_overrides(args).map_err(|e| Exit::Failed(e.to_string()))?;
-    Ok(StartOptions::load_with_wait(
-        ini.as_deref(),
-        socket,
-        log,
-        wait_s,
-        stop_side,
-        overrides,
-    )?)
+    let mut opts =
+        StartOptions::load_with_wait(ini.as_deref(), socket, log, wait_s, stop_side, overrides)?;
+    opts.force = flag_present(args, "--force");
+    Ok(opts)
 }
 
 /// **经服务执行**（服务在跑时的 `sql`/`shell` 走这条）：打印与直连同形。

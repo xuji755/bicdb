@@ -549,6 +549,18 @@ class Link:
         except (KeyError, ValueError) as error:
             raise ProtocolError("ROUTE 应答无效") from error
 
+    def bind_workspace(self, selection: Optional[str] = None) -> dict:
+        payload = self.call("BIND", (selection or "").encode("utf-8"))
+        try:
+            fields = dict(line.split("=", 1) for line in payload.decode("utf-8").splitlines())
+            route = {"user_id": int(fields["user_id"]), "workspace_id": int(fields["workspace_id"]),
+                     "name": bytes.fromhex(fields["name_hex"]).decode("utf-8"), "root": bytes.fromhex(fields["root_hex"]).decode("utf-8")}
+            if route["user_id"] <= 0 or route["workspace_id"] <= 0 or not route["root"]:
+                raise ValueError("invalid route")
+            return route
+        except (KeyError, ValueError) as error:
+            raise ProtocolError("BIND 应答无效") from error
+
     def describe(self, name: str) -> list[Column]:
         return decode_columns(self.call("DESCRIBE", name.encode("utf-8")))
 

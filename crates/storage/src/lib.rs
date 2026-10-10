@@ -97,6 +97,7 @@ pub mod controlfile;
 pub mod cr;
 pub mod datafile;
 pub mod dbwr;
+pub mod fault_audit;
 pub mod fragment;
 pub mod globalctl;
 pub mod heap;
@@ -104,9 +105,13 @@ pub mod itl;
 pub mod key;
 pub mod page;
 pub mod pagefile;
+pub mod recovery_journal;
 pub mod row;
 pub mod rowid;
 pub mod scan;
 pub mod segment;
 pub mod temp;
 pub mod undo;
+
+/// Workspace-specific WAL durability routing for the shared cache.
+pub mod wal_router;

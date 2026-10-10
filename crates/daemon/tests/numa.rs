@@ -355,7 +355,7 @@ fn rebinding_drains_the_pool_then_moves_the_cgroup_binding() {
         g.write_header(&h);
         g.mark_dirty(Lsn::from_raw(1).expect("1 合法"));
     }
-    let p = pool.partition_of(&ws_bytes);
+    let p = pool.partition_for(key);
     assert_eq!(pool.allocated_frames(p), 1);
 
     // Draining：刷尽 + 丢净帧（帧缓冲释放——重绑定后按新节点重新分配）。

@@ -194,6 +194,16 @@ impl Client {
         crate::message::OwnedWorkspace::decode(&text).map_err(ClientError::Codec)
     }
 
+    /// Bind this authenticated connection to one owned logical workspace.
+    /// ROUTE is lookup-only; BIND changes subsequent SQL execution context.
+    pub fn bind_workspace(
+        &mut self,
+        selection: Option<&str>,
+    ) -> Result<crate::message::OwnedWorkspace, ClientError> {
+        let text = self.call("BIND", selection.unwrap_or(""))?;
+        crate::message::OwnedWorkspace::decode(&text).map_err(ClientError::Codec)
+    }
+
     /// **执行 SQL**（参数随请求：直连与服务两条路径行为一致）。
     pub fn sql(
         &mut self,

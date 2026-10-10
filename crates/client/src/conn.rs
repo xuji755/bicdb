@@ -359,6 +359,30 @@ impl Connection {
         Self::from_socket_with_timeout(&socket, Some(timeout))
     }
 
+    /// Connect using an explicit standard parameter file and verify HELLO identity.
+    pub fn connect_configured(ini: &Path, timeout: std::time::Duration) -> Result<Self, Error> {
+        if !ini.is_file() {
+            return Err(Error::Discover {
+                why: "a standard instance parameter file is required".into(),
+            });
+        }
+        let (root, _) = discover::instance_for(Some(ini))
+            .map_err(|e| Error::Discover { why: e.to_string() })?;
+        let connection = Self::connect_with_timeout(ini, timeout)?;
+        let expected = root
+            .canonicalize()
+            .map_err(|e| Error::Discover { why: e.to_string() })?;
+        let actual = Path::new(connection.instance())
+            .canonicalize()
+            .map_err(|e| Error::Discover { why: e.to_string() })?;
+        if actual != expected {
+            return Err(Error::Discover {
+                why: "configured database instance does not match HELLO".into(),
+            });
+        }
+        Ok(connection)
+    }
+
     /// 连上：不给来源 ⇒ 按 `$BICDB_INI`、再退到当前目录的 `./bicdb.ini`。
     ///
     /// **顺带认环境里的身份**（照 libpq 的 `PGUSER`/`PGPASSWORD` 口径）：
@@ -491,6 +515,14 @@ impl Connection {
         selection: Option<&str>,
     ) -> Result<bicdb_net::message::OwnedWorkspace, Error> {
         self.client.route_owned(selection).map_err(map_err)
+    }
+
+    /// Bind subsequent SQL to the authenticated principal's owned workspace.
+    pub fn bind_workspace(
+        &mut self,
+        selection: Option<&str>,
+    ) -> Result<bicdb_net::message::OwnedWorkspace, Error> {
+        self.client.bind_workspace(selection).map_err(map_err)
     }
 
     /// 口令是否已过期（受限会话）；`None` = 没认证。

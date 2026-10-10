@@ -304,6 +304,16 @@ class Connection:
         except (wire.ProtocolError, OSError) as error:
             raise exceptions.OperationalError(str(error)) from None
 
+    def bind_workspace(self, selection: Optional[str] = None) -> dict:
+        """Bind subsequent SQL to the authenticated user's owned workspace."""
+        self._check_open()
+        try:
+            return self._link.bind_workspace(selection)
+        except wire.ServerError as error:
+            raise exceptions.from_server(str(error)) from None
+        except (wire.ProtocolError, OSError) as error:
+            raise exceptions.OperationalError(str(error)) from None
+
     def status(self) -> dict:
         """服务自述（``key=value``）。"""
         self._check_open()

@@ -827,6 +827,72 @@ fn dcl_shapes_follow_the_frozen_design() {
         &w7.action,
         AlterWorkspaceAction::ToTemplate { name } if name.as_slice() == b"base"
     ));
+    // Runtime open modes are a closed, typed set. FORCE only modifies READ WRITE.
+    let Stmt::AlterWorkspace(ro) = parse("ALTER WORKSPACE prod OPEN READ ONLY").unwrap() else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        ro.action,
+        AlterWorkspaceAction::Open(bicdb_sql::WorkspaceOpenMode::ReadOnly)
+    ));
+    let Stmt::AlterWorkspace(rw) = parse("ALTER WORKSPACE 7 OPEN READ WRITE").unwrap() else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        rw.action,
+        AlterWorkspaceAction::Open(bicdb_sql::WorkspaceOpenMode::ReadWrite)
+    ));
+    let Stmt::AlterWorkspace(force) =
+        parse("ALTER WORKSPACE 'prod' OPEN READ WRITE FORCE").unwrap()
+    else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        force.action,
+        AlterWorkspaceAction::Open(bicdb_sql::WorkspaceOpenMode::ReadWriteForce)
+    ));
+    for invalid in [
+        "ALTER WORKSPACE prod OPEN",
+        "ALTER WORKSPACE prod OPEN WRITE",
+        "ALTER WORKSPACE prod OPEN READ",
+        "ALTER WORKSPACE prod OPEN READ ONLY FORCE",
+    ] {
+        assert!(parse(invalid).is_err(), "必须拒绝：{invalid}");
+    }
+    let Stmt::AlterWorkspace(page_verify) =
+        parse("ALTER WORKSPACE prod VERIFY RECOVERY PAGE 7 123").unwrap()
+    else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        page_verify.action,
+        AlterWorkspaceAction::VerifyRecovery(bicdb_sql::RecoveryVerifyScope::Page {
+            file_id: 7,
+            block_id: 123
+        })
+    ));
+    let Stmt::AlterWorkspace(object_verify) =
+        parse("ALTER WORKSPACE 7 VERIFY RECOVERY OBJECT 4294967295").unwrap()
+    else {
+        panic!("不是 ALTER WORKSPACE")
+    };
+    assert!(matches!(
+        object_verify.action,
+        AlterWorkspaceAction::VerifyRecovery(bicdb_sql::RecoveryVerifyScope::Object {
+            object_id: u32::MAX
+        })
+    ));
+    for invalid in [
+        "ALTER WORKSPACE prod VERIFY",
+        "ALTER WORKSPACE prod VERIFY RECOVERY",
+        "ALTER WORKSPACE prod VERIFY RECOVERY PAGE 7",
+        "ALTER WORKSPACE prod VERIFY RECOVERY PAGE -1 2",
+        "ALTER WORKSPACE prod VERIFY RECOVERY PAGE 65536 2",
+        "ALTER WORKSPACE prod VERIFY RECOVERY OBJECT 4294967296",
+        "ALTER WORKSPACE prod VERIFY RECOVERY WORKSPACE",
+    ] {
+        assert!(parse(invalid).is_err(), "必须拒绝：{invalid}");
+    }
 
     // ── 引用位的两种写法等价：`名 := 标识符 | Str`（`prod` = `'prod'`）──
     let Stmt::AlterFilesystem(bare) = parse("ALTER FILESYSTEM data2 SET ALLOCATE = OFF").unwrap()

@@ -20,7 +20,9 @@
 //! ——对**单进程 CLI** 而言"进程生命周期 = 实例生命周期"，这不是取巧而是语义
 //! 本身（引擎的类型参数要求实例级借用）。daemon 化时改为实例结构体持有。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use bicdb_catalog::{create_dictionary, ddl, Catalog};
 use bicdb_common::seq::{CommitSeq, Lsn};
@@ -113,6 +115,8 @@ pub const WAL_DIR: &str = "wal";
 pub const DEFAULT_FILE0_BLOCKS: u64 = 4096;
 /// 撤销文件初始块数的**默认值**（参数文件 `[init] undo_initial_blocks` 可改）。
 pub const DEFAULT_UNDO_BLOCKS: u64 = 512;
+/// 临时文件初始块数（file 2；no-cache/no-redo，启动与干净停机都重置）。
+pub const DEFAULT_TEMP_BLOCKS: u64 = 512;
 /// 日志每组成员页数的**默认值**（参数文件 `[init] wal_group_pages` 可改）。
 pub const DEFAULT_WAL_GROUP_PAGES: u32 = 8192;
 
@@ -210,7 +214,9 @@ fn publish_data_files(
     let mut wrote = false;
     for (file_id, role, path) in files {
         // 大小取**文件自述**（`blocks()` 读文件头；不是 `stat` 长度——两者含义不同）。
-        let blocks = DataFile::open(io, path)?.blocks();
+        let file = DataFile::open(io, path)?;
+        let blocks = file.blocks();
+        file.close()?;
         let path_bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec();
         // **已登记且对得上就跑**（幂等的意义就在这里：常态打开**不写**控制文件）。
         if let Ok(existing) = cf.data_file_record(usize::from(*file_id)) {
@@ -423,10 +429,24 @@ fn apply_process_params(params: &InstanceParams) -> Result<(), BootError> {
 }
 
 /// 缓存策略（参数文件 → [`CacheConfig`]）。
+fn cache_partition_capacity(params: &InstanceParams) -> Result<usize, BootError> {
+    let partitions = params.run.kcbwds;
+    if partitions == 0
+        || !partitions.is_power_of_two()
+        || partitions > 64
+        || params.run.pool_frames % partitions != 0
+    {
+        return Err(BootError::Catalog(
+            "buffer.kcbwds 必须为 1–64 的 2 的幂，且整除总 pool_frames".into(),
+        ));
+    }
+    Ok(params.run.pool_frames / partitions)
+}
+
 fn cache_config(params: &InstanceParams) -> bicdb_storage::buffer::CacheConfig {
     let r = &params.run;
     bicdb_storage::buffer::CacheConfig::for_capacity_tuned(
-        r.pool_frames,
+        r.pool_frames / r.kcbwds.max(1),
         bicdb_storage::buffer::CacheTuning {
             hash_buckets: r.hash_buckets,
             bucket_latches: r.bucket_latches,
@@ -490,8 +510,109 @@ fn resolve(file0: FileHandle, undo: FileHandle, r: Rdba) -> Option<(FileHandle, 
     }
 }
 
+/// Minimum cache capacity reserved for each activated workspace (2 GiB).
+pub const MIN_WORKSPACE_CACHE_FRAMES: usize =
+    2 * 1024 * 1024 * 1024 / bicdb_storage::page::PAGE_SIZE;
+
+fn check_cache_admission(total_frames: usize, count: usize) -> Result<(), BootError> {
+    let required = count
+        .checked_mul(MIN_WORKSPACE_CACHE_FRAMES)
+        .ok_or_else(|| BootError::Config("工作区缓存保障容量溢出".into()))?;
+    if total_frames < required {
+        return Err(BootError::Config(format!("共享 DB Cache 容量不足：{count} 个工作区至少需要 {} GiB，当前 {} 帧；每工作区最低 2 GiB", count * 2, total_frames)));
+    }
+    Ok(())
+}
+
+/// One process-wide cache and file/WAL registry for all logical workspaces.
+/// Workspace-local engines retain independent undo and log streams.
+pub struct SharedInstanceCache {
+    /// All handles belong to the same I/O implementation.
+    pub io: &'static OsFileIo,
+    /// Single shared database buffer cache.
+    pub pool: &'static BufferPool<'static>,
+    files: Arc<RwLock<BTreeMap<[u8; 8], (FileHandle, FileHandle)>>>,
+    pub(crate) wal: Arc<bicdb_storage::wal_router::WorkspaceWalRouter>,
+}
+impl SharedInstanceCache {
+    fn new(io: &'static OsFileIo, params: &InstanceParams) -> Result<Arc<Self>, BootError> {
+        check_cache_admission(params.run.pool_frames, 1)?;
+        let files = Arc::new(RwLock::new(
+            BTreeMap::<[u8; 8], (FileHandle, FileHandle)>::new(),
+        ));
+        let resolver = Arc::clone(&files);
+        let wal = Arc::new(bicdb_storage::wal_router::WorkspaceWalRouter::default());
+        let pool = Box::leak(Box::new(BufferPool::with_partitions(
+            io,
+            params.run.kcbwds,
+            cache_partition_capacity(params)?,
+            move |ws, r| {
+                let map = resolver.read().ok()?;
+                let (meta, undo) = map.get(ws)?;
+                resolve(*meta, *undo, r)
+            },
+            Arc::clone(&wal),
+            SystemClock,
+            cache_config(params),
+        )?));
+        Ok(Arc::new(Self {
+            io,
+            pool,
+            files,
+            wal,
+        }))
+    }
+    fn register(
+        &self,
+        ws: [u8; 8],
+        meta: FileHandle,
+        undo: FileHandle,
+        guard: Arc<bicdb_wal::group::WalShared<'static>>,
+    ) -> Result<(), BootError> {
+        // Admission is serialized by the service control loop. Never hold the
+        // file registry while acquiring cache structures: resolution uses the
+        // reverse order during page selection.
+        let count = {
+            let files = self
+                .files
+                .read()
+                .map_err(|_| BootError::Catalog("文件注册表锁损坏".into()))?;
+            if files.contains_key(&ws) {
+                return Err(BootError::Catalog("工作区已注册到共享缓存".into()));
+            }
+            files.len() + 1
+        };
+        check_cache_admission(self.pool.capacity() * self.pool.partition_count(), count)?;
+        self.pool
+            .reserve_workspace(ws, MIN_WORKSPACE_CACHE_FRAMES)?;
+        if let Err(error) = self.wal.register(ws, guard) {
+            let _ = self.pool.release_empty_workspace_reservation(ws);
+            return Err(BootError::Io(error));
+        }
+        let inserted = match self.files.write() {
+            Ok(mut files) => {
+                if files.contains_key(&ws) {
+                    Err(BootError::Catalog("工作区已注册到共享缓存".into()))
+                } else {
+                    files.insert(ws, (meta, undo));
+                    Ok(())
+                }
+            }
+            Err(_) => Err(BootError::Catalog("文件注册表锁损坏".into())),
+        };
+        if let Err(error) = inserted {
+            let _ = self.wal.unregister_registration(ws);
+            let _ = self.pool.release_empty_workspace_reservation(ws);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 /// **一个已打开的实例**（CLI 的常驻件）。
 pub struct Instance {
+    /// Service-wide shared cache; absent only in standalone direct mode.
+    pub shared_cache: Option<Arc<SharedInstanceCache>>,
     /// **本实例的有效参数**（参数文件 + 命令行覆盖之后的；诊断与"要参数的功能"用它）。
     pub params: InstanceParams,
     /// 工作区标识（`workspace_ref = SHA-256(workspace_id)` 前 8 字节）——
@@ -511,6 +632,13 @@ pub struct Instance {
     pub catalog: Catalog<'static>,
     /// 打开期的恢复回执（诊断；`None` = 建区当次）。
     pub recovery: Option<RecoverySummary>,
+    /// Identified consistency checks bypassed by an explicit private-workspace
+    /// FORCE open. `None` means the workspace passed the normal recovery gate.
+    pub forced_recovery: Option<String>,
+    // Declared before the lifecycle lock: implicit Drop drains the audit writer
+    // before releasing ownership to another process. Shared daemon pools use
+    // their single instance-wide writer instead.
+    fault_audit: Option<bicdb_storage::fault_audit::FaultAuditWriter>,
     /// **实例锁**（单写者纪律；Drop 即释放）。服务模式由守护进程持有，
     /// 直连模式由本进程持有——同一时刻只允许一个写者。
     /// 读它的地方：`Instance::lock_holder`（诊断）与服务退出前的显式释放。
@@ -538,27 +666,99 @@ pub struct RecoverySummary {
 }
 
 impl Instance {
+    /// Open an independent workspace-local catalog handle for a service worker.
+    ///
+    /// Catalog row caches and mutable lookup state are session-local; the
+    /// buffer pool and transaction engine remain shared and provide page/WAL/
+    /// lock concurrency. Workers must open a fresh handle rather than sharing
+    /// `Instance::catalog` behind one global mutex, otherwise one long query
+    /// serializes the whole database service.
+    pub fn open_worker_catalog(&self) -> Result<Catalog<'static>, BootError> {
+        let path = data_path(&self.dir, self.ws_ref, "meta");
+        let mut catalog =
+            Catalog::open(self.io, &path).map_err(|e| BootError::Catalog(e.to_string()))?;
+        catalog.attach_pool(self.pool);
+        catalog.set_current_seq(seq(self.seq()));
+        Ok(catalog)
+    }
+
     /// **关闭**：完全检查点（脏页写回 + 发布低水位）——干净退出。
     ///
     /// 崩溃不走这里：此时 WAL 是唯一耐久源，`open` 的重做阶段负责重建。
     pub fn shutdown(&mut self) -> Result<(), BootError> {
+        let result = self.shutdown_data();
+        if let Err(error) = &result {
+            self.pool
+                .quarantine_workspace(self.ws_ref, format!("停机失败：{error}"));
+        }
+        let audit = self
+            .fault_audit
+            .take()
+            .map_or(Ok(()), |writer| writer.finish());
+        match (result, audit) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(BootError::Io(error)),
+            (Err(error), Err(audit)) => Err(BootError::Io(std::io::Error::other(format!(
+                "{error}；停机故障审计失败：{audit}"
+            )))),
+        }
+    }
+
+    fn start_direct_fault_audit(&mut self) -> Result<(), BootError> {
+        let writer = bicdb_storage::fault_audit::FaultAuditWriter::start(self.io)?;
+        let sink = writer.sink();
+        sink.register(self.ws_ref, &self.dir.join("recovery.audit"))?;
+        self.pool
+            .set_fault_handler(Arc::new(move |workspace, reason| {
+                sink.record(workspace, reason)
+            }))?;
+        self.fault_audit = Some(writer);
+        Ok(())
+    }
+
+    fn shutdown_data(&mut self) -> Result<(), BootError> {
         // **收尾前先把没结束的事务回滚**：留着不管的话，检查点会把它的
         // 未提交改动原样留在文件里，下次打开要靠恢复回滚——能现在就干净，
         // 就不留给恢复（与"连接断开即回滚"同一口径）。
         if let Some(mut txn) = self.txn.take() {
-            let _ = self.engine.rollback(&mut txn);
+            if let Err(error) = self.engine.rollback(&mut txn) {
+                self.txn = Some(txn);
+                self.pool
+                    .quarantine_workspace(self.ws_ref, format!("停机回滚失败：{error}"));
+                return Err(BootError::Io(std::io::Error::other(format!(
+                    "停机回滚失败：{error}"
+                ))));
+            }
         }
-        let report = self.engine.checkpoint_full(self.ws_ref)?;
-        // **推进 `file_scn`**（§2.4）：干净关闭后，两个文件的内容确实达到了
-        // 检查点位点——头字段是"打开链核对"（`check_files`）的事实来源，
-        // 长期不推进的话那道核对永远不可能发现"文件超前"。
-        let lsn = report.progress.checkpoint_lsn.as_raw();
-        self.catalog.file_mut().set_file_scn(lsn)?;
-        self.catalog.file_mut().sync()?;
-        let mut undo = DataFile::open(self.io, &self.undo_path)?;
-        undo.set_file_scn(lsn)?;
-        undo.sync()?;
-        undo.close()?;
+        let report = self.engine.checkpoint_shutdown(self.ws_ref)?;
+        let dirty = self.pool.dirty_len(self.ws_ref);
+        if dirty != 0 {
+            return Err(BootError::Io(std::io::Error::other(format!(
+                "完全检查点后仍有 {dirty} 个脏块"
+            ))));
+        }
+        // Engine checkpoint orchestration already published persistent file
+        // header metadata after DBWR drain and CF publication.
+        let _ = report;
+
+        // Temp is an independent no-cache/no-redo file. It never participates
+        // in the checkpoint; reset an existing file only after durable data
+        // and redo have reached the clean-shutdown point.
+        let temp_path = self
+            .dir
+            .join(DATA_DIR)
+            .join(data_file_name(self.ws_ref, "temp"));
+        if temp_path.exists() {
+            let temp = DataFile::open_temp_reset(
+                self.io,
+                &temp_path,
+                self.ws_ref,
+                bicdb_storage::datafile::MIN_FILE_BLOCKS,
+            )?;
+            temp.sync()?;
+            temp.close()?;
+        }
         Ok(())
     }
 
@@ -665,9 +865,13 @@ pub fn create_instance_with(
     catalog
         .seed_own_dictionary(&built)
         .map_err(|e| BootError::Catalog(e.to_string()))?;
-    drop(catalog);
+    catalog
+        .close()
+        .map_err(|e| BootError::Catalog(e.to_string()))?;
     // 建区期的直写必须**先落盘再进 redo**（物理增量无法重建不存在的页）。
-    DataFile::open(io_dyn, &file0_path)?.sync()?;
+    let file0_sync = DataFile::open(io_dyn, &file0_path)?;
+    file0_sync.sync()?;
+    file0_sync.close()?;
 
     // ② 撤销段（V1.0 单段）。
     let undo_path = data_path(dir, ws_ref, "undo");
@@ -682,6 +886,13 @@ pub fn create_instance_with(
     let undo_handle = undo_file.handle();
     let undo_seg = create_undo_segment(undo_file, 2, 3, 4)?;
     debug_assert_eq!(undo_seg.page0_block(), undo_page0());
+
+    // file 2 is deliberately outside DB Cache and WAL. Formatting/resetting it
+    // here establishes an empty temp tablespace for the first open.
+    let temp_path = data_path(dir, ws_ref, "temp");
+    let temp = DataFile::open_temp_reset(io_dyn, &temp_path, ws_ref, DEFAULT_TEMP_BLOCKS)?;
+    temp.sync()?;
+    temp.close()?;
 
     // ③ 控制文件双副本 + 日志组。
     let cf: &'static mut ControlFile<'static> = Box::leak(Box::new(ControlFile::format(
@@ -700,6 +911,11 @@ pub fn create_instance_with(
         &[
             (FILE0_ID, META_ROLE, &file0_path),
             (UNDO_ID, UNDO_FILE_ROLE, &undo_path),
+            (
+                bicdb_storage::datafile::TEMP_FILE_ID,
+                bicdb_storage::datafile::TEMP_FILE_ROLE,
+                &temp_path,
+            ),
         ],
     )?;
     let wal_path = p(dir, WAL_DIR);
@@ -709,14 +925,24 @@ pub fn create_instance_with(
     // ④ 池（WAL 守卫 = 日志的刷盘核心）+ 引擎 + 目录。
     let file0_handle = DataFile::open(io_dyn, &file0_path)?.handle();
     let guard = writer.shared();
-    let pool: &'static BufferPool<'static> = Box::leak(Box::new(BufferPool::with_config(
+    let pool: &'static BufferPool<'static> = Box::leak(Box::new(BufferPool::with_partitions(
         io_dyn,
-        params.run.pool_frames,
+        params.run.kcbwds,
+        cache_partition_capacity(params)?,
         move |_ws, r| resolve(file0_handle, undo_handle, r),
         guard,
         SystemClock,
         cache_config(params),
     )?));
+    for file_id in [FILE0_ID, UNDO_ID] {
+        pool.register_checkpoint_file(bicdb_storage::buffer::BufferKey::new(
+            ws_ref,
+            bicdb_storage::rowid::Rdba::from_parts(file_id, 0).expect("file header address"),
+        ));
+    }
+    if is_public {
+        pool.set_critical_workspace(ws_ref);
+    }
     let mut engine = Engine::new(
         pool,
         writer,
@@ -763,7 +989,7 @@ pub fn create_instance_with(
         register_workspace(home, dir, ws_id)?;
     }
 
-    Ok(Instance {
+    let mut instance = Instance {
         params: params.clone(),
         ws_ref,
         dir: dir.to_path_buf(),
@@ -772,10 +998,15 @@ pub fn create_instance_with(
         pool,
         engine,
         catalog,
+        shared_cache: None,
         recovery: None,
+        forced_recovery: None,
+        fault_audit: None,
         lock: Some(lock),
         txn: None,
-    })
+    };
+    instance.start_direct_fault_audit()?;
+    Ok(instance)
 }
 
 /// **打开既有实例（直连模式）**：先取实例锁（单写者），再打开。
@@ -792,10 +1023,163 @@ pub fn open_unlocked_with(
     params: &InstanceParams,
     lock: Option<InstanceLock>,
 ) -> Result<Instance, BootError> {
+    open_unlocked_internal(params, lock, None, false, false)
+}
+
+/// Open PUBLIC once, then attach logical workspaces to its shared cache.
+/// This does not create a daemon or a second database cache.
+pub fn open_shared_with(
+    params: &InstanceParams,
+    lock: Option<InstanceLock>,
+    shared: Option<Arc<SharedInstanceCache>>,
+) -> Result<Instance, BootError> {
+    open_unlocked_internal(params, lock, shared, true, false)
+}
+
+/// Explicitly allow the narrow, audited private-workspace FORCE recovery
+/// classifications. The function independently verifies that the target is
+/// not PUBLIC; callers cannot turn this into a PUBLIC bypass.
+pub fn open_shared_force_private(
+    params: &InstanceParams,
+    lock: Option<InstanceLock>,
+    shared: Option<Arc<SharedInstanceCache>>,
+) -> Result<Instance, BootError> {
+    open_unlocked_internal(params, lock, shared, true, true)
+}
+
+#[derive(Debug)]
+struct ForceRecovery {
+    requested: bool,
+    skipped: Vec<String>,
+}
+
+fn apply_persisted_recovery_isolation(
+    pool: &BufferPool<'_>,
+    workspace: [u8; 8],
+    is_public: bool,
+    records: &[bicdb_storage::recovery_journal::RecoveryRecord],
+) -> Result<(), BootError> {
+    use bicdb_storage::recovery_journal::{RecoveryScope, RecoveryState};
+    let mut pages = std::collections::BTreeMap::new();
+    let mut objects = std::collections::BTreeMap::new();
+    let mut broad = std::collections::BTreeMap::new();
+    for record in records {
+        let clear = record.state == RecoveryState::Verified;
+        let reason = format!(
+            "recovery$ sequence {} {}: {}",
+            record.sequence, record.actor, record.detail
+        );
+        match record.scope {
+            RecoveryScope::Workspace => {}
+            RecoveryScope::Page { file_id, block_id } => {
+                let rdba = Rdba::from_parts(file_id, block_id).ok_or_else(|| {
+                    BootError::Catalog(format!(
+                        "恢复审计 sequence {} 的页面范围无效",
+                        record.sequence
+                    ))
+                })?;
+                if clear {
+                    pages.remove(&rdba);
+                } else {
+                    pages.entry(rdba).or_insert(reason);
+                }
+            }
+            RecoveryScope::Object { object_id } => {
+                if object_id > u64::from(u32::MAX) {
+                    return Err(BootError::Catalog(format!(
+                        "恢复审计 sequence {} 的对象号越界",
+                        record.sequence
+                    )));
+                }
+                if clear {
+                    objects.remove(&object_id);
+                } else {
+                    objects.entry(object_id).or_insert(reason);
+                }
+            }
+            RecoveryScope::Transaction { txn_id } => {
+                let key = format!("TRANSACTION {txn_id}");
+                if clear {
+                    broad.remove(&key);
+                } else {
+                    broad.entry(key).or_insert(reason);
+                }
+            }
+            RecoveryScope::RedoRange { start_lsn, end_lsn } => {
+                let key = format!("REDO [{start_lsn},{end_lsn})");
+                if clear {
+                    broad.remove(&key);
+                } else {
+                    broad.entry(key).or_insert(reason);
+                }
+            }
+        }
+    }
+    if is_public && (!pages.is_empty() || !objects.is_empty() || !broad.is_empty()) {
+        return Err(BootError::Catalog(
+            "PUBLIC 存在未清除的结构化恢复隔离项，必须修复并验证后才能开放".into(),
+        ));
+    }
+    for (rdba, reason) in pages {
+        pool.quarantine_page(
+            bicdb_storage::buffer::BufferKey::new(workspace, rdba),
+            reason,
+        );
+    }
+    for (object_id, reason) in objects {
+        pool.quarantine_object(workspace, object_id, reason);
+    }
+    if !broad.is_empty() {
+        pool.set_workspace_read_only(
+            workspace,
+            broad.into_values().collect::<Vec<_>>().join("；"),
+        );
+    }
+    Ok(())
+}
+impl ForceRecovery {
+    fn new(requested: bool, is_public: bool) -> Result<Self, BootError> {
+        if requested && is_public {
+            return Err(BootError::Catalog(
+                "PUBLIC 禁止 FORCE：必须完成一致性修复后才能开放".into(),
+            ));
+        }
+        Ok(Self {
+            requested,
+            skipped: Vec::new(),
+        })
+    }
+    fn check(&mut self, inconsistent: bool, detail: String) -> Result<(), BootError> {
+        if !inconsistent {
+            return Ok(());
+        }
+        if !self.requested {
+            return Err(BootError::Catalog(format!("拒绝打开：{detail}")));
+        }
+        self.skipped.push(detail);
+        Ok(())
+    }
+    fn detail(self) -> Option<String> {
+        (!self.skipped.is_empty()).then(|| self.skipped.join("；"))
+    }
+}
+
+fn open_unlocked_internal(
+    params: &InstanceParams,
+    lock: Option<InstanceLock>,
+    shared: Option<Arc<SharedInstanceCache>>,
+    use_shared: bool,
+    force_private: bool,
+) -> Result<Instance, BootError> {
     let dir = params.db_root.clone();
     let dir = dir.as_path();
-    apply_process_params(params)?;
-    let io: &'static OsFileIo = Box::leak(Box::new(OsFileIo::new()));
+    if shared.is_none() {
+        apply_process_params(params)?;
+    }
+    let io: &'static OsFileIo = shared
+        .as_ref()
+        .map(|cache| cache.io)
+        .unwrap_or_else(|| Box::leak(Box::new(OsFileIo::new())));
     let io_dyn: &'static dyn FileIo = io;
     let wal_path = p(dir, WAL_DIR);
     let (cf_path_a, cf_path_b) = (p(dir, CF_A), p(dir, CF_B));
@@ -804,137 +1188,369 @@ pub fn open_unlocked_with(
     // 与数据文件名——"文件头里的标识"与"文件名里的标识"同源，不会各说各话。
     let ws_id = {
         let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
-        cf_ro.workspace_entry()?.workspace_id
+        let result = cf_ro.workspace_entry().map(|entry| entry.workspace_id);
+        let close = cf_ro.close();
+        let ws_id = result?;
+        close?;
+        ws_id
     };
     let ws_ref = bicdb_workspace::workspace_ref(ws_id);
-    let file0_path = data_path(dir, ws_ref, "meta");
-    if !file0_path.exists() {
-        return Err(BootError::Catalog(missing_meta_message(dir, &file0_path)));
-    }
-    let undo_path = data_path(dir, ws_ref, "undo");
-
-    let file0_handle = DataFile::open(io_dyn, &file0_path)?.handle();
-    let undo_file: &'static mut DataFile<'static> =
-        Box::leak(Box::new(DataFile::open(io_dyn, &undo_path)?));
-    let undo_handle = undo_file.handle();
-    let undo_seg = Segment::open(undo_file, undo_page0())?;
-
-    // 起点 = 控制文件的检查点 LSN（低水位）。
-    let spec = group_spec(&params.init);
-    let progress = {
-        let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
-        // **建区期参数核对**（控制文件权威）：不符 ⇒ 拒绝打开（改需重建）。
-        check_creation_facts(dir, params, &cf_ro.redo_entries()?)?;
-        cf_ro.checkpoint_progress()?
-    };
-
-    // **打开链的事实核对**（`目录详设` §2.5）：各文件头位点 vs 控制文件检查点。
-    // 超前（文件比控制文件新：拷错/配错控制文件）⇒ **拒绝打开**；本函数此前
-    // 直接进恢复，`catalog::consistency` 整模块只有单测消费者（2026-10-06 审计）。
-    let file0_scn = DataFile::open(io_dyn, &file0_path)?.file_scn();
-    let undo_scn = DataFile::open(io_dyn, &undo_path)?.file_scn();
-
-    // 写口（续写位置在组集内部重建）+ 只读组视图（恢复的扫描面）。
-    let cf: &'static mut ControlFile<'static> =
-        Box::leak(Box::new(ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?));
-    // **幂等补登记**：文件清单的权威是控制文件（`目录详设` 纪律 7），而本切片
-    // 之前的实例从未写过它——不补的话 `file$` 在旧实例上永远是空集。
-    // `creation_blocks` 在补登记时取**当前大小**（创建时的值已不可考，如实记当前）。
-    publish_data_files(
-        io_dyn,
-        cf,
-        &[
-            (FILE0_ID, META_ROLE, &file0_path),
-            (UNDO_ID, UNDO_FILE_ROLE, &undo_path),
-        ],
+    use bicdb_storage::recovery_journal::{RecoveryJournal, RecoveryState};
+    let mut recovery_audit = RecoveryJournal::open(io_dyn, &dir.join("recovery.audit"), ws_ref)?;
+    recovery_audit.append(
+        RecoveryState::Recovering,
+        0,
+        "bicdb/open",
+        "恢复开始；起点尚待控制进度校验",
     )?;
-    let mut writer = GroupWriter::open(io_dyn, cf, &wal_path, spec)?;
+    // Keep the instance lock outside the closure until audit publication.
+    // No connection or background registration can observe an unaudited open.
+    let result = (|| -> Result<Instance, BootError> {
+        let file0_path = data_path(dir, ws_ref, "meta");
+        if !file0_path.exists() {
+            return Err(BootError::Catalog(missing_meta_message(dir, &file0_path)));
+        }
+        // Determine PUBLIC from the dictionary shape itself, before any FORCE
+        // decision. A path comparison alone is insufficient for standalone or
+        // relocated deployments. Failure to parse the dictionary is structural
+        // damage and is never force-skippable.
+        let identity_catalog =
+            Catalog::open(io_dyn, &file0_path).map_err(|e| BootError::Catalog(e.to_string()))?;
+        let is_public = identity_catalog.is_public();
+        identity_catalog
+            .close()
+            .map_err(|e| BootError::Catalog(e.to_string()))?;
+        let mut force = ForceRecovery::new(force_private, is_public)?;
+        let undo_path = data_path(dir, ws_ref, "undo");
 
-    // **恢复**（顺序不可换：分析 → 重做 → 输家回滚；见 `wal::recovery`）。
-    let mut chain = UndoChain::open(undo_seg);
-    let summary = {
-        let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
-        let groups = online_groups(io_dyn, &cf_ro, &wal_path, spec)?;
-        // 核对：文件位点 vs 检查点（`chain_start` = 在线组的最小起点；无日志 ⇒ None）。
-        let chain_start = groups.iter().map(|g| g.start_lsn).min();
-        let points = vec![
-            bicdb_catalog::FilePoint::Readable {
-                file_id: FILE0_ID,
-                role: META_ROLE,
-                file_scn: file0_scn,
-            },
-            bicdb_catalog::FilePoint::Readable {
-                file_id: UNDO_ID,
-                role: 1,
-                file_scn: undo_scn,
-            },
-        ];
-        let report = bicdb_catalog::check_files(progress.checkpoint_lsn, chain_start, &points);
-        if report.refused {
-            return Err(BootError::Catalog(format!(
-                "拒绝打开：文件超前于控制文件（{}）——像是配错了控制文件/拷错文件",
-                report
+        let file0_handle = DataFile::open(io_dyn, &file0_path)?.handle();
+        let undo_file: &'static mut DataFile<'static> =
+            Box::leak(Box::new(DataFile::open(io_dyn, &undo_path)?));
+        let undo_handle = undo_file.handle();
+        let undo_seg = Segment::open(undo_file, undo_page0())?;
+        // Temp never participates in redo/undo recovery. Reset it before any
+        // session can be admitted; stale contents from either a clean or crashed
+        // previous process are never reusable.
+        let temp_path = data_path(dir, ws_ref, "temp");
+        let temp = DataFile::open_temp_reset(io_dyn, &temp_path, ws_ref, DEFAULT_TEMP_BLOCKS)?;
+        temp.sync()?;
+        temp.close()?;
+
+        // 起点 = 控制文件的检查点 LSN（低水位）。
+        let spec = group_spec(&params.init);
+        let progress = {
+            let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
+            let result = (|| {
+                // **建区期参数核对**（控制文件权威）：不符 ⇒ 拒绝打开（改需重建）。
+                check_creation_facts(dir, params, &cf_ro.redo_entries()?)?;
+                Ok::<_, BootError>(cf_ro.checkpoint_progress()?)
+            })();
+            let close = cf_ro.close();
+            let progress = result?;
+            close?;
+            progress
+        };
+
+        // **打开链的事实核对**（`目录详设` §2.5）：各文件头位点 vs 控制文件检查点。
+        // 超前（文件比控制文件新：拷错/配错控制文件）⇒ **拒绝打开**；本函数此前
+        // 直接进恢复，`catalog::consistency` 整模块只有单测消费者（2026-10-06 审计）。
+        let file0_head = DataFile::open(io_dyn, &file0_path)?;
+        let undo_head = DataFile::open(io_dyn, &undo_path)?;
+        let file0_scn = file0_head.file_scn();
+        let undo_scn = undo_head.file_scn();
+        let checkpoint_ahead = [
+            file0_head.checkpoint_commit_scn(),
+            undo_head.checkpoint_commit_scn(),
+        ]
+        .into_iter()
+        .any(|scn| scn > progress.checkpoint_commit_seq.as_raw());
+        force.check(
+            checkpoint_ahead,
+            "数据文件 checkpoint SCN 超前于控制文件".to_owned(),
+        )?;
+        file0_head.close()?;
+        undo_head.close()?;
+
+        // 写口（续写位置在组集内部重建）+ 只读组视图（恢复的扫描面）。
+        let cf: &'static mut ControlFile<'static> =
+            Box::leak(Box::new(ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?));
+        // **幂等补登记**：文件清单的权威是控制文件（`目录详设` 纪律 7），而本切片
+        // 之前的实例从未写过它——不补的话 `file$` 在旧实例上永远是空集。
+        // `creation_blocks` 在补登记时取**当前大小**（创建时的值已不可考，如实记当前）。
+        publish_data_files(
+            io_dyn,
+            cf,
+            &[
+                (FILE0_ID, META_ROLE, &file0_path),
+                (UNDO_ID, UNDO_FILE_ROLE, &undo_path),
+                (
+                    bicdb_storage::datafile::TEMP_FILE_ID,
+                    bicdb_storage::datafile::TEMP_FILE_ROLE,
+                    &temp_path,
+                ),
+            ],
+        )?;
+        let mut writer = GroupWriter::open(io_dyn, cf, &wal_path, spec)?;
+
+        // **恢复**（顺序不可换：分析 → 重做 → 输家回滚；见 `wal::recovery`）。
+        let mut chain = UndoChain::open(undo_seg);
+        let summary = {
+            let cf_ro = ControlFile::open(io_dyn, &cf_path_a, &cf_path_b)?;
+            let groups_result = online_groups(io_dyn, &cf_ro, &wal_path, spec);
+            let close = cf_ro.close();
+            let groups = groups_result?;
+            close?;
+            // 核对：文件位点 vs 检查点（`chain_start` = 在线组的最小起点；无日志 ⇒ None）。
+            let chain_start = groups.iter().map(|g| g.start_lsn).min();
+            let points = vec![
+                bicdb_catalog::FilePoint::Readable {
+                    file_id: FILE0_ID,
+                    role: META_ROLE,
+                    file_scn: file0_scn,
+                },
+                bicdb_catalog::FilePoint::Readable {
+                    file_id: UNDO_ID,
+                    role: 1,
+                    file_scn: undo_scn,
+                },
+            ];
+            let report = bicdb_catalog::check_files(progress.checkpoint_lsn, chain_start, &points);
+            if report.refused {
+                let findings = report
                     .findings
                     .iter()
                     .map(|f| f.to_string())
                     .collect::<Vec<_>>()
-                    .join("；")
-            )));
-        }
-        if !report.is_clean() {
-            eprintln!("（一致性核对有发现：{report:?}）");
-        }
-        let mut resolve = |r: Rdba| resolve(file0_handle, undo_handle, r);
-        let report = recover(
-            io_dyn,
-            &groups,
-            progress.checkpoint_lsn,
-            &mut chain,
-            &mut writer,
-            &mut resolve,
-        )?;
-        RecoverySummary {
-            start_lsn: report.start_lsn.as_raw(),
-            applied_blocks: report.redo.applied_blocks as u64,
-            txns_rolled_back: report.undo.txns_rolled_back,
-            highest_commit_seq: report.analysis.highest_commit_seq,
-            log_end: report.log_end.as_raw(),
-        }
-    };
+                    .join("；");
+                force.check(
+                    true,
+                    format!("文件超前于控制文件（{findings}）——像是配错了控制文件/拷错文件"),
+                )?;
+            }
+            if !report.is_clean() {
+                eprintln!("（一致性核对有发现：{report:?}）");
+            }
+            let mut resolve = |r: Rdba| resolve(file0_handle, undo_handle, r);
+            let recovery = recover(
+                io_dyn,
+                &groups,
+                progress.checkpoint_lsn,
+                &mut chain,
+                &mut writer,
+                &mut resolve,
+            );
+            let mut close_error = None;
+            for group in &groups {
+                if let Err(error) = io_dyn.close(group.handle) {
+                    close_error.get_or_insert(error);
+                }
+            }
+            let report = recovery?;
+            if let Some(error) = close_error {
+                return Err(BootError::Io(error));
+            }
+            // Recovery is an admission gate. No Active/PendingRollback slot may
+            // survive the undo phase; exposing SQL in that state would turn an
+            // incomplete recovery into normal runtime state.
+            let header = chain.page(0).map_err(|error| {
+                BootError::Catalog(format!("恢复后读取 undo 状态失败：{error}"))
+            })?;
+            for slot_no in 0..bicdb_storage::undo::TXN_SLOTS as u16 {
+                let slot = bicdb_storage::undo::read_slot(&header, slot_no).map_err(|error| {
+                    BootError::Catalog(format!("恢复后校验 undo 状态失败：{error}"))
+                })?;
+                if matches!(
+                    slot.state,
+                    bicdb_storage::undo::TxnState::Active
+                        | bicdb_storage::undo::TxnState::PendingRollback
+                ) {
+                    return Err(BootError::Catalog(format!(
+                        "恢复未完成：undo 事务槽 {slot_no} 仍为 {:?}",
+                        slot.state
+                    )));
+                }
+            }
+            RecoverySummary {
+                start_lsn: report.start_lsn.as_raw(),
+                applied_blocks: report.redo.applied_blocks as u64,
+                txns_rolled_back: report.undo.txns_rolled_back,
+                highest_commit_seq: report.analysis.highest_commit_seq,
+                log_end: report.log_end.as_raw(),
+            }
+        };
 
-    // 当前提交序号 = 控制文件与日志流的**较大者**（恢复后不得回退）。
-    let recovered_seq = progress
-        .current_commit_seq
-        .as_raw()
-        .max(summary.highest_commit_seq);
-    let guard = writer.shared();
-    let pool: &'static BufferPool<'static> = Box::leak(Box::new(BufferPool::with_config(
-        io_dyn,
-        params.run.pool_frames,
-        move |_ws, r| resolve(file0_handle, undo_handle, r),
-        guard,
-        SystemClock,
-        cache_config(params),
-    )?));
-    let mut engine = Engine::new(pool, writer, chain.with_pool(pool), seq(recovered_seq));
-    engine.set_policy(wait_policy(params));
-    let engine: &'static Engine<'static, 'static, 'static, 'static> = Box::leak(Box::new(engine));
-    let mut catalog =
-        Catalog::open(io_dyn, &file0_path).map_err(|e| BootError::Catalog(e.to_string()))?;
-    catalog.attach_pool(pool);
-    catalog.set_current_seq(seq(recovered_seq));
+        // 当前提交序号 = 控制文件与日志流的**较大者**（恢复后不得回退）。
+        let recovered_seq = progress
+            .current_commit_seq
+            .as_raw()
+            .max(summary.highest_commit_seq);
+        let guard = writer.shared();
+        let shared_cache = if use_shared {
+            Some(match shared {
+                Some(cache) => cache,
+                None => SharedInstanceCache::new(io, params)?,
+            })
+        } else {
+            None
+        };
+        let pool: &'static BufferPool<'static> = if let Some(cache) = &shared_cache {
+            cache.register(ws_ref, file0_handle, undo_handle, guard)?;
+            cache.pool
+        } else {
+            Box::leak(Box::new(BufferPool::with_partitions(
+                io_dyn,
+                params.run.kcbwds,
+                cache_partition_capacity(params)?,
+                move |ws, r| {
+                    if *ws == ws_ref {
+                        resolve(file0_handle, undo_handle, r)
+                    } else {
+                        None
+                    }
+                },
+                guard,
+                SystemClock,
+                cache_config(params),
+            )?))
+        };
+        for file_id in [FILE0_ID, UNDO_ID] {
+            pool.register_checkpoint_file(bicdb_storage::buffer::BufferKey::new(
+                ws_ref,
+                bicdb_storage::rowid::Rdba::from_parts(file_id, 0).expect("file header address"),
+            ));
+        }
+        if crate::home::Home::locate().is_ok_and(|home| same_dir(dir, &home.public_dir())) {
+            pool.set_critical_workspace(ws_ref);
+        }
+        apply_persisted_recovery_isolation(pool, ws_ref, is_public, recovery_audit.records())?;
+        let mut engine = Engine::new(pool, writer, chain.with_pool(pool), seq(recovered_seq));
+        engine.set_policy(wait_policy(params));
+        let engine: &'static Engine<'static, 'static, 'static, 'static> =
+            Box::leak(Box::new(engine));
+        // Make recovery effects, compensation redo and the new checkpoint durable
+        // before the caller can bind a socket or publish READY.
+        engine.checkpoint_full(ws_ref)?;
+        if pool.dirty_len(ws_ref) != 0 {
+            return Err(BootError::Catalog(
+                "恢复检查点完成后仍存在脏块，拒绝开放实例".into(),
+            ));
+        }
+        let mut catalog =
+            Catalog::open(io_dyn, &file0_path).map_err(|e| BootError::Catalog(e.to_string()))?;
+        catalog.attach_pool(pool);
+        catalog.set_current_seq(seq(recovered_seq));
 
-    Ok(Instance {
-        params: params.clone(),
-        ws_ref,
-        dir: dir.to_path_buf(),
-        io,
-        undo_path: undo_path.clone(),
-        pool,
-        engine,
-        catalog,
-        recovery: Some(summary),
-        lock,
-        txn: None,
-    })
+        Ok(Instance {
+            params: params.clone(),
+            ws_ref,
+            dir: dir.to_path_buf(),
+            io,
+            undo_path: undo_path.clone(),
+            pool,
+            engine,
+            catalog,
+            shared_cache,
+            recovery: Some(summary),
+            forced_recovery: force.detail(),
+            fault_audit: None,
+            lock: None,
+            txn: None,
+        })
+    })();
+    match result {
+        Ok(mut instance) => {
+            let summary = instance
+                .recovery
+                .expect("opened workspace recovery receipt");
+            let (audit_state, actor, detail) = if let Some(detail) = &instance.forced_recovery {
+                (
+                    RecoveryState::Forced,
+                    "bicdb/start --force",
+                    format!("私有工作区完成恢复后强制开放；跳过项：{detail}"),
+                )
+            } else {
+                (
+                    RecoveryState::Verified,
+                    "bicdb/open",
+                    "redo/undo 校验、loser 回滚及耐久检查点完成".to_owned(),
+                )
+            };
+            if let Err(error) = recovery_audit.append(audit_state, summary.log_end, actor, &detail)
+            {
+                instance
+                    .pool
+                    .quarantine_workspace(ws_ref, format!("恢复审计持久化失败：{error}"));
+                return Err(BootError::Io(error));
+            }
+            instance.lock = lock;
+            if !use_shared {
+                instance.start_direct_fault_audit()?;
+            }
+            Ok(instance)
+        }
+        Err(error) => {
+            let mut detail = error.to_string();
+            if detail.len() > 4096 {
+                let mut end = 4096;
+                while !detail.is_char_boundary(end) {
+                    end -= 1;
+                }
+                detail.truncate(end);
+            }
+            match recovery_audit.append(RecoveryState::Failed, 0, "bicdb/open", &detail) {
+                Ok(_) => Err(error),
+                Err(audit_error) => Err(BootError::Io(std::io::Error::other(format!(
+                    "恢复失败：{error}；审计持久化也失败：{audit_error}"
+                )))),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_admission_tests {
+    use super::*;
+    #[test]
+    fn two_gib_is_guaranteed_per_activated_workspace() {
+        assert!(check_cache_admission(3 * MIN_WORKSPACE_CACHE_FRAMES, 3).is_ok());
+        assert!(check_cache_admission(3 * MIN_WORKSPACE_CACHE_FRAMES - 1, 3).is_err());
+        assert!(check_cache_admission(MIN_WORKSPACE_CACHE_FRAMES, 2).is_err());
+        assert!(check_cache_admission(usize::MAX, usize::MAX).is_err());
+    }
+    #[test]
+    fn cache_frames_are_total_and_divided_between_writers() {
+        let mut params = InstanceParams::default();
+        params.run.pool_frames = 3 * MIN_WORKSPACE_CACHE_FRAMES;
+        params.run.kcbwds = 4;
+        assert_eq!(
+            cache_partition_capacity(&params).unwrap() * 4,
+            params.run.pool_frames
+        );
+        params.run.pool_frames += 1;
+        assert!(cache_partition_capacity(&params).is_err());
+        params.run.kcbwds = 3;
+        assert!(cache_partition_capacity(&params).is_err());
+    }
+
+    #[test]
+    fn force_is_private_narrow_and_only_records_actual_skips() {
+        assert!(ForceRecovery::new(true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("PUBLIC 禁止 FORCE"));
+
+        let mut normal = ForceRecovery::new(false, false).unwrap();
+        assert!(normal
+            .check(true, "checkpoint ahead".into())
+            .unwrap_err()
+            .to_string()
+            .contains("拒绝打开"));
+
+        let mut forced = ForceRecovery::new(true, false).unwrap();
+        forced.check(false, "unused".into()).unwrap();
+        forced.check(true, "checkpoint ahead".into()).unwrap();
+        assert_eq!(forced.detail().as_deref(), Some("checkpoint ahead"));
+
+        assert!(ForceRecovery::new(true, false).unwrap().detail().is_none());
+    }
 }

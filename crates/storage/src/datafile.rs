@@ -9,7 +9,7 @@
 //!
 //! 文件头页页体：偏移 68  file_id 2B │ role 1B │ format_version 1B │ flags 2B │
 //!                        当前大小 6B（块数）│ workspace_ref 8B（止于 88）
-//!                偏移 88  保留 8B
+//!                偏移 88  checkpoint_commit_scn 8B（旧文件为 0）
 //!                偏移 96  **file_scn 8B**——本文件最新持久化位点（LSN）
 //!                偏移 104 位图空间头：run_count 1B │ 保留 3B │
 //!                        runs[] 4B×40（各位图区的起始块号）│ 保留
@@ -41,9 +41,11 @@ use crate::pagefile;
 /// 文件头页页体内的字段起点。
 pub const FILE_HEADER_BODY_OFFSET: usize = 68;
 /// `file_scn` 在页体内的偏移（… 当前大小 6 + workspace_ref 8 = 68..88，
-/// 保留 8B = 88..96）。
+/// checkpoint commit SCN 8B = 88..96）。
 pub const FILE_SCN_OFFSET: usize = 96;
-/// 位图空间头在页体内的偏移（68..88 头部字段 + 88..96 保留 + 96..104 `file_scn`）。
+/// Workspace checkpoint commit SCN; consumes previously reserved bytes.
+pub const CHECKPOINT_COMMIT_SCN_OFFSET: usize = 88;
+/// 位图空间头在页体内的偏移（68..88 头部字段 + 88..96 checkpoint SCN + 96..104 `file_scn`）。
 pub const BITMAP_SPACE_HEAD_OFFSET: usize = 104;
 /// 位图区起始块号数组的偏移（run_count 1B + 保留 3B）。
 pub const BITMAP_RUNS_OFFSET: usize = 108;
@@ -176,6 +178,9 @@ pub struct FileHead {
     ///
     /// 与**控制文件检查点**比对判一致性（`目录详设` §2.5）；**只前移**。
     pub file_scn: u64,
+    /// Durable checkpoint commit SCN, independent of the recovery LSN.
+    /// Older files have zero in these previously reserved bytes.
+    pub checkpoint_commit_scn: u64,
 }
 
 /// 读文件头。
@@ -201,6 +206,11 @@ pub fn read_file_head(page: &Page) -> Result<FileHead, DataFileError> {
         blocks: u64::from_le_bytes(blocks),
         workspace_ref,
         file_scn: u64::from_le_bytes(scn),
+        checkpoint_commit_scn: u64::from_le_bytes(
+            b[CHECKPOINT_COMMIT_SCN_OFFSET..CHECKPOINT_COMMIT_SCN_OFFSET + 8]
+                .try_into()
+                .expect("SCN width"),
+        ),
     })
 }
 
@@ -220,6 +230,8 @@ pub fn write_file_head(page: &mut Page, h: &FileHead) -> Result<(), DataFileErro
         .copy_from_slice(&h.blocks.to_le_bytes()[..6]);
     b[FILE_HEADER_BODY_OFFSET + 12..FILE_HEADER_BODY_OFFSET + 20].copy_from_slice(&h.workspace_ref);
     b[FILE_SCN_OFFSET..FILE_SCN_OFFSET + 8].copy_from_slice(&h.file_scn.to_le_bytes());
+    b[CHECKPOINT_COMMIT_SCN_OFFSET..CHECKPOINT_COMMIT_SCN_OFFSET + 8]
+        .copy_from_slice(&h.checkpoint_commit_scn.to_le_bytes());
     Ok(())
 }
 
@@ -335,6 +347,7 @@ impl<'a> DataFile<'a> {
                 workspace_ref,
                 // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
                 file_scn: 0,
+                checkpoint_commit_scn: 0,
             },
             runs: Vec::new(),
         };
@@ -411,6 +424,7 @@ impl<'a> DataFile<'a> {
                 workspace_ref,
                 // 创建位点 = 0（尚未持久化任何用户修改）；由刷盘路径前移。
                 file_scn: 0,
+                checkpoint_commit_scn: 0,
             },
             runs: Vec::new(),
         };
@@ -595,7 +609,7 @@ impl<'a> DataFile<'a> {
         // **头页写成功之后**才提交内存尺寸：中途失败时同值重试仍然可行
         // （先改内存会让"磁盘头仍旧值、内存已新值"卡死——`NotGrowing`）。
         let mut header = self.read_page(0)?;
-        let mut head = self.head;
+        let mut head = read_file_head(&header)?;
         head.blocks = new_blocks;
         write_file_head(&mut header, &head)?;
         self.write_page(0, &mut header)?;
@@ -609,6 +623,12 @@ impl<'a> DataFile<'a> {
         self.head.file_scn
     }
 
+    /// Last published workspace checkpoint commit SCN (not a recovery LSN).
+    #[must_use]
+    pub fn checkpoint_commit_scn(&self) -> u64 {
+        self.head.checkpoint_commit_scn
+    }
+
     /// **推进 `file_scn`**（文件级恢复位点；`目录详设` §2.4/§2.5）。
     ///
     /// 纪律（**只前移**，倒退即具名拒绝）：
@@ -619,17 +639,18 @@ impl<'a> DataFile<'a> {
     /// 头页**副本**的同步写入属建区/刷盘路径（目录详设 §2.1/§2.4，随 C1 落地）；
     /// 本文件只保证字段本身的读写与单调校验。
     pub fn set_file_scn(&mut self, scn: u64) -> Result<(), DataFileError> {
-        if scn < self.head.file_scn {
+        let mut header = self.read_page(0)?;
+        let mut head = read_file_head(&header)?;
+        if scn < head.file_scn {
             return Err(DataFileError::ScnWentBackwards {
-                current: self.head.file_scn,
+                current: head.file_scn,
                 requested: scn,
             });
         }
-        if scn == self.head.file_scn {
+        if scn == head.file_scn {
+            self.head = head;
             return Ok(());
         }
-        let mut header = self.read_page(0)?;
-        let mut head = self.head;
         head.file_scn = scn;
         write_file_head(&mut header, &head)?;
         self.write_page(0, &mut header)?;

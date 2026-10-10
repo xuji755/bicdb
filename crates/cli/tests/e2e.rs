@@ -17,6 +17,13 @@ use bicdb_cli::boot::{create_instance, open_instance, Instance};
 use bicdb_cli::config::InstanceParams;
 use bicdb_exec::Value;
 use bicdb_sql::session::{QueryResult, Session, SessionError};
+use bicdb_storage::buffer::BufferKey;
+use bicdb_storage::recovery_journal::{
+    read_records, RecoveryJournal, RecoveryScope, RecoveryState,
+};
+use bicdb_storage::rowid::Rdba;
+use bicdb_workspace::io::OsFileIo;
+use bicdb_workspace::{workspace_ref, WorkspaceId};
 
 #[test]
 fn growing_rows_near_page_capacity_migrate_and_preserve_rollback_and_restart() {
@@ -1436,8 +1443,9 @@ fn file_dollar_exposes_the_workspaces_file_list() {
         vec![
             vec!["0".to_owned(), "0".to_owned(), "1".to_owned()],
             vec!["1".to_owned(), "1".to_owned(), "1".to_owned()],
+            vec!["2".to_owned(), "2".to_owned(), "1".to_owned()],
         ],
-        "file 0（元数据）与 file 1（撤销）：{got:?}"
+        "file 0（元数据）、file 1（撤销）与 file 2（临时）：{got:?}"
     );
     // ② 列形状：七列，名字与顺序照设计。
     match ok(&mut inst, "SELECT * FROM file$").last() {
@@ -1470,7 +1478,7 @@ fn file_dollar_exposes_the_workspaces_file_list() {
         one[0]
     );
     let agg = rows(&ok(&mut inst, "SELECT COUNT(*) FROM file$"));
-    assert_eq!(agg, vec![vec!["2".to_owned()]]);
+    assert_eq!(agg, vec![vec!["3".to_owned()]]);
     // 与大表连接也可以（固定表就是个表源）。
     ok(&mut inst, "CREATE TABLE t (k NUMBER NOT NULL)");
     ok(
@@ -1490,6 +1498,233 @@ fn file_dollar_exposes_the_workspaces_file_list() {
     assert!(e.contains("不存在"), "{e}");
 }
 
+#[test]
+fn recovery_dollar_exposes_validated_workspace_recovery_history_readonly() {
+    let dir = TempDir::new("recoverydollar");
+    let params = params_for(dir.path());
+    let mut created = create_instance(&params, None).expect("建区");
+    created.shutdown().expect("首次关闭");
+    drop(created);
+    let mut inst = open_instance(&params).expect("恢复打开");
+    let got = rows(&ok(
+        &mut inst,
+        "SELECT sequence, state, recovery_lsn, scope_kind, actor, detail \
+         FROM recovery$ ORDER BY sequence",
+    ));
+    assert!(!got.is_empty(), "建库和打开必须留下恢复审计记录");
+    assert_eq!(got.last().unwrap()[1], "VERIFIED", "最后状态应完成验证");
+    assert!(got.iter().all(|row| row[3] == "WORKSPACE"));
+    assert!(got.windows(2).all(|pair| {
+        pair[0][0].parse::<u64>().unwrap() + 1 == pair[1][0].parse::<u64>().unwrap()
+    }));
+    let error = err(&mut inst, "DELETE FROM recovery$");
+    assert!(error.contains("不存在"), "恢复审计没有 SQL 写入口：{error}");
+
+    let tables = rows(&ok(&mut inst, "SHOW TABLES"));
+    assert!(tables
+        .iter()
+        .any(|row| row[0] == "recovery$" && row[1] == "FIXED"));
+    inst.shutdown().expect("关");
+}
+
+#[test]
+fn structured_recovery_scopes_are_restored_as_access_isolation() {
+    let dir = TempDir::new("persisted-recovery-isolation");
+    let params = params_for(dir.path());
+    let mut created = create_instance(&params, None).expect("建区");
+    ok(
+        &mut created,
+        "CREATE TABLE isolated_t (id NUMBER); CREATE TABLE healthy_t (id NUMBER)",
+    );
+    let object_rows = rows(&ok(
+        &mut created,
+        "SELECT \"obj#\" FROM obj$ WHERE name = 'isolated_t'",
+    ));
+    let object_id = object_rows[0][0].parse::<u64>().unwrap();
+    created.shutdown().expect("首次关闭");
+    drop(created);
+
+    // A normal reopen creates the audit file for legacy/new workspaces.
+    let mut opened = open_instance(&params).expect("首次恢复");
+    opened.shutdown().expect("恢复后关闭");
+    drop(opened);
+
+    let ws = workspace_ref(WorkspaceId::from_raw(1).unwrap());
+    let io = OsFileIo::new();
+    let mut audit = RecoveryJournal::open(&io, &dir.path().join("recovery.audit"), ws).unwrap();
+    audit
+        .append_scoped(
+            RecoveryState::Failed,
+            0,
+            RecoveryScope::Page {
+                file_id: 0,
+                block_id: 999,
+            },
+            "media-recovery",
+            "page repair pending",
+        )
+        .unwrap();
+    audit
+        .append_scoped(
+            RecoveryState::Failed,
+            0,
+            RecoveryScope::Object { object_id },
+            "catalog-validation",
+            "object repair pending",
+        )
+        .unwrap();
+    drop(audit);
+
+    let mut reopened = open_instance(&params).expect("带隔离项恢复");
+    let error = reopened
+        .pool
+        .pin(BufferKey::new(ws, Rdba::from_parts(0, 999).unwrap()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("页面已隔离") && error.contains("page repair pending"));
+    let error = err(&mut reopened, "SELECT * FROM isolated_t");
+    assert!(error.contains("已由恢复管理隔离"), "{error}");
+    assert!(error.contains("object repair pending"), "{error}");
+    assert!(ok(&mut reopened, "SELECT * FROM healthy_t")[0].row_count() == 0);
+    reopened.shutdown().expect("关闭");
+    drop(reopened);
+
+    let mut audit = RecoveryJournal::open(&io, &dir.path().join("recovery.audit"), ws).unwrap();
+    audit
+        .append_scoped(
+            RecoveryState::Verified,
+            0,
+            RecoveryScope::Page {
+                file_id: 0,
+                block_id: 999,
+            },
+            "repair-verify",
+            "page verified",
+        )
+        .unwrap();
+    audit
+        .append_scoped(
+            RecoveryState::Verified,
+            0,
+            RecoveryScope::Object { object_id },
+            "repair-verify",
+            "object verified",
+        )
+        .unwrap();
+    drop(audit);
+    let mut repaired = open_instance(&params).expect("验证记录清除隔离");
+    assert!(ok(&mut repaired, "SELECT * FROM isolated_t")[0].row_count() == 0);
+    let page_error = repaired
+        .pool
+        .pin(BufferKey::new(ws, Rdba::from_parts(0, 999).unwrap()))
+        .unwrap_err()
+        .to_string();
+    assert!(!page_error.contains("页面已隔离"), "{page_error}");
+    repaired.shutdown().expect("修复后关闭");
+}
+
+#[test]
+fn offline_verification_clears_only_the_scope_whose_media_and_audit_succeed() {
+    let dir = TempDir::new("offline-public-recovery-verify");
+    let params = params_for(dir.path());
+    let mut created = create_instance(&params, None).expect("建区");
+    ok(&mut created, "CREATE TABLE repair_t (id NUMBER)");
+    let object_id = rows(&ok(
+        &mut created,
+        "SELECT \"obj#\" FROM obj$ WHERE name = 'repair_t'",
+    ))[0][0]
+        .parse::<u32>()
+        .unwrap();
+    created.shutdown().expect("关闭");
+    drop(created);
+
+    let ws = workspace_ref(WorkspaceId::from_raw(1).unwrap());
+    let io = OsFileIo::new();
+    let mut audit = RecoveryJournal::open(&io, &dir.path().join("recovery.audit"), ws).unwrap();
+    audit
+        .append_scoped(
+            RecoveryState::Failed,
+            0,
+            RecoveryScope::Page {
+                file_id: 0,
+                block_id: 0,
+            },
+            "media-repair",
+            "file header repair pending",
+        )
+        .unwrap();
+    audit
+        .append_scoped(
+            RecoveryState::Failed,
+            0,
+            RecoveryScope::Object {
+                object_id: u64::from(object_id),
+            },
+            "object-repair",
+            "segment verification pending",
+        )
+        .unwrap();
+    drop(audit);
+
+    let (first_archive, active) =
+        bicdb_cli::recovery_admin::archive(&params).expect("带活动范围归档");
+    assert_eq!(active, 2);
+    assert!(read_records(&io, &first_archive, ws).unwrap().len() >= 2);
+    let retained = read_records(&io, &dir.path().join("recovery.audit"), ws).unwrap();
+    assert_eq!(retained.len(), 2);
+    assert!(retained
+        .iter()
+        .all(|record| record.state == RecoveryState::Failed));
+
+    bicdb_cli::recovery_admin::verify(
+        &params,
+        bicdb_cli::recovery_admin::VerifyScope::Page {
+            file_id: 0,
+            block_id: 0,
+        },
+    )
+    .expect("离线验证页面");
+    let mut partly_repaired = open_instance(&params).expect("带对象隔离打开");
+    assert_eq!(partly_repaired.pool.quarantined_page_count(ws), 0);
+    assert_eq!(partly_repaired.pool.quarantined_object_count(ws), 1);
+    let error = err(&mut partly_repaired, "SELECT * FROM repair_t");
+    assert!(error.contains("隔离"), "{error}");
+    partly_repaired.shutdown().expect("部分验证后关闭");
+    drop(partly_repaired);
+    bicdb_cli::recovery_admin::verify(
+        &params,
+        bicdb_cli::recovery_admin::VerifyScope::Object { object_id },
+    )
+    .expect("离线验证对象");
+
+    let mut reopened = open_instance(&params).expect("全部精确范围验证后可正常打开");
+    let verified = rows(&ok(
+        &mut reopened,
+        "SELECT scope_kind, state FROM recovery$ ORDER BY sequence",
+    ));
+    let page_verified = verified
+        .iter()
+        .position(|row| row == &["PAGE", "VERIFIED"])
+        .expect("PAGE Verified 记录");
+    let object_verified = verified
+        .iter()
+        .position(|row| row == &["OBJECT", "VERIFIED"])
+        .expect("OBJECT Verified 记录");
+    assert!(page_verified < object_verified);
+    assert_eq!(verified.last().unwrap(), &["WORKSPACE", "VERIFIED"]);
+    reopened.shutdown().expect("关闭");
+    drop(reopened);
+
+    let (archive_path, active) = bicdb_cli::recovery_admin::archive(&params).expect("归档审计");
+    assert_eq!(active, 0, "全部范围已验证，不应保留活动隔离项");
+    let archived = read_records(&io, &archive_path, ws).expect("归档可完整校验");
+    assert!(!archived.is_empty());
+    let compact = read_records(&io, &dir.path().join("recovery.audit"), ws).expect("压缩审计");
+    assert!(compact.is_empty());
+    let mut after_archive = open_instance(&params).expect("归档后的空活动清单可正常恢复");
+    after_archive.shutdown().expect("归档后关闭");
+}
+
 /// **清单即事实**：`file$` 的 `path` 列指向 `data/` 下**真实存在**的文件，
 /// 且文件名里的工作区标识与文件头同源（`workspace_ref` = SHA-256(工作区号) 前 8 字节）。
 #[test]
@@ -1500,7 +1735,7 @@ fn file_dollar_rows_point_at_real_files() {
         &mut inst,
         "SELECT \"file#\", path FROM file$ ORDER BY 1",
     ));
-    assert_eq!(paths.len(), 2);
+    assert_eq!(paths.len(), 3);
     for (i, p) in paths.iter().enumerate() {
         let path = std::path::Path::new(&p[1]);
         assert!(
@@ -1518,6 +1753,11 @@ fn file_dollar_rows_point_at_real_files() {
         paths[1][1].contains("7c9fa136d4413fa6_undo"),
         "{:?}",
         paths[1]
+    );
+    assert!(
+        paths[2][1].contains("7c9fa136d4413fa6_temp"),
+        "{:?}",
+        paths[2]
     );
     inst.shutdown().expect("关");
 }

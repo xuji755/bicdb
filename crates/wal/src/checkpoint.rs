@@ -1,4 +1,4 @@
-//! 检查点（§11.7）：**CKPT 角色——只把位置写进控制文件，不写数据块**。
+//! 检查点（§11.7）：**CKPT 角色——发布控制文件与文件头检查点元数据，不写脏数据块**。
 //!
 //! ```text
 //! 写线程（DBWR）           检查点（CKPT）
@@ -69,6 +69,13 @@ pub enum CheckpointError {
     Undo(UndoError),
     /// Checkpoint requires the live undo chain bound to this pool.
     InvalidUndo(&'static str),
+    /// Clean shutdown requires every client transaction to have ended.
+    OutstandingTransaction {
+        /// Physical undo transaction slot.
+        slot: u16,
+        /// Unresolved transaction state.
+        state: bicdb_storage::undo::TxnState,
+    },
     /// **低水位回退**——违反单调性，拒绝发布。
     Regression {
         /// 控制文件里的现值。
@@ -87,6 +94,9 @@ impl std::fmt::Display for CheckpointError {
             CheckpointError::Chain(e) => write!(f, "检查点 undo 链：{e}"),
             CheckpointError::Undo(e) => write!(f, "检查点事务表：{e}"),
             CheckpointError::InvalidUndo(e) => write!(f, "检查点 undo：{e}"),
+            CheckpointError::OutstandingTransaction { slot, state } => {
+                write!(f, "拒绝干净关闭：undo 槽 {slot} 仍为 {state:?}")
+            }
             CheckpointError::Regression { old, new } => write!(
                 f,
                 "低水位不得回退：现值 {}，请求 {}",
@@ -158,6 +168,7 @@ pub fn publish_checkpoint(
         )
     })?;
     writer.flush(record_lsn)?;
+    writer.record_checkpoint_end();
     Ok(CheckpointReport {
         progress,
         record_lsn,
@@ -178,7 +189,10 @@ pub fn full_checkpoint(
     oldest_snapshot_commit_seq: CommitSeq,
     timestamp: u64,
 ) -> Result<CheckpointReport, CheckpointError> {
+    writer.flush(writer.appended_lsn())?;
+    pool.load_checkpoint_headers(workspace)?;
     let flushed = pool.flush_workspace(workspace)?;
+    pool.sync_workspace(workspace)?;
     let log_end = writer.appended_lsn();
     let progress = CheckpointProgress {
         checkpoint_commit_seq,
@@ -187,9 +201,51 @@ pub fn full_checkpoint(
         oldest_snapshot_commit_seq,
         timestamp,
     };
+    let mut headers = pool
+        .prepare_checkpoint_headers(workspace)?
+        .ok_or(bicdb_storage::buffer::BufferError::FreeBufferWait)?;
     let mut report = publish_checkpoint(writer, progress)?;
+    pool.publish_prepared_file_checkpoints(
+        workspace,
+        report.progress.checkpoint_lsn,
+        report.progress.checkpoint_commit_seq,
+        &mut headers,
+    )?;
     report.pages_written = flushed.pages_written;
     Ok(report)
+}
+
+/// Clean-shutdown admission gate. Runtime checkpoints may retain active
+/// transactions; shutdown may not. The caller holds writer and chain locks.
+/// Validate a private repaired image before any checkpoint publication or WAL
+/// reuse. Durable known commits are not mistaken for unfinished transactions.
+pub fn shutdown_checkpoint(
+    writer: &mut GroupWriter<'_, '_>,
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+    oldest_snapshot_commit_seq: CommitSeq,
+    timestamp: u64,
+) -> Result<CheckpointReport, CheckpointError> {
+    if chain.bound_pool_addr() != Some(pool as *const _ as usize) {
+        return Err(CheckpointError::InvalidUndo(
+            "chain must be bound to the checkpoint pool",
+        ));
+    }
+    let mut header = chain.page(0).map_err(CheckpointError::Chain)?;
+    repair_committed_slots(&mut header, &writer.checkpoint_commits())
+        .map_err(CheckpointError::Undo)?;
+    for slot in 0..bicdb_storage::undo::TXN_SLOTS as u16 {
+        let state = bicdb_storage::undo::read_slot(&header, slot)
+            .map_err(CheckpointError::Undo)?
+            .state;
+        if matches!(
+            state,
+            bicdb_storage::undo::TxnState::Active | bicdb_storage::undo::TxnState::PendingRollback
+        ) {
+            return Err(CheckpointError::OutstandingTransaction { slot, state });
+        }
+    }
+    transaction_checkpoint(writer, pool, chain, oldest_snapshot_commit_seq, timestamp)
 }
 
 /// Full checkpoint at a completed write-operation boundary, including active
@@ -246,6 +302,146 @@ pub fn transaction_checkpoint(
     )?;
     writer.clear_checkpoint_commits();
     Ok(report)
+}
+
+fn undo_header_key(chain: &UndoChain<'_, '_>) -> Result<BufferKey, CheckpointError> {
+    let segment = chain.segment();
+    let block = segment
+        .logical_block(0)
+        .ok_or(CheckpointError::InvalidUndo("missing header block"))?;
+    let rdba = Rdba::from_parts(segment.file_id(), block)
+        .ok_or(CheckpointError::InvalidUndo("invalid header address"))?;
+    Ok(BufferKey::new(segment.workspace_ref(), rdba))
+}
+
+/// Independent undo maintenance. Never writes a data file or publishes a
+/// checkpoint. Busy headers defer; DBWR owns persistence of the repaired page.
+pub fn repair_transaction_slots(
+    writer: &mut GroupWriter<'_, '_>,
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+) -> Result<Option<bool>, CheckpointError> {
+    if chain.bound_pool_addr() != Some(pool as *const _ as usize) {
+        return Err(CheckpointError::InvalidUndo(
+            "chain must be bound to the checkpoint pool",
+        ));
+    }
+    let Some(floor) = writer.checkpoint_commit_floor() else {
+        return Ok(Some(false));
+    };
+    let key = undo_header_key(chain)?;
+    let Some(mut guard) = pool.try_pin(key) else {
+        return Ok(None);
+    };
+    let mut repaired = (*guard).clone();
+    repair_committed_slots(&mut repaired, &writer.checkpoint_commits())
+        .map_err(CheckpointError::Undo)?;
+    if repaired.as_bytes() == guard.as_bytes() {
+        return Ok(Some(false));
+    }
+    let mut header = repaired
+        .header()
+        .ok_or(CheckpointError::InvalidUndo("invalid header page"))?;
+    let stamp =
+        Lsn::from_raw(writer.appended_lsn().as_raw().saturating_sub(1)).expect("LSN domain");
+    header.page_lsn = header.page_lsn.max(stamp);
+    repaired.write_header(&header);
+    repaired.bump_mod_seq();
+    guard.as_bytes_mut().copy_from_slice(repaired.as_bytes());
+    // Keep the commit WAL until the reconstructed slot state is durable.
+    guard.mark_dirty(floor);
+    Ok(Some(true))
+}
+
+/// Incremental transaction-aware checkpoint at a completed write-operation
+/// boundary. Does not wait for pins or flush data pages. Caller holds writer
+/// and undo locks; LGWR and DBWR handle pending durability asynchronously.
+pub fn transaction_checkpoint_incremental(
+    writer: &mut GroupWriter<'_, '_>,
+    pool: &BufferPool<'_>,
+    chain: &UndoChain<'_, '_>,
+    oldest_snapshot_commit_seq: CommitSeq,
+    timestamp: u64,
+) -> Result<Option<CheckpointReport>, CheckpointError> {
+    if chain.bound_pool_addr() != Some(pool as *const _ as usize) {
+        return Err(CheckpointError::InvalidUndo(
+            "chain must be bound to the checkpoint pool",
+        ));
+    }
+    let workspace = chain.segment().workspace_ref();
+    let end = writer.appended_lsn();
+    if writer.synced_lsn() < end {
+        pool.request_redo_flush(workspace, end)?;
+        return Ok(None);
+    }
+    let commit_floor = writer.checkpoint_commit_floor();
+    let mut retain_commits = false;
+    if commit_floor.is_some() {
+        let key = undo_header_key(chain)?;
+        let Some(guard) = pool.try_pin(key) else {
+            return Ok(None);
+        };
+        let mut checked = (*guard).clone();
+        repair_committed_slots(&mut checked, &writer.checkpoint_commits())
+            .map_err(CheckpointError::Undo)?;
+        // CKPT only validates. The independent undo maintenance worker repairs
+        // slots; DBWR subsequently writes the repaired page.
+        retain_commits = checked.as_bytes() != guard.as_bytes();
+        drop(guard);
+        retain_commits |= pool.is_dirty(key);
+    }
+    // Freeze the lower bound BEFORE syncing: DBWR may clean a page while its
+    // file write is still only in the OS cache. No foreground writer can enter
+    // until the caller releases the workspace writer/undo boundary locks.
+    let mut recovery_lsn = low_water(pool, workspace, end).min(end);
+    if retain_commits {
+        recovery_lsn = recovery_lsn.min(commit_floor.expect("commit floor"));
+    }
+    let old = writer.checkpoint_progress()?;
+    let current = writer.commit_watermark();
+    let Some(mut headers) = pool.prepare_checkpoint_headers(workspace)? else {
+        return Ok(None);
+    };
+    let idle = pool.dirty_len(workspace) == 0
+        && old.checkpoint_commit_seq == current
+        && !writer.has_redo_after_checkpoint();
+    if idle || (recovery_lsn == old.checkpoint_lsn && current == old.current_commit_seq) {
+        pool.publish_prepared_file_checkpoints(
+            workspace,
+            old.checkpoint_lsn,
+            old.checkpoint_commit_seq,
+            &mut headers,
+        )?;
+        if !retain_commits {
+            writer.clear_checkpoint_commits();
+        }
+        return Ok(None);
+    }
+    pool.sync_workspace(workspace)?;
+    let report = publish_checkpoint(
+        writer,
+        CheckpointProgress {
+            checkpoint_commit_seq: if recovery_lsn == end {
+                current
+            } else {
+                old.checkpoint_commit_seq
+            },
+            checkpoint_lsn: recovery_lsn,
+            current_commit_seq: current,
+            oldest_snapshot_commit_seq,
+            timestamp,
+        },
+    )?;
+    pool.publish_prepared_file_checkpoints(
+        workspace,
+        report.progress.checkpoint_lsn,
+        report.progress.checkpoint_commit_seq,
+        &mut headers,
+    )?;
+    if !retain_commits {
+        writer.clear_checkpoint_commits();
+    }
+    Ok(Some(report))
 }
 
 #[cfg(test)]
@@ -521,6 +717,93 @@ mod tests {
             matches!(err, CheckpointError::Regression { old, new } if old == lsn(100) && new == lsn(50)),
             "{err}"
         );
+    }
+
+    #[test]
+    fn data_sync_failure_cannot_publish_checkpoint_or_allow_log_reuse() {
+        use bicdb_workspace::io::{FaultInjecting, FaultOp, FaultRule};
+        let io = FaultInjecting::new(mem());
+        let data = io
+            .open(
+                Path::new("/mem/data9"),
+                OpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .unwrap();
+        io.set_len(data, bicdb_storage::page::PAGE_SIZE as u64)
+            .unwrap();
+        pagefile::write_page(&io, data, 0, &mut Page::new(PageType::HeapTable, WS, 9, 0)).unwrap();
+        let mut cf = ControlFile::format(
+            &io,
+            Path::new(A),
+            Path::new(B),
+            &ws_entry(),
+            &RedoEntries::new(2, 1).unwrap(),
+            &ArchiveRecord::default(),
+        )
+        .unwrap();
+        let mut writer = GroupWriter::create(
+            &io,
+            &mut cf,
+            Path::new(WAL),
+            GroupSpec::new(2, 1, 64).unwrap(),
+            lsn(0),
+        )
+        .unwrap();
+        let at = writer
+            .append(|lsn| {
+                RedoRecord::page_modification(
+                    lsn,
+                    0,
+                    vec![crate::record::BlockRef {
+                        flags: 0,
+                        rdba: rdba(9, 0),
+                        changes: vec![crate::record::Change {
+                            offset: 4096,
+                            after: vec![0x77],
+                        }],
+                    }],
+                )
+            })
+            .unwrap();
+        writer.flush(writer.appended_lsn()).unwrap();
+        let pool = BufferPool::new(
+            &io,
+            2,
+            move |ws, r| (*ws == WS && r.file_id() == 9).then_some((data, r.block_id())),
+            FakeWal {
+                durable: std::sync::atomic::AtomicU64::new(u64::MAX >> 16),
+            },
+        )
+        .unwrap();
+        {
+            let mut guard = pool.pin(BufferKey::new(WS, rdba(9, 0))).unwrap();
+            guard.as_bytes_mut()[4096] = 0x77;
+            let mut header = guard.header().unwrap();
+            header.page_lsn = at;
+            guard.write_header(&header);
+            guard.mark_dirty(at);
+        }
+        let old = writer.checkpoint_progress().unwrap();
+        io.reset_counters();
+        io.add_rule(FaultRule::once(
+            FaultOp::SyncData,
+            1,
+            std::io::ErrorKind::Other,
+        ));
+        let error = full_checkpoint(&mut writer, &pool, WS, seq(0), seq(0), seq(0), 0).unwrap_err();
+        assert!(matches!(error, CheckpointError::Pool(_)), "{error}");
+        assert_eq!(
+            writer.checkpoint_progress().unwrap(),
+            old,
+            "数据页 write 成功而 sync 失败，不允许提前发布恢复位置或降级日志组"
+        );
+        assert_eq!(
+            pool.dirty_len(WS),
+            0,
+            "页已写出；尚未同步的文件必须继续记账"
+        );
+        let retry = full_checkpoint(&mut writer, &pool, WS, seq(0), seq(0), seq(0), 0).unwrap();
+        assert!(retry.progress.checkpoint_lsn > old.checkpoint_lsn);
     }
 
     #[test]

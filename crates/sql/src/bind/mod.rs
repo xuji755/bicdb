@@ -63,7 +63,7 @@ impl NameSpace {
 ///
 /// `session$`/`lock$` 随会话层落地（`API` REQ-API-018）；名字现在就占用，
 /// 免得将来再撞名。
-pub const FIXED_TABLES: &[&str] = &["file$", "session$", "lock$", "attachment$"];
+pub const FIXED_TABLES: &[&str] = &["file$", "recovery$", "session$", "lock$", "attachment$"];
 
 /// SQL-visible dictionary definitions. Physical credential columns are excluded.
 pub fn dictionary_columns(name: &str) -> Option<Vec<CatalogColumn>> {
@@ -426,7 +426,10 @@ impl<'v, V: CatalogView> NameResolver<'v, V> {
             }
             // `public` 的管理元数据 `file$`：只有 admin 可见（`public` 的
             // `file$` 对普通用户不可见，本工作区的 `file$` 对其属主可见）。
-            if *fixed == "file$" && self.view.is_public() && !self.policy.is_admin {
+            if matches!(*fixed, "file$" | "recovery$")
+                && self.view.is_public()
+                && !self.policy.is_admin
+            {
                 return Err(BindError::NotFound {
                     name: name.to_owned(),
                     ns: NameSpace::Table,
