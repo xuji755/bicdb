@@ -26,7 +26,7 @@ It unifies five kinds of data under one transactional store:
 
 ### Status
 
-> **v0.3.1 (2026-10-10).** The on-disk engine, WAL/Undo recovery,
+> **v0.3.2 (2026-10-10).** The on-disk engine, WAL/Undo recovery,
 > transactions, buffer pool, heap tables, B+Tree indexes, catalog and local
 > service protocol are working and covered by the workspace test suite. The SQL
 > layer supports DDL/DML, aggregates, two-table joins, set operations,
@@ -264,7 +264,7 @@ bicdb 是面向 **AI Agent** 的单机、按工作区隔离、多连接事务型
 
 ### 当前状态
 
-> **v0.3.1（2026-10-10）**。磁盘存储、WAL/Undo 恢复、事务、缓冲池、堆表、
+> **v0.3.2（2026-10-10）**。磁盘存储、WAL/Undo 恢复、事务、缓冲池、堆表、
 > B+Tree、目录和本机服务协议已经可运行，并由工作区测试覆盖。SQL 已支持 DDL/DML、
 > 聚合、两表连接、集合运算、`INSERT … SELECT`、具名参数和规则式索引访问。
 >

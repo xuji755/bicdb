@@ -6,6 +6,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-10-10
+
+### Fixed
+
+- Removed the incorrect 2 GiB cache reservation per logical workspace. All
+  workspaces share the instance cache; KCBWDS partitions govern DBWR workers.
+- Preserved authenticated identity after failed workspace binding, including
+  malformed requests, and retained the original binding after duplicate BIND.
+- Stopped transient configuration/admission failures from permanently marking
+  a workspace as requiring recovery.
+- Scheduled full-text batch maintenance independently per workspace and by
+  elapsed time, avoiding starvation from continuous SQL/STATUS requests.
+  Read-only and faulted workspaces skip background write batches.
+- Stabilized checkpoint/Undo worker ownership when new workspaces register,
+  and bounded connection acceptance to prevent control-loop starvation.
+
+### Added
+
+- Added configurable `service.max_bound_workspaces` (default 1024, including
+  PUBLIC) and current/maximum workspace counts in STATUS. This limits resident
+  opened workspaces independently of the cache size and connection limit.
+- Added opt-in existing-instance regression checks for BIND recovery and
+  private-workspace full-text catch-up and retrieval.
+
+### Known limitations
+
+- Full-text maintenance batches and first-bind recovery still run on the
+  control thread and can delay control requests during expensive work.
+- Opened workspaces remain resident until restart; disconnecting the last
+  client does not automatically release a workspace admission slot.
+
 ## [0.3.1] — 2026-10-10
 
 ### Fixed
