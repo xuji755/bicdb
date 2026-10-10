@@ -1,0 +1,53 @@
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: startsWith(github.event.head_commit.message, 'release:')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the versioned GitHub release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const manifest = fs.readFileSync('Cargo.toml', 'utf8');
+            const match = manifest.match(/\[workspace\.package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/);
+            if (!match) throw new Error('workspace package version is missing');
+
+            const version = match[1];
+            const tag = `v${version}`;
+            const changelog = fs.readFileSync('CHANGELOG.md', 'utf8');
+            const heading = `## [${version}]`;
+            const start = changelog.indexOf(heading);
+            if (start < 0) throw new Error(`${heading} is missing from CHANGELOG.md`);
+            const following = changelog.indexOf('\n## [', start + heading.length);
+            const body = changelog.slice(start, following < 0 ? undefined : following).trim();
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+              core.info(`${tag} is already published`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                name: `bicdb ${tag}`,
+                body,
+                draft: false,
+                prerelease: false,
+              });
+            }
