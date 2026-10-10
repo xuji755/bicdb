@@ -6,6 +6,29 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-10-10
+
+### Fixed
+
+- Fixed the daemon file-handle lifecycle so accepted connections, workspace
+  catalogs and control-file handles are released instead of accumulating until
+  the process limit is exhausted.
+- Fixed concurrent updates after row-lock waits by resolving stable logical
+  ROWIDs through forwarding records when a row must migrate.
+
+### Added
+
+- Added one shared daemon for PUBLIC and registered private workspaces, with
+  authenticated workspace binding and configurable global/per-workspace
+  execution limits.
+- Added background durability workers, global checkpoint coordination,
+  per-workspace WAL routing, DBWR partitions and idle backoff.
+- Added structured recovery audit, page/object quarantine and verification,
+  offline audit archival, and narrowly scoped forced startup for non-PUBLIC
+  workspaces. PUBLIC remains subject to mandatory consistency recovery.
+- Added clean-shutdown gates that roll back active transactions, flush WAL and
+  dirty pages, checkpoint every workspace and validate temporary-state cleanup.
+
 ## [0.3.0] — 2026-10-10
 
 ### Release highlights
