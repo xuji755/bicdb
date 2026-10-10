@@ -1077,8 +1077,24 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
     let mut pending_fast_stop = false;
     let mut fast_stop_started: Option<Instant> = None;
     let mut fast_stop_reported = false;
+    let mut next_maintenance = Instant::now();
     let stop_after = 'service: loop {
         resume_row_waits(&mut parked, &mut scheduler, &work_tx, pending_fast_stop)?;
+        if !pending_fast_stop && Instant::now() >= next_maintenance {
+            if scheduler.idle_in(inst.ws_ref)
+                && !workspace_has_open_transaction(&connections, inst.ws_ref, inst.ws_ref)
+            {
+                maintain_workspace_fulltext(&mut inst, &mut fulltext, params, &mut log)?;
+            }
+            for (workspace, target) in &mut workspaces {
+                if scheduler.idle_in(*workspace)
+                    && !workspace_has_open_transaction(&connections, inst.ws_ref, *workspace)
+                {
+                    maintain_workspace_fulltext(target, &mut fulltext, params, &mut log)?;
+                }
+            }
+            next_maintenance = Instant::now() + Duration::from_millis(100);
+        }
         if pending_fast_stop {
             let execution = scheduler.metrics();
             if execution.active == 0 && execution.queued == 0 && execution.parked == 0 {
@@ -1099,7 +1115,12 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                 fast_stop_reported = true;
             }
         }
-        while !pending_fast_stop {
+        // Bound accept work so an incoming connection stream cannot starve
+        // queued SQL completions, STATUS, shutdown or maintenance.
+        for _ in 0..64 {
+            if pending_fast_stop {
+                break;
+            }
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1145,21 +1166,7 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
 
         let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !workspace_has_open_transaction(&connections, inst.ws_ref, inst.ws_ref)
-                    && scheduler.idle_in(inst.ws_ref)
-                {
-                    maintain_workspace_fulltext(&mut inst, &mut fulltext, params, &mut log)?;
-                }
-                for (workspace, target) in &mut workspaces {
-                    if !workspace_has_open_transaction(&connections, inst.ws_ref, *workspace)
-                        && scheduler.idle_in(*workspace)
-                    {
-                        maintain_workspace_fulltext(target, &mut fulltext, params, &mut log)?;
-                    }
-                }
-                continue;
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(ServiceError::State("服务连接调度器意外关闭".into()));
             }
@@ -1694,6 +1701,8 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                         if connection.workspace.is_some() {
                             return Err("本连接已经绑定工作区；切换需新建连接".into());
                         }
+                        let selection =
+                            std::str::from_utf8(&payload).map_err(|_| "BIND 请求必须是 UTF-8")?;
                         let state = connection.state.as_mut().ok_or("本连接有请求正在执行")?;
                         if state.in_transaction() {
                             return Err("事务期间不能绑定工作区".into());
@@ -1709,8 +1718,6 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                             crate::home::Home::locate().ok().map(|h| h.root),
                             Some(inst.io),
                         );
-                        let selection =
-                            std::str::from_utf8(&payload).map_err(|_| "BIND 请求必须是 UTF-8")?;
                         let route = public.route_owned_workspace(if selection.is_empty() {
                             None
                         } else {
@@ -1794,10 +1801,9 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                     })();
                     let response = match result {
                         Ok(route) => WireReply::ok(route.encode().into_bytes()),
-                        Err(error) => {
-                            connection.auth_failed = true;
-                            WireReply::error(error.into_bytes())
-                        }
+                        // BIND errors preserve the existing authenticated identity
+                        // and binding; only AUTH may invalidate authentication.
+                        Err(error) => WireReply::error(error.into_bytes()),
                     };
                     let _ = reply.send(response);
                     continue;
@@ -2020,16 +2026,6 @@ pub fn run_daemon(opts: &StartOptions, foreground: bool) -> Result<(), ServiceEr
                     fast_stop_started.get_or_insert_with(Instant::now);
                     continue;
                 }
-                // Poll by elapsed time after every request as well as during
-                // idle periods. A client polling SHOW FULLTEXT every 40 ms
-                // must not starve a 100 ms maintenance interval forever.
-                // Any suspended explicit transaction pauses maintenance for
-                // the whole workspace, preserving the single-session rule.
-                if !workspace_has_open_transaction(&connections, inst.ws_ref, inst.ws_ref)
-                    && scheduler.idle_in(inst.ws_ref)
-                {
-                    maintain_workspace_fulltext(&mut inst, &mut fulltext, params, &mut log)?;
-                }
             }
         }
     };
@@ -2104,6 +2100,12 @@ fn maintain_workspace_fulltext(
     params: &crate::config::InstanceParams,
     log: &mut LogFile,
 ) -> Result<(), ServiceError> {
+    // Read-only and faulted workspaces must not start background write batches.
+    if instance.pool.workspace_fault(instance.ws_ref).is_some()
+        || instance.pool.workspace_read_only(instance.ws_ref).is_some()
+    {
+        return Ok(());
+    }
     let scheduler = match schedulers.entry(instance.ws_ref) {
         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
@@ -2114,8 +2116,11 @@ fn maintain_workspace_fulltext(
             .map_err(|error| ServiceError::State(error.to_string()))?,
         ),
     };
+    // SQL workers publish graph/segment metadata through independent catalogs.
+    // A retained control-plane catalog may still cache an old segment HWM.
+    let mut catalog = instance.open_worker_catalog()?;
     let seq = instance.seq();
-    let mut session = Session::new(instance.pool, instance.engine, &mut instance.catalog, seq);
+    let mut session = Session::new(instance.pool, instance.engine, &mut catalog, seq);
     session
         .set_fulltext_defaults(
             params.run.fulltext_interval_ms,

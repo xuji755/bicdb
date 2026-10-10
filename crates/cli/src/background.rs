@@ -130,12 +130,12 @@ impl Background {
                             .iter()
                             .map(|(ws, (engine, wal))| (*ws, *engine, Arc::clone(wal)))
                             .collect();
-                        for (index, (ws, engine, wal)) in snapshot.into_iter().enumerate() {
+                        for (ws, engine, wal) in snapshot {
                             if stop.load(Ordering::Acquire) {
                                 break;
                             }
                             if pool.workspace_fault(ws).is_some() { continue; }
-                            if index % count != shard {
+                            if workspace_worker(ws, count) != shard {
                                 continue;
                             }
                             let result = if undo {
@@ -259,6 +259,12 @@ impl Drop for Background {
     }
 }
 
+// Stable assignment prevents adding a workspace from moving existing engines
+// between workers whose snapshots were captured at different times.
+fn workspace_worker(workspace: [u8; 8], count: usize) -> usize {
+    (u64::from_le_bytes(workspace) % count as u64) as usize
+}
+
 // Periodic maintenance is not awakened by unrelated LGWR notifications. The
 // predicate is checked under the notification mutex, preventing lost wakeups.
 fn park_worker(
@@ -277,6 +283,25 @@ fn park_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registration_does_not_reassign_existing_workspace_workers() {
+        let before = [[20; 8], [40; 8], [60; 8]];
+        let after = [[10; 8], [20; 8], [30; 8], [40; 8], [60; 8]];
+        for count in [1, 2, 3, 8, 64] {
+            for workspace in before {
+                let owner = workspace_worker(workspace, count);
+                let matching: Vec<_> = (0..count)
+                    .filter(|shard| {
+                        after
+                            .iter()
+                            .any(|ws| *ws == workspace && workspace_worker(*ws, count) == *shard)
+                    })
+                    .collect();
+                assert_eq!(matching, vec![owner]);
+            }
+        }
+    }
+
     #[test]
     fn maintenance_sleeps_through_log_notifications_and_shutdown_wakes_it() {
         let signal = Arc::new((Mutex::new(0), Condvar::new()));
