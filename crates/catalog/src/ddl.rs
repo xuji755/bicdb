@@ -1562,7 +1562,7 @@ fn build_graph_tree(
         unique,
         Some((dict::index_kind::GRAPH_PROPERTY, source)),
     )?;
-    fill_graph_tree(w, block, entries)?;
+    fill_graph_tree(w, block, entries, unique)?;
     w.insert_stat(obj, entries.len() as u64)?;
     Ok(())
 }
@@ -1571,28 +1571,32 @@ fn fill_graph_tree(
     w: &mut DictWriter<'_, '_, '_, '_, '_>,
     block: u32,
     entries: &[(Vec<u8>, u64)],
+    unique: bool,
 ) -> Result<(), DdlError> {
-    let ws = w.cat.ws();
+    let mut prepared = Vec::with_capacity(entries.len());
     for (key, id) in entries {
         w.cat.check_ddl_deadline()?;
         if *id == 0 || *id >= 1 << 48 || key.len() > bicdb_index::MAX_KEY_LEN {
             return Err(DdlError::BadIndexDef("invalid graph index entry".into()));
         }
-        bicdb_txn::write::checkpoint_safe_point(w.pool, w.log, w.chain)?;
         let bytes = id.to_le_bytes();
         let payload = RowId::from_bytes(bytes[..6].try_into().expect("element ID"));
-        let root = acc_index::insert_entry(
-            w.pool,
-            w.log,
-            w.cat.file_mut(),
-            ws,
-            block,
-            w.txn,
-            key,
-            payload,
-        )?;
-        acc_index::write_tree_head_redo(w.pool, w.log, w.cat.file_mut(), ws, block, w.txn, root)?;
+        prepared.push((key.clone(), payload));
     }
+    prepared.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    bicdb_txn::write::checkpoint_safe_point(w.pool, w.log, w.chain)?;
+    let ws = w.cat.ws();
+    acc_index::build_index_checkpointed(
+        w.pool,
+        w.log,
+        w.chain,
+        w.cat.file_mut(),
+        ws,
+        block,
+        w.txn,
+        &prepared,
+        unique,
+    )?;
     Ok(())
 }
 
@@ -1655,7 +1659,7 @@ pub fn rebuild_graph_property_index(
         ));
     }
     let (_, seq) = with_ddl_txn(cat, engine, |w| {
-        reset_graph_tree(w, obj, entries)?;
+        reset_graph_tree(w, obj, entries, unique)?;
         Ok(())
     })?;
     Ok(GraphIndexOutcome {
@@ -1669,11 +1673,12 @@ fn reset_graph_tree(
     w: &mut DictWriter<'_, '_, '_, '_, '_>,
     obj: u32,
     entries: &[(Vec<u8>, u64)],
+    unique: bool,
 ) -> Result<(), DdlError> {
     // Keep dictionary key rows intact: their B-tree delete has no undo.
     // Build a fresh segment, then change only undo-protected non-key values.
     let block = create_empty_index_segment(w, obj)?;
-    fill_graph_tree(w, block, entries)?;
+    fill_graph_tree(w, block, entries, unique)?;
     set_index_status(w, obj, 1)?;
     switch_graph_segment(w, obj, block, entries.len())
 }
@@ -1886,6 +1891,8 @@ fn fill_fulltext_heap(
         },
     ];
     let mut bytes = 0usize;
+    let mut keys = Vec::with_capacity(rows.len());
+    let ws = w.ws();
     for (ordinal, data) in rows {
         w.cat.check_ddl_deadline()?;
         bytes = bytes.saturating_add(data.len());
@@ -1899,7 +1906,6 @@ fn fill_fulltext_heap(
             &[DictValue::Num(*ordinal), DictValue::Bytes(data.clone())],
             &columns,
         )?;
-        let ws = w.ws();
         let rid = TableAccess::new(w.pool, ws).insert(
             w.log,
             w.chain,
@@ -1910,26 +1916,22 @@ fn fill_fulltext_heap(
             &InsertPolicy::in_place(0),
         )?;
         let key = row::key_from_row(&encoded, &[0])?;
-        let root = acc_index::insert_entry(
-            w.pool,
-            w.log,
-            w.cat.file_mut(),
-            ws,
-            key_tree,
-            w.txn,
-            &key,
-            rid,
-        )?;
-        acc_index::write_tree_head_redo(
-            w.pool,
-            w.log,
-            w.cat.file_mut(),
-            ws,
-            key_tree,
-            w.txn,
-            root,
-        )?;
+        keys.push((key, rid));
     }
+    keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    w.cat.check_ddl_deadline()?;
+    bicdb_txn::write::checkpoint_safe_point(w.pool, w.log, w.chain)?;
+    acc_index::build_index_checkpointed(
+        w.pool,
+        w.log,
+        w.chain,
+        w.cat.file_mut(),
+        ws,
+        key_tree,
+        w.txn,
+        &keys,
+        true,
+    )?;
     Ok(())
 }
 
@@ -1987,7 +1989,7 @@ fn create_graph_fulltext_index_inner(
             false,
             Some((dict::index_kind::GRAPH_FULLTEXT, build.source)),
         )?;
-        fill_graph_tree(w, block, build.entries)?;
+        fill_graph_tree(w, block, build.entries, false)?;
         w.insert_stat(obj, build.entries.len() as u64)?;
         let data = allocate_obj_number(w, None)?;
         let data_name = graph_fulltext_store_name(obj);
@@ -2112,7 +2114,7 @@ fn rebuild_graph_fulltext_index_inner(
         )?;
         let key_tree = create_empty_index_segment(w, key_obj)?;
         fill_fulltext_heap(w, heap, key_tree, build.rows)?;
-        reset_graph_tree(w, obj, build.entries)?;
+        reset_graph_tree(w, obj, build.entries, false)?;
         switch_graph_segment(w, key_obj, key_tree, build.rows.len())?;
         set_index_status(w, key_obj, 1)?;
         switch_graph_segment(w, data, heap, build.rows.len())?;
@@ -2537,7 +2539,7 @@ fn create_graph_access_tree(
         false,
         Some((kind, source)),
     )?;
-    fill_graph_tree(w, block, entries)?;
+    fill_graph_tree(w, block, entries, false)?;
     w.insert_stat(obj, entries.len() as u64)?;
     Ok(obj)
 }
@@ -2650,7 +2652,7 @@ pub fn rebuild_graph_access_indexes(
     with_ddl_txn(cat, engine, |w| {
         for b in builds {
             if let Some(obj) = existing.get(&b.kind) {
-                reset_graph_tree(w, *obj, b.entries)?;
+                reset_graph_tree(w, *obj, b.entries, false)?;
             } else {
                 create_graph_access_tree(w, base, b.kind, b.entries)?;
             }

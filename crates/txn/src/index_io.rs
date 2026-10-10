@@ -33,6 +33,7 @@ use bicdb_storage::segment::{self, Segment};
 use bicdb_wal::group::GroupWriter;
 
 use crate::write::{self, Txn};
+use bicdb_storage::undo::UndoChain;
 
 /// 索引写口的错误包装（`IndexIo` 的既有约定：字符串化的 I/O 错误）。
 fn io_err(what: impl std::fmt::Display) -> IndexError {
@@ -50,7 +51,7 @@ fn rdba_of(file_id: u16, block: u32) -> Result<Rdba, IndexError> {
 /// - `'a` = 本写口的借用期；`'b` = 池的文件借用；
 /// - `'w`/`'wc` = 日志写口的（文件、控制文件）借用；
 /// - `'s`/`'sf` = 索引段的（文件、段文件借用）借用。
-pub struct TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf> {
+pub struct TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf, 'u, 'uf> {
     pool: &'a BufferPool<'b>,
     log: &'a mut GroupWriter<'w, 'wc>,
     seg: &'a mut Segment<'s, 'sf>,
@@ -59,9 +60,10 @@ pub struct TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf> {
     ws: [u8; 8],
     /// **本次会话分配出的新块**（`apply_page` 据此走"全新页"分支；见模块文档③）。
     fresh: BTreeSet<u32>,
+    checkpoint_chain: Option<&'a UndoChain<'u, 'uf>>,
 }
 
-impl<'a, 'b, 'w, 'wc, 's, 'sf> TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf> {
+impl<'a, 'b, 'w, 'wc, 's, 'sf, 'u, 'uf> TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf, 'u, 'uf> {
     /// 打开写口（`txn` = 产生这些索引页修改的事务）。
     pub fn new(
         pool: &'a BufferPool<'b>,
@@ -77,7 +79,21 @@ impl<'a, 'b, 'w, 'wc, 's, 'sf> TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf> {
             txn_raw: txn.raw(),
             ws,
             fresh: BTreeSet::new(),
+            checkpoint_chain: None,
         }
+    }
+
+    /// Open a bulk-build writer that can checkpoint between completed pages.
+    pub fn new_checkpointed(
+        pool: &'a BufferPool<'b>,
+        log: &'a mut GroupWriter<'w, 'wc>,
+        chain: &'a UndoChain<'u, 'uf>,
+        seg: &'a mut Segment<'s, 'sf>,
+        txn: &Txn,
+    ) -> Self {
+        let mut io = Self::new(pool, log, seg, txn);
+        io.checkpoint_chain = Some(chain);
+        io
     }
 
     /// **一张页的当前镜像**（池优先；未命中直读段文件，未初始化 ⇒ `None`）。
@@ -231,7 +247,13 @@ impl<'a, 'b, 'w, 'wc, 's, 'sf> TxnIndexIo<'a, 'b, 'w, 'wc, 's, 'sf> {
     }
 }
 
-impl IndexIo for TxnIndexIo<'_, '_, '_, '_, '_, '_> {
+impl IndexIo for TxnIndexIo<'_, '_, '_, '_, '_, '_, '_, '_> {
+    fn safe_point(&mut self) -> Result<(), IndexError> {
+        if let Some(chain) = self.checkpoint_chain {
+            write::checkpoint_safe_point(self.pool, self.log, chain).map_err(io_err)?;
+        }
+        Ok(())
+    }
     fn allocate_page(&mut self) -> Result<u32, IndexError> {
         self.allocate()
     }

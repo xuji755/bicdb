@@ -17,6 +17,11 @@ use crate::IndexError;
 
 /// 页存取口（块号寻址）。
 pub trait PageStore {
+    /// Large bulk builds may use this operation boundary to reclaim WAL.
+    /// In-memory/read-only stores need no action.
+    fn safe_point(&mut self) -> Result<(), IndexError> {
+        Ok(())
+    }
     /// 读一页。
     fn read(&mut self, block: u32) -> Result<Page, IndexError>;
     /// 写一页（**写者负责 seal**；实现方可以顺手落盘）。
@@ -65,6 +70,10 @@ pub fn no_link() -> RowId {
 /// 恢复幂等重放；分裂记录的**正文随记录**（§9.1.5 第 5 步）⇒ 盘上不存在的
 /// 新页也能被重放重建）。
 pub trait IndexIo {
+    /// Reclaim WAL at a page operation boundary when the implementation needs it.
+    fn safe_point(&mut self) -> Result<(), IndexError> {
+        Ok(())
+    }
     /// **分配一张新页**（段空间管理；返回块号，内容由调用方随后写入）。
     fn allocate_page(&mut self) -> Result<u32, IndexError>;
     /// **把一页的新内容写下去**：执行器实现为"经池改页 + redo + 标脏"；
@@ -106,6 +115,9 @@ impl<'a, 'b, 'io, I: IndexIo> PoolStore<'a, 'b, 'io, I> {
 }
 
 impl<I: IndexIo> PageStore for PoolStore<'_, '_, '_, I> {
+    fn safe_point(&mut self) -> Result<(), IndexError> {
+        self.io.safe_point()
+    }
     fn read(&mut self, block: u32) -> Result<Page, IndexError> {
         let key = self.key_of(block)?;
         match self.pool.pin(key) {

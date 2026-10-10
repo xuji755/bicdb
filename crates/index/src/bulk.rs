@@ -106,6 +106,7 @@ impl<'s, S: PageStore> Tree<'s, S> {
         let mut prev_prev: Option<u32> = None;
         let mut leaf_blocks = 0usize;
         while i < entries.len() {
+            store.safe_point()?;
             let block = store.allocate()?;
             let mut page = Page::new(PageType::IndexLeaf, ws, file_id, block);
             let mut k = pack_leaf(&mut page, &entries[i..], fill)?;
@@ -158,6 +159,7 @@ impl<'s, S: PageStore> Tree<'s, S> {
             let mut j = 0usize;
             let mut first_of_level = true;
             while j < children.len() {
+                store.safe_point()?;
                 let block = store.allocate()?;
                 let leaf_page = false;
                 let page_type = if is_last_level {

@@ -26,6 +26,7 @@ use bicdb_storage::buffer::{BufferKey, BufferPool};
 use bicdb_storage::datafile::DataFile;
 use bicdb_storage::rowid::RowId;
 use bicdb_storage::segment::{self, Segment, SegmentSpaceError};
+use bicdb_storage::undo::UndoChain;
 use bicdb_txn::index_io::TxnIndexIo;
 use bicdb_txn::write::{self, Txn};
 use bicdb_wal::group::GroupWriter;
@@ -179,6 +180,44 @@ pub fn build_index(
         (tree.root(), report)
     };
     drop(seg);
+    write_tree_head_redo(pool, log, file, ws, seg_page0, txn, root)?;
+    Ok(report)
+}
+
+/// Bulk-build an index while allowing WAL checkpoints between completed pages.
+///
+/// DDL callers use this for large native graph/full-text trees. The active
+/// transaction remains open; the safe point only makes already-written redo
+/// reusable after dirty pages are flushed.
+#[allow(clippy::too_many_arguments)]
+pub fn build_index_checkpointed(
+    pool: &BufferPool<'_>,
+    log: &mut GroupWriter<'_, '_>,
+    chain: &UndoChain<'_, '_>,
+    file: &mut DataFile<'_>,
+    ws: [u8; 8],
+    seg_page0: u32,
+    txn: &Txn,
+    entries: &[(Vec<u8>, RowId)],
+    unique: bool,
+) -> Result<bicdb_index::BulkLoadReport, TableAccessError> {
+    let file_id = file.file_id();
+    let mut seg = open_seg(pool, file, seg_page0, ws)?;
+    let (root, report) = {
+        let mut io = TxnIndexIo::new_checkpointed(pool, log, chain, &mut seg, txn);
+        let mut store = bicdb_index::PoolStore::new(pool, &mut io, file_id, ws);
+        let (tree, report) = bicdb_index::Tree::bulk_load(
+            &mut store,
+            file_id,
+            ws,
+            entries,
+            unique,
+            bicdb_index::bulk_fill_percent(),
+        )?;
+        (tree.root(), report)
+    };
+    drop(seg);
+    write::checkpoint_safe_point(pool, log, chain)?;
     write_tree_head_redo(pool, log, file, ws, seg_page0, txn, root)?;
     Ok(report)
 }

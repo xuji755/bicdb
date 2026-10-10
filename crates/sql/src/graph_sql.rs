@@ -2089,23 +2089,70 @@ impl Session<'_, '_, '_, '_> {
         let batch = journal.batch(index.obj, batch_rows).map_err(error)?;
         let documents = self.fulltext_batch_documents(graph_name, graph, index, batch.events())?;
         let next_journal = journal.acknowledge(&batch).map_err(error)?;
-        let (generation, changed) =
-            self.publish_fulltext_documents(graph, index, journal, &next_journal, old, documents)?;
-        Ok((next_journal, generation, changed))
+        let (generation, changed, published_journal) = self.publish_fulltext_documents(
+            graph_name,
+            graph,
+            index,
+            journal,
+            &next_journal,
+            old,
+            documents,
+        )?;
+        Ok((published_journal, generation, changed))
     }
     fn publish_fulltext_documents(
         &mut self,
+        graph_name: &str,
         graph: u32,
         index: &NativeFulltextIndex,
         journal: &Journal,
         next_journal: &Journal,
         old: &Generation,
         documents: Vec<(u64, Option<fulltext::Document>)>,
-    ) -> Result<(Generation, usize), SessionError> {
+    ) -> Result<(Generation, usize, Journal), SessionError> {
         self.check_graph_deadline("publish_fulltext_documents")?;
         let limits = TextLimits::default();
         let changed: BTreeSet<_> = documents.iter().map(|(id, _)| *id).collect();
         let covered_seq = next_journal.consumers()[&index.obj].covered_seq;
+        // Updating v4 statistics through the generic heap DML path scans the
+        // protected record store and becomes quadratic for a real corpus. Once
+        // the corpus is nontrivial, coalesce every pending event into one native
+        // bulk rebuild. The graph snapshot and the rebuilt journal watermark are
+        // published by the same DDL transaction.
+        if old.storage_format() == 4 && !changed.is_empty() {
+            let rebuilt_journal = journal.rebuilt(index.obj).map_err(error)?;
+            let (source_graph, _) = self.load_graph(graph_name, &self.graph_limits.clone())?;
+            let generation = Generation::build(
+                index.definition.clone(),
+                &source_graph,
+                old.generation()
+                    .checked_add(1)
+                    .ok_or_else(|| error("full-text generation overflow"))?,
+                journal.source_seq(),
+                &limits,
+            )
+            .map_err(error)?;
+            let rows = generation.native_rows(&limits).map_err(error)?;
+            let entries = generation.native_entries(&limits).map_err(error)?;
+            let build = ddl::GraphFulltextBuild {
+                source: &index.source,
+                entries: &entries,
+                rows: &rows,
+            };
+            ddl::rebuild_graph_fulltext_index_with_journal(
+                self.catalog,
+                self.engine,
+                &index.name,
+                graph_name,
+                &build,
+                &rebuilt_journal
+                    .native_rows(&journal_limits())
+                    .map_err(error)?,
+            )?;
+            self.seq = self.catalog.current_seq();
+            self.fulltext_cache = None;
+            return Ok((generation, changed.len(), rebuilt_journal));
+        }
         let (generation, patch, added) = if old.storage_format() == 4 {
             let name = ddl::graph_fulltext_store_name(index.obj);
             let mut before = self
@@ -2186,7 +2233,7 @@ impl Session<'_, '_, '_, '_> {
             ],
             &[GraphIndexChanges { block, added }],
         )?;
-        Ok((generation, changed.len()))
+        Ok((generation, changed.len(), next_journal.clone()))
     }
     fn wait_fulltext_journal(
         &mut self,
@@ -2258,7 +2305,8 @@ impl Session<'_, '_, '_, '_> {
             let documents =
                 self.fulltext_batch_documents(graph_name, graph, index, batch.events())?;
             let (next_wait, next_journal) = wait.acknowledge(&journal, &batch).map_err(error)?;
-            let (next_generation, changed) = self.publish_fulltext_documents(
+            let (next_generation, changed, published_journal) = self.publish_fulltext_documents(
+                graph_name,
                 graph,
                 index,
                 &journal,
@@ -2273,7 +2321,7 @@ impl Session<'_, '_, '_, '_> {
             // The committed batch is exactly this prepared journal image.
             // Re-reading after the final COMMIT could turn successful coverage
             // into a timeout error while the acknowledgement is already durable.
-            journal = next_journal;
+            journal = published_journal;
         };
         let consumer = journal.consumers()[&index.obj];
         Ok(QueryResult::Rows {
@@ -4464,61 +4512,22 @@ impl Session<'_, '_, '_, '_> {
                 // Batch row changes so the current DML materializer scans at most
                 // once per batch, rather than once for every entity chunk. Bound
                 // batch width also limits SQL AST and parameter allocations.
-                for batch in patch.removed.chunks(256) {
+                for key in &patch.removed {
                     self.check_graph_deadline("before record delete batch")?;
-                    let values: Vec<(String, Value)> = batch
-                        .iter()
-                        .enumerate()
-                        .map(|(i, key)| {
-                            (
-                                format!("k{i}"),
-                                Value::Number(Number::parse(&key.to_string()).expect("u64")),
-                            )
-                        })
-                        .collect();
-                    let refs: Vec<(&str, Value)> = values
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect();
-                    let keys = values
-                        .iter()
-                        .map(|(k, _)| format!(":{k}"))
-                        .collect::<Vec<_>>()
-                        .join(",");
+                    let value = Value::Number(Number::parse(&key.to_string()).expect("u64"));
                     self.graph_sql(
-                        &format!("DELETE FROM {name} WHERE ordinal IN ({keys})"),
-                        &refs,
+                        &format!("DELETE FROM {name} WHERE ordinal=:k"),
+                        &[("k", value)],
                     )?;
                     self.check_graph_deadline("after record delete batch")?;
                 }
-                let updates: Vec<_> = patch.updated.iter().collect();
-                for batch in updates.chunks(128) {
+                for (key, data) in &patch.updated {
                     self.check_graph_deadline("before record update batch")?;
-                    let mut values = vec![];
-                    let mut cases = vec![];
-                    let mut keys = vec![];
-                    for (i, (key, data)) in batch.iter().enumerate() {
-                        values.push((
-                            format!("k{i}"),
-                            Value::Number(Number::parse(&key.to_string()).expect("u64")),
-                        ));
-                        values.push((format!("d{i}"), Value::Bytes(data.to_vec())));
-                        keys.push(format!(":k{i}"));
-                        cases.push(format!(
-                            "WHEN ordinal=:k{i} THEN CAST(:d{i} AS VARCHAR2(4096))"
-                        ));
-                    }
-                    let refs: Vec<(&str, Value)> = values
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect();
+                    let key = Value::Number(Number::parse(&key.to_string()).expect("u64"));
+                    let data = Value::Bytes(data.clone());
                     self.graph_sql(
-                        &format!(
-                            "UPDATE {name} SET data=CASE {} ELSE data END WHERE ordinal IN ({})",
-                            cases.join(" "),
-                            keys.join(",")
-                        ),
-                        &refs,
+                        &format!("UPDATE {name} SET data=:d WHERE ordinal=:k"),
+                        &[("d", data), ("k", key)],
                     )?;
                     self.check_graph_deadline("after record update batch")?;
                 }
