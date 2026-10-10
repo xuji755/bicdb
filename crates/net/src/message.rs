@@ -33,7 +33,7 @@ pub const WIRE_VERSION: u8 = 1;
 pub struct Hello {
     /// 协议版本。
     pub wire: u8,
-    /// 服务/引擎版本（`0.2.0` 形态）。
+    /// 服务/引擎版本（`0.3.0` 形态）。
     pub version: String,
     /// 实例根区目录（诊断）。
     pub instance: String,

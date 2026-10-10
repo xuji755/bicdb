@@ -5,7 +5,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # MSRV：代码可编译的最低 Rust 版本。这是比工具链精确版本更宽松、更稳定的
 # 约束——开发人员用任意 >= 1.80 的 stable 均可构建。

@@ -6,9 +6,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-10
+
+### Release highlights
+
+- Added native property-graph storage, a practical Cypher subset, SQL graph
+  projections, property indexes, graph full-text search and deferred batch index
+  maintenance with transaction and recovery coverage.
+- Added authenticated users, isolated workspaces, workspace templates, public
+  and private connection flows, dictionary/fixed-table introspection and the
+  current Rust/Python client surfaces.
+- Changed large graph/full-text index creation to sorted bulk builds with safe
+  WAL checkpoints, and coalesced deferred full-text maintenance into one atomic
+  generation rebuild. This removes the per-entry root rewrite bottleneck on
+  real knowledge-graph corpora.
+
 ### Documentation — 2026-10-10
 
-- Updated the English/Chinese project status to the v0.2.0 development line,
+- Updated the English/Chinese project status to the v0.3.0 release,
   including authenticated private workspaces, structure templates, native graph
   storage, the Cypher subset, property indexes, `GRAPH_TABLE`, graph full-text
   search and deferred index maintenance.
@@ -785,3 +800,4 @@ P1–P4 are implemented; P5 (SQL / catalog) is in progress.
 [0.1.0]: https://github.com/xuji755/bicdb/releases/tag/v0.1.0
 [0.1.1]: https://github.com/xuji755/bicdb/releases/tag/v0.1.1
 [0.2.0]: https://github.com/xuji755/bicdb/releases/tag/v0.2.0
+[0.3.0]: https://github.com/xuji755/bicdb/releases/tag/v0.3.0
